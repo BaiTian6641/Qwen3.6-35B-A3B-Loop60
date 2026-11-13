@@ -46,6 +46,7 @@ class ToyConfig:
     norm_topk_prob: bool = True
     rms_norm_eps: float = 1e-6
     model_type: str = "toy_qwen3_5_moe"
+    _attn_implementation: str = "eager"
 
     def __post_init__(self) -> None:
         if not self.layer_types:
@@ -117,11 +118,31 @@ def apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) ->
     return torch.cat([xr * cos + _rotate_half(xr) * sin, xp], dim=-1)
 
 
+def dense_causal_attention(module, query, key, value, attention_mask=None, scaling=None, dropout=0.0, **kwargs):
+    """HF attention-interface signature: q [B,H,Tq,D], k/v [B,G,Tk,D] -> ([B,Tq,H,D], None).
+
+    Queries are the last Tq positions of the Tk keys (cache semantics, no padding).
+    """
+    h, g = query.shape[1], key.shape[1]
+    tq, tk = query.shape[-2], key.shape[-2]
+    k, v = key.repeat_interleave(h // g, dim=1), value.repeat_interleave(h // g, dim=1)
+    qpos = torch.arange(tk - tq, tk, device=query.device)[:, None]
+    mask = torch.arange(tk, device=query.device)[None, :] <= qpos
+    o = F.scaled_dot_product_attention(query, k, v, attn_mask=mask, scale=scaling)
+    return o.transpose(1, 2), None
+
+
+# like transformers.AttentionInterface: config._attn_implementation -> function
+TOY_ATTENTION_FUNCTIONS = {"eager": dense_causal_attention, "sdpa": dense_causal_attention}
+
+
 class ToyGatedAttention(nn.Module):
     def __init__(self, config: ToyConfig, layer_idx: int):
         super().__init__()
+        self.config = config
         self.layer_idx = layer_idx
         self.h, self.kv, self.d = config.num_attention_heads, config.num_key_value_heads, config.head_dim
+        self.scaling = self.d ** -0.5
         hs = config.hidden_size
         self.q_proj = nn.Linear(hs, self.h * self.d * 2, bias=False)  # query + output gate
         self.k_proj = nn.Linear(hs, self.kv * self.d, bias=False)
@@ -141,14 +162,9 @@ class ToyGatedAttention(nn.Module):
         q, k = apply_partial_rope(q, cos, sin), apply_partial_rope(k, cos, sin)
         if past_key_values is not None:
             k, v = past_key_values.update(k, v, self.layer_idx, {"cache_position": cache_position})
-        rep = self.h // self.kv
-        k, v = k.repeat_interleave(rep, dim=1), v.repeat_interleave(rep, dim=1)
-        tk = k.shape[-2]
-        qpos = torch.arange(tk - t, tk, device=x.device)[:, None]
-        kpos = torch.arange(tk, device=x.device)[None, :]
-        mask = kpos <= qpos
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        o = o.transpose(1, 2).reshape(b, t, self.h, self.d) * torch.sigmoid(gate)
+        attn_fn = TOY_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        o, _ = attn_fn(self, q, k, v, attention_mask, scaling=self.scaling)
+        o = o.reshape(b, t, self.h, self.d) * torch.sigmoid(gate)
         return self.o_proj(o.reshape(b, t, self.h * self.d))
 
 

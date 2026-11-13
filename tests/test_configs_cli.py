@@ -26,6 +26,11 @@ def test_every_config_loads_and_validates(path):
     else:
         types = QWEN_TYPES
         assert loop.virtual_layers(40) == 64, f"{path}: Qwen configs must target 64 virtual layers"
+        if "stages/" in path.replace("\\", "/") or "eval/" in path.replace("\\", "/"):
+            assert loop.per_pass_router is True
+            sync = (cfg.get("checkpoint") or {}).get("sync") or {}
+            assert sync.get("hf_repo") == "TassP0lar/Qwen3.6-35B-A3B-Loop64"
+            assert sync.get("private") is False
     assert loop.validate(types) == []
     assert len(build_schedule(loop, types)) == loop.virtual_layers(len(types))
     if cfg.get("stage_type") in ("lm", "rl"):

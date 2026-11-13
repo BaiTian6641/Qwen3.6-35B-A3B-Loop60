@@ -25,3 +25,5 @@ data:
     - {name: toy_text, weight: 0.3}
 eval_quick:
   n_batches: 2
+checkpoint:
+  sync: {enabled: false, hf_repo: null}

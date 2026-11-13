@@ -6,6 +6,8 @@ _base_: [../base.yaml, ../model/qwen36_bf16.yaml]
 stage: s1_loop_heal
 stage_type: lm
 run: {name: s1_loop_heal}
+loop:
+  router_diversity_weight: 0.005     # encourage pass-2 dynamic re-routing to complementary experts
 experts:
   enabled: true
   stats_path: runs/s0_probe/esft_stats.json

@@ -10,6 +10,7 @@ experts:
   per_pass: union
 loop:
   train_pass_probs: [0.15, 0.85]
+  router_diversity_weight: 0.002
 train:
   init_from: runs/s1_loop_heal
   steps: 3000

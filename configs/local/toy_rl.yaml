@@ -24,5 +24,7 @@ rl:
         limit: 2
         max_new_tokens: 4
         offline_items:
-          - {id: a, problem: "1+1?", answer: "2"}
-          - {id: b, problem: "2+2?", answer: "4"}
+            - {id: a, problem: "1+1?", answer: "2"}
+            - {id: b, problem: "2+2?", answer: "4"}
+checkpoint:
+  sync: {enabled: false, hf_repo: null}

@@ -1,7 +1,7 @@
 # Shared defaults for every stage. Stage files override via `_base_`.
 seed: 0
 run:
-  root: runs            # overridden by $QLOOP_RUN_ROOT (Colab: /content/drive/MyDrive/qloop_runs)
+  root: runs            # overridden by $QLOOP_RUN_ROOT (Colab SSD: /content/runs, synced to HF Hub)
 debug:
   level: 1              # 0 quiet | 1 normal | 2 verbose (+NaN hooks) | 3 forensic (CUDA_LAUNCH_BLOCKING, anomaly)
 
@@ -21,6 +21,10 @@ loop:
   bridge_rank: 0
   step_embedding: true
   gate_init: 0.0              # zero-init pass gate => bit-identical to stock Qwen3.6 at step 0
+  per_pass_router: true       # per-pass dynamic expert routing: pass 2+ recruits distinct experts beyond 3B active
+  router_adapter_rank: 32     # zero-init residual router adapter per (pass>=2, core_layer)
+  router_repel_init: 0.0      # learnable cross-pass repulsion against earlier passes' Top-8 experts
+  router_diversity_weight: 0.0
   mor: false                  # token-level depth routing (enable after the loop has healed)
   mor_target_depth: null
   write_mask: true            # DeltaNet write mask for exited tokens (train == decode semantics)
@@ -53,7 +57,7 @@ experts:
   fraction: 0.10
   by: affinity
   per_pass: union
-  rank: 0                     # 0 = full-rank deltas; >0 = low-rank deltas (alpha/rank scaling)
+  rank: 64                    # rank-64 ESFT deltas (~1.4 GB ckpt, <4 GB VRAM on 96 GB GPU); 0 = full-rank
 
 train:
   resume: true
@@ -63,8 +67,8 @@ train:
   log_every: 10
   ckpt_every: 100
   eval_every: 200
-  keep_last: 3
-  time_budget_hours: 22       # Colab sessions die; we checkpoint + exit cleanly, re-run resumes
+  keep_last: 1                # keep 1 local step checkpoint; full stage history lives on HF Hub commits
+  time_budget_hours: 22       # Colab sessions die; we checkpoint + commit to HF Hub + exit cleanly
   loss_impl: auto             # CCE on CUDA if installed, else chunked CE (never materialises 248K-vocab logits)
   pass_position_ids: false
   aux_weights: {loop_aux: 1.0, lsa_kl: 1.0}
@@ -83,4 +87,12 @@ eval_quick:
   depths: [1, 2]
 
 checkpoint:
-  sync: {}                    # {copy_to: /content/drive/MyDrive/qloop_ckpt} and/or {hf_repo: you/qloop-ckpts}
+  sync:
+    enabled: true
+    hf_repo: TassP0lar/Qwen3.6-35B-A3B-Loop64
+    private: false
+    push_every_ckpt: true
+    push_optim: false         # keep Hub commits compact (~1-3 GB); set true if mid-stage Adam/APOLLO state needed
+    prune_local_after_push: true
+    squash_on_quota: true
+    min_free_gib: 15.0

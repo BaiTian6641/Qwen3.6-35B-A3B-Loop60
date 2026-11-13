@@ -485,7 +485,9 @@ class HubSyncManager:
     @classmethod
     def from_sync_cfg(cls, sync_cfg: dict[str, Any] | None, api: Any = None) -> HubSyncManager | None:
         cfg = dict(sync_cfg or {})
-        repo = cfg.get("hf_repo") or os.environ.get("QLOOP_HF_REPO")
+        if cfg.get("enabled", True) is False:
+            return None
+        repo = cfg.get("hf_repo") if "hf_repo" in cfg else os.environ.get("QLOOP_HF_REPO")
         if not repo:
             return None
         return cls(

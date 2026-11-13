@@ -162,12 +162,14 @@ def run_doctor(freeze_path: str | None = None, datasets: bool = False, model: st
         checks.append(check_hf_access(model))
     if datasets:
         try:
-            from ..data.registry import DATASETS, verify_specs
+            from ..data.registry import REGISTRY, format_verify_report, verify_specs
 
-            rep = verify_specs(list(DATASETS.values()))
-            for name, r in rep.items():
-                ok = r.get("exists")
-                checks.append(Check(f"dataset {name}", PASS if ok else WARN, str(r)[:160]))
+            rep = verify_specs(list(REGISTRY.values()))
+            print(format_verify_report(rep))
+            for r in rep:
+                status = PASS if r.get("ok") else (WARN if r.get("exists") else FAIL)
+                checks.append(Check(f"dataset {r.get('name')}", status, str(r.get("detail") or r.get("access"))[:160],
+                                    "" if r.get("ok") else "accept terms on the HF page / check HF_TOKEN"))
         except Exception as e:
             checks.append(Check("datasets", WARN, f"verification failed: {e!r}"))
     if freeze_path:

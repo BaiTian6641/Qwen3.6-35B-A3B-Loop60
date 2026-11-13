@@ -143,3 +143,21 @@ flowchart LR
 - 数据集与基准的元数据：标记为 `verified=False` 的条目（例如 davinci 是 `.jsonl.7z`，需要本地解压），用 `qloop doctor --datasets` 逐一核验访问权限与 gated 状态。
 - Harbor / τ-bench 的 CLI 参数名，以及 RL 数学题源 `BytedTsinghua-SIA/DAPO-Math-17k` 的字段名：首次使用前请先跑 `--dry-run` 核对。
 - APOLLO 的 `√scale` 细节：本地 fallback 按参考实现编写。Colab 上安装 `apollo-torch` 后会自动改用官方实现。
+
+---
+
+## 6. 跨趟动态专家重路由（突破 3B 激活上限）与 Spark-X2.6-Recursion 经验迁移
+
+### 6.1 突破单趟 3B 激活参数的物理机制 (`PassRouterAdapters`)
+原版 `Qwen3.6-35B-A3B` 虽然拥有 35B 总参数（其中 32.2B 在 256 个路由专家中），但每个词元只跑 40 层且每层固定只激活 Top-8 专家（合计约 3B 激活参数）。仅靠共享的物理路由器权重 $W_{\text{gate}}$ 在第 2 趟重跑时，容易继续掉入第 1 趟已选过的同一批热点专家。
+
+参考 `Spark-X2.6-Recursion` 中按递归趟次挂载低秩深思适配器（Per-Pass Deliberation Adapters）的设计，我们在 `src/qloop/model/loop.py` 中实现了 **`PassRouterAdapters`**：
+1. **按 `(趟次 r ≥ 2, 核心层)` 独立的门控残差适配器**：低秩瓶颈 `down -> SiLU -> 零初始化 up + 零初始化 bias`，兼容旧版 `nn.Linear` 路由器与 HF≥5 的 `Qwen3_5MoeTopKRouter` 三元组输出 `(probs, scores, indices)`。第 0 步残差严格为 0，保持与原版 40 层模型 100% bit 级一致。
+2. **跨趟专家排斥门（Cross-Pass Expert Repulsion）与多样性辅助损失**：跟踪同一序列位置在前序趟次已激活的专家掩码 $M_{<r}$，通过零初始化可学习排斥系数 $\gamma_{r,\ell}$ 抑制重复唤醒同一批专家，并可选叠加跨趟路由概率内积惩罚 `router_diversity_weight`。
+3. **有效咨询参数量扩展**：无需复制 1 MB 底座权重，24 层核心区跑 2 趟即可在每层唤醒最多 16 个不同专家（3 趟最多 24 个），使单 token 实际调用的独特参数规模从 `~3.0B` 扩展至 `~4.5B–5.9B`，配套实时监控指标 `loop/reroute_rate`、`loop/unique_experts_core` 与 `loop/effective_expert_mult`。
+
+### 6.2 Colab 230 GB 磁盘预算与 Hugging Face 提交历史同步 (`TassP0lar/Qwen3.6-35B-A3B-Loop64`)
+针对 Google Colab 单实例 230 GB 本地磁盘上限与 24 小时会话超时限制，吸收 `Spark-X2.6-Recursion` 的 `HubSync` + `super_squash_history` 机制并针对 35B MoE 做了升级（`src/qloop/hub.py`）：
+1. **零 Google Drive 依赖，全提交历史驱动**：通过 Colab Secret `HF_TOKEN` 将每个阶段的增量可训练权重包（`~1–3 GB`，绝不重复上传 70 GB BF16 底座）、`manifest.json` 阶段状态机以及自动渲染的 `README.md` 模型卡原子提交到公开仓库 `TassP0lar/Qwen3.6-35B-A3B-Loop64`；若远端触发存储配额限制，自动调用 `super_squash_history` 压缩历史快照后重试。
+2. **跨阶段累积增量传递（Cumulative Delta Handoff）**：`Stack.checkpoint_params()` 与 `Stack.restore_checkpoint()` 自动保留跨阶段冻结切片（`carried_params`）、未挂载组件（如穿过 S4 保留到评测阶段的 `lsa_indexer`）并将前序阶段未挂载的 `HotExpertDeltas` 原地折叠进浮点专家底座，确保 `S1 -> S2 -> S3 -> S4 -> Eval -> load_qloop_from_hub` 全链路零信息丢失。
+3. **230 GB 磁盘水位守卫**：底座缓存（`~70 GB`）固定保留在 `/content/hf_cache/hub`；`keep_last: 1` 仅保留最新本地步，阶段完成后自动剥离本地 `optim.pt`/`rng.pt`、清理前序阶段 `checkpoints/` 与 `$HF_HOME/{xet,upload}` 临时分片缓存，全程将空闲磁盘稳定维持在 `85–110 GiB` 以上。

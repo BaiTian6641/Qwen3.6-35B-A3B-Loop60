@@ -348,3 +348,40 @@ def test_quota_squash_and_cli_sync_commands(tmp_path, monkeypatch, capsys):
     assert main(["sync", "disk", "--clean"]) == 0
     out = capsys.readouterr().out
     assert "free_gib" in out
+
+
+def test_colab_setup_env_requires_hf_token_and_configures_ssd_paths(tmp_path, monkeypatch):
+    import pytest
+
+    from qloop.colab import setup_env, tail_metrics
+
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    monkeypatch.delenv("QLOOP_HF_REPO", raising=False)
+    monkeypatch.delenv("QLOOP_RUN_ROOT", raising=False)
+    monkeypatch.delenv("HF_HOME", raising=False)
+    with pytest.raises(RuntimeError, match="HF_TOKEN is missing"):
+        setup_env(
+            hf_repo=DEFAULT_HF_REPO,
+            run_root=str(tmp_path / "runs"),
+            hf_home=str(tmp_path / "hf_cache"),
+            require_hf_token=True,
+        )
+
+    monkeypatch.setenv("HF_TOKEN", "hf_test_dummy_token")
+    found = setup_env(
+        hf_repo=DEFAULT_HF_REPO,
+        run_root=str(tmp_path / "runs"),
+        hf_home=str(tmp_path / "hf_cache"),
+    )
+    assert found["HF_TOKEN"] == "set"
+    assert os.environ["QLOOP_HF_REPO"] == DEFAULT_HF_REPO
+    assert os.environ["QLOOP_RUN_ROOT"] == str(tmp_path / "runs")
+    assert os.environ["HF_HOME"] == str(tmp_path / "hf_cache")
+
+    s1_dir = tmp_path / "runs" / "s1_loop_heal"
+    s1_dir.mkdir(parents=True, exist_ok=True)
+    (s1_dir / "metrics.jsonl").write_text(
+        '{"step": 10, "loss/lm": 1.2345, "eval/depth_gain": 0.0812, "loop/reroute_rate": 0.625}\n'
+    )
+    tail_metrics("s1_loop_heal")

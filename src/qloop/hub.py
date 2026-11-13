@@ -546,8 +546,8 @@ class HubSyncManager:
 
     def download_file(self, path_in_repo: str, dst_path: str) -> bool:
         os.makedirs(os.path.dirname(os.path.abspath(dst_path)), exist_ok=True)
-        if hasattr(self.api, "download_file"):
-            return bool(self.api.download_file(self.repo_id, path_in_repo, dst_path))
+        if self._api is not None and hasattr(self._api, "download_file"):
+            return bool(self._api.download_file(self.repo_id, path_in_repo, dst_path))
         try:
             from huggingface_hub import hf_hub_download
 

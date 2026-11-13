@@ -68,7 +68,8 @@ def setup_run(run_dir: str, level: int = 1) -> str:
         os.environ.setdefault("TORCH_USE_CUDA_DSA", "1")
     import faulthandler
 
-    faulthandler.enable(all_threads=True)
+    with contextlib.suppress(Exception):
+        faulthandler.enable(all_threads=True)
 
     log.setLevel(logging.DEBUG)
     log.handlers.clear()

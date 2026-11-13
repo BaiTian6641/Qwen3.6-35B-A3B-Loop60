@@ -22,7 +22,7 @@ from typing import Any
 import torch
 
 from ..debug import cuda_mem_brief, require, stage
-from .checkpoint import CheckpointManager, collect_trainable, restore_trainable
+from .checkpoint import CheckpointManager
 from .loss import lm_loss
 from .optim import FusedStepOptimizer
 from .stack import Stack, build_stack
@@ -62,9 +62,19 @@ def _to_device(batch: list[dict[str, Any]], device: torch.device, pass_pos: bool
 
 
 class LMTrainer:
-    def __init__(self, cfg: dict[str, Any], run_dir: str, stack: Stack | None = None):
+    def __init__(self, cfg: dict[str, Any], run_dir: str, stack: Stack | None = None, hub_api: Any = None):
         self.cfg, self.run_dir = cfg, run_dir
         self.tcfg = dict(cfg.get("train") or {})
+        self._hub_api = hub_api
+        sync_cfg = (cfg.get("checkpoint") or {}).get("sync")
+        if stack is None and sync_cfg:
+            from ..hub import HubSyncManager
+
+            hub = HubSyncManager.from_sync_cfg(sync_cfg, api=hub_api)
+            if hub is not None:
+                stage_id = str(cfg.get("stage") or os.path.basename(os.path.abspath(run_dir)))
+                run_root = os.path.dirname(os.path.abspath(run_dir))
+                hub.prepare_stage_workspace(stage_id, dict(cfg), run_root)
         self.stack = stack or build_stack(cfg)
         require(bool(self.stack.named_trainable), "nothing is trainable - check train.trainable / loop / lsa / experts")
         self.seed = int(cfg.get("seed", 0))
@@ -75,7 +85,7 @@ class LMTrainer:
         ocfg.setdefault("seed", self.seed)
         self.opt = FusedStepOptimizer.from_config(list(self.stack.named_trainable.items()), ocfg)
         self.ckpt = CheckpointManager(run_dir, keep_last=int(self.tcfg.get("keep_last", 3)),
-                                      sync=(cfg.get("checkpoint") or {}).get("sync"))
+                                      sync=sync_cfg, hub_api=hub_api)
         self.metrics = MetricsLogger(run_dir, cfg)
         self.step = 0
         self.tokens_seen = 0
@@ -109,18 +119,33 @@ class LMTrainer:
                 "data": self.stream.state_dict() if self.stream is not None else None,
                 "config": self.cfg.get("_meta_", {})}
 
-    def save(self) -> str:
-        return self.ckpt.save(self.step, collect_trainable(self.stack.named_trainable), self.opt.state_dict(),
-                              self._state())
+    def save(self, *, completed: bool = False, metrics: dict[str, Any] | None = None) -> str:
+        raw_cfg = self.cfg.to_dict() if hasattr(self.cfg, "to_dict") else dict(self.cfg)
+        return self.ckpt.save(
+            self.step,
+            self.stack.checkpoint_params(),
+            self.opt.state_dict(),
+            self._state(),
+            completed=completed,
+            target_steps=int(self.tcfg.get("steps", 1000)),
+            metrics=metrics,
+            config_dict=raw_cfg,
+        )
 
     def maybe_resume(self) -> None:
-        init = self.tcfg.get("init_from")
+        from ..hub import resolve_run_path
+
+        run_root = os.path.dirname(os.path.abspath(self.run_dir))
+        init = resolve_run_path(self.tcfg.get("init_from"), run_root=run_root)
         if self.tcfg.get("resume", True) and self.ckpt.latest():
             ck = self.ckpt.load(map_location="cpu")
-            restore_trainable(self.stack.named_trainable, ck["params"], strict=True)
+            assert ck is not None
+            st = ck["state"]
+            smeta = st.get("stack") or {}
+            sc = float((smeta.get("expert_delta_scale")) or 1.0)
+            self.stack.restore_checkpoint(ck["params"], strict=True, expert_delta_scale=sc, prior_stack_meta=smeta)
             if ck["optim"] is not None:
                 self.opt.load_state_dict(ck["optim"])
-            st = ck["state"]
             self.step, self.tokens_seen = int(st["step"]), int(st.get("tokens_seen", 0))
             if st.get("data") is not None and self.stream is not None:
                 self.stream.load_state_dict(st["data"])
@@ -128,8 +153,13 @@ class LMTrainer:
         elif init:
             ck = CheckpointManager(init, keep_last=0).load(map_location="cpu") if os.path.isdir(init) else None
             require(ck is not None, "train.init_from: no checkpoint found", init_from=init)
-            restore_trainable(self.stack.named_trainable, ck["params"], strict=False)
-            log.info("initialised trainables from %s (non-strict; optimizer fresh)", ck["path"])
+            assert ck is not None
+            smeta = (ck.get("state") or {}).get("stack") or {}
+            sc = float((smeta.get("expert_delta_scale")) or 1.0)
+            counts = self.stack.restore_checkpoint(
+                ck["params"], strict=False, expert_delta_scale=sc, prior_stack_meta=smeta
+            )
+            log.info("initialised from %s (%s; optimizer fresh)", ck["path"], counts)
 
     # ------------------------------------------------------------------ eval
     @torch.no_grad()
@@ -233,19 +263,22 @@ class LMTrainer:
                     self.metrics.log(self.step, last)
                     t_log, tok_log = time.time(), 0
                 if eval_every and self.step % eval_every == 0:
-                    self.metrics.log(self.step, self.quick_eval())
+                    ev = self.quick_eval()
+                    last.update(ev)
+                    self.metrics.log(self.step, ev)
                 if self.step % ckpt_every == 0:
-                    self.save()
+                    self.save(metrics=last)
                 if budget and time.time() - t_start > budget:
                     log.warning("time budget %.1fh reached: checkpointing and stopping", budget / 3600)
                     break
         except KeyboardInterrupt:
             log.warning("interrupted: saving checkpoint before exit")
-            self.save()
+            self.save(metrics=last)
             raise
-        path = self.save()
         if hasattr(self.stream, "log_stats"):
             self.stream.log_stats()
         final = self.quick_eval() if self.eval_batches else {}
-        self.metrics.log(self.step, final)
+        if final:
+            self.metrics.log(self.step, final)
+        path = self.save(completed=(self.step >= steps), metrics={**last, **final})
         return {"step": self.step, "checkpoint": path, "last": last, "eval": final}

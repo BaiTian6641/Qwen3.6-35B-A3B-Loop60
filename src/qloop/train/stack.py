@@ -17,12 +17,18 @@ import torch
 from torch import nn
 
 from ..debug import register_nonfinite_hooks, require, stage
-from ..model.experts import ExpertStats, HotExpertDeltas, attach_hot_expert_deltas, freeze_all_but
+from ..model.experts import (
+    ExpertStats,
+    HotExpertDeltas,
+    attach_hot_expert_deltas,
+    fold_expert_deltas_state_into_base_,
+    freeze_all_but,
+)
 from ..model.introspect import ModelParts, inspect_model
 from ..model.loading import load_model
 from ..model.loop import LoopController, apply_loop
 from ..model.lsa import LSAManager, install_lsa
-from .checkpoint import stable_names
+from .checkpoint import collect_trainable, stable_names
 
 log = logging.getLogger("qloop")
 
@@ -36,6 +42,11 @@ class Stack:
     lsa: LSAManager | None = None
     deltas: HotExpertDeltas | None = None
     named_trainable: dict[str, nn.Parameter] = field(default_factory=dict)
+    named_all: dict[str, nn.Parameter] = field(default_factory=dict)
+    carried_params: dict[str, nn.Parameter] = field(default_factory=dict)
+    passthrough_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    carried_lsa_cfg: dict[str, Any] | None = None
+    _folded_experts: set[tuple[int, int]] = field(default_factory=set)
     load_info: dict[str, Any] = field(default_factory=dict)
     hot_map: dict[int, list[int]] | None = None
 
@@ -74,25 +85,93 @@ class Stack:
             s.update(self.lsa.stats())
         return s
 
+    def checkpoint_params(self) -> dict[str, torch.Tensor]:
+        """Cumulative diff relative to the pristine HF base model (`passthrough + carried + trainable`)."""
+        out: dict[str, torch.Tensor] = dict(self.passthrough_tensors)
+        for k, p in self.carried_params.items():
+            out[k] = p.detach()
+        out.update(collect_trainable(self.named_trainable))
+        return out
+
+    def restore_checkpoint(
+        self,
+        saved: dict[str, torch.Tensor],
+        *,
+        strict: bool = True,
+        expert_delta_scale: float = 1.0,
+        prior_stack_meta: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        """Restore `saved` across both active trainables and frozen prior-stage adaptations."""
+        if prior_stack_meta:
+            if self.lsa is None and isinstance(prior_stack_meta.get("lsa"), dict):
+                self.carried_lsa_cfg = dict(prior_stack_meta["lsa"])
+            if self.deltas is None and prior_stack_meta.get("expert_delta_scale") is not None:
+                expert_delta_scale = float(prior_stack_meta["expert_delta_scale"])
+        if strict:
+            missing = [n for n, p in self.named_trainable.items() if p.requires_grad and n not in saved]
+            if missing:
+                raise RuntimeError(
+                    f"checkpoint mismatch: missing={missing[:10]} (+{max(0, len(missing) - 10)}). "
+                    "Did the loop/LSA/expert config change? use strict=false to load partially."
+                )
+        lookup = self.named_all or self.named_trainable
+        n_train = 0
+        with torch.no_grad():
+            for n, t in saved.items():
+                if n in lookup:
+                    p = lookup[n]
+                    if p.shape != t.shape:
+                        raise RuntimeError(
+                            f"shape mismatch for {n}: model {tuple(p.shape)} vs ckpt {tuple(t.shape)}"
+                        )
+                    p.copy_(t.to(p.device, p.dtype))
+                    if n in self.named_trainable:
+                        n_train += 1
+                    else:
+                        self.carried_params[n] = p
+                else:
+                    if strict and not self.named_all:
+                        raise RuntimeError(f"checkpoint mismatch: unexpected key {n!r}")
+                    self.passthrough_tensors[n] = t.detach().to("cpu")
+
+        folded = fold_expert_deltas_state_into_base_(
+            self.model,
+            self.passthrough_tensors,
+            scale=expert_delta_scale,
+            skip=self._folded_experts,
+        )
+        self._folded_experts |= folded
+        return {
+            "trainable": n_train,
+            "carried": len(self.carried_params),
+            "passthrough": len(self.passthrough_tensors),
+            "folded_experts": len(folded),
+        }
+
     def describe(self) -> dict[str, Any]:
         return {
             "loop": None if self.loop is None else self.loop.spec.__dict__,
-            "lsa": None if self.lsa is None else self.lsa.cfg.__dict__,
+            "lsa": (self.lsa.cfg.__dict__ if self.lsa is not None else self.carried_lsa_cfg),
             "hot_experts": None if self.hot_map is None else {str(k): v for k, v in self.hot_map.items()},
+            "expert_delta_scale": None if self.deltas is None else self.deltas.scale,
             "n_trainable": sum(p.numel() for p in self.named_trainable.values()),
         }
 
 
 def _hot_map(ecfg: dict[str, Any]) -> dict[int, list[int]] | None:
-    if ecfg.get("hot_map_path"):
+    from ..hub import resolve_run_path
+
+    hm_path = resolve_run_path(ecfg.get("hot_map_path"))
+    if hm_path:
         import json
 
-        with open(ecfg["hot_map_path"], encoding="utf-8") as f:
+        with open(hm_path, encoding="utf-8") as f:
             raw = json.load(f)
         return {int(k): [int(e) for e in v] for k, v in raw.items()}
-    path = ecfg.get("stats_path")
+    path = resolve_run_path(ecfg.get("stats_path"))
     require(bool(path) and os.path.exists(path), "experts.enabled needs experts.stats_path (run `qloop scan-experts`) "
             "or experts.hot_map_path", stats_path=path)
+    assert path is not None
     stats = ExpertStats.from_json(path)
     sel: dict[str, Any] = {"by": ecfg.get("by", "affinity"), "per_pass": ecfg.get("per_pass", "union")}
     if ecfg.get("per_layer_k") is not None:
@@ -153,8 +232,9 @@ def build_stack(cfg: dict[str, Any]) -> Stack:
     params = {id(p): p for p in model.parameters()}
     if st.loop is not None:
         params.update({id(p): p for p in st.loop.adapters.parameters()})
-    st.named_trainable = {names[i]: p for i, p in params.items() if p.requires_grad}
     require(all(i in names for i in params), "a parameter has no stable name (internal error)")
+    st.named_all = {names[i]: p for i, p in params.items()}
+    st.named_trainable = {names[i]: p for i, p in params.items() if p.requires_grad}
     n_tr = sum(p.numel() for p in st.named_trainable.values())
     log.info("trainable tensors: %d (%.3fM params)", len(st.named_trainable), n_tr / 1e6)
     if int((cfg.get("debug") or {}).get("level", 1)) >= 2 or (cfg.get("debug") or {}).get("nan_hooks"):

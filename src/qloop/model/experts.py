@@ -691,6 +691,77 @@ def attach_hot_expert_deltas(model: nn.Module, hot: dict[int, list[int]], regist
     return deltas
 
 
+_EXPERT_DELTA_KEY_RE = re.compile(
+    r"(?:^|\.)expert_deltas\.deltas\.L(\d+)\.(gate_up|down|gate_up_A|gate_up_B|down_A|down_B)\.(\d+)$"
+)
+
+
+@torch.no_grad()
+def fold_expert_deltas_state_into_base_(
+    model: nn.Module,
+    params: dict[str, torch.Tensor],
+    *,
+    scale: float = 1.0,
+    skip: set[tuple[int, int]] | None = None,
+) -> set[tuple[int, int]]:
+    """Fold unattached `expert_deltas` tensors from a prior stage directly into float base experts.
+
+    Enables downstream stages (`S3`, narrower `S4`, `eval`, or `load_qloop_from_hub`) to preserve
+    earlier hot-expert adaptations without keeping extra `HotExpertDeltas` hooks or duplicating the
+    70 GB base checkpoint.
+    """
+    grouped: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+    for k, t in params.items():
+        m = _EXPERT_DELTA_KEY_RE.search(k)
+        if m is None:
+            continue
+        pair = (int(m.group(1)), int(m.group(3)))
+        if skip and pair in skip:
+            continue
+        grouped.setdefault(pair, {})[m.group(2)] = t
+    if not grouped:
+        return set()
+
+    layers, cfg, _ = physical_layers(model)
+    by_idx = dict(layers)
+    hidden = getattr(cfg, "hidden_size", None)
+    folded: set[tuple[int, int]] = set()
+    for (layer, e), parts in sorted(grouped.items()):
+        if layer not in by_idx:
+            continue
+        mlp = _moe_of(by_idx[layer], layer)
+        gu, dn = mlp.experts.gate_up_proj, mlp.experts.down_proj
+        if not (_is_plain_float(gu) and _is_plain_float(dn)):
+            log.warning("layer %d: skipping fold of expert %d into non-float base weights", layer, e)
+            continue
+        if "gate_up" in parts and "down" in parts:
+            dgu = parts["gate_up"].to(device=gu.device, dtype=torch.float32)
+            ddn = parts["down"].to(device=dn.device, dtype=torch.float32)
+        elif {"gate_up_A", "gate_up_B", "down_A", "down_B"} <= set(parts):
+            dgu = float(scale) * (
+                parts["gate_up_B"].to(device=gu.device, dtype=torch.float32)
+                @ parts["gate_up_A"].to(device=gu.device, dtype=torch.float32)
+            )
+            ddn = float(scale) * (
+                parts["down_B"].to(device=dn.device, dtype=torch.float32)
+                @ parts["down_A"].to(device=dn.device, dtype=torch.float32)
+            )
+        else:
+            continue
+        h = hidden or int(dn.shape[1])
+        transposed = not (gu.shape[-1] == h and dn.shape[-2] == h)
+        if transposed:
+            gu[e] += dgu.t().to(gu.dtype)
+            dn[e] += ddn.t().to(dn.dtype)
+        else:
+            gu[e] += dgu.to(gu.dtype)
+            dn[e] += ddn.to(dn.dtype)
+        folded.add((layer, e))
+    if folded:
+        log.info("folded %d prior-stage hot-expert deltas into float base experts", len(folded))
+    return folded
+
+
 # ============================================================================ freezing
 
 PARAM_GROUP_RULES: list[tuple[str, str]] = [

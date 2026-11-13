@@ -9,7 +9,6 @@ from __future__ import annotations
 import importlib
 import logging
 import os
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -108,11 +107,20 @@ def check_packages() -> list[Check]:
 
 
 def check_system() -> list[Check]:
+    from ..hub import disk_report, resolve_hf_token
+
     out = []
-    total, _, free = shutil.disk_usage(os.environ.get("QLOOP_RUN_ROOT", os.getcwd()))
-    gb = free / 2**30
-    out.append(Check("disk", PASS if gb > 120 else WARN, f"{gb:.0f} GiB free of {total / 2**30:.0f}",
-                     "" if gb > 120 else "base weights (~22-70 GB) + HF cache + checkpoints need >120 GB"))
+    rep = disk_report()
+    gb = float(rep["free_gib"])
+    cached_w = float(rep["hf_hub_weights_gib"])
+    ok_disk = (gb + cached_w) >= 115.0 and gb >= 40.0
+    out.append(Check(
+        "disk",
+        PASS if ok_disk else WARN,
+        f"{gb:.0f} GiB free of {rep['total_gib']:.0f} GiB (HF weights cache: {cached_w:.1f} GiB, "
+        f"runs: {rep['runs_gib']:.1f} GiB)",
+        "" if ok_disk else "Colab 230 GB SSD: run `python -m qloop sync disk --clean` to reclaim staging/old ckpts",
+    ))
     try:
         import psutil
 
@@ -120,9 +128,14 @@ def check_system() -> list[Check]:
         out.append(Check("ram", PASS if ram >= 80 else WARN, f"{ram:.0f} GiB"))
     except Exception:
         pass
-    tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    out.append(Check("hf token", PASS if tok else WARN, "set" if tok else "missing",
-                     "" if tok else "Colab: add HF_TOKEN to Secrets (gated datasets: GPQA, GAIA, HLE ...)"))
+    tok = resolve_hf_token()
+    hf_repo = os.environ.get("QLOOP_HF_REPO", "TassP0lar/Qwen3.6-35B-A3B-Loop64")
+    out.append(Check(
+        "hf token",
+        PASS if tok else WARN,
+        f"set (sync target: {hf_repo})" if tok else "missing",
+        "" if tok else f"Colab: add write-enabled HF_TOKEN to Secrets to sync commits to {hf_repo}",
+    ))
     docker = os.path.exists("/var/run/docker.sock")
     docker_msg = "available" if docker else "no docker daemon (expected on Colab)"
     out.append(Check("docker", PASS if docker else WARN, docker_msg,

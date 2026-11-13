@@ -33,7 +33,7 @@ from typing import Any, Callable
 import torch
 
 from ..debug import require, stage
-from .checkpoint import CheckpointManager, collect_trainable, restore_trainable
+from .checkpoint import CheckpointManager, restore_trainable
 from .loss import token_entropy, token_logprobs
 from .optim import FusedStepOptimizer
 from .stack import Stack, build_stack
@@ -271,12 +271,21 @@ class _Seq:
 
 
 class GRPOTrainer:
-    def __init__(self, cfg: dict[str, Any], run_dir: str, stack: Stack | None = None):
+    def __init__(self, cfg: dict[str, Any], run_dir: str, stack: Stack | None = None, hub_api: Any = None):
         from ..eval.generate import Generator
 
         self.cfg, self.run_dir = cfg, run_dir
         self.rl = dict(cfg.get("rl") or {})
         self.tcfg = dict(cfg.get("train") or {})
+        sync_cfg = (cfg.get("checkpoint") or {}).get("sync")
+        if stack is None and sync_cfg:
+            from ..hub import HubSyncManager
+
+            hub = HubSyncManager.from_sync_cfg(sync_cfg, api=hub_api)
+            if hub is not None:
+                stage_id = str(cfg.get("stage") or os.path.basename(os.path.abspath(run_dir)))
+                run_root = os.path.dirname(os.path.abspath(run_dir))
+                hub.prepare_stage_workspace(stage_id, dict(cfg), run_root)
         self.stack = stack or build_stack(cfg)
         require(bool(self.stack.named_trainable), "nothing is trainable")
         self.seed = int(cfg.get("seed", 0))
@@ -285,7 +294,7 @@ class GRPOTrainer:
         ocfg.setdefault("total_steps", int(self.tcfg.get("steps", 200)))
         self.opt = FusedStepOptimizer.from_config(list(self.stack.named_trainable.items()), ocfg)
         self.ckpt = CheckpointManager(run_dir, keep_last=int(self.tcfg.get("keep_last", 3)),
-                                      sync=(cfg.get("checkpoint") or {}).get("sync"))
+                                      sync=sync_cfg, hub_api=hub_api)
         self.metrics = MetricsLogger(run_dir, cfg)
         self.gen = Generator(self.stack.model, self.stack.tokenizer, loop_controller=self.stack.loop,
                              max_context=self.rl.get("max_context"))
@@ -490,19 +499,20 @@ class GRPOTrainer:
         if not scores:
             return {}
         score, mean_len = sum(scores) / len(scores), sum(lens) / len(lens)
-        path = self.ckpt.save(self.step, collect_trainable(self.stack.named_trainable), self.opt.state_dict(),
-                              self._state())
+        gate_metrics = {"gate/score": score, "gate/mean_len": mean_len, **{f"gate/{k}": v for k, v in res.items()}}
+        path = self._save_ckpt(metrics=gate_metrics)
         ok_len = self.best_len is None or mean_len <= float(gcfg.get("max_len_growth", 1.5)) * self.best_len
         improved = self.best_gate is None or score >= self.best_gate + float(gcfg.get("min_delta", 0.0))
         if improved and ok_len:
             self.best_gate, self.best_len = score, mean_len
-            self.ckpt.promote(path)
+            self.ckpt.promote(path, metrics=gate_metrics)
             decision = "promoted"
         else:
             prom = self.ckpt.promoted()
             if prom and gcfg.get("rollback", True):
                 ck = self.ckpt.load(prom)
-                restore_trainable(self.stack.named_trainable, ck["params"])
+                assert ck is not None
+                restore_trainable(self.stack.named_trainable, ck["params"], strict=False)
                 if ck["optim"] is not None:
                     self.opt.load_state_dict(ck["optim"])
                 decision = f"rolled back to {os.path.basename(prom)}"
@@ -510,8 +520,7 @@ class GRPOTrainer:
                 decision = "rejected (no rollback)"
         log.info("[rl] gate step %d: score %.4f (best %s) len %.0f -> %s", self.step, score, self.best_gate,
                  mean_len, decision)
-        return {"gate/score": score, "gate/mean_len": mean_len, "gate/decision": decision,
-                **{f"gate/{k}": v for k, v in res.items()}}
+        return {**gate_metrics, "gate/decision": decision}
 
     # ------------------------------------------------------------------ main loop
     def _state(self) -> dict[str, Any]:
@@ -519,21 +528,45 @@ class GRPOTrainer:
                 "init_entropy": self.init_entropy, "best_gate": self.best_gate, "best_len": self.best_len,
                 "stack": self.stack.describe()}
 
+    def _save_ckpt(self, *, completed: bool = False, metrics: dict[str, Any] | None = None) -> str:
+        raw_cfg = self.cfg.to_dict() if hasattr(self.cfg, "to_dict") else dict(self.cfg)
+        return self.ckpt.save(
+            self.step,
+            self.stack.checkpoint_params(),
+            self.opt.state_dict(),
+            self._state(),
+            completed=completed,
+            target_steps=int(self.tcfg.get("steps", 200)),
+            metrics=metrics,
+            config_dict=raw_cfg,
+        )
+
     def _resume(self) -> None:
+        from ..hub import resolve_run_path
+
+        run_root = os.path.dirname(os.path.abspath(self.run_dir))
         if not (self.tcfg.get("resume", True) and self.ckpt.latest()):
-            init = self.tcfg.get("init_from")
+            init = resolve_run_path(self.tcfg.get("init_from"), run_root=run_root)
             if init:
-                ck = CheckpointManager(init, keep_last=0).load()
+                ck = CheckpointManager(init, keep_last=0).load() if os.path.isdir(init) else None
                 require(ck is not None, "train.init_from: no checkpoint", init_from=init)
-                restore_trainable(self.stack.named_trainable, ck["params"], strict=False)
+                assert ck is not None
+                smeta = (ck.get("state") or {}).get("stack") or {}
+                sc = float((smeta.get("expert_delta_scale")) or 1.0)
+                self.stack.restore_checkpoint(
+                    ck["params"], strict=False, expert_delta_scale=sc, prior_stack_meta=smeta
+                )
                 if self.ref is not None:
                     self.ref = {n: p.detach().clone() for n, p in self.stack.named_trainable.items()}
             return
         ck = self.ckpt.load()
-        restore_trainable(self.stack.named_trainable, ck["params"])
+        assert ck is not None
+        st = ck["state"]
+        smeta = st.get("stack") or {}
+        sc = float((smeta.get("expert_delta_scale")) or 1.0)
+        self.stack.restore_checkpoint(ck["params"], strict=True, expert_delta_scale=sc, prior_stack_meta=smeta)
         if ck["optim"] is not None:
             self.opt.load_state_dict(ck["optim"])
-        st = ck["state"]
         self.step = int(st["step"])
         self.sampler.load_state_dict(st["sampler"])
         self.temperature = float(st.get("temperature", self.temperature))
@@ -568,17 +601,14 @@ class GRPOTrainer:
                 if gate_every and self.step % gate_every == 0:
                     self.metrics.log(self.step, self.gate())
                 elif self.step % ckpt_every == 0:
-                    self.ckpt.save(self.step, collect_trainable(self.stack.named_trainable), self.opt.state_dict(),
-                                   self._state())
+                    self._save_ckpt(metrics=last)
                 if budget and time.time() - t0 > budget:
                     log.warning("[rl] time budget reached")
                     break
         except KeyboardInterrupt:
-            self.ckpt.save(self.step, collect_trainable(self.stack.named_trainable), self.opt.state_dict(),
-                           self._state())
+            self._save_ckpt(metrics=last)
             raise
         finally:
             self.pool.shutdown(wait=False)
-        path = self.ckpt.save(self.step, collect_trainable(self.stack.named_trainable), self.opt.state_dict(),
-                              self._state())
+        path = self._save_ckpt(completed=(self.step >= steps), metrics=last)
         return {"step": self.step, "checkpoint": path, "last": last}

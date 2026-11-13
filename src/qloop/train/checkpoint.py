@@ -51,11 +51,14 @@ def _set_rng_state(st: dict[str, Any]) -> None:
 
 
 class CheckpointManager:
-    def __init__(self, run_dir: str, keep_last: int = 3, sync: dict[str, Any] | None = None):
+    def __init__(self, run_dir: str, keep_last: int = 3, sync: dict[str, Any] | None = None,
+                 hub_api: Any = None):
+        self.run_dir = run_dir
         self.dir = os.path.join(run_dir, "checkpoints")
         os.makedirs(self.dir, exist_ok=True)
         self.keep_last = keep_last
-        self.sync = sync or {}
+        self.sync = dict(sync or {})
+        self._hub_api = hub_api
 
     # ------------------------------------------------------------------ paths
     def _pointer(self, name: str) -> str | None:
@@ -79,9 +82,34 @@ class CheckpointManager:
             f.write(os.path.basename(target))
         os.replace(tmp, os.path.join(self.dir, name))
 
+    def _guard_disk_before_save(self) -> None:
+        min_gib = self.sync.get("min_free_gib")
+        if min_gib is None:
+            return
+        from ..hub import disk_report, reclaim_disk_space
+
+        run_root = os.path.dirname(os.path.abspath(self.run_dir))
+        stage_name = os.path.basename(os.path.abspath(self.run_dir))
+        rep = disk_report(run_root)
+        if rep["free_gib"] < float(min_gib):
+            log.warning("low free disk (%.1f GiB < %.1f GiB): reclaiming staging/old checkpoints",
+                        rep["free_gib"], float(min_gib))
+            reclaim_disk_space(run_root, keep_stages=(stage_name,), clean_hf_staging=True, clean_pip_cache=True)
+
     # ------------------------------------------------------------------ save / load
-    def save(self, step: int, params: dict[str, torch.Tensor], optim_state: dict[str, Any] | None,
-             state: dict[str, Any]) -> str:
+    def save(
+        self,
+        step: int,
+        params: dict[str, torch.Tensor],
+        optim_state: dict[str, Any] | None,
+        state: dict[str, Any],
+        *,
+        completed: bool = False,
+        target_steps: int | None = None,
+        metrics: dict[str, Any] | None = None,
+        config_dict: dict[str, Any] | None = None,
+    ) -> str:
+        self._guard_disk_before_save()
         name = f"step_{step:07d}"
         final = os.path.join(self.dir, name)
         tmp = os.path.join(self.dir, f".tmp_{name}_{os.getpid()}")
@@ -101,7 +129,15 @@ class CheckpointManager:
         self._rotate()
         size = sum(os.path.getsize(os.path.join(final, f)) for f in os.listdir(final)) / 2**20
         log.info("checkpoint %s saved (%.0f MiB, %.1fs)", final, size, time.time() - t0)
-        self._sync(final)
+        self._sync(
+            final,
+            stage_name=str(state.get("stage") or os.path.basename(os.path.abspath(self.run_dir))),
+            completed=completed,
+            promoted=False,
+            target_steps=target_steps,
+            metrics=metrics,
+            config_dict=config_dict,
+        )
         return final
 
     def load(self, path: str | None = None, map_location: str = "cpu") -> dict[str, Any] | None:
@@ -120,9 +156,11 @@ class CheckpointManager:
         log.info("loaded checkpoint %s (step %s)", path, state.get("step"))
         return out
 
-    def promote(self, path: str) -> None:
+    def promote(self, path: str, *, metrics: dict[str, Any] | None = None) -> None:
         self._write_pointer("PROMOTED", path)
         log.info("promoted %s", path)
+        stage_name = os.path.basename(os.path.abspath(self.run_dir))
+        self._sync(path, stage_name=stage_name, completed=False, promoted=True, metrics=metrics)
 
     def _rotate(self) -> None:
         keep = {os.path.basename(p) for p in (self.latest(), self.promoted()) if p}
@@ -131,7 +169,17 @@ class CheckpointManager:
             if d not in keep:
                 shutil.rmtree(os.path.join(self.dir, d), ignore_errors=True)
 
-    def _sync(self, path: str) -> None:
+    def _sync(
+        self,
+        path: str,
+        *,
+        stage_name: str,
+        completed: bool = False,
+        promoted: bool = False,
+        target_steps: int | None = None,
+        metrics: dict[str, Any] | None = None,
+        config_dict: dict[str, Any] | None = None,
+    ) -> None:
         dest = self.sync.get("copy_to")
         if dest:
             try:
@@ -141,18 +189,36 @@ class CheckpointManager:
                 log.info("synced checkpoint to %s", target)
             except Exception as e:
                 log.warning("checkpoint copy to %s failed: %r", dest, e)
-        repo = self.sync.get("hf_repo")
-        if repo:
-            try:
-                from huggingface_hub import HfApi
 
-                api = HfApi()
-                api.create_repo(repo, private=True, exist_ok=True)
-                api.upload_folder(folder_path=path, repo_id=repo, path_in_repo=os.path.basename(path),
-                                  commit_message=f"qloop checkpoint {os.path.basename(path)}")
-                log.info("uploaded checkpoint to hf://%s/%s", repo, os.path.basename(path))
-            except Exception as e:
-                log.warning("HF upload to %s failed: %r (training continues)", repo, e)
+        from ..hub import HubSyncManager, reclaim_disk_space
+
+        hub = HubSyncManager.from_sync_cfg(self.sync, api=self._hub_api)
+        if hub is not None and bool(self.sync.get("push_every_ckpt", True) or completed or promoted):
+            oid = hub.push_checkpoint(
+                stage_name=stage_name,
+                ckpt_dir=path,
+                completed=completed,
+                promoted=promoted,
+                target_steps=target_steps,
+                include_optim=bool(self.sync.get("push_optim", False)),
+                metrics=metrics,
+                config_dict=config_dict,
+            )
+            if oid and bool(self.sync.get("prune_local_after_push", True)):
+                run_root = os.path.dirname(os.path.abspath(self.run_dir))
+                if completed:
+                    reclaim_disk_space(
+                        run_root,
+                        keep_stages=(),
+                        strip_optim_stages=(stage_name,),
+                        clean_hf_staging=True,
+                    )
+                else:
+                    reclaim_disk_space(
+                        run_root,
+                        keep_stages=(stage_name,),
+                        clean_hf_staging=True,
+                    )
 
 
 def collect_trainable(named: dict[str, nn.Parameter]) -> dict[str, torch.Tensor]:

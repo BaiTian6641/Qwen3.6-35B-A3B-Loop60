@@ -1,0 +1,37 @@
+# S2 - high-density CoT + knowledge SFT on the healed looped model (doc §4 Step 1A mixture).
+_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+stage: s2_sft
+stage_type: lm
+run: {name: s2_sft}
+experts:
+  enabled: true
+  stats_path: runs/s1_loop_heal/esft_stats_looped.json   # re-scan AFTER healing: pass-2 hot experts differ
+  fraction: 0.12
+  per_pass: union
+loop:
+  train_pass_probs: [0.15, 0.85]
+train:
+  init_from: runs/s1_loop_heal
+  steps: 3000
+  grad_accum: 8
+  trainable:
+    - "mlp\\.gate\\.weight$"
+    - "shared_expert\\."
+    - "self_attn\\."
+    - "linear_attn\\.(in_proj|out_proj)"
+    - "input_layernorm|post_attention_layernorm"
+  allowed_groups: [loop_adapters, router, shared_expert, attention, deltanet, norms, expert_deltas]
+  optim: {lr: 2.0e-5}
+data:
+  seq_len: 32768
+  sources:
+    - {name: fable51, weight: 0.315}
+    - {name: opus46_3000x, weight: 0.09}
+    - {name: opus46_3300x, weight: 0.09}
+    - {name: opus46_traceinv, weight: 0.09}
+    - {name: agentic_fable5, weight: 0.09}
+    - {name: openthoughts3, weight: 0.09}
+    - {name: ot_agent_sft, weight: 0.045}
+    - {name: nemotron_post, weight: 0.10}   # reasoning on/off switch
+    - {name: finepdfs_mix, weight: 0.09}    # 10% knowledge replay
+  decontaminate: {enabled: true, ngram: 13, groups: [aime_2026, gpqa, hle, arc_agi_2], on_missing: warn}

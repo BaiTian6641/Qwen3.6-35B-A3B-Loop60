@@ -1,0 +1,19 @@
+# S0 - de-risking probes + ESFT scan on the real model (≈1-2 h on the G4 runtime).
+#   python -m qloop probe -c configs/stages/s0_probe.yaml --backward --surgery --core-ranges
+#   python -m qloop scan-experts -c configs/stages/s0_probe.yaml --batches 256 --seq-len 4096
+_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+stage: s0_probe
+run: {name: s0_probe}
+loop:
+  enabled: false        # probes apply/remove the loop themselves; the scan sees the stock model
+lsa:
+  enabled: false
+data:
+  seq_len: 4096
+  streaming: true
+  sources:
+    - {name: finepdfs_mix, weight: 0.4}
+    - {name: fable51, weight: 0.2}
+    - {name: opus46_3000x, weight: 0.2}
+    - {name: openthoughts3, weight: 0.2}
+  decontaminate: {enabled: false}

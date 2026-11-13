@@ -1,0 +1,36 @@
+# S1 - loop healing: teach the 64-layer looped model to *use* its second pass.
+# Starts bit-identical to stock Qwen3.6 (zero-init gates). Go/no-go signal: eval/depth_gain > 0
+# (held-out loss at depth 2 lower than at depth 1). If it stays <= 0 after ~100M tokens, stop and
+# revisit the core range (qloop probe --core-ranges) before spending more compute.
+_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+stage: s1_loop_heal
+stage_type: lm
+run: {name: s1_loop_heal}
+experts:
+  enabled: true
+  stats_path: runs/s0_probe/esft_stats.json
+  fraction: 0.10
+train:
+  steps: 2000                      # 2000 x 16 x 8K ≈ 262M tokens; resumable across sessions
+  grad_accum: 16
+  trainable:                       # regexes on stable (pre-loop) parameter names
+    - "mlp\\.gate\\.weight$"       # routers: must adapt to pass-2 inputs (dynamic expert re-routing)
+    - "shared_expert\\."
+    - "self_attn\\.(o_proj|q_norm|k_norm)"
+    - "input_layernorm|post_attention_layernorm"
+  allowed_groups: [loop_adapters, router, shared_expert, attention, norms, expert_deltas]
+  optim: {lr: 3.0e-5}
+data:
+  seq_len: 8192
+  respect_doc_boundaries: true
+  sources:
+    - {name: finepdfs_mix, weight: 0.40}   # world-knowledge replay keeps depth-1 intact
+    - {name: fineweb_edu, weight: 0.15}
+    - {name: fable51, weight: 0.15}
+    - {name: opus46_3000x, weight: 0.10}
+    - {name: openthoughts3, weight: 0.10}
+    - {name: nemotron_post, weight: 0.10}
+  decontaminate: {enabled: true, ngram: 13, groups: [aime_2026, gpqa, hle, arc_agi_2], on_missing: warn}
+eval_quick:
+  n_batches: 16
+  depths: [1, 2]

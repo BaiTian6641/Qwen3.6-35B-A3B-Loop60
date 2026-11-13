@@ -1,0 +1,54 @@
+# S4 - GRPO recursive self-improvement with verifiable rewards (+ optional teacher guidance).
+# Rollouts use the in-process cache sampler at the trained loop depth (exactly on-policy).
+_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+stage: s4_rl
+stage_type: rl
+run: {name: s4_rl}
+experts:
+  enabled: true
+  stats_path: runs/s1_loop_heal/esft_stats_looped.json
+  fraction: 0.03               # narrow funnel: 2-3% core reasoning experts
+loop:
+  train_pass_probs: [0.1, 0.9]
+train:
+  init_from: runs/s3_long_lsa
+  steps: 400
+  ckpt_every: 25
+  trainable:
+    - "mlp\\.gate\\.weight$"
+    - "shared_expert\\."
+    - "self_attn\\.o_proj"
+  allowed_groups: [loop_adapters, router, shared_expert, attention, expert_deltas]
+  optim: {lr: 1.0e-6, warmup_steps: 10, max_grad_norm_per_param: 0.5}
+rl:
+  tasks:
+    - {source: hf, name: dapo_math, hf_id: BytedTsinghua-SIA/DAPO-Math-17k, split: train,
+       prompt_field: prompt, answer_field: solution, verifier: "scorer:math", weight: 0.6}
+    - {source: registry, name: kernelbench_train, verifier: "scorer:kernelbench", speedup_bonus: 0.5,
+       device: cuda, weight: 0.4}
+  group_size: 8
+  prompts_per_step: 8
+  max_new_tokens: 8192
+  temperature: 1.0
+  top_p: 1.0
+  micro_batch_seqs: 2
+  clip_low: 0.2
+  clip_high: 0.28
+  adv_norm: std
+  ppo_epochs: 1
+  kl_coef: 0.0
+  entropy_floor_frac: 0.6
+  temperature_max: 1.3
+  overlong: {enabled: true, buffer: 1024, penalty: 1.0}
+  verifier_workers: 8
+  teacher: {}                  # {base_url: https://api.example.com/v1, model: <frontier>, api_key_env: TEACHER_API_KEY,
+                               #  max_calls_per_step: 2, sft_weight: 0.1}
+  gate:
+    every: 50
+    depth: 2
+    min_delta: 0.0
+    max_len_growth: 1.5
+    rollback: true
+    benchmarks:
+      - {name: aime_2026, limit: 30, max_new_tokens: 16384}
+      - {name: kernelbench_l3, limit: 20}

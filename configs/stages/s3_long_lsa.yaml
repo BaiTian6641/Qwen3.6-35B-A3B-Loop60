@@ -1,0 +1,34 @@
+# S3 - long context: YaRN to 1M + D-LSA index distillation (doc §4 Step 1B), base frozen.
+# Training length is capped by *activations* (not KV): a 1M-token sequence needs ~4 GiB per checkpointed
+# layer input x 64 virtual layers. Train the indexers at 128K (KV share makes pass-2 reuse pass-1 buckets),
+# then evaluate sparse attention at 1M (KV ≈ 10.24 GB FP8 for the 10 full-attention layers).
+_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+stage: s3_long_lsa
+stage_type: lm
+run: {name: s3_long_lsa}
+model:
+  yarn_target_len: 1048576
+lsa:
+  enabled: true
+  mode: distill
+loop:
+  train_pass_probs: [0.2, 0.8]
+train:
+  init_from: runs/s2_sft
+  steps: 600
+  grad_accum: 2
+  trainable:
+    - "self_attn\\.(q_norm|k_norm)"       # tiny: lets attention re-normalise under YaRN
+  allowed_groups: [loop_adapters, lsa_indexers, attention]
+  aux_weights: {lsa_kl: 1.0}
+  optim: {lr: 1.0e-4}
+data:
+  seq_len: 131072
+  respect_doc_boundaries: false
+  sources:
+    - {name: fable5_distill, weight: 0.5}  # 462 ultra-long traces
+    - {name: finepdfs_mix, weight: 0.5}
+  decontaminate: {enabled: false}
+eval_quick:
+  n_batches: 2
+  depths: [1, 2]

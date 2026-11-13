@@ -1,0 +1,27 @@
+# Laptop smoke run of the full LM stage (toy model, every component on):
+#   python -m qloop train -c configs/local/toy_lm.yaml
+_base_: [../base.yaml, ../model/toy.yaml]
+stage: toy_lm
+stage_type: lm
+run: {name: toy_lm}
+lsa:
+  enabled: true
+  mode: distill
+  distill_query_frac: 0.5
+loop:
+  checkpoint: true
+train:
+  steps: 20
+  grad_accum: 2
+  log_every: 5
+  ckpt_every: 10
+  eval_every: 10
+  time_budget_hours: 0
+  trainable: ["mlp\\.gate\\.weight$", "self_attn\\.o_proj"]
+data:
+  seq_len: 64
+  sources:
+    - {name: toy_cot, weight: 0.7}
+    - {name: toy_text, weight: 0.3}
+eval_quick:
+  n_batches: 2

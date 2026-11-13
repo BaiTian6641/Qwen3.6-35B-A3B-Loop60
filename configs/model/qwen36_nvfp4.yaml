@@ -1,0 +1,12 @@
+# Unsloth NVFP4-Fast (~20 GiB): ideal for rollout/serving. Use it as a *training* base only after
+# `qloop probe --backward -c configs/stages/s0_probe.yaml -s _base_...` shows gradients flow through
+# the frozen NVFP4 experts on your transformers/kernel versions (the doctor warns otherwise).
+# Expert deltas then need a dequant_fn for merging; export merged weights from the BF16 base instead.
+model:
+  name: unsloth/Qwen3.6-35B-A3B-NVFP4-Fast
+  dtype: bfloat16
+  attn_implementation: sdpa
+  device_map: cuda:0
+  text_only: true
+  trust_remote_code: false
+  yarn_target_len: null

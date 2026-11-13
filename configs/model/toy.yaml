@@ -1,0 +1,23 @@
+# Structurally faithful toy (16 layers = 4 macro-blocks) for laptop development.
+model:
+  name: toy
+  dtype: float32
+  device_map: cpu
+  toy: {seed: 0}
+loop:
+  prelude_end: 4
+  core_end: 12
+  target_virtual_layers: 24
+lsa:
+  index_dim: 4
+  block_size: 16
+  pool: 2
+  avg_bucket_keys: 4
+  max_bucket_keys: 8
+  window: 16
+  sinks: 2
+  num_select: 2
+train:
+  optim:
+    lr: 3.0e-3
+    apollo: {min_dim: 16}

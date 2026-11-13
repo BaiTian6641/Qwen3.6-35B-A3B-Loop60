@@ -1,0 +1,28 @@
+# Laptop smoke run of the GRPO stage on the toy model:
+#   python -m qloop train -c configs/local/toy_rl.yaml
+_base_: [../base.yaml, ../model/toy.yaml]
+stage: toy_rl
+stage_type: rl
+run: {name: toy_rl}
+train:
+  steps: 4
+  ckpt_every: 2
+  time_budget_hours: 0
+  trainable: ["mlp\\.gate\\.weight$"]
+  optim: {lr: 1.0e-2}
+rl:
+  tasks:
+    - {source: toy_arith, n: 32, verifier: regex, pattern: "[aeiou]"}
+  group_size: 4
+  prompts_per_step: 2
+  max_new_tokens: 8
+  micro_batch_seqs: 4
+  gate:
+    every: 2
+    benchmarks:
+      - name: aime_2026
+        limit: 2
+        max_new_tokens: 4
+        offline_items:
+          - {id: a, problem: "1+1?", answer: "2"}
+          - {id: b, problem: "2+2?", answer: "4"}

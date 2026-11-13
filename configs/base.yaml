@@ -1,0 +1,86 @@
+# Shared defaults for every stage. Stage files override via `_base_`.
+seed: 0
+run:
+  root: runs            # overridden by $QLOOP_RUN_ROOT (Colab: /content/drive/MyDrive/qloop_runs)
+debug:
+  level: 1              # 0 quiet | 1 normal | 2 verbose (+NaN hooks) | 3 forensic (CUDA_LAUNCH_BLOCKING, anomaly)
+
+# ---------------------------------------------------------------- 64-layer Encode-Think-Decode loop
+# Qwen3.6-35B-A3B: 40 layers = 10 x (3 Gated DeltaNet + 1 Gated Attention).
+# prelude [0,8) x1  +  core [8,32) x2  +  coda [32,40) x1  =  8 + 48 + 8 = 64 virtual layers.
+# `qloop probe --core-ranges` ranks all macro-block-aligned 64-layer alternatives
+# (e.g. 4/28x2/8, 12/24x2/4, or 3-pass 12-layer cores) on your data before you commit.
+loop:
+  enabled: true
+  prelude_end: 8
+  core_end: 32
+  num_passes: 2
+  target_virtual_layers: 64
+  kv_share: true              # MoR recursive KV sharing: pass-2 attention reuses pass-1 K/V (+ LSA buckets)
+  bridge_init: [0.6, 0.2, 0.2]  # convex mHC bridge over [h_prev, prelude anchor, norm-matched h_prev]
+  bridge_rank: 0
+  step_embedding: true
+  gate_init: 0.0              # zero-init pass gate => bit-identical to stock Qwen3.6 at step 0
+  mor: false                  # token-level depth routing (enable after the loop has healed)
+  mor_target_depth: null
+  write_mask: true            # DeltaNet write mask for exited tokens (train == decode semantics)
+  checkpoint: true            # activation checkpointing per virtual layer (non-reentrant)
+  train_pass_probs: [0.25, 0.75]   # sample depth 1 sometimes: keeps the stock-graph path (vLLM-servable) healthy
+
+# ---------------------------------------------------------------- D-LSA (off unless a stage enables it)
+lsa:
+  enabled: false
+  mode: distill
+  index_dim: 64
+  index_on: nope              # index only the 192 non-rotary dims of each 256-d head
+  pool: 4
+  block_size: 512
+  avg_bucket_keys: 8
+  max_bucket_keys: 32
+  num_select: 64
+  window: 512
+  sinks: 64
+  search: flat
+  temperature: 0.1
+  distill_weight: 1.0
+  distill_query_frac: 0.0625
+  query_chunk: 256
+
+# ---------------------------------------------------------------- ESFT hot-expert deltas
+experts:
+  enabled: false
+  stats_path: null            # from `qloop scan-experts`
+  fraction: 0.10
+  by: affinity
+  per_pass: union
+  rank: 0                     # 0 = full-rank deltas; >0 = low-rank deltas (alpha/rank scaling)
+
+train:
+  resume: true
+  steps: 1000
+  micro_batch: 1
+  grad_accum: 16
+  log_every: 10
+  ckpt_every: 100
+  eval_every: 200
+  keep_last: 3
+  time_budget_hours: 22       # Colab sessions die; we checkpoint + exit cleanly, re-run resumes
+  loss_impl: auto             # CCE on CUDA if installed, else chunked CE (never materialises 248K-vocab logits)
+  pass_position_ids: false
+  aux_weights: {loop_aux: 1.0, lsa_kl: 1.0}
+  optim:
+    lr: 5.0e-5
+    warmup_steps: 50
+    min_lr_ratio: 0.1
+    fused: true
+    impl: auto                # apollo_torch if installed, else the built-in faithful APOLLO
+    max_grad_norm_per_param: 1.0
+    apollo: {enabled: true, rank: 1, scale_type: tensor, scale: 128.0, update_proj_gap: 200, min_dim: 128}
+    lr_mult: {"loop_adapters": 20.0, "lsa_indexer": 10.0, "mlp\\.gate\\.weight$": 0.5}
+
+eval_quick:
+  n_batches: 8
+  depths: [1, 2]
+
+checkpoint:
+  sync: {}                    # {copy_to: /content/drive/MyDrive/qloop_ckpt} and/or {hf_repo: you/qloop-ckpts}

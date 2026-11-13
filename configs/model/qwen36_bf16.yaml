@@ -1,0 +1,10 @@
+# Official BF16 weights (~70 GB): the most reliable *training* base (plain float experts =>
+# backward through frozen experts works with stock transformers, and expert deltas can be merged).
+model:
+  name: Qwen/Qwen3.6-35B-A3B
+  dtype: bfloat16
+  attn_implementation: sdpa     # RTX PRO 6000 = sm_120: FlashAttention-3 is Hopper-only
+  device_map: cuda:0
+  text_only: true
+  trust_remote_code: false
+  yarn_target_len: null

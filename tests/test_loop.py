@@ -161,6 +161,140 @@ def test_routing_overlap_and_stats():
     assert set(ov) == set(range(4, 12)) and all(0.0 <= v <= 1.0 for v in ov.values())
     st = ctl.stats()
     assert "loop/gate_abs_mean_p2" in st and st["loop/active_passes"] == 2.0
+    assert "loop/reroute_rate" in st and "loop/unique_experts_core" in st
+    assert "loop/effective_expert_mult" in st and st["loop/effective_expert_mult"] >= 1.0
+
+
+def test_per_pass_router_repel_expands_active_experts_across_passes():
+    # Toy has num_experts=8, top_k=2 -> up to 2*3 = 6 unique experts across 3 passes
+    spec3 = {"prelude_end": 4, "core_end": 12, "num_passes": 3, "target_virtual_layers": 32,
+             "per_pass_router": True, "router_adapter_rank": 0}
+    model = build_toy()
+    ctl = apply_loop(model, spec3)
+    with torch.no_grad():
+        ctl.adapters.gates.fill_(0.5)
+    ctl.set_router_repel(100.0)
+    ids = _ids(b=2, t=6)
+    ctl.set_active_passes(1)
+    model(ids)
+    u1 = ctl.stats()["loop/unique_experts_core"]
+    ctl.set_active_passes(2)
+    model(ids)
+    st2 = ctl.stats()
+    ctl.set_active_passes(3)
+    model(ids)
+    st3 = ctl.stats()
+    assert u1 == pytest.approx(2.0)
+    assert st2["loop/reroute_rate"] == pytest.approx(1.0)
+    assert st2["loop/expert_jaccard_p12"] == pytest.approx(0.0)
+    assert st2["loop/unique_experts_core"] == pytest.approx(4.0)
+    assert st3["loop/unique_experts_core"] == pytest.approx(6.0)
+    assert st3["loop/effective_expert_mult"] > st2["loop/effective_expert_mult"] > 1.0
+
+
+def test_per_pass_router_hook_ordering_matches_merged_hot_expert_deltas():
+    """HotExpertDeltas attaches BEFORE apply_loop in build_stack; prepend=True must keep routing aligned."""
+    from qloop.model.experts import attach_hot_expert_deltas
+
+    base = build_toy().double()
+    hot = {i: [0, 2, 5, 7] for i in range(4, 12)}
+    m1 = copy.deepcopy(base)
+    d1 = attach_hot_expert_deltas(m1, hot, rank=0)
+    g = torch.Generator().manual_seed(11)
+    with torch.no_grad():
+        for p in d1.parameters():
+            p.copy_(torch.randn(p.shape, generator=g, dtype=p.dtype) * 0.25)
+    ctl1 = apply_loop(m1, dict(TOY_SPEC, per_pass_router=True, router_adapter_rank=8))
+    _randomize_adapters(ctl1, scale=1.5, seed=19)
+    ctl1.set_router_repel(3.0)
+
+    # Reference: merge deltas into physical expert base weights, then apply the exact same loop adapters
+    m2 = copy.deepcopy(base)
+    d2 = attach_hot_expert_deltas(m2, hot, rank=0)
+    d2.load_state_dict(d1.state_dict())
+    d2.merge_into_base_()
+    d2.detach()
+    ctl2 = apply_loop(m2, dict(TOY_SPEC, per_pass_router=True, router_adapter_rank=8))
+    ctl2.adapters.load_state_dict(ctl1.adapters.state_dict())
+
+    ids = _ids(b=2, t=7)
+    out1 = m1(ids).logits
+    out2 = m2(ids).logits
+    torch.testing.assert_close(out1, out2, rtol=1e-10, atol=1e-11)
+
+
+def test_per_pass_router_supports_hf_v5_topk_router_tuple_format():
+    """HF>=5 Qwen3_5MoeTopKRouter returns (router_probs, top_scores, top_indices) directly from gate()."""
+    class TupleTopKRouter(torch.nn.Module):
+        def __init__(self, linear, top_k, norm_topk):
+            super().__init__()
+            self.weight = linear.weight
+            self.top_k = top_k
+            self.norm_topk = norm_topk
+
+        def forward(self, x):
+            flat = x.reshape(-1, x.shape[-1])
+            probs = torch.softmax(flat @ self.weight.t(), dim=-1)
+            top_w, top_idx = probs.topk(self.top_k, dim=-1)
+            if self.norm_topk:
+                top_w = top_w / top_w.sum(-1, keepdim=True)
+            return probs, top_w.to(x.dtype), top_idx
+
+    class TupleMoeWrapper(torch.nn.Module):
+        def __init__(self, orig_mlp):
+            super().__init__()
+            self.gate = TupleTopKRouter(orig_mlp.gate, orig_mlp.top_k, orig_mlp.norm_topk)
+            self.experts = orig_mlp.experts
+            self.shared_expert = orig_mlp.shared_expert
+            self.shared_expert_gate = orig_mlp.shared_expert_gate
+
+        def forward(self, x):
+            b, t, h = x.shape
+            flat = x.reshape(-1, h)
+            _probs, top_w, top_idx = self.gate(flat)
+            out = self.experts(flat, top_idx, top_w)
+            out = out + torch.sigmoid(self.shared_expert_gate(flat)) * self.shared_expert(flat)
+            return out.view(b, t, h)
+
+    model = build_toy().double()
+    for lyr in model.model.layers:
+        lyr.mlp = TupleMoeWrapper(lyr.mlp)
+    ids = _ids(b=2, t=6)
+    ref = model(ids).logits.detach()
+    ctl = apply_loop(model, dict(TOY_SPEC, per_pass_router=True, router_diversity_weight=0.1))
+    # Step-0 bit-exact identity even with TupleTopKRouter
+    assert torch.equal(model(ids).logits, ref)
+    # Diversity aux loss drives gradients into pass_router even at step 0
+    aux = ctl.aux_loss()
+    assert aux is not None
+    aux.backward()
+    assert ctl.adapters.pass_router.up.grad.abs().sum() > 0
+    assert ctl.adapters.pass_router.repel.grad.abs().sum() > 0
+    # Strong repulsion forces disjoint experts in pass 2
+    model.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        ctl.adapters.gates.fill_(0.4)
+    ctl.set_router_repel(50.0)
+    out = model(ids).logits
+    assert not torch.allclose(out, ref)
+    assert ctl.stats()["loop/reroute_rate"] == pytest.approx(1.0)
+
+
+def test_router_diversity_checkpoint_gradient_parity():
+    torch.manual_seed(0)
+    base = build_toy()
+    grads = []
+    for ckpt in (False, True):
+        model = copy.deepcopy(base)
+        ctl = apply_loop(model, dict(TOY_SPEC, checkpoint=ckpt, per_pass_router=True, router_diversity_weight=0.2))
+        _randomize_adapters(ctl, scale=0.4, seed=7)
+        model.train()
+        loss = model(_ids(), labels=_ids()).loss + ctl.aux_loss()
+        loss.backward()
+        grads.append({n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None})
+    assert grads[0].keys() == grads[1].keys()
+    for n in grads[0]:
+        torch.testing.assert_close(grads[0][n], grads[1][n], rtol=1e-4, atol=1e-6, msg=n)
 
 
 def test_mhc_primitives():

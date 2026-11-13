@@ -61,11 +61,17 @@ def check_torch_gpu() -> list[Check]:
                      "" if status == PASS else "35B-A3B training recipes assume ~96 GB (RTX PRO 6000 Blackwell)"))
     archs = torch.cuda.get_arch_list()
     want = f"sm_{p.major}{p.minor}"
-    if want not in archs and f"compute_{p.major}{p.minor}" not in archs:
+    comp = f"compute_{p.major}{p.minor}"
+    matched = [
+        a for a in archs
+        if (a.startswith(want) and not a[len(want):len(want) + 1].isdigit())
+        or (a.startswith(comp) and not a[len(comp):len(comp) + 1].isdigit())
+    ]
+    if not matched:
         out.append(Check("torch arch", FAIL, f"{want} not in torch build {archs}",
                          "install a torch wheel built for this GPU (Blackwell sm_120 needs CUDA >= 12.8 wheels)"))
     else:
-        out.append(Check("torch arch", PASS, f"{want} supported"))
+        out.append(Check("torch arch", PASS, f"{want} supported ({', '.join(matched)})"))
     if p.major == 12:
         out.append(Check("attention kernels", PASS if _version("flash_attn") is None else WARN,
                          "Blackwell workstation (sm_120): FlashAttention-3 is Hopper-only; using SDPA/cuDNN or FA2",
@@ -86,11 +92,19 @@ def check_packages() -> list[Check]:
     if tv is None:
         out.append(Check("transformers", WARN, "not installed", "pip install -U transformers (needed for real model)"))
     else:
-        try:
-            importlib.import_module("transformers.models.qwen3_5_moe")
-            out.append(Check("transformers", PASS, f"{tv} (qwen3_5_moe available)"))
-        except Exception:
-            out.append(Check("transformers", FAIL, f"{tv} lacks qwen3_5_moe", "pip install -U transformers"))
+        found_moe = None
+        for mod_name in ("transformers.models.qwen3_6_moe", "transformers.models.qwen3_5_moe"):
+            try:
+                importlib.import_module(mod_name)
+                found_moe = mod_name.rsplit(".", 1)[-1]
+                break
+            except Exception:
+                continue
+        if found_moe:
+            out.append(Check("transformers", PASS, f"{tv} ({found_moe} available)"))
+        else:
+            out.append(Check("transformers", FAIL, f"{tv} lacks qwen3_5_moe/qwen3_6_moe",
+                             "pip install -U transformers"))
     specs: list[tuple[str, str, str, str]] = [
         ("fla", "flash-linear-attention", WARN, "Gated DeltaNet fast kernels; without them HF uses a slow torch path"),
         ("causal_conv1d", "causal-conv1d", WARN, "short-conv kernel for DeltaNet (fallback is slower)"),

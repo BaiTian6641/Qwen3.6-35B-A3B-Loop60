@@ -19,6 +19,7 @@ Design:
 from __future__ import annotations
 
 import glob
+import importlib.util
 import json
 import os
 import shlex
@@ -87,10 +88,15 @@ def setup_env(
 
     os.makedirs(run_root, exist_ok=True)
     os.makedirs(hf_home, exist_ok=True)
+    src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cur_pp = os.environ.get("PYTHONPATH", "")
+    if src_dir not in cur_pp.split(os.pathsep):
+        os.environ["PYTHONPATH"] = f"{src_dir}{os.pathsep}{cur_pp}" if cur_pp else src_dir
     os.environ["QLOOP_HF_REPO"] = hf_repo
     os.environ["QLOOP_RUN_ROOT"] = run_root
     os.environ["HF_HOME"] = hf_home
-    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    if importlib.util.find_spec("hf_transfer") is not None:
+        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 

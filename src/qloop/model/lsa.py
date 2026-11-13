@@ -40,7 +40,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ._dtype import upcast
-from .introspect import FULL, attention_module, inspect_model
+from .introspect import FULL, attention_module, find_text_model, inspect_model
 
 log = logging.getLogger("qloop")
 
@@ -613,16 +613,34 @@ def _resolve_dense_and_register(model: nn.Module, text_config: Any) -> tuple[str
         raise RuntimeError(f"cannot use attn_implementation={prev!r} as LSA dense fallback; load the model with "
                            f"attn_implementation='sdpa' (or one of {list(ALL_ATTENTION_FUNCTIONS.keys())})")
     _DENSE_FN[0] = ALL_ATTENTION_FUNCTIONS[prev]
-    AttentionInterface.register(LSA_IMPL_NAME, lsa_attention)
+    try:
+        AttentionInterface.register(LSA_IMPL_NAME, lsa_attention)
+    except Exception:
+        ALL_ATTENTION_FUNCTIONS[LSA_IMPL_NAME] = lsa_attention
+    try:
+        from transformers import AttentionMaskInterface
+        from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+
+        if prev in ALL_MASK_ATTENTION_FUNCTIONS:
+            try:
+                AttentionMaskInterface.register(LSA_IMPL_NAME, ALL_MASK_ATTENTION_FUNCTIONS[prev])
+            except Exception:
+                ALL_MASK_ATTENTION_FUNCTIONS[LSA_IMPL_NAME] = ALL_MASK_ATTENTION_FUNCTIONS[prev]
+    except Exception:
+        pass
 
     def set_impl(name: str) -> None:  # pragma: no cover - requires transformers
-        if hasattr(model, "set_attn_implementation"):
+        tm = find_text_model(model)
+        if hasattr(tm, "set_attn_implementation"):
             try:
-                model.set_attn_implementation(name)
-                return
+                tm.set_attn_implementation(name)
             except Exception as e:
-                log.debug("set_attn_implementation(%s) failed (%r); setting config attribute", name, e)
-        for cfg in {id(c): c for c in (text_config, getattr(model, "config", None)) if c is not None}.values():
+                log.debug("text_model.set_attn_implementation(%s) failed (%r); setting config attribute", name, e)
+        targets = [text_config, getattr(tm, "config", None)]
+        root_cfg = getattr(model, "config", None)
+        if root_cfg is not None and getattr(root_cfg, "text_config", None) is None:
+            targets.append(root_cfg)
+        for cfg in {id(c): c for c in targets if c is not None}.values():
             cfg._attn_implementation = name
     return prev, set_impl
 

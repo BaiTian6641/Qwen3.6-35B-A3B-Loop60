@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import gc
 import logging
 import time
 from collections import Counter
@@ -82,6 +83,28 @@ def _load_toy(mcfg: dict[str, Any]):
     return model, tok
 
 
+def _missing_decoder_keys(loading_info: Any) -> list[str]:
+    if not isinstance(loading_info, dict):
+        return []
+    return [k for k in loading_info.get("missing_keys", ()) if "layers." in k or "embed_tokens" in k]
+
+
+def _prune_visual_tower(model: nn.Module) -> int:
+    """Drop unused vision tower modules when `text_only=True` loaded a multimodal wrapper."""
+    freed = 0
+    for owner in (model, getattr(model, "model", None)):
+        vis = getattr(owner, "visual", None)
+        if isinstance(vis, nn.Module):
+            freed += sum(p.numel() for p in vis.parameters())
+            owner.visual = None
+    if freed > 0:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        log.info("pruned unused visual tower (%.2fB params) for text_only mode %s", freed / 1e9, cuda_mem_brief("| "))
+    return freed
+
+
 def _load_hf(mcfg: dict[str, Any]):
     try:
         import transformers
@@ -103,16 +126,39 @@ def _load_hf(mcfg: dict[str, Any]):
             from .lsa import apply_yarn
 
             apply_yarn(text_cfg, int(mcfg["yarn_target_len"]))
-    kwargs = dict(common, torch_dtype=resolve_dtype(mcfg.get("dtype")), device_map=mcfg.get("device_map", "cuda:0"),
-                  attn_implementation=mcfg.get("attn_implementation", "sdpa"),
-                  low_cpu_mem_usage=bool(mcfg.get("low_cpu_mem_usage", True)))
+    ver_head = str(getattr(transformers, "__version__", "5")).split(".", 1)[0]
+    dtype_key = "dtype" if (ver_head.isdigit() and int(ver_head) >= 5) else "torch_dtype"
+    kwargs: dict[str, Any] = dict(
+        common,
+        device_map=mcfg.get("device_map", "cuda:0"),
+        attn_implementation=mcfg.get("attn_implementation", "sdpa"),
+        low_cpu_mem_usage=bool(mcfg.get("low_cpu_mem_usage", True)),
+        **{dtype_key: resolve_dtype(mcfg.get("dtype"))},
+    )
     with stage("load weights"):
         t0 = time.time()
         model = None
         errors = []
-        if mcfg.get("text_only", True):
+        text_only = bool(mcfg.get("text_only", True))
+        if text_only:
             try:
-                model = AutoModelForCausalLM.from_pretrained(name, config=text_cfg, **kwargs)
+                res = AutoModelForCausalLM.from_pretrained(name, config=text_cfg, output_loading_info=True, **kwargs)
+                cand, linfo = res if isinstance(res, tuple) else (res, {})
+                missing = _missing_decoder_keys(linfo)
+                if missing:
+                    errors.append(f"AutoModelForCausalLM(text_config): {len(missing)} missing keys ({missing[:3]})")
+                    log.warning(
+                        "AutoModelForCausalLM left %d decoder keys uninitialized (%s); "
+                        "falling back to AutoModelForImageTextToText + visual prune",
+                        len(missing),
+                        missing[:3],
+                    )
+                    del cand
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                else:
+                    model = cand
             except Exception as e:
                 errors.append(f"AutoModelForCausalLM(text_config): {e!r}")
                 log.warning("text-only load failed (%r); falling back to the full multimodal class", e)
@@ -120,7 +166,17 @@ def _load_hf(mcfg: dict[str, Any]):
             try:
                 from transformers import AutoModelForImageTextToText
 
-                model = AutoModelForImageTextToText.from_pretrained(name, config=config, **kwargs)
+                res = AutoModelForImageTextToText.from_pretrained(
+                    name, config=config, output_loading_info=True, **kwargs
+                )
+                model, linfo = res if isinstance(res, tuple) else (res, {})
+                missing = _missing_decoder_keys(linfo)
+                if missing:
+                    raise RuntimeError(
+                        f"AutoModelForImageTextToText left {len(missing)} language keys missing: {missing[:5]}"
+                    )
+                if text_only:
+                    _prune_visual_tower(model)
             except Exception as e:
                 errors.append(f"AutoModelForImageTextToText: {e!r}")
                 raise RuntimeError("could not load model:\n  " + "\n  ".join(errors)) from e

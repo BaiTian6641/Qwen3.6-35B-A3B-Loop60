@@ -25,12 +25,14 @@ colab = [
   "apollo-torch",
   "cut-cross-entropy",
   "flash-linear-attention",
-  "rich",
 ]
 dev = ["pytest"]
 
 [project.scripts]
 qloop = "qloop.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]

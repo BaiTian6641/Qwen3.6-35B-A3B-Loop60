@@ -385,3 +385,110 @@ def test_colab_setup_env_requires_hf_token_and_configures_ssd_paths(tmp_path, mo
         '{"step": 10, "loss/lm": 1.2345, "eval/depth_gain": 0.0812, "loop/reroute_rate": 0.625}\n'
     )
     tail_metrics("s1_loop_heal")
+
+
+def test_colab_pep420_namespace_shadow_recovery(tmp_path):
+    """Reproduce Colab's `/content/qloop` PEP 420 namespace-shadow bug and verify Cell 2 recovery."""
+    import importlib
+    import sys
+
+    import pytest
+
+    content_dir = tmp_path / "content"
+    shadow_repo = content_dir / "qloop"
+    (shadow_repo / "src").mkdir(parents=True)
+
+    real_src = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+    saved_path = list(sys.path)
+    saved_mods = {k: v for k, v in sys.modules.items() if k == "qloop" or k.startswith("qloop.")}
+    try:
+        for k in list(saved_mods):
+            del sys.modules[k]
+        sys.path = [str(content_dir)] + [p for p in saved_path if os.path.abspath(p) != real_src]
+        importlib.invalidate_caches()
+
+        ns_mod = importlib.import_module("qloop")
+        assert getattr(ns_mod, "__file__", None) is None
+        with pytest.raises(ModuleNotFoundError, match="qloop\\.colab"):
+            importlib.import_module("qloop.colab")
+
+        # Execute the exact Cell 2 recovery bootstrap
+        if real_src not in sys.path:
+            sys.path.insert(0, real_src)
+        if "qloop" in sys.modules and getattr(sys.modules["qloop"], "__file__", None) is None:
+            for k in [m for m in sys.modules if m == "qloop" or m.startswith("qloop.")]:
+                del sys.modules[k]
+        importlib.invalidate_caches()
+
+        colab_mod = importlib.import_module("qloop.colab")
+        assert callable(colab_mod.setup_env)
+        assert getattr(sys.modules["qloop"], "__file__", None) is not None
+    finally:
+        for k in [m for m in list(sys.modules) if m == "qloop" or m.startswith("qloop.")]:
+            del sys.modules[k]
+        sys.modules.update(saved_mods)
+        sys.path = saved_path
+        importlib.invalidate_caches()
+
+
+def test_hf_loading_tf5_dtype_and_missing_keys_multimodal_fallback(monkeypatch):
+    """Verify `_load_hf` uses `dtype=` on TF>=5, catches silent missing decoder keys, and prunes `.visual`."""
+    import sys
+    import types
+
+    from torch import nn
+
+    from qloop.model.loading import _load_hf
+
+    seen_calls: list[tuple[str, dict]] = []
+
+    class DummyMultimodalInner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.visual = nn.Linear(8, 8)
+            self.language_model = nn.Linear(8, 8)
+
+    class DummyMultimodalWrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = DummyMultimodalInner()
+
+    fake_tf = types.ModuleType("transformers")
+    fake_tf.__version__ = "5.3.0"
+
+    class FakeAutoConfig:
+        @staticmethod
+        def from_pretrained(_name, **_kw):
+            cfg = types.SimpleNamespace(model_type="qwen3_6_moe", text_config=types.SimpleNamespace())
+            return cfg
+
+    class FakeAutoCausal:
+        @staticmethod
+        def from_pretrained(_name, **kw):
+            seen_calls.append(("causal", kw))
+            return nn.Linear(4, 4), {"missing_keys": ["model.layers.0.self_attn.q_proj.weight"]}
+
+    class FakeAutoVL:
+        @staticmethod
+        def from_pretrained(_name, **kw):
+            seen_calls.append(("vl", kw))
+            return DummyMultimodalWrapper(), {"missing_keys": []}
+
+    class FakeAutoTok:
+        @staticmethod
+        def from_pretrained(_name, **_kw):
+            return "tok"
+
+    fake_tf.AutoConfig = FakeAutoConfig
+    fake_tf.AutoModelForCausalLM = FakeAutoCausal
+    fake_tf.AutoModelForImageTextToText = FakeAutoVL
+    fake_tf.AutoTokenizer = FakeAutoTok
+    monkeypatch.setitem(sys.modules, "transformers", fake_tf)
+
+    model, tok = _load_hf({"name": "Qwen/Qwen3.6-35B-A3B", "dtype": "bfloat16", "text_only": True})
+    assert tok == "tok"
+    assert [c[0] for c in seen_calls] == ["causal", "vl"]
+    assert "dtype" in seen_calls[0][1] and "torch_dtype" not in seen_calls[0][1]
+    assert seen_calls[0][1]["output_loading_info"] is True
+    assert model.model.visual is None
+    assert not any("visual" in n for n, _ in model.named_parameters())

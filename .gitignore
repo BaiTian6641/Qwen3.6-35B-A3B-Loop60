@@ -5,8 +5,8 @@ __pycache__/
 *.so
 *.egg-info/
 .eggs/
-build/
-dist/
+/build/
+/dist/
 pip-wheel-metadata/
 .pytest_cache/
 .ruff_cache/
@@ -14,10 +14,10 @@ pip-wheel-metadata/
 .coverage
 htmlcov/
 
-# ---------------------------------------------------------------- environments
-.venv/
-venv/
-env/
+# ---------------------------------------------------------------- environments (root-anchored: src/qloop/env is code!)
+/.venv/
+/venv/
+/env/
 .python-version
 .env
 .env.*

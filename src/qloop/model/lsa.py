@@ -489,8 +489,10 @@ def lsa_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor, val
     if sparse and attention_mask is not None and cfg.strict_mask:
         raise RuntimeError("LSA sparse mode does not support padding masks (strict_mask=true); "
                            "use sequence packing without padding")
+    # NOTE: computed identically during checkpoint recomputation (same RNG state is restored), so
+    # the saved-tensor structure matches; only the *registration* of the loss is skipped then.
     want_kl = (cfg.distill_weight > 0 and torch.is_grad_enabled() and idx.wq.requires_grad
-               and not _in_backward() and tk >= cfg.block_size + 1)
+               and tk >= cfg.block_size + 1)
     index = idx.bucket_index(key) if (sparse or want_kl) else None
     if want_kl and index is not None:
         cand = torch.nonzero((qpos_all // cfg.block_size) > 0).flatten()
@@ -505,7 +507,7 @@ def lsa_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor, val
                 kl = _distill_kl(qg[:, :, :, sel], qz, qpos_all[sel], key.detach(), index, idx, scaling)
                 if kl is not None:
                     kls.append(kl)
-            if kls:
+            if kls and not _in_backward():
                 loss = torch.stack(kls).mean()
                 idx.pending.append(cfg.distill_weight * loss)
                 idx.last_stats["distill_kl"] = float(loss.detach())

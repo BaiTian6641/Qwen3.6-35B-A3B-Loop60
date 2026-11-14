@@ -33,7 +33,7 @@ from ..model.introspect import find_lm_head, find_text_model
 from ..model.loading import resolve_device, resolve_dtype
 from ..model.loop import LoopController, LoopSpec, apply_loop
 from ..model.lsa import LSAConfig, LSAManager, apply_yarn, install_lsa
-from ..model.quant_autograd import install_quantized_autograd_bridge
+from ..model.quant_autograd import FP8_DTYPES, install_quantized_autograd_bridge
 
 log = logging.getLogger("qloop")
 
@@ -695,7 +695,44 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
             instance = cls(config, _defer_loop=True, _dtype_override=dt_override)
             param_map = dict(instance.backbone.named_parameters())
             buf_map = dict(instance.backbone.named_buffers())
+            mod_map = dict(instance.backbone.named_modules())
             expected_params = set(param_map.keys())
+            q_arch = dict((config.qloop_v3_arch or {}).get("quantization") or {})
+            nvfp4_mod_meta = dict(q_arch.get("nvfp4_modules") or {})
+            dyn_quant_attrs = {
+                "weight_packed",
+                "weight_scale",
+                "weight_scale_inv",
+                "weight_global_scale",
+                "weight_scale_2",
+                "gate_up_proj_packed",
+                "gate_up_proj_scale",
+                "gate_up_proj_scale_inv",
+                "gate_up_proj_global_scale",
+                "gate_up_global_scale",
+                "gate_up_proj_scale_2",
+                "down_proj_packed",
+                "down_proj_scale",
+                "down_proj_scale_inv",
+                "down_proj_global_scale",
+                "down_global_scale",
+                "down_proj_scale_2",
+                "scale_inv",
+                "global_scale",
+                "input_scale",
+                "input_global_scale",
+                "activation_scale",
+                "k_scale",
+                "v_scale",
+                "q_scale",
+                "o_scale",
+                "weight_shape",
+            }
+            replaced_dense_for = {
+                "gate_up_proj_packed": "gate_up_proj",
+                "down_proj_packed": "down_proj",
+                "weight_packed": "weight",
+            }
 
             index_path = os.path.join(local_dir, "model.safetensors.index.json")
             single_path = os.path.join(local_dir, "model.safetensors")
@@ -742,6 +779,51 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
                             target = head_mod.weight
                             is_param = True
                     if target is None:
+                        p_path, sep, a_name = key.rpartition(".")
+                        p_mod = mod_map.get(p_path) if sep else None
+                        if (
+                            p_mod is None
+                            and sep
+                            and p_path.endswith(".kv_cache")
+                            and a_name in ("k_scale", "v_scale", "q_scale", "quant_scale")
+                        ):
+                            gp_path, gp_sep, kvc_nm = p_path.rpartition(".")
+                            gp_mod = mod_map.get(gp_path) if gp_sep else None
+                            if gp_mod is not None and kvc_nm == "kv_cache":
+                                kvc_stub = nn.Module()
+                                gp_mod.kv_cache = kvc_stub  # type: ignore[attr-defined]
+                                mod_map[p_path] = kvc_stub
+                                p_mod = kvc_stub
+                        if p_mod is not None and a_name in dyn_quant_attrs:
+                            dense_attr = replaced_dense_for.get(a_name)
+                            if dense_attr is not None:
+                                dense_key = f"{p_path}.{dense_attr}" if p_path else dense_attr
+                                p_mod._parameters.pop(dense_attr, None)
+                                p_mod._buffers.pop(dense_attr, None)
+                                param_map.pop(dense_key, None)
+                                buf_map.pop(dense_key, None)
+                                expected_params.discard(dense_key)
+                            m_meta = nvfp4_mod_meta.get(p_path) or {}
+                            if m_meta.get("storage") == "buffers":
+                                p_mod.register_buffer(a_name, tensor.clone())
+                                buf_map[key] = p_mod._buffers[a_name]  # type: ignore[assignment]
+                            else:
+                                new_p = nn.Parameter(tensor.clone(), requires_grad=False)
+                                p_mod.register_parameter(a_name, new_p)
+                                param_map[key] = new_p
+                                expected_params.add(key)
+                                loaded_backbone.add(key)
+                            if a_name.endswith("_packed") or m_meta:
+                                if getattr(p_mod, "group_size", None) is None:
+                                    p_mod.group_size = int(m_meta.get("group_size", 16))  # type: ignore[attr-defined]
+                                sm = m_meta.get("scale_mode")
+                                if sm in ("divisor", "multiplier"):
+                                    p_mod._qloop_nvfp4_scale_mode = str(sm)  # type: ignore[attr-defined]
+                                elif a_name.endswith("_global_scale") and not hasattr(
+                                    p_mod, "_qloop_nvfp4_scale_mode"
+                                ):
+                                    p_mod._qloop_nvfp4_scale_mode = "divisor"  # type: ignore[attr-defined]
+                            continue
                         unexpected_keys.append(key)
                         continue
                     require(
@@ -749,7 +831,17 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
                         f"shape mismatch for {key}: model {tuple(target.shape)} vs shard {tuple(tensor.shape)}",
                     )
                     with torch.no_grad():
-                        if dt_override is None and target.dtype != tensor.dtype:
+                        if tensor.dtype in FP8_DTYPES or not tensor.is_floating_point():
+                            if isinstance(target, nn.Parameter):
+                                target.data = tensor.to(device=target.device)
+                            else:
+                                p_path, _, a_nm = key.rpartition(".")
+                                p_mod = mod_map.get(p_path)
+                                if p_mod is not None and a_nm in p_mod._buffers:
+                                    p_mod._buffers[a_nm] = tensor.to(device=target.device)
+                                else:
+                                    target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+                        elif dt_override is None and target.dtype != tensor.dtype:
                             target.data = tensor.to(device=target.device, dtype=tensor.dtype)
                         else:
                             target.copy_(tensor.to(device=target.device, dtype=target.dtype))
@@ -781,6 +873,7 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
                     unexpected=unexpected_keys[:10],
                 )
 
+            install_quantized_autograd_bridge(instance.backbone)
             instance._finalize_loop(loop_tensors)
         finally:
             if tmp_handle is not None:
@@ -918,6 +1011,7 @@ import math
 import os
 import struct
 import sys
+import types
 from collections import OrderedDict
 from typing import Any, Callable
 
@@ -967,7 +1061,7 @@ else:
         _ST_MAP["F8_E5M2"] = torch.float8_e5m2
 
     def _upcast(x: torch.Tensor) -> torch.Tensor:
-        return x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+        return x if x.dtype == torch.float64 else x.float()
 
     def _resolve_dt(spec: Any) -> torch.dtype:
         if isinstance(spec, torch.dtype):
@@ -2779,9 +2873,65 @@ else:
             )
             self.mor_router = nn.Linear(hidden, n_passes) if spec.get("mor", False) else None
 
+    def _st_resolve_kv_scale(
+        lyr: Any,
+        cache: Any,
+        layer_idx: int,
+        *,
+        is_key: bool,
+    ) -> torch.Tensor | None:
+        attr_single = "k_scale" if is_key else "v_scale"
+        attr_plural = "k_scales" if is_key else "v_scales"
+        for holder in (lyr, cache):
+            if holder is None:
+                continue
+            sc = getattr(holder, attr_single, None)
+            if isinstance(sc, torch.Tensor):
+                return sc
+            scs = getattr(holder, attr_plural, None)
+            if isinstance(scs, (list, tuple, nn.ParameterList)) and 0 <= layer_idx < len(scs):
+                cand = scs[layer_idx]
+                if isinstance(cand, torch.Tensor):
+                    return cand
+            elif isinstance(scs, dict) and layer_idx in scs and isinstance(scs[layer_idx], torch.Tensor):
+                return scs[layer_idx]
+        return None
+
+    def _st_dequant_kv_slot(
+        t: torch.Tensor,
+        out_dt: torch.dtype,
+        lyr: Any,
+        cache: Any,
+        layer_idx: int,
+        *,
+        is_key: bool,
+    ) -> torch.Tensor:
+        if t.dtype in _FP8_DTYPES or not t.is_floating_point():
+            sc = _st_resolve_kv_scale(lyr, cache, layer_idx, is_key=is_key)
+            if isinstance(sc, torch.Tensor):
+                sf = sc.to(device=t.device, dtype=torch.float32)
+                if sf.numel() == 1:
+                    sf = sf.reshape(())
+                elif sf.ndim == 1 and t.ndim == 4 and sf.shape[0] == t.shape[1]:
+                    sf = sf.view(1, -1, 1, 1)
+                elif sf.ndim < t.ndim:
+                    while sf.ndim < t.ndim:
+                        sf = sf.unsqueeze(-1)
+                return (t.to(torch.float32) * sf).to(out_dt)
+            return t.to(out_dt)
+        return t if t.dtype == out_dt else t.to(out_dt)
+
     class _SharedKVProxy:
-        def __init__(self, cache: Any) -> None:
+        def __init__(
+            self,
+            cache: Any,
+            stash: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+            *,
+            record: bool = False,
+        ) -> None:
             object.__setattr__(self, "_cache", cache)
+            object.__setattr__(self, "_stash", stash)
+            object.__setattr__(self, "_record", bool(record))
 
         def __getattr__(self, name: str) -> Any:
             return getattr(object.__getattribute__(self, "_cache"), name)
@@ -2800,25 +2950,56 @@ else:
 
         def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int, *a: Any, **kw: Any) -> Any:
             cache = object.__getattribute__(self, "_cache")
-            if hasattr(cache, "dequantize") or type(cache).__name__ in ("QuantizedHybridCache", "_QuantizedKV"):
+            stash = object.__getattribute__(self, "_stash")
+            record = object.__getattribute__(self, "_record")
+            lidx = int(layer_idx)
+            if record:
+                res = cache.update(k, v, layer_idx, *a, **kw)
+                if stash is not None and isinstance(res, tuple) and len(res) >= 2:
+                    stash[lidx] = (res[0], res[1])
+                return res
+            if stash is not None and lidx in stash:
+                return stash[lidx]
+            if type(cache).__name__ in ("QuantizedHybridCache", "_QuantizedKV"):
                 return cache.update(k[..., :0, :], v[..., :0, :], layer_idx, *a, **kw)
-            layers = getattr(cache, "layers", None)
-            if isinstance(layers, (list, tuple, nn.ModuleList)) and 0 <= layer_idx < len(layers):
-                lyr = layers[layer_idx]
-                k_t, v_t = getattr(lyr, "keys", None), getattr(lyr, "values", None)
-                if isinstance(k_t, torch.Tensor) and isinstance(v_t, torch.Tensor) and k_t.numel() > 0:
-                    return k_t, v_t
-            kc, vc = getattr(cache, "key_cache", None), getattr(cache, "value_cache", None)
-            if (
-                isinstance(kc, list)
-                and isinstance(vc, list)
-                and 0 <= layer_idx < len(kc)
-                and 0 <= layer_idx < len(vc)
-                and isinstance(kc[layer_idx], torch.Tensor)
-                and isinstance(vc[layer_idx], torch.Tensor)
-                and kc[layer_idx].numel() > 0
-            ):
-                return kc[layer_idx], vc[layer_idx]
+            inner_cache = getattr(cache, "cache", None)
+            if inner_cache is None:
+                inner_cache = getattr(cache, "_cache", None)
+            for holder in (cache, inner_cache):
+                if holder is None:
+                    continue
+                layers = getattr(holder, "layers", None)
+                if isinstance(layers, (list, tuple, nn.ModuleList)) and 0 <= lidx < len(layers):
+                    lyr = layers[lidx]
+                    deq_fn = getattr(lyr, "_dequantize", None)
+                    qk, qv = getattr(lyr, "_quantized_keys", None), getattr(lyr, "_quantized_values", None)
+                    if (
+                        callable(deq_fn)
+                        and isinstance(qk, torch.Tensor)
+                        and isinstance(qv, torch.Tensor)
+                        and qk.numel() > 0
+                    ):
+                        return deq_fn(qk).to(k.dtype), deq_fn(qv).to(v.dtype)
+                    k_t, v_t = getattr(lyr, "keys", None), getattr(lyr, "values", None)
+                    if isinstance(k_t, torch.Tensor) and isinstance(v_t, torch.Tensor) and k_t.numel() > 0:
+                        return (
+                            _st_dequant_kv_slot(k_t, k.dtype, lyr, cache, lidx, is_key=True),
+                            _st_dequant_kv_slot(v_t, v.dtype, lyr, cache, lidx, is_key=False),
+                        )
+                kc, vc = getattr(holder, "key_cache", None), getattr(holder, "value_cache", None)
+                if (
+                    isinstance(kc, list)
+                    and isinstance(vc, list)
+                    and 0 <= lidx < len(kc)
+                    and 0 <= lidx < len(vc)
+                    and isinstance(kc[lidx], torch.Tensor)
+                    and isinstance(vc[lidx], torch.Tensor)
+                    and kc[lidx].numel() > 0
+                ):
+                    return (
+                        _st_dequant_kv_slot(kc[lidx], k.dtype, None, cache, lidx, is_key=True),
+                        _st_dequant_kv_slot(vc[lidx], v.dtype, None, cache, lidx, is_key=False),
+                    )
             return cache.update(k[..., :0, :], v[..., :0, :], layer_idx, *a, **kw)
 
     class _StandaloneDepthContext:
@@ -3119,7 +3300,9 @@ else:
             deq = fv * s.repeat_interleave(gsize, dim=-1)[..., :ku]
         if isinstance(gs, torch.Tensor):
             gf = gs.to(device=u8.device, dtype=torch.float32)
-            if gf.ndim == 1 and gf.shape[0] == deq.shape[0]:
+            if gf.numel() == 1:
+                gf = gf.reshape(())
+            elif gf.ndim == 1 and gf.shape[0] == deq.shape[0]:
                 gf = gf.reshape(deq.shape[0], *([1] * (deq.ndim - 1)))
             elif deq.ndim == 3 and gf.ndim == 2 and gf.shape[0] == deq.shape[0] and gf.shape[1] in (1, deq.shape[1]):
                 gf = gf.unsqueeze(-1)
@@ -3161,11 +3344,31 @@ else:
                 return "linear_nvfp4"
         return None
 
+    def _st_slice_scale_single(
+        s: torch.Tensor | None,
+        eid: int,
+        n_exp: int,
+        m_dim: int | None = None,
+    ) -> torch.Tensor | None:
+        if s is None or s.ndim == 0 or s.numel() == 1:
+            return s
+        if s.ndim == 2 and n_exp > 0:
+            r, c = int(s.shape[0]), int(s.shape[1])
+            if r != n_exp and r % n_exp == 0:
+                return s.reshape(n_exp, r // n_exp, c)[eid]
+            if r == n_exp and m_dim is not None and c != m_dim:
+                return s[eid].unsqueeze(0)
+            if r == n_exp:
+                return s[eid]
+        if s.shape[0] == n_exp and s.ndim in (1, 3):
+            return s[eid]
+        return s
+
     def _st_slice_scale_batch(
         s: torch.Tensor | None,
         eids: torch.Tensor,
         n_exp: int,
-        m_dim: int,
+        m_dim: int | None = None,
     ) -> torch.Tensor | None:
         if s is None or s.ndim == 0 or s.numel() == 1:
             return s
@@ -3174,13 +3377,19 @@ else:
             r, c = int(s.shape[0]), int(s.shape[1])
             if r != n_exp and r % n_exp == 0:
                 return s.reshape(n_exp, r // n_exp, c).index_select(0, ei)
-            if r == n_exp and c != m_dim:
+            if r == n_exp and m_dim is not None and c != m_dim:
                 return s.reshape(n_exp, 1, c).index_select(0, ei)
             if r == n_exp:
                 return s.index_select(0, ei)
         if s.shape[0] == n_exp and s.ndim in (1, 3):
             return s.index_select(0, ei)
         return s
+
+    def _st_nvfp4_mul_gs(mod: nn.Module, gs_nm: str | None, scale2_name: str) -> bool:
+        smode = getattr(mod, "_qloop_nvfp4_scale_mode", None)
+        if smode in ("divisor", "multiplier"):
+            return bool(smode == "multiplier")
+        return bool(gs_nm == scale2_name)
 
     def _st_deq_lin(mod: nn.Module, dt: torch.dtype) -> torch.Tensor:
         kind = _st_quant_kind(mod)
@@ -3192,7 +3401,58 @@ else:
             wp = mod.weight
         gs_nm, gs = _st_first_tensor(mod, ("weight_global_scale", "global_scale", "weight_scale_2"))
         gsize = int(getattr(mod, "group_size", None) or 16)
-        return _st_deq_nvfp4(wp, mod.weight_scale, gs, dt, gsize, mul_gs=(gs_nm == "weight_scale_2"))
+        return _st_deq_nvfp4(
+            wp, mod.weight_scale, gs, dt, gsize, mul_gs=_st_nvfp4_mul_gs(mod, gs_nm, "weight_scale_2")
+        )
+
+    def _st_deq_moe_expert(mod: nn.Module, eid: int, dt: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        kind = _st_quant_kind(mod)
+        if kind == "moe_fp8":
+            gu_a, dn_a = mod.gate_up_proj, mod.down_proj
+            n_exp = int(gu_a.shape[0])
+            bs = _st_bsize_of(mod)
+            gu_s = _st_resolve_fp8_scale(mod, gu_a, _ST_GU_S_ATTRS, "gu")
+            dn_s = _st_resolve_fp8_scale(mod, dn_a, _ST_DN_S_ATTRS, "dn")
+            guc = _st_deq_fp8(gu_a[eid], _st_slice_scale_single(gu_s, eid, n_exp, int(gu_a.shape[1])), dt, bs)
+            dnc = _st_deq_fp8(dn_a[eid], _st_slice_scale_single(dn_s, eid, n_exp, int(dn_a.shape[1])), dt, bs)
+        else:
+            gu_raw = getattr(mod, "gate_up_proj_packed", None)
+            if not isinstance(gu_raw, torch.Tensor):
+                gu_raw = mod.gate_up_proj
+            dn_raw = getattr(mod, "down_proj_packed", None)
+            if not isinstance(dn_raw, torch.Tensor):
+                dn_raw = mod.down_proj
+            n_exp = int(gu_raw.shape[0])
+            gsz = int(getattr(mod, "group_size", None) or 16)
+            gs_nm, gu_gs = _st_first_tensor(
+                mod, ("gate_up_proj_global_scale", "gate_up_global_scale", "gate_up_proj_scale_2")
+            )
+            dn_nm, dn_gs = _st_first_tensor(
+                mod, ("down_proj_global_scale", "down_global_scale", "down_proj_scale_2")
+            )
+            gu_s_e = _st_slice_scale_single(mod.gate_up_proj_scale, eid, n_exp, int(gu_raw.shape[1]))
+            dn_s_e = _st_slice_scale_single(mod.down_proj_scale, eid, n_exp, int(dn_raw.shape[1]))
+            assert gu_s_e is not None and dn_s_e is not None
+            guc = _st_deq_nvfp4(
+                gu_raw[eid],
+                gu_s_e,
+                _st_slice_scale_single(gu_gs, eid, n_exp),
+                dt,
+                gsz,
+                mul_gs=_st_nvfp4_mul_gs(mod, gs_nm, "gate_up_proj_scale_2"),
+            )
+            dnc = _st_deq_nvfp4(
+                dn_raw[eid],
+                dn_s_e,
+                _st_slice_scale_single(dn_gs, eid, n_exp),
+                dt,
+                gsz,
+                mul_gs=_st_nvfp4_mul_gs(mod, dn_nm, "down_proj_scale_2"),
+            )
+        if guc.shape[0] == dnc.shape[1] and guc.shape[1] == 2 * dnc.shape[0]:
+            guc = guc.t().contiguous()
+            dnc = dnc.t().contiguous()
+        return guc, dnc
 
     def _st_moe_fallback(mod: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> torch.Tensor:
         pos_t = [a for a in args if isinstance(a, torch.Tensor)]
@@ -3285,18 +3545,18 @@ else:
                 guc = _st_deq_nvfp4(
                     gu_raw.index_select(0, eids_t),
                     gu_s_b,
-                    _st_slice_scale_batch(gu_gs, eids_t, n_exp, -1),
+                    _st_slice_scale_batch(gu_gs, eids_t, n_exp),
                     fh.dtype,
                     gsz,
-                    mul_gs=(gs_nm == "gate_up_proj_scale_2"),
+                    mul_gs=_st_nvfp4_mul_gs(mod, gs_nm, "gate_up_proj_scale_2"),
                 )
                 dnc = _st_deq_nvfp4(
                     dn_raw.index_select(0, eids_t),
                     dn_s_b,
-                    _st_slice_scale_batch(dn_gs, eids_t, n_exp, -1),
+                    _st_slice_scale_batch(dn_gs, eids_t, n_exp),
                     fh.dtype,
                     gsz,
-                    mul_gs=(dn_nm == "down_proj_scale_2"),
+                    mul_gs=_st_nvfp4_mul_gs(mod, dn_nm, "down_proj_scale_2"),
                 )
             if guc.shape[1] == dnc.shape[2] and guc.shape[2] == 2 * dnc.shape[1]:
                 guc = guc.transpose(1, 2).contiguous()
@@ -3329,42 +3589,82 @@ else:
                     mod.out_features = outf  # type: ignore[attr-defined]
             if getattr(mod, "_qloop_standalone_qfb", False):
                 continue
+            had_inst_fwd = "forward" in mod.__dict__
+            orig_inst_fwd = mod.__dict__.get("forward")
             orig_fwd = mod.forward
+            raw_fn = getattr(orig_fwd, "__func__", orig_fwd)
+            mod._qloop_st_had_inst_fwd = had_inst_fwd  # type: ignore[attr-defined]
+            mod._qloop_st_orig_inst_fwd = orig_inst_fwd  # type: ignore[attr-defined]
             if kind in ("linear_fp8", "linear_nvfp4"):
+                if kind == "linear_nvfp4" and not isinstance(getattr(mod, "weight", None), torch.Tensor):
+                    mod._qloop_fb_only = True  # type: ignore[attr-defined]
 
-                def _make_qlin(m: nn.Module = mod, ofn: Callable[..., Any] = orig_fwd):
-                    @functools.wraps(ofn)
-                    def _qlin(*a: Any, **kw: Any) -> Any:
-                        if not getattr(m, "_qloop_fb_only", False):
+                def _make_qlin(ofn: Callable[..., Any] = orig_fwd, rfn: Callable[..., Any] = raw_fn):
+                    @functools.wraps(rfn)
+                    def _qlin(_self: nn.Module, *a: Any, **kw: Any) -> Any:
+                        cur_kind = _st_quant_kind(_self)
+                        if cur_kind is None:
+                            x0 = a[0] if a else next(v for v in kw.values() if isinstance(v, torch.Tensor))
+                            w0 = _self.weight.to(device=x0.device, dtype=x0.dtype)
+                            b0 = getattr(_self, "bias", None)
+                            bc0 = b0.to(device=x0.device, dtype=x0.dtype) if isinstance(b0, torch.Tensor) else None
+                            return F.linear(x0, w0, bc0)
+                        if not getattr(_self, "_qloop_fb_only", False):
                             try:
                                 return ofn(*a, **kw)
-                            except (ImportError, ModuleNotFoundError, NotImplementedError):
-                                m._qloop_fb_only = True  # type: ignore[attr-defined]
+                            except (ImportError, ModuleNotFoundError, NotImplementedError, AttributeError):
+                                _self._qloop_fb_only = True  # type: ignore[attr-defined]
                         x = a[0] if a else next(v for v in kw.values() if isinstance(v, torch.Tensor))
-                        wd = _st_deq_lin(m, x.dtype)
-                        b = getattr(m, "bias", None)
+                        wd = _st_deq_lin(_self, x.dtype)
+                        b = getattr(_self, "bias", None)
                         bc = b.to(device=x.device, dtype=x.dtype) if isinstance(b, torch.Tensor) else None
                         return F.linear(x, wd, bc)
 
                     return _qlin
 
-                mod.forward = _make_qlin()  # type: ignore[method-assign]
+                mod.forward = types.MethodType(_make_qlin(), mod)  # type: ignore[method-assign]
             else:
+                if kind == "moe_nvfp4" and not isinstance(getattr(mod, "gate_up_proj", None), torch.Tensor):
+                    mod._qloop_fb_only = True  # type: ignore[attr-defined]
 
-                def _make_qmoe(m: nn.Module = mod, ofn: Callable[..., Any] = orig_fwd):
-                    @functools.wraps(ofn)
-                    def _qmoe(*a: Any, **kw: Any) -> Any:
-                        if not getattr(m, "_qloop_fb_only", False):
+                def _make_qmoe(ofn: Callable[..., Any] = orig_fwd, rfn: Callable[..., Any] = raw_fn):
+                    @functools.wraps(rfn)
+                    def _qmoe(_self: nn.Module, *a: Any, **kw: Any) -> Any:
+                        if _st_quant_kind(_self) is None:
+                            return ofn(*a, **kw)
+                        if not getattr(_self, "_qloop_fb_only", False):
                             try:
                                 return ofn(*a, **kw)
-                            except (ImportError, ModuleNotFoundError, NotImplementedError):
-                                m._qloop_fb_only = True  # type: ignore[attr-defined]
-                        return _st_moe_fallback(m, a, kw)
+                            except (ImportError, ModuleNotFoundError, NotImplementedError, AttributeError):
+                                _self._qloop_fb_only = True  # type: ignore[attr-defined]
+                        return _st_moe_fallback(_self, a, kw)
 
                     return _qmoe
 
-                mod.forward = _make_qmoe()  # type: ignore[method-assign]
+                mod.forward = types.MethodType(_make_qmoe(), mod)  # type: ignore[method-assign]
             mod._qloop_standalone_qfb = True  # type: ignore[attr-defined]
+
+    def _st_uninstall_quant_fallback(root: nn.Module) -> None:
+        seen: set[int] = set()
+        for mod in root.modules():
+            if id(mod) in seen:
+                continue
+            seen.add(id(mod))
+            if not getattr(mod, "_qloop_standalone_qfb", False):
+                continue
+            had_inst = bool(getattr(mod, "_qloop_st_had_inst_fwd", False))
+            orig_inst = getattr(mod, "_qloop_st_orig_inst_fwd", None)
+            if had_inst:
+                mod.forward = orig_inst  # type: ignore[method-assign]
+            else:
+                mod.__dict__.pop("forward", None)
+            for flag in (
+                "_qloop_standalone_qfb",
+                "_qloop_st_had_inst_fwd",
+                "_qloop_st_orig_inst_fwd",
+                "_qloop_fb_only",
+            ):
+                mod.__dict__.pop(flag, None)
 
     def _router_of(layer: nn.Module) -> nn.Module | None:
         mlp = getattr(layer, "mlp", None)
@@ -3405,9 +3705,9 @@ else:
 
         def forward(self, hidden_states: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
             ow = self._owner
-            vidx, _phys, r, entry, exit_flag, cidx = self._meta
+            vidx, phys, r, entry, exit_flag, cidx = self._meta
             if vidx == 0:
-                ow._loop_ctx = {"anchor": None, "start": {}, "kv": {}, "routing": {}, "keep": {}}
+                ow._loop_ctx = {"anchor": None, "start": {}, "kv": {}, "pkv": {}, "routing": {}, "keep": {}}
             if r > ow.active_passes:
                 return (hidden_states, *([None] * ow._tuple_extra)) if ow._tuple_out else hidden_states
             ctx = ow._loop_ctx
@@ -3432,14 +3732,24 @@ else:
             pkv = kwargs.get(pkv_k) if pkv_k is not None else None
             if vidx == 0 and pkv is not None:
                 ow._sync_cache_last_linear(pkv)
-            if pkv is not None and cidx != vidx and pkv_k is not None:
-                pkv_layers = getattr(pkv, "layers", None)
-                if isinstance(pkv_layers, (list, tuple, nn.ModuleList)) and 0 <= vidx < len(pkv_layers):
-                    v_lyr = pkv_layers[vidx]
-                    if hasattr(v_lyr, "supports_early_init") and getattr(v_lyr, "keys", None) is None:
-                        v_lyr.supports_early_init = False
-                kwargs = dict(kwargs)
-                kwargs[pkv_k] = _SharedKVProxy(pkv)
+            if pkv is not None and pkv_k is not None:
+                if cidx != vidx:
+                    pkv_layers = getattr(pkv, "layers", None)
+                    if isinstance(pkv_layers, (list, tuple, nn.ModuleList)) and 0 <= vidx < len(pkv_layers):
+                        v_lyr = pkv_layers[vidx]
+                        if hasattr(v_lyr, "supports_early_init") and getattr(v_lyr, "keys", None) is None:
+                            v_lyr.supports_early_init = False
+                    kwargs = dict(kwargs)
+                    kwargs[pkv_k] = _SharedKVProxy(pkv, stash=ctx["pkv"], record=False)
+                elif (
+                    bool(ow._loop_spec.get("kv_share", True))
+                    and int(ow._loop_spec.get("num_passes", 2)) > 1
+                    and r == 1
+                    and self.layer_type == "full_attention"
+                    and int(ow._loop_spec.get("prelude_end", 8)) <= phys < int(ow._loop_spec.get("core_end", 32))
+                ):
+                    kwargs = dict(kwargs)
+                    kwargs[pkv_k] = _SharedKVProxy(pkv, stash=ctx["pkv"], record=True)
             prev = ow._cur_pass
             ow._cur_pass = r
             for m in self._idx_mods:
@@ -3646,7 +3956,20 @@ else:
 
                                 return _grule
 
-                            setattr(attn, attr, _make_grule())
+                            gr_fn = _make_grule()
+                            if (
+                                isinstance(orig_attr_fn, types.MethodType)
+                                and getattr(orig_attr_fn, "__self__", None) is attn
+                            ):
+                                raw_gfn = getattr(orig_attr_fn, "__func__", orig_attr_fn)
+
+                                @functools.wraps(raw_gfn)
+                                def _bound_grule(_s: nn.Module, *ga: Any, _gw: Callable[..., Any] = gr_fn, **gkw: Any):
+                                    return _gw(*ga, **gkw)
+
+                                setattr(attn, attr, types.MethodType(_bound_grule, attn))
+                            else:
+                                setattr(attn, attr, gr_fn)
 
                     def _make_gpre(
                         ad_r: _StandaloneGDN2Adapter = ad,
@@ -3801,7 +4124,20 @@ else:
 
                                 return _hrule
 
-                            setattr(attn, attr, _make_hrule())
+                            hr_fn = _make_hrule()
+                            if (
+                                isinstance(orig_h_fn, types.MethodType)
+                                and getattr(orig_h_fn, "__self__", None) is attn
+                            ):
+                                raw_hfn = getattr(orig_h_fn, "__func__", orig_h_fn)
+
+                                @functools.wraps(raw_hfn)
+                                def _bound_hrule(_s: nn.Module, *ha: Any, _hw: Callable[..., Any] = hr_fn, **hkw: Any):
+                                    return _hw(*ha, **hkw)
+
+                                setattr(attn, attr, types.MethodType(_bound_hrule, attn))
+                            else:
+                                setattr(attn, attr, hr_fn)
 
                     def _make_hpre(
                         ad_r: _StandaloneHSSDAdapter = had,
@@ -3980,6 +4316,14 @@ else:
 
                     ALL_ATTENTION_FUNCTIONS[lsa_name] = _hf_lsa
                     tc._attn_implementation = lsa_name
+                    for ly in tm.layers:
+                        sa = getattr(getattr(ly, "inner", ly), "self_attn", None)
+                        scfg = getattr(sa, "config", None) if sa is not None else None
+                        if scfg is not None:
+                            try:
+                                scfg._attn_implementation = lsa_name
+                            except Exception:
+                                pass
             except Exception:
                 pass
 
@@ -4031,6 +4375,9 @@ else:
                         continue
                     for nm, proj in _find_children(s_attn, kv_names).items():
                         proj.register_forward_hook(self._make_kv_hook(phys, nm))
+                    kvc_mod = getattr(s_attn, "kv_cache", None)
+                    if isinstance(kvc_mod, nn.Module):
+                        self._wrap_standalone_kv_cache(phys, kvc_mod)
 
             if self._loop_adapters.pass_attn is not None:
                 for phys, pkey, mod in attn_mods:
@@ -4098,6 +4445,27 @@ else:
                     self._sync_cache_last_linear(pkv)
 
             tm.register_forward_pre_hook(_tm_cache_pre, with_kwargs=True)
+
+        def _wrap_standalone_kv_cache(self, phys: int, kvc_mod: nn.Module) -> None:
+            orig_fwd = kvc_mod.forward
+            raw_fn = getattr(orig_fwd, "__func__", orig_fwd)
+
+            @functools.wraps(raw_fn)
+            def _st_kvc(_self: nn.Module, *a: Any, **kw: Any) -> Any:
+                r = self._cur_pass
+                if r < 1:
+                    return orig_fwd(*a, **kw)
+                key = (phys, "__kv_cache_mod__")
+                if r == 1:
+                    res = orig_fwd(*a, **kw)
+                    self._loop_ctx.setdefault("kv", {})[key] = res
+                    return res
+                kv_d = self._loop_ctx.get("kv", {})
+                if key in kv_d:
+                    return kv_d[key]
+                return orig_fwd(*a, **kw)
+
+            kvc_mod.forward = types.MethodType(_st_kvc, kvc_mod)  # type: ignore[method-assign]
 
         def _make_kv_hook(self, phys: int, nm: str):
             def _hook(_m: nn.Module, _inp: Any, out: torch.Tensor):
@@ -4396,8 +4764,45 @@ else:
             inst = cls(config, _defer_loop=True, _dtype_override=dt_override)
             pmap = dict(inst.backbone.named_parameters())
             bmap = dict(inst.backbone.named_buffers())
+            mmap = dict(inst.backbone.named_modules())
             expected_bb = set(pmap.keys())
             tie_we = bool(getattr(config, "tie_word_embeddings", False))
+            q_arch = dict((config.qloop_v3_arch or {}).get("quantization") or {})
+            nvfp4_meta_map = dict(q_arch.get("nvfp4_modules") or {})
+            dyn_qattrs = {
+                "weight_packed",
+                "weight_scale",
+                "weight_scale_inv",
+                "weight_global_scale",
+                "weight_scale_2",
+                "gate_up_proj_packed",
+                "gate_up_proj_scale",
+                "gate_up_proj_scale_inv",
+                "gate_up_proj_global_scale",
+                "gate_up_global_scale",
+                "gate_up_proj_scale_2",
+                "down_proj_packed",
+                "down_proj_scale",
+                "down_proj_scale_inv",
+                "down_proj_global_scale",
+                "down_global_scale",
+                "down_proj_scale_2",
+                "scale_inv",
+                "global_scale",
+                "input_scale",
+                "input_global_scale",
+                "activation_scale",
+                "k_scale",
+                "v_scale",
+                "q_scale",
+                "o_scale",
+                "weight_shape",
+            }
+            repl_dense = {
+                "gate_up_proj_packed": "gate_up_proj",
+                "down_proj_packed": "down_proj",
+                "weight_packed": "weight",
+            }
 
             idx_p = os.path.join(local_dir, "model.safetensors.index.json")
             single_p = os.path.join(local_dir, "model.safetensors")
@@ -4437,6 +4842,51 @@ else:
                             target = hm.weight
                             is_param = True
                     if target is None:
+                        p_path, sep, a_nm = k.rpartition(".")
+                        p_mod = mmap.get(p_path) if sep else None
+                        if (
+                            p_mod is None
+                            and sep
+                            and p_path.endswith(".kv_cache")
+                            and a_nm in ("k_scale", "v_scale", "q_scale", "quant_scale")
+                        ):
+                            gp_path, gp_sep, kvc_nm = p_path.rpartition(".")
+                            gp_mod = mmap.get(gp_path) if gp_sep else None
+                            if gp_mod is not None and kvc_nm == "kv_cache":
+                                kvc_stub = nn.Module()
+                                gp_mod.kv_cache = kvc_stub  # type: ignore[attr-defined]
+                                mmap[p_path] = kvc_stub
+                                p_mod = kvc_stub
+                        if p_mod is not None and a_nm in dyn_qattrs:
+                            d_attr = repl_dense.get(a_nm)
+                            if d_attr is not None:
+                                d_key = f"{p_path}.{d_attr}" if p_path else d_attr
+                                p_mod._parameters.pop(d_attr, None)
+                                p_mod._buffers.pop(d_attr, None)
+                                pmap.pop(d_key, None)
+                                bmap.pop(d_key, None)
+                                expected_bb.discard(d_key)
+                            m_meta = nvfp4_meta_map.get(p_path) or {}
+                            if m_meta.get("storage") == "buffers":
+                                p_mod.register_buffer(a_nm, t.clone())
+                                bmap[k] = p_mod._buffers[a_nm]  # type: ignore[assignment]
+                            else:
+                                np_val = nn.Parameter(t.clone(), requires_grad=False)
+                                p_mod.register_parameter(a_nm, np_val)
+                                pmap[k] = np_val
+                                expected_bb.add(k)
+                                loaded_bb.add(k)
+                            if a_nm.endswith("_packed") or m_meta:
+                                if getattr(p_mod, "group_size", None) is None:
+                                    p_mod.group_size = int(m_meta.get("group_size", 16))  # type: ignore[attr-defined]
+                                sm = m_meta.get("scale_mode")
+                                if sm in ("divisor", "multiplier"):
+                                    p_mod._qloop_nvfp4_scale_mode = str(sm)  # type: ignore[attr-defined]
+                                elif a_nm.endswith("_global_scale") and not hasattr(
+                                    p_mod, "_qloop_nvfp4_scale_mode"
+                                ):
+                                    p_mod._qloop_nvfp4_scale_mode = "divisor"  # type: ignore[attr-defined]
+                            continue
                         unexpected_bb.append(k)
                         continue
                     if tuple(target.shape) != tuple(t.shape):
@@ -4444,7 +4894,17 @@ else:
                             f"shape mismatch for {k}: model {tuple(target.shape)} vs shard {tuple(t.shape)}"
                         )
                     with torch.no_grad():
-                        if dt_override is None and target.dtype != t.dtype:
+                        if t.dtype in _FP8_DTYPES or not t.is_floating_point():
+                            if isinstance(target, nn.Parameter):
+                                target.data = t.to(device=target.device)
+                            else:
+                                p_path, _, a_nm = k.rpartition(".")
+                                p_mod = mmap.get(p_path)
+                                if p_mod is not None and a_nm in p_mod._buffers:
+                                    p_mod._buffers[a_nm] = t.to(device=target.device)
+                                else:
+                                    target.copy_(t.to(device=target.device, dtype=target.dtype))
+                        elif dt_override is None and target.dtype != t.dtype:
                             target.data = t.to(device=target.device, dtype=t.dtype)
                         else:
                             target.copy_(t.to(device=target.device, dtype=target.dtype))

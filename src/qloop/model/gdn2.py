@@ -31,9 +31,11 @@ Why GDN-2 upgrades stock Gated DeltaNet cleanly on Qwen3.6-35B-A3B:
 """
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import sys
+import types
 from dataclasses import dataclass, fields
 from typing import Any, Callable
 
@@ -656,6 +658,20 @@ def install_gdn2(model: nn.Module, cfg: GDN2Config | dict[str, Any] | None = Non
 
         restorers.append(_del_adapter)
 
+        if "_kernel_repo" in attn.__dict__ and "forward" in attn.__dict__:
+            saved_kfwd = attn.__dict__.pop("forward")
+            saved_krepo = attn.__dict__.pop("_kernel_repo")
+
+            def _restore_kernel_fwd(
+                a: nn.Module = attn,
+                kfwd: Any = saved_kfwd,
+                krepo: Any = saved_krepo,
+            ) -> None:
+                a.forward = kfwd  # type: ignore[method-assign]
+                a.__dict__["_kernel_repo"] = krepo
+
+            restorers.append(_restore_kernel_fwd)
+
         wrapped_chunk = False
         wrapped_rec = False
         for attr, rec_only in rule_specs:
@@ -666,24 +682,37 @@ def install_gdn2(model: nn.Module, cfg: GDN2Config | dict[str, Any] | None = Non
                 else:
                     wrapped_chunk = True
                 had_instance_attr = attr in attn.__dict__
-                setattr(
-                    attn,
-                    attr,
-                    _make_rule_wrapper(
-                        attn, adapter, x_stack, orig_fn, recurrent_only=rec_only, in_rule_box=in_rule_box
-                    ),
+                orig_inst_attr = attn.__dict__.get(attr)
+                rule_w = _make_rule_wrapper(
+                    attn, adapter, x_stack, orig_fn, recurrent_only=rec_only, in_rule_box=in_rule_box
                 )
+                if isinstance(orig_fn, types.MethodType) and getattr(orig_fn, "__self__", None) is attn:
+                    raw_rfn = getattr(orig_fn, "__func__", orig_fn)
+
+                    @functools.wraps(raw_rfn)
+                    def _bound_rule(
+                        _self: nn.Module,
+                        *r_args: Any,
+                        _rw: Callable[..., Any] = rule_w,
+                        **r_kwargs: Any,
+                    ) -> Any:
+                        return _rw(*r_args, **r_kwargs)
+
+                    rule_patch: Any = types.MethodType(_bound_rule, attn)
+                else:
+                    rule_patch = rule_w
+                setattr(attn, attr, rule_patch)
 
                 def _restore_attr(
                     a: nn.Module = attn,
                     name: str = attr,
-                    fn: Callable[..., Any] = orig_fn,
+                    fn: Any = orig_inst_attr,
                     had: bool = had_instance_attr,
                 ) -> None:
                     if had:
                         setattr(a, name, fn)
-                    elif name in a.__dict__:
-                        delattr(a, name)
+                    else:
+                        a.__dict__.pop(name, None)
 
                 restorers.append(_restore_attr)
 

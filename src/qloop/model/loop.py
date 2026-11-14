@@ -24,10 +24,12 @@ How it is wired (no re-implementation of the HF forward):
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 import math
 import random
+import types
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -191,7 +193,8 @@ class LoopContext:
     def __init__(self) -> None:
         self.anchor: torch.Tensor | None = None
         self.start: dict[int, torch.Tensor] = {}
-        self.kv_stash: dict[tuple[int, str], torch.Tensor] = {}
+        self.kv_stash: dict[tuple[int, str], Any] = {}
+        self.pkv_stash: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.keep: dict[int, torch.Tensor] = {}       # pass -> [B,T] {0,1}
         self.coef: dict[int, torch.Tensor] = {}       # pass -> [B,T,1] straight-through MoR coef
         self.aux: dict[str, torch.Tensor] = {}
@@ -201,11 +204,69 @@ class LoopContext:
         self.stats: dict[str, float] = {}
 
 
+def _resolve_kv_slot_scale(
+    lyr: Any,
+    cache: Any,
+    layer_idx: int,
+    *,
+    is_key: bool,
+) -> torch.Tensor | None:
+    attr_single = "k_scale" if is_key else "v_scale"
+    attr_plural = "k_scales" if is_key else "v_scales"
+    for holder in (lyr, cache):
+        if holder is None:
+            continue
+        sc = getattr(holder, attr_single, None)
+        if isinstance(sc, torch.Tensor):
+            return sc
+        scs = getattr(holder, attr_plural, None)
+        if isinstance(scs, (list, tuple, nn.ParameterList)) and 0 <= layer_idx < len(scs):
+            cand = scs[layer_idx]
+            if isinstance(cand, torch.Tensor):
+                return cand
+        elif isinstance(scs, dict) and layer_idx in scs and isinstance(scs[layer_idx], torch.Tensor):
+            return scs[layer_idx]
+    return None
+
+
+def _dequant_kv_slot_tensor(
+    t: torch.Tensor,
+    out_dt: torch.dtype,
+    lyr: Any,
+    cache: Any,
+    layer_idx: int,
+    *,
+    is_key: bool,
+) -> torch.Tensor:
+    if t.dtype in FP8_DTYPES or not t.is_floating_point():
+        sc = _resolve_kv_slot_scale(lyr, cache, layer_idx, is_key=is_key)
+        if isinstance(sc, torch.Tensor):
+            sf = sc.to(device=t.device, dtype=torch.float32)
+            if sf.numel() == 1:
+                sf = sf.reshape(())
+            elif sf.ndim == 1 and t.ndim == 4 and sf.shape[0] == t.shape[1]:
+                sf = sf.view(1, -1, 1, 1)
+            elif sf.ndim < t.ndim:
+                while sf.ndim < t.ndim:
+                    sf = sf.unsqueeze(-1)
+            return (t.to(torch.float32) * sf).to(out_dt)
+        return t.to(out_dt)
+    return t if t.dtype == out_dt else t.to(out_dt)
+
+
 class SharedKVView:
     """Cache proxy for pass>=2 full attention: `update` appends nothing, returns pass-1 K/V."""
 
-    def __init__(self, cache: Any):
+    def __init__(
+        self,
+        cache: Any,
+        stash: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        *,
+        record: bool = False,
+    ):
         object.__setattr__(self, "_cache", cache)
+        object.__setattr__(self, "_stash", stash)
+        object.__setattr__(self, "_record", bool(record))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(object.__getattribute__(self, "_cache"), name)
@@ -224,27 +285,59 @@ class SharedKVView:
 
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         cache = object.__getattribute__(self, "_cache")
-        if hasattr(cache, "dequantize") or type(cache).__name__ in ("QuantizedHybridCache", "_QuantizedKV"):
+        stash = object.__getattribute__(self, "_stash")
+        record = object.__getattribute__(self, "_record")
+        lidx = int(layer_idx)
+        if record:
+            res = cache.update(key_states, value_states, layer_idx, *args, **kwargs)
+            if stash is not None and isinstance(res, tuple) and len(res) >= 2:
+                stash[lidx] = (res[0], res[1])
+            return res
+        if stash is not None and lidx in stash:
+            return stash[lidx]
+        if type(cache).__name__ in ("QuantizedHybridCache", "_QuantizedKV"):
             return cache.update(key_states[..., :0, :], value_states[..., :0, :], layer_idx, *args, **kwargs)
-        layers = getattr(cache, "layers", None)
-        if isinstance(layers, (list, tuple, nn.ModuleList)) and 0 <= layer_idx < len(layers):
-            lyr = layers[layer_idx]
-            k_t = getattr(lyr, "keys", None)
-            v_t = getattr(lyr, "values", None)
-            if isinstance(k_t, torch.Tensor) and isinstance(v_t, torch.Tensor) and k_t.numel() > 0:
-                return k_t, v_t
-        kc = getattr(cache, "key_cache", None)
-        vc = getattr(cache, "value_cache", None)
-        if (
-            isinstance(kc, list)
-            and isinstance(vc, list)
-            and 0 <= layer_idx < len(kc)
-            and 0 <= layer_idx < len(vc)
-            and isinstance(kc[layer_idx], torch.Tensor)
-            and isinstance(vc[layer_idx], torch.Tensor)
-            and kc[layer_idx].numel() > 0
-        ):
-            return kc[layer_idx], vc[layer_idx]
+        inner_cache = getattr(cache, "cache", None)
+        if inner_cache is None:
+            inner_cache = getattr(cache, "_cache", None)
+        for holder in (cache, inner_cache):
+            if holder is None:
+                continue
+            layers = getattr(holder, "layers", None)
+            if isinstance(layers, (list, tuple, nn.ModuleList)) and 0 <= lidx < len(layers):
+                lyr = layers[lidx]
+                deq_fn = getattr(lyr, "_dequantize", None)
+                qk = getattr(lyr, "_quantized_keys", None)
+                qv = getattr(lyr, "_quantized_values", None)
+                if (
+                    callable(deq_fn)
+                    and isinstance(qk, torch.Tensor)
+                    and isinstance(qv, torch.Tensor)
+                    and qk.numel() > 0
+                ):
+                    return deq_fn(qk).to(key_states.dtype), deq_fn(qv).to(value_states.dtype)
+                k_t = getattr(lyr, "keys", None)
+                v_t = getattr(lyr, "values", None)
+                if isinstance(k_t, torch.Tensor) and isinstance(v_t, torch.Tensor) and k_t.numel() > 0:
+                    return (
+                        _dequant_kv_slot_tensor(k_t, key_states.dtype, lyr, cache, lidx, is_key=True),
+                        _dequant_kv_slot_tensor(v_t, value_states.dtype, lyr, cache, lidx, is_key=False),
+                    )
+            kc = getattr(holder, "key_cache", None)
+            vc = getattr(holder, "value_cache", None)
+            if (
+                isinstance(kc, list)
+                and isinstance(vc, list)
+                and 0 <= lidx < len(kc)
+                and 0 <= lidx < len(vc)
+                and isinstance(kc[lidx], torch.Tensor)
+                and isinstance(vc[lidx], torch.Tensor)
+                and kc[lidx].numel() > 0
+            ):
+                return (
+                    _dequant_kv_slot_tensor(kc[lidx], key_states.dtype, None, cache, lidx, is_key=True),
+                    _dequant_kv_slot_tensor(vc[lidx], value_states.dtype, None, cache, lidx, is_key=False),
+                )
         return cache.update(key_states[..., :0, :], value_states[..., :0, :], layer_idx, *args, **kwargs)
 
 
@@ -470,14 +563,24 @@ class VirtualLayer(nn.Module):
         pkv = kwargs.get(pkv_key) if pkv_key is not None else None
         if s.vidx == 0 and pkv is not None:
             ctl._sync_cache_last_linear(pkv)
-        if pkv is not None and s.cache_idx != s.vidx and pkv_key is not None:
-            pkv_layers = getattr(pkv, "layers", None)
-            if isinstance(pkv_layers, (list, tuple, nn.ModuleList)) and 0 <= s.vidx < len(pkv_layers):
-                v_lyr = pkv_layers[s.vidx]
-                if hasattr(v_lyr, "supports_early_init") and getattr(v_lyr, "keys", None) is None:
-                    v_lyr.supports_early_init = False
-            kwargs = dict(kwargs)
-            kwargs[pkv_key] = SharedKVView(pkv)
+        if pkv is not None and pkv_key is not None:
+            if s.cache_idx != s.vidx:
+                pkv_layers = getattr(pkv, "layers", None)
+                if isinstance(pkv_layers, (list, tuple, nn.ModuleList)) and 0 <= s.vidx < len(pkv_layers):
+                    v_lyr = pkv_layers[s.vidx]
+                    if hasattr(v_lyr, "supports_early_init") and getattr(v_lyr, "keys", None) is None:
+                        v_lyr.supports_early_init = False
+                kwargs = dict(kwargs)
+                kwargs[pkv_key] = SharedKVView(pkv, stash=ctx.pkv_stash, record=False)
+            elif (
+                ctl.spec.kv_share
+                and ctl.spec.num_passes > 1
+                and s.r == 1
+                and s.layer_type == FULL
+                and ctl.spec.prelude_end <= s.phys < ctl.spec.core_end
+            ):
+                kwargs = dict(kwargs)
+                kwargs[pkv_key] = SharedKVView(pkv, stash=ctx.pkv_stash, record=True)
         r, idx_mods, cache_idx, inner = s.r, self._idx_mods, s.cache_idx, self.inner
         attn_mod = getattr(inner, "self_attn", None)
 
@@ -561,6 +664,7 @@ class LoopController:
         self._tuple_out = False
         self._tuple_extra = 0
         self._hooks: list[Any] = []
+        self._wrapped_fwds: list[tuple[nn.Module, bool, Any]] = []
         self._is_probs_cache: dict[int, bool] = {}
         tm.layers = nn.ModuleList(VirtualLayer(self, s, parts.layers[s.phys]) for s in self.schedule)
         cfg.num_hidden_layers = len(self.schedule)
@@ -612,12 +716,16 @@ class LoopController:
         self._hooks.append(self.parts.text_model.register_forward_pre_hook(_tm_cache_pre, with_kwargs=True))
         if spec.kv_share and spec.num_passes > 1:
             for phys, layer in self._core_layers(FULL):
-                found = find_children(attention_module(layer, FULL), list(spec.kv_proj_names))
+                attn = attention_module(layer, FULL)
+                found = find_children(attn, list(spec.kv_proj_names))
                 if len(found) != len(spec.kv_proj_names):
                     raise RuntimeError(f"kv_share: layer {phys} attention lacks {spec.kv_proj_names}; children: "
-                                       f"{[n for n, _ in attention_module(layer, FULL).named_children()]}")
+                                       f"{[n for n, _ in attn.named_children()]}")
                 for name, mod in found.items():
                     self._hooks.append(mod.register_forward_hook(self._kv_hook(phys, name)))
+                kvc_mod = getattr(attn, "kv_cache", None)
+                if isinstance(kvc_mod, nn.Module):
+                    self._wrap_kv_cache_submodule(phys, kvc_mod)
         if self.adapters.pass_attn is not None:
             for phys, key, mod in self._attn_proj_mods:
                 self._hooks.append(mod.register_forward_hook(self._attn_lora_hook(phys, key)))
@@ -651,6 +759,30 @@ class LoopController:
                 router = router_of(self._orig["layers"][phys])
                 if router is not None:
                     self._hooks.append(router.register_forward_hook(self._route_hook(phys, k, e)))
+
+    def _wrap_kv_cache_submodule(self, phys: int, kvc_mod: nn.Module) -> None:
+        had_inst_fwd = "forward" in kvc_mod.__dict__
+        orig_inst_fwd = kvc_mod.__dict__.get("forward")
+        orig_fwd = kvc_mod.forward
+        raw_fn = getattr(orig_fwd, "__func__", orig_fwd)
+
+        @functools.wraps(raw_fn)
+        def _kvc_fwd(_self: nn.Module, *a: Any, **kw: Any) -> Any:
+            cur = self._cur
+            if cur is None:
+                return orig_fwd(*a, **kw)
+            ctx, r = cur
+            key = (phys, "__kv_cache_mod__")
+            if r == 1:
+                res = orig_fwd(*a, **kw)
+                ctx.kv_stash[key] = res
+                return res
+            if key in ctx.kv_stash:
+                return ctx.kv_stash[key]
+            return orig_fwd(*a, **kw)
+
+        kvc_mod.forward = types.MethodType(_kvc_fwd, kvc_mod)  # type: ignore[method-assign]
+        self._wrapped_fwds.append((kvc_mod, had_inst_fwd, orig_inst_fwd))
 
     def _kv_hook(self, phys: int, name: str):
         def hook(mod: nn.Module, inp: Any, out: torch.Tensor):
@@ -1030,6 +1162,12 @@ class LoopController:
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
+        for mod, had_inst_fwd, orig_inst_fwd in reversed(self._wrapped_fwds):
+            if had_inst_fwd:
+                mod.forward = orig_inst_fwd  # type: ignore[method-assign]
+            else:
+                mod.__dict__.pop("forward", None)
+        self._wrapped_fwds.clear()
         tm, cfg = self.parts.text_model, self.parts.text_config
         tm.layers = self._orig["layers"]
         cfg.num_hidden_layers = self._orig["num_hidden_layers"]
@@ -1041,18 +1179,53 @@ class LoopController:
         log.info("loop retrofit removed (adapters kept on controller.adapters)")
 
 
-def _iter_canonical_params(mod: nn.Module, prefix: str, seen: set[int]) -> list[tuple[str, torch.Tensor]]:
+_QUANT_EXPERT_DICT_SUFFIXES = ("_packed", "_scale", "_scales", "_scale_inv", "_global_scale", "_scale_2")
+_QUANT_EXPERT_DICT_EXACT = frozenset({"gate_up_proj", "down_proj", "weight", "bias"})
+
+
+def _iter_canonical_params(
+    mod: nn.Module,
+    prefix: str,
+    seen_tensors: set[int],
+    seen_mods: set[int] | None = None,
+    seen_names: set[str] | None = None,
+) -> list[tuple[str, torch.Tensor]]:
+    if seen_mods is None:
+        seen_mods = set()
+    if seen_names is None:
+        seen_names = set()
+    if id(mod) in seen_mods:
+        return []
+    seen_mods.add(id(mod))
+
     out: list[tuple[str, torch.Tensor]] = []
     for pname, p in mod._parameters.items():
-        if p is not None and id(p) not in seen:
-            seen.add(id(p))
-            full = f"{prefix}.{pname}" if prefix else pname
+        if p is None:
+            continue
+        full = f"{prefix}.{pname}" if prefix else pname
+        if full not in seen_names and id(p) not in seen_tensors:
+            seen_names.add(full)
+            seen_tensors.add(id(p))
             out.append((full, p))
     for bname, b in mod._buffers.items():
-        if b is not None and id(b) not in seen:
-            seen.add(id(b))
-            full = f"{prefix}.{bname}" if prefix else bname
+        if b is None:
+            continue
+        full = f"{prefix}.{bname}" if prefix else bname
+        if full not in seen_names and id(b) not in seen_tensors:
+            seen_names.add(full)
+            seen_tensors.add(id(b))
             out.append((full, b))
+    for aname, val in mod.__dict__.items():
+        if aname.startswith("_") or aname in mod._parameters or aname in mod._buffers:
+            continue
+        if not isinstance(val, torch.Tensor):
+            continue
+        if aname in _QUANT_EXPERT_DICT_EXACT or aname.endswith(_QUANT_EXPERT_DICT_SUFFIXES):
+            full = f"{prefix}.{aname}" if prefix else aname
+            if full not in seen_names and id(val) not in seen_tensors:
+                seen_names.add(full)
+                seen_tensors.add(id(val))
+                out.append((full, val))
     for cname, child in mod._modules.items():
         if child is None:
             continue
@@ -1061,13 +1234,13 @@ def _iter_canonical_params(mod: nn.Module, prefix: str, seen: set[int]) -> list[
         inner = getattr(child, "inner", None)
         if slot is not None and isinstance(inner, nn.Module) and hasattr(slot, "phys"):
             c_prefix = f"{prefix}.{slot.phys}" if prefix else str(slot.phys)
-            out.extend(_iter_canonical_params(inner, c_prefix, seen))
+            out.extend(_iter_canonical_params(inner, c_prefix, seen_tensors, seen_mods, seen_names))
         elif isinstance(meta, tuple) and len(meta) >= 2 and isinstance(inner, nn.Module):
             c_prefix = f"{prefix}.{meta[1]}" if prefix else str(meta[1])
-            out.extend(_iter_canonical_params(inner, c_prefix, seen))
+            out.extend(_iter_canonical_params(inner, c_prefix, seen_tensors, seen_mods, seen_names))
         else:
             c_prefix = f"{prefix}.{cname}" if prefix else cname
-            out.extend(_iter_canonical_params(child, c_prefix, seen))
+            out.extend(_iter_canonical_params(child, c_prefix, seen_tensors, seen_mods, seen_names))
     return out
 
 
@@ -1093,10 +1266,10 @@ def sha256_frozen_experts(model: nn.Module) -> str:
     `requires_grad == False`, canonicalising `VirtualLayer` wrappers back to physical layer
     indices so the digest is identical before, during, and after `apply_loop`.
     """
-    seen: set[int] = set()
+    seen_tensors: set[int] = set()
     items = [
         (name, t)
-        for name, t in _iter_canonical_params(model, "", seen)
+        for name, t in _iter_canonical_params(model, "", seen_tensors)
         if not t.requires_grad and _is_expert_param_path(name)
     ]
     items.sort(key=lambda kv: kv[0])
@@ -1104,7 +1277,7 @@ def sha256_frozen_experts(model: nn.Module) -> str:
     for name, t in items:
         header = f"{name}|{t.dtype}|{tuple(t.shape)}|".encode()
         digest.update(header)
-        raw = t.detach().contiguous().cpu().reshape(-1).view(torch.uint8).numpy().tobytes()
+        raw = t.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
         digest.update(raw)
     return digest.hexdigest()
 

@@ -622,6 +622,11 @@ def extract_arch_spec(
         he_arch = {"enabled": False, "merged_into_base": True}
 
     quant_info = detect_model_quantization(src.backbone)
+    nvfp4_meta = _collect_nvfp4_module_metadata(src.backbone, tm, phys_pairs)
+    if nvfp4_meta:
+        quant_info = dict(quant_info)
+        quant_info["is_quantized"] = True
+        quant_info["nvfp4_modules"] = nvfp4_meta
     arch: dict[str, Any] = {
         "schema_version": 3,
         "backbone_kind": kind,
@@ -651,6 +656,58 @@ def extract_arch_spec(
             else:
                 arch[k] = copy.deepcopy(v)
     return bcfg, arch
+
+
+def _collect_nvfp4_module_metadata(
+    backbone: nn.Module,
+    tm: nn.Module,
+    phys_pairs: list[tuple[int, nn.Module]],
+) -> dict[str, dict[str, Any]]:
+    tm_prefix = ""
+    for mod_name, mod in backbone.named_modules():
+        if mod is tm:
+            tm_prefix = mod_name
+            break
+
+    def _inspect_subtree(root_mod: nn.Module, base_prefix: str, out: dict[str, dict[str, Any]]) -> None:
+        for sub_name, sub in root_mod.named_modules():
+            full_path = f"{base_prefix}.{sub_name}" if (base_prefix and sub_name) else (base_prefix or sub_name)
+            has_packed = any(
+                isinstance(getattr(sub, a, None), torch.Tensor)
+                for a in ("gate_up_proj_packed", "down_proj_packed", "weight_packed")
+            )
+            smode = getattr(sub, "_qloop_nvfp4_scale_mode", None)
+            if not has_packed and smode is None:
+                continue
+            in_bufs = any(
+                a in sub._buffers and sub._buffers[a] is not None
+                for a in ("gate_up_proj_packed", "down_proj_packed", "weight_packed")
+            )
+            in_params = any(
+                a in sub._parameters and sub._parameters[a] is not None
+                for a in ("gate_up_proj_packed", "down_proj_packed", "weight_packed")
+            )
+            if smode not in ("divisor", "multiplier"):
+                has_s2 = any(
+                    isinstance(getattr(sub, a, None), torch.Tensor)
+                    for a in ("gate_up_proj_scale_2", "down_proj_scale_2", "weight_scale_2")
+                )
+                smode = "multiplier" if has_s2 else "divisor"
+            out[full_path] = {
+                "group_size": int(getattr(sub, "group_size", None) or 16),
+                "scale_mode": str(smode),
+                "storage": "buffers" if (in_bufs and not in_params) else "parameters",
+            }
+
+    meta: dict[str, dict[str, Any]] = {}
+    for phys_idx, layer in phys_pairs:
+        l_pfx = f"{tm_prefix}.layers.{phys_idx}" if tm_prefix else f"layers.{phys_idx}"
+        _inspect_subtree(layer, l_pfx, meta)
+    for cname, child in backbone.named_children():
+        if child is tm:
+            continue
+        _inspect_subtree(child, cname, meta)
+    return meta
 
 
 # ============================================================================ canonical tensor planner
@@ -698,6 +755,13 @@ def _module_own_state_tensors(mod: nn.Module) -> list[tuple[str, torch.Tensor]]:
     for mname, sub in mod.named_modules():
         np_set = non_persist_by_mod.get(id(sub), set())
         sub_is_quant = is_quantized_module(sub)
+        for pname, pval in sub._parameters.items():
+            if pval is None:
+                continue
+            full = f"{mname}.{pname}" if mname else pname
+            if full not in seen_keys:
+                seen_keys.add(full)
+                out.append((full, pval))
         for bname, buf in sub._buffers.items():
             if buf is None:
                 continue
@@ -1847,14 +1911,20 @@ def load_whole_model_pack(
     return pack
 
 
+export_model_pack = export_whole_model_pack
+load_exported_pack = load_whole_model_pack
+
+
 __all__ = [
     "GENERATION_CONFIG_FILE",
     "PACK_MANIFEST_FILE",
     "SAFETENSORS_INDEX_FILE",
     "LoadedModelPack",
     "WholeModelPackConfig",
+    "export_model_pack",
     "export_whole_model_pack",
     "extract_arch_spec",
+    "load_exported_pack",
     "load_whole_model_pack",
     "push_whole_model_pack",
     "stream_whole_model_pack",

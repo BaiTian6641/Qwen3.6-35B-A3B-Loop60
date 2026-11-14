@@ -277,6 +277,8 @@ class LMTrainer:
             raise
         if hasattr(self.stream, "log_stats"):
             self.stream.log_stats()
+        if st.frozen_experts_sha256 is not None:
+            st.verify_frozen_experts()
         final = self.quick_eval() if self.eval_batches else {}
         if final:
             self.metrics.log(self.step, final)

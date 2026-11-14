@@ -27,8 +27,10 @@ import subprocess
 import sys
 import time
 from collections.abc import Sequence
+from typing import Any
 
 DEFAULT_HF_REPO = "TassP0lar/Qwen3.6-35B-A3B-Loop64"
+DEFAULT_PACK_REPO = "TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack"
 SECRETS = (
     "HF_TOKEN",
     "WANDB_API_KEY",
@@ -42,17 +44,29 @@ DEFAULT_METRIC_KEYS = (
     "loss/lm",
     "eval/loss_d1",
     "eval/loss_d2",
+    "eval/loss_d3",
     "eval/depth_gain",
     "loop/reroute_rate",
     "loop/unique_experts_core",
     "loop/effective_expert_mult",
     "gdn2/erase_write_l1",
+    "loss/hssd_budget",
+    "hssd/budget_aux_loss",
     "lsa/distill_kl",
     "reward/mean",
     "gate/score",
     "tok_per_s",
     "mem/peak_gib",
 )
+
+
+def _subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cur_pp = env.get("PYTHONPATH", "")
+    if src_dir not in cur_pp.split(os.pathsep):
+        env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{cur_pp}" if cur_pp else src_dir
+    return env
 
 
 def setup_env(
@@ -141,7 +155,14 @@ def q(args: str, check: bool = True) -> int:
     cmd = [sys.executable, "-u", "-m", "qloop", *shlex.split(args)]
     print("$", " ".join(cmd), flush=True)
     t0 = time.time()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=_subprocess_env(),
+    )
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -232,3 +253,237 @@ def tail_metrics(
     for r in rows[-n:]:
         filtered = {k: round(r[k], 4) for k in keys if isinstance(r.get(k), (int, float))}
         print(f"step {r.get('step', '?'):>6}:", filtered)
+
+
+def run_probe_notebook_suite(
+    *,
+    config_path: str = "configs/stages/s0_probe.yaml",
+    hf_repo: str | None = None,
+    smoke_toy: bool = False,
+    seq_len: int | None = None,
+    n_seqs: int | None = None,
+    target_virtual: int | None = None,
+    run_math_gate: bool = True,
+    push_to_hub: bool = False,
+    debug: int = 1,
+    overrides: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Run Gate -1 (`fp64` math) + Gate 0a + Gate 0p-1..3 structured probes and return report + paths."""
+    repo = hf_repo or os.environ.get("QLOOP_HF_REPO", DEFAULT_HF_REPO)
+    run_root = os.environ.get("QLOOP_RUN_ROOT", "runs")
+    probe_dir = os.path.join(run_root, "probe")
+    os.makedirs(probe_dir, exist_ok=True)
+    json_path = os.path.join(probe_dir, "probe_report.json")
+    md_path = os.path.join(probe_dir, "probe_report.md")
+
+    eff_seq = int(seq_len) if seq_len is not None else (64 if smoke_toy else 2048)
+    eff_n = int(n_seqs) if n_seqs is not None else (2 if smoke_toy else 4)
+    eff_virt = int(target_virtual) if target_virtual is not None else (24 if smoke_toy else 88)
+
+    caller_keys = {ov.split("=", 1)[0].strip() for ov in overrides if "=" in ov}
+    eff_overrides: list[str] = []
+    if smoke_toy:
+        toy_defaults = (
+            ("model.name", "toy"),
+            ("model.dtype", "float32"),
+            ("model.device_map", "cpu"),
+            ("data.streaming", "false"),
+            ("data.sources", '[{"name":"toy_cot","weight":0.7},{"name":"toy_text","weight":0.3}]'),
+        )
+        for k, v in toy_defaults:
+            if k not in caller_keys:
+                eff_overrides.append(f"{k}={v}")
+
+    if push_to_hub:
+        if "checkpoint.sync.hf_repo" not in caller_keys:
+            eff_overrides.append(f"checkpoint.sync.hf_repo={repo}")
+        if "checkpoint.sync.enabled" not in caller_keys:
+            eff_overrides.append("checkpoint.sync.enabled=true")
+    elif "checkpoint.sync.enabled" not in caller_keys:
+        eff_overrides.append("checkpoint.sync.enabled=false")
+
+    eff_overrides.extend(overrides)
+
+    parts = [
+        "probe",
+        "-c",
+        shlex.quote(config_path),
+        "--structured",
+        "--n",
+        str(eff_n),
+        "--seq-len",
+        str(eff_seq),
+        "--target-virtual",
+        str(eff_virt),
+        "--out-json",
+        shlex.quote(json_path),
+        "--out-md",
+        shlex.quote(md_path),
+        "--debug",
+        str(int(debug)),
+    ]
+    for ov in eff_overrides:
+        parts += ["-s", shlex.quote(ov)]
+    q(" ".join(parts))
+
+    with open(json_path, encoding="utf-8") as f:
+        report: dict[str, Any] = json.load(f)
+
+    if run_math_gate:
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        math_test = os.path.join(repo_root, "tests", "test_loop_hssd_v3_math.py")
+        cmd = [sys.executable, "-m", "pytest", "-q", math_test]
+        print("$", " ".join(cmd), flush=True)
+        res = subprocess.run(cmd, check=False, capture_output=True, text=True, env=_subprocess_env())
+        if res.stdout:
+            print(res.stdout, end="", flush=True)
+        if res.stderr:
+            print(res.stderr, end="", flush=True)
+        math_ok = res.returncode == 0
+        if not math_ok:
+            raise RuntimeError(f"Gate -1 fp64 math verification failed (rc={res.returncode})")
+
+        gates: dict[str, Any] = {
+            "gate_minus_1_math": {
+                "passed": True,
+                "metric": "fp64_invariants_passed",
+                "value": 7,
+            },
+            **dict(report.get("gates") or {}),
+        }
+        report["gates"] = gates
+        summary = dict(report.get("summary") or {})
+        summary["num_gates_passed"] = sum(1 for g in gates.values() if g.get("passed"))
+        summary["num_gates_total"] = len(gates)
+        summary["all_critical_ok"] = bool(summary.get("all_critical_ok", True) and math_ok)
+        report["summary"] = summary
+
+        from .model.probes import format_probe_report_markdown
+
+        report["markdown"] = format_probe_report_markdown(report)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, default=str)
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(str(report["markdown"]))
+
+        if push_to_hub:
+            from .hub import HubSyncManager
+
+            hub = HubSyncManager(repo_id=repo, private=False)
+            hub.push_artifacts(
+                "s0_probe",
+                {
+                    "artifacts/probes/probe_report.json": json_path,
+                    "artifacts/probes/probe_report.md": md_path,
+                },
+                completed=False,
+            )
+
+    return {
+        **report,
+        "json_path": json_path,
+        "md_path": md_path,
+    }
+
+
+def _local_stage_done(run_root: str, stage_name: str) -> bool:
+    if stage_name == "s0_probe":
+        return os.path.isfile(os.path.join(run_root, "s0_probe", "esft_stats.json")) or os.path.isfile(
+            os.path.join(run_root, "probe", "probe_report.json")
+        )
+    ck_dir = os.path.join(run_root, stage_name, "checkpoints")
+    return os.path.isfile(os.path.join(ck_dir, "PROMOTED")) or os.path.isfile(os.path.join(ck_dir, "LATEST"))
+
+
+def run_v3_e2e_and_ship_pack(
+    *,
+    hf_repo: str | None = None,
+    pack_repo: str | None = None,
+    stages: Sequence[str] = (
+        "s0_probe",
+        "s1_loop_a6b",
+        "s1b_hssd_distill",
+        "s3_long_1m_lsa",
+        "s2_joint_bptt",
+        "s4_rl",
+    ),
+    until: str | None = None,
+    debug: int = 1,
+    time_budget_hours: float = 21.5,
+    ship_whole_model_pack: bool = True,
+    stream_low_disk: bool = True,
+    merge_hot_experts: bool = True,
+    max_shard_size_bytes: int = 4_500_000_000,
+    out_dir: str | None = None,
+    force: bool = False,
+    overrides: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Run/resume the Loop-HSSD v3 pipeline and stream the final Whole Model Pack upon completion."""
+    from .hub import HubSyncManager, resolve_stage_config_path
+
+    sync_repo = hf_repo or os.environ.get("QLOOP_HF_REPO", DEFAULT_HF_REPO)
+    target_pack_repo = pack_repo if pack_repo is not None else DEFAULT_PACK_REPO
+    stage_tuple = tuple(stages)
+    rc = run_pipeline(
+        hf_repo=sync_repo,
+        debug=debug,
+        time_budget_hours=time_budget_hours,
+        stages=stage_tuple,
+        until=until,
+        force=force,
+        overrides=overrides,
+    )
+
+    effective_stages = stage_tuple[: stage_tuple.index(until) + 1] if until and until in stage_tuple else stage_tuple
+
+    run_root = os.environ.get("QLOOP_RUN_ROOT", "runs")
+    manifest = HubSyncManager(repo_id=sync_repo, private=False).fetch_manifest()
+    all_completed = bool(effective_stages) and all(
+        manifest.is_completed(st) or _local_stage_done(run_root, st) for st in effective_stages
+    )
+
+    shipped = False
+    if rc == 0 and ship_whole_model_pack and all_completed and effective_stages:
+        final_stage = effective_stages[-1]
+        reclaim_disk(keep=final_stage)
+        if final_stage == "s4_rl" and ("s2_joint_bptt" in stage_tuple or "s1b_hssd_distill" in stage_tuple):
+            pack_cfg = resolve_stage_config_path("s2_joint_bptt")
+        else:
+            pack_cfg = resolve_stage_config_path(final_stage)
+        ckpt_dir = os.path.join(run_root, final_stage)
+        parts = [
+            "export-pack",
+            "-c",
+            shlex.quote(pack_cfg),
+            "--ckpt",
+            shlex.quote(ckpt_dir),
+            "--max-shard-bytes",
+            str(int(max_shard_size_bytes)),
+            "--debug",
+            str(int(debug)),
+        ]
+        if target_pack_repo:
+            parts += ["--push-repo", shlex.quote(target_pack_repo)]
+        if out_dir:
+            parts += ["--out", shlex.quote(out_dir)]
+        if stream_low_disk:
+            parts.append("--stream-low-disk")
+        if not merge_hot_experts:
+            parts.append("--no-merge-hot-experts")
+        caller_keys = {ov.split("=", 1)[0].strip() for ov in overrides if "=" in ov}
+        if "checkpoint.sync.hf_repo" not in caller_keys:
+            parts += ["-s", shlex.quote(f"checkpoint.sync.hf_repo={sync_repo}")]
+        for ov in overrides:
+            parts += ["-s", shlex.quote(ov)]
+        q(" ".join(parts))
+        shipped = True
+
+    return {
+        "pipeline_rc": rc,
+        "sync_repo": sync_repo,
+        "pack_repo": target_pack_repo,
+        "stages": list(effective_stages),
+        "all_stages_completed": all_completed,
+        "pack_shipped": shipped,
+        "out_dir": out_dir,
+    }

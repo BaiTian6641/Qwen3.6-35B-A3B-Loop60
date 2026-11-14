@@ -29,6 +29,7 @@ from typing import Any
 log = logging.getLogger("qloop")
 
 DEFAULT_HF_REPO = "TassP0lar/Qwen3.6-35B-A3B-Loop64"
+DEFAULT_PACK_REPO = "TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack"
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.6-35B-A3B"
 MANIFEST_FILE = "manifest.json"
 PIPELINE_ORDER: tuple[str, ...] = (
@@ -40,16 +41,44 @@ PIPELINE_ORDER: tuple[str, ...] = (
     "s4_rl",
     "eval",
 )
+V3_PIPELINE_ORDER: tuple[str, ...] = (
+    "s0_probe",
+    "s1_loop_a6b",
+    "s1b_hssd_distill",
+    "s3_long_1m_lsa",
+    "s2_joint_bptt",
+    "s4_rl",
+)
+_V3_STAGE_SET = frozenset({"s1_loop_a6b", "s1b_hssd_distill", "s3_long_1m_lsa", "s2_joint_bptt"})
 
 # Artifact files produced outside `checkpoints/` that downstream stages depend on.
 ARTIFACT_PATHS: dict[str, tuple[str, str]] = {
     "s0_probe/probe.json": ("artifacts/s0_probe/probe.json", "s0_probe/probe.json"),
+    "s0_probe/probe_report.json": ("artifacts/probes/probe_report.json", "s0_probe/probe_report.json"),
+    "s0_probe/probe_report.md": ("artifacts/probes/probe_report.md", "s0_probe/probe_report.md"),
     "s0_probe/esft_stats.json": ("artifacts/s0_probe/esft_stats.json", "s0_probe/esft_stats.json"),
     "s1_loop_heal/esft_stats_looped.json": (
         "artifacts/s1_loop_heal/esft_stats_looped.json",
         "s1_loop_heal/esft_stats_looped.json",
     ),
+    "s1_loop_a6b/esft_stats_looped.json": (
+        "artifacts/s1_loop_a6b/esft_stats_looped.json",
+        "s1_loop_a6b/esft_stats_looped.json",
+    ),
 }
+
+
+def resolve_stage_config_path(stage_name: str, config_root: str = "configs") -> str:
+    """Resolve a v2 or v3 pipeline stage identifier to its YAML config path under `config_root`."""
+    st = stage_name.strip()
+    if st == "eval":
+        return os.path.join(config_root, "eval", "suite.yaml")
+    if st == "s1_rescan":
+        return os.path.join(config_root, "stages", "s1_loop_heal.yaml")
+    cand = os.path.join(config_root, "stages", f"{st}.yaml")
+    if st in PIPELINE_ORDER or st in V3_PIPELINE_ORDER or os.path.isfile(cand):
+        return cand
+    raise ValueError(f"unknown pipeline stage {stage_name!r}")
 
 
 def _utc_now() -> str:
@@ -410,7 +439,8 @@ def render_model_card(manifest: HubManifest) -> str:
         "| Stage | Status | Step | LM Loss | Depth Gain (`L_d1 - L_d2`) | Pass-2 Reroute Rate | Updated (UTC) |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :--- |",
     ]
-    for st in PIPELINE_ORDER:
+    order = V3_PIPELINE_ORDER if any(s in manifest.stages for s in _V3_STAGE_SET) else PIPELINE_ORDER
+    for st in order:
         info = manifest.stages.get(st) or {}
         status = info.get("status", "pending")
         step = info.get("step", 0)
@@ -682,15 +712,23 @@ class HubSyncManager:
             p_end = int(loop_desc.get("prelude_end", 8))
             c_end = int(loop_desc.get("core_end", 32))
             n_pass = int(loop_desc.get("num_passes", 2))
+            phys_l = int(manifest.architecture.get("physical_layers", 40))
+            virt_l = p_end + (c_end - p_end) * n_pass + (phys_l - c_end)
             manifest.architecture.update({
+                "virtual_layers": virt_l,
                 "prelude_end": p_end,
                 "core_end": c_end,
                 "num_passes": n_pass,
                 "per_pass_router": bool(loop_desc.get("per_pass_router", True)),
                 "kv_share": bool(loop_desc.get("kv_share", True)),
             })
+        hssd_desc = stack_desc.get("hssd") if isinstance(stack_desc.get("hssd"), dict) else None
         gdn2_desc = stack_desc.get("gdn2") if isinstance(stack_desc.get("gdn2"), dict) else None
-        if gdn2_desc is not None:
+        if hssd_desc is not None:
+            manifest.architecture["linear_attention"] = "hssd"
+            manifest.architecture["hssd_rank"] = int(hssd_desc.get("rank", 64))
+            manifest.architecture["hssd_pages"] = int(hssd_desc.get("num_pages", 8))
+        elif gdn2_desc is not None:
             manifest.architecture["linear_attention"] = "gdn2"
             manifest.architecture["gdn2_rank"] = int(gdn2_desc.get("rank", 64))
 
@@ -970,7 +1008,13 @@ def load_qloop_from_hub(
     # At inference we fold any `expert_deltas` directly into float base weights via `restore_checkpoint`
     # (zero hook overhead during generation).
     raw_cfg["experts"] = {"enabled": False}
-    if any("gdn2_adapter." in k for k in saved):
+    if any("hssd_adapter." in k for k in saved):
+        prior_hssd = dict((meta.get("stack") or {}).get("hssd") or {})
+        hcfg = {**dict(raw_cfg.get("hssd") or {}), **prior_hssd}
+        hcfg["enabled"] = True
+        raw_cfg["hssd"] = hcfg
+        raw_cfg["gdn2"] = {"enabled": False}
+    elif any("gdn2_adapter." in k for k in saved):
         prior_gdn2 = dict((meta.get("stack") or {}).get("gdn2") or {})
         gcfg = {**dict(raw_cfg.get("gdn2") or {}), **prior_gdn2}
         for k, t in saved.items():

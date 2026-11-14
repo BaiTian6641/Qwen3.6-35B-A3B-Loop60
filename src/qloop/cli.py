@@ -4,14 +4,16 @@ Every command runs in a fresh process (so CUDA_LAUNCH_BLOCKING & friends apply a
 never poisons the notebook kernel), gets a run directory, a log file and a crash report.
 
   doctor        environment table (+ --freeze lockfile, --datasets access check)
-  probe         --backward | --core-ranges | --surgery  (cheap de-risking on the real model)
+  probe         --backward | --core-ranges | --surgery | --structured
   scan-experts  ESFT router-affinity scan -> experts json (feeds experts.stats_path)
-  train         LM stages (loop heal / SFT / long-context + D-LSA) or RL stage (GRPO/RSI)
+  train         LM stages (loop heal / HSSD / SFT / long-context + D-LSA) or RL stage (GRPO/RSI)
   eval          benchmark suite with the loop-depth sweep
+  infer         OptimizedLoopInferenceEngine on a shipped Whole Model Pack
   sync          HF Hub commit-history sync, 230 GB disk guard & self-resuming stage pipeline
   serve         OpenAI-compatible server for external agent harnesses (Harbor, tau-bench)
   external      run Harbor / tau-bench against a served endpoint
   export        trainable adapters bundle, optional merged depth-1 HF checkpoint
+  export-pack   self-contained sharded safetensors Whole Model Pack (+ low-disk HF streaming)
 """
 from __future__ import annotations
 
@@ -121,7 +123,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_probe(args: argparse.Namespace) -> int:
     from .model.loading import load_model
-    from .model.probes import probe_backward, probe_core_ranges, surgery_check
+    from .model.probes import (
+        probe_backward,
+        probe_core_ranges,
+        run_structured_probe_suite,
+        surgery_check,
+    )
 
     cfg = _load(args)
     run_dir = _start(cfg, "probe", args)
@@ -133,13 +140,40 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
         st = Stack(model, tok, inspect_model(model))
         seq = int(args.seq_len)
+        if getattr(args, "structured", False):
+            with stage("probe:structured"):
+                tgt = int(args.target_virtual or cfg.get_path("loop.target_virtual_layers") or 88)
+                batches = _probe_ids(st, cfg, int(args.n), seq)
+                rep = run_structured_probe_suite(model, batches, target_virtual=tgt)
+            json_path = args.out_json or os.path.join(run_dir, "probe_report.json")
+            md_path = args.out_md or os.path.join(run_dir, "probe_report.md")
+            os.makedirs(os.path.dirname(os.path.abspath(json_path)), exist_ok=True)
+            os.makedirs(os.path.dirname(os.path.abspath(md_path)), exist_ok=True)
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(rep, f, indent=2, default=str)
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(str(rep.get("markdown") or ""))
+            log.info("structured probe report -> %s | %s", json_path, md_path)
+            hub = _hub_for_cfg(cfg)
+            if hub is not None:
+                hub.push_artifacts(
+                    "s0_probe",
+                    {
+                        "artifacts/probes/probe_report.json": json_path,
+                        "artifacts/probes/probe_report.md": md_path,
+                    },
+                    completed=False,
+                )
+            if not (args.backward or args.core_ranges or args.surgery):
+                return 0
+            out["structured"] = rep
         if args.backward:
             with stage("probe:backward"):
                 out["backward"] = probe_backward(model, _probe_ids(st, cfg, 1, seq)[0])
         if args.core_ranges:
             with stage("probe:core-ranges"):
-                rows = probe_core_ranges(model, _probe_ids(st, cfg, args.n, seq),
-                                         target_virtual=int(cfg.get_path("loop.target_virtual_layers") or 64))
+                tgt_cr = int(args.target_virtual or cfg.get_path("loop.target_virtual_layers") or 64)
+                rows = probe_core_ranges(model, _probe_ids(st, cfg, args.n, seq), target_virtual=tgt_cr)
                 out["core_ranges"] = rows[:20]
         if args.surgery:
             with stage("probe:surgery"):
@@ -306,6 +340,87 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_pack(args: argparse.Namespace) -> int:
+    from .export_pack import export_whole_model_pack, push_whole_model_pack
+
+    cfg = _load(args)
+    run_dir = _start(cfg, "export_pack", args)
+    with crash_guard(run_dir):
+        require(
+            bool(args.out or args.push_repo),
+            "`qloop export-pack` requires at least one of `--out <dir>` or `--push-repo <repo_id>`",
+        )
+        st = _stack_with_ckpt(cfg, args.ckpt)
+        merge_hot = not bool(args.no_merge_hot_experts)
+        max_shard = int(args.max_shard_bytes)
+        if args.push_repo:
+            if args.out and args.stream_low_disk:
+                export_whole_model_pack(
+                    st,
+                    args.out,
+                    tokenizer=st.tokenizer,
+                    max_shard_size_bytes=max_shard,
+                    merge_hot_experts=merge_hot,
+                    merge_in_place=False,
+                    repo_id=args.push_repo,
+                )
+            res = push_whole_model_pack(
+                st,
+                args.push_repo,
+                stream_low_disk=bool(args.stream_low_disk),
+                tokenizer=st.tokenizer,
+                max_shard_size_bytes=max_shard,
+                merge_hot_experts=merge_hot,
+                private=bool(args.private),
+                out_dir=None if args.stream_low_disk else args.out,
+            )
+            log.info("pushed Whole Model Pack -> hf://%s (%s shards)", args.push_repo, res.get("num_shards"))
+        else:
+            assert args.out is not None
+            res = export_whole_model_pack(
+                st,
+                args.out,
+                tokenizer=st.tokenizer,
+                max_shard_size_bytes=max_shard,
+                merge_hot_experts=merge_hot,
+            )
+            log.info("exported Whole Model Pack -> %s (%s shards)", args.out, res.get("num_shards"))
+    return 0
+
+
+def cmd_infer(args: argparse.Namespace) -> int:
+    from .infer import InferenceConfig, OptimizedLoopInferenceEngine
+
+    run_dir = _start(None, "infer", args)
+    with crash_guard(run_dir):
+        icfg = InferenceConfig(
+            active_passes=args.depth,
+            prefill_chunk_size=int(args.prefill_chunk_size),
+            kv_cache_quant=str(args.kv_quant),
+            temperature=float(args.temperature),
+            max_new_tokens=int(args.max_new_tokens),
+        )
+        engine = OptimizedLoopInferenceEngine.from_pretrained(args.pack, cfg=icfg)
+        if args.depth is not None:
+            with engine.depth(int(args.depth)):
+                gen = engine.generate(
+                    args.prompt,
+                    max_new_tokens=int(args.max_new_tokens),
+                    temperature=float(args.temperature),
+                )
+        else:
+            gen = engine.generate(
+                args.prompt,
+                max_new_tokens=int(args.max_new_tokens),
+                temperature=float(args.temperature),
+            )
+        payload: dict[str, Any] = gen.to_dict() if hasattr(gen, "to_dict") else {"text": str(gen)}
+        if args.benchmark:
+            payload["benchmark"] = engine.benchmark()
+        print(json.dumps(payload, indent=2, default=str))
+    return 0
+
+
 def _pipeline_stage_cmds(
     stage_name: str,
     *,
@@ -317,7 +432,10 @@ def _pipeline_stage_cmds(
     time_budget_hours: float | None,
     scan_batches: int,
     scan_seq_len: int,
+    all_stages: tuple[str, ...] = (),
 ) -> list[list[str]]:
+    from .hub import _V3_STAGE_SET, resolve_stage_config_path
+
     py = [sys.executable, "-u", "-m", "qloop"]
     common = ["--debug", str(debug_level), "-s", f"checkpoint.sync.hf_repo={repo_id}"]
     for ov in overrides:
@@ -326,28 +444,80 @@ def _pipeline_stage_cmds(
     if time_budget_hours is not None:
         train_extra.extend(["-s", f"train.time_budget_hours={time_budget_hours}"])
 
+    is_v3_pipeline = any(s in _V3_STAGE_SET for s in all_stages)
+
     if stage_name == "s0_probe":
-        cpath = os.path.join(config_root, "stages", "s0_probe.yaml")
+        cpath = resolve_stage_config_path("s0_probe", config_root)
         out_stats = os.path.join(run_root, "s0_probe", "esft_stats.json")
+        probe_flags = ["--structured"] if is_v3_pipeline else ["--backward", "--surgery", "--core-ranges"]
         return [
-            [*py, "probe", "-c", cpath, "--backward", "--surgery", "--core-ranges", *common],
+            [*py, "probe", "-c", cpath, *probe_flags, *common],
             [*py, "scan-experts", "-c", cpath, "--batches", str(scan_batches), "--seq-len", str(scan_seq_len),
              "--out", out_stats, *common],
         ]
-    if stage_name == "s1_loop_heal":
-        return [[*py, "train", "-c", os.path.join(config_root, "stages", "s1_loop_heal.yaml"), *train_extra]]
     if stage_name == "s1_rescan":
-        cpath = os.path.join(config_root, "stages", "s1_loop_heal.yaml")
+        cpath = resolve_stage_config_path("s1_rescan", config_root)
         ckpt = os.path.join(run_root, "s1_loop_heal")
         out_stats = os.path.join(run_root, "s1_loop_heal", "esft_stats_looped.json")
         return [[*py, "scan-experts", "-c", cpath, "--ckpt", ckpt, "--batches", str(scan_batches),
                  "--seq-len", str(scan_seq_len), "--out", out_stats, *common]]
-    if stage_name in ("s2_sft", "s3_long_lsa", "s4_rl"):
-        return [[*py, "train", "-c", os.path.join(config_root, "stages", f"{stage_name}.yaml"), *train_extra]]
     if stage_name == "eval":
-        return [[*py, "eval", "-c", os.path.join(config_root, "eval", "suite.yaml"),
-                 "--ckpt", os.path.join(run_root, "s4_rl"), *common]]
-    raise ValueError(f"unknown pipeline stage {stage_name!r}")
+        cpath = resolve_stage_config_path("eval", config_root)
+        eval_extra = list(common)
+        if is_v3_pipeline:
+            ov_keys = {ov.split("=", 1)[0].strip() for ov in overrides if "=" in ov}
+            v3_eval_defaults = (
+                ("loop.num_passes", "3"),
+                ("loop.target_virtual_layers", "88"),
+                ("loop.train_pass_probs", "[0.15,0.50,0.35]"),
+                ("loop.bridge_mode", "subspace"),
+                ("loop.bridge_rank", "256"),
+                ("loop.bridge_init", "[0.05,0.85,0.10]"),
+                ("loop.attn_adapter_rank", "64"),
+                ("gdn2.enabled", "false"),
+                ("hssd.enabled", "true"),
+                ("lsa.num_query_passes", "3"),
+                ("eval.defaults.depths", "[1,2,3]"),
+            )
+            for k, v in v3_eval_defaults:
+                if k not in ov_keys:
+                    eval_extra.extend(["-s", f"{k}={v}"])
+        return [[*py, "eval", "-c", cpath, "--ckpt", os.path.join(run_root, "s4_rl"), *eval_extra]]
+
+    cpath = resolve_stage_config_path(stage_name, config_root)
+    stage_extra = list(train_extra)
+    if stage_name == "s4_rl" and is_v3_pipeline:
+        ov_keys = {ov.split("=", 1)[0].strip() for ov in overrides if "=" in ov}
+        v3_rl_defaults = [
+            ("loop.num_passes", "3"),
+            ("loop.target_virtual_layers", "88"),
+            ("loop.train_pass_probs", "[0.10,0.40,0.50]"),
+            ("loop.bridge_mode", "subspace"),
+            ("loop.bridge_rank", "256"),
+            ("loop.bridge_init", "[0.05,0.85,0.10]"),
+            ("loop.attn_adapter_rank", "64"),
+            ("gdn2.enabled", "false"),
+            ("hssd.enabled", "true"),
+            ("lsa.num_query_passes", "3"),
+            ("rl.gate.depth", "3"),
+            (
+                "train.allowed_groups",
+                '["loop_adapters","hssd_adapters","gdn2_adapters","lsa_indexers","router","shared_expert","attention","expert_deltas"]',
+            ),
+        ]
+        if "s2_joint_bptt" in all_stages:
+            v3_rl_defaults.insert(0, ("train.init_from", "runs/s2_joint_bptt"))
+        for k, v in v3_rl_defaults:
+            if k not in ov_keys:
+                stage_extra.extend(["-s", f"{k}={v}"])
+        looped_stats = os.path.join(run_root, "s1_loop_heal", "esft_stats_looped.json")
+        looped_a6b_stats = os.path.join(run_root, "s1_loop_a6b", "esft_stats_looped.json")
+        if "experts.enabled" not in ov_keys:
+            if os.path.isfile(looped_a6b_stats) and "experts.stats_path" not in ov_keys:
+                stage_extra.extend(["-s", "experts.stats_path=runs/s1_loop_a6b/esft_stats_looped.json"])
+            elif "s1_loop_heal" not in all_stages and not os.path.isfile(looped_stats):
+                stage_extra.extend(["-s", "experts.enabled=false"])
+    return [[*py, "train", "-c", cpath, *stage_extra]]
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
@@ -371,7 +541,7 @@ def _run_sync_action(
     run_root: str,
     ckpt_cls: Any,
 ) -> int:
-    from .hub import PIPELINE_ORDER, disk_report, reclaim_disk_space
+    from .hub import _V3_STAGE_SET, PIPELINE_ORDER, V3_PIPELINE_ORDER, disk_report, reclaim_disk_space
 
     if args.action == "disk":
         if args.clean:
@@ -385,16 +555,17 @@ def _run_sync_action(
         manifest = hub.fetch_manifest()
         commits = hub.recent_commits(limit=8)
         disk = disk_report(run_root)
+        order = V3_PIPELINE_ORDER if any(s in manifest.stages for s in _V3_STAGE_SET) else PIPELINE_ORDER
         print(f"HF Repo       : https://huggingface.co/{repo_id} (public)")
-        print(f"Next Stage    : {manifest.next_incomplete_stage() or 'ALL COMPLETED'}")
+        print(f"Next Stage    : {manifest.next_incomplete_stage(order) or 'ALL COMPLETED'}")
         print(f"Latest Commit : stage={manifest.latest_stage or '-'} step={manifest.latest_step} "
               f"at {manifest.updated_at}")
         print(f"Local Disk    : {disk['free_gib']:.1f} GiB free / {disk['total_gib']:.1f} GiB total "
               f"(HF base cache={disk['hf_hub_weights_gib']:.1f} GiB, runs={disk['runs_gib']:.2f} GiB)")
         print("\nStage Progress:")
-        print(f"  {'stage':<14} {'status':<12} {'step':<14} {'lm_loss':<10} {'depth_gain':<12} {'reroute'}")
-        print("  " + "-" * 74)
-        for st in PIPELINE_ORDER:
+        print(f"  {'stage':<18} {'status':<12} {'step':<14} {'lm_loss':<10} {'depth_gain':<12} {'reroute'}")
+        print("  " + "-" * 78)
+        for st in order:
             info = manifest.stages.get(st) or {}
             status = info.get("status", "pending")
             step = info.get("step", 0)
@@ -407,7 +578,7 @@ def _run_sync_action(
             lm_s = f"{lm:.4f}" if isinstance(lm, (int, float)) else "-"
             dg_s = f"{dg:+.4f}" if isinstance(dg, (int, float)) else "-"
             rr_s = f"{rr:.3f}" if isinstance(rr, (int, float)) else "-"
-            print(f"  {st:<14} {status:<12} {step_s:<14} {lm_s:<10} {dg_s:<12} {rr_s}")
+            print(f"  {st:<18} {status:<12} {step_s:<14} {lm_s:<10} {dg_s:<12} {rr_s}")
         if commits:
             print("\nRecent Hub Commits:")
             for c in commits:
@@ -468,6 +639,7 @@ def _run_sync_action(
                 time_budget_hours=args.time_budget_hours,
                 scan_batches=int(args.scan_batches),
                 scan_seq_len=int(args.scan_seq_len),
+                all_stages=stages,
             )
             log.info("[pipeline] === starting stage %s (%d command(s)) ===", st_name, len(cmds))
             for cmd in cmds:
@@ -484,10 +656,10 @@ def _run_sync_action(
                     st_name, manifest.stage_step(st_name), repo_id,
                 )
                 return 0
-            if st_name == "s1_loop_heal":
-                s1_m = (manifest.stages.get("s1_loop_heal") or {}).get("metrics") or {}
-                log.info("[pipeline] S1 loop heal complete: depth_gain=%s reroute_rate=%s",
-                         s1_m.get("eval/depth_gain"), s1_m.get("loop/reroute_rate"))
+            if st_name in ("s1_loop_heal", "s1_loop_a6b"):
+                s1_m = (manifest.stages.get(st_name) or {}).get("metrics") or {}
+                log.info("[pipeline] %s complete: depth_gain=%s reroute_rate=%s",
+                         st_name, s1_m.get("eval/depth_gain"), s1_m.get("loop/reroute_rate"))
             if args.until == st_name:
                 break
         log.info("[pipeline] requested pipeline stages finished and synced to https://huggingface.co/%s", repo_id)
@@ -510,11 +682,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=None, help="verify access to this model repo")
     p.set_defaults(fn=cmd_doctor)
 
-    p = sub.add_parser("probe", help="backward / core-range / surgery probes")
+    p = sub.add_parser("probe", help="backward / core-range / surgery / structured Gate 0p probes")
     _common(p)
     p.add_argument("--backward", action="store_true")
     p.add_argument("--core-ranges", action="store_true")
     p.add_argument("--surgery", action="store_true")
+    p.add_argument("--structured", action="store_true", help="run Gate 0a + Gate 0p-1..3 structured probe suite")
+    p.add_argument("--out-json", default=None, help="path to write structured probe_report.json")
+    p.add_argument("--out-md", default=None, help="path to write structured probe_report.md")
+    p.add_argument("--target-virtual", type=int, default=None, help="target virtual depth (e.g. 64 or 88)")
     p.add_argument("--n", type=int, default=4, help="number of probe sequences")
     p.add_argument("--seq-len", type=int, default=2048)
     p.set_defaults(fn=cmd_probe)
@@ -535,6 +711,18 @@ def build_parser() -> argparse.ArgumentParser:
     _common(p)
     p.add_argument("--ckpt", default=None)
     p.set_defaults(fn=cmd_eval)
+
+    p = sub.add_parser("infer", help="run OptimizedLoopInferenceEngine on a Whole Model Pack")
+    _common(p, config=False)
+    p.add_argument("--pack", required=True, help="local Whole Model Pack directory or HF repo_id")
+    p.add_argument("--prompt", default="Prove step-by-step that sqrt(2) is irrational.")
+    p.add_argument("--depth", type=int, default=None, help="active loop pass depth (1, 2, or 3)")
+    p.add_argument("--max-new-tokens", type=int, default=128)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--prefill-chunk-size", type=int, default=4096)
+    p.add_argument("--kv-quant", default="native", choices=["native", "fp8", "hadamard_int4"])
+    p.add_argument("--benchmark", action="store_true")
+    p.set_defaults(fn=cmd_infer)
 
     p = sub.add_parser("sync", help="HF Hub commit-history sync, 230 GB disk guard & pipeline runner")
     _common(p, config=False)
@@ -577,6 +765,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True)
     p.add_argument("--merged-depth1", action="store_true")
     p.set_defaults(fn=cmd_export)
+
+    p = sub.add_parser("export-pack", help="export or stream self-contained Whole Model Pack")
+    _common(p)
+    p.add_argument("--ckpt", default=None, help="run dir or checkpoint dir to load trainables from")
+    p.add_argument("--out", default=None, help="local directory to write Whole Model Pack")
+    p.add_argument("--push-repo", default=None, help="HF Hub repo_id to push Whole Model Pack to")
+    p.add_argument("--stream-low-disk", action="store_true", help="stream one shard at a time (< 6 GB temp disk)")
+    p.add_argument("--max-shard-bytes", type=int, default=4_500_000_000, help="maximum safetensors shard size in bytes")
+    p.add_argument("--no-merge-hot-experts", action="store_true", help="keep HotExpertDeltas unmerged")
+    p.add_argument("--private", action="store_true", help="create private HF repo when pushing")
+    p.set_defaults(fn=cmd_export_pack)
     return ap
 
 

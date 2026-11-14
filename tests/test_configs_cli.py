@@ -8,6 +8,7 @@ import pytest
 from qloop.cli import main
 from qloop.config import load_config
 from qloop.model.gdn2 import GDN2Config
+from qloop.model.hssd import HSSDConfig
 from qloop.model.loop import LoopSpec, build_schedule
 from qloop.model.lsa import LSAConfig
 
@@ -22,15 +23,16 @@ def test_every_config_loads_and_validates(path):
         return  # partial (model-only / base) fragments
     loop = LoopSpec.from_dict(dict(cfg.get("loop") or {}))
     GDN2Config.from_dict(dict(cfg.get("gdn2") or {})).validate()
+    HSSDConfig.from_dict(dict(cfg.get("hssd") or {})).validate()
     LSAConfig.from_dict(dict(cfg.get("lsa") or {})).validate()
     if cfg.model.name == "toy":
         types = ["full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(16)]
     else:
         types = QWEN_TYPES
-        assert loop.virtual_layers(40) == 64, f"{path}: Qwen configs must target 64 virtual layers"
+        assert loop.virtual_layers(40) in (64, 88), f"{path}: Qwen configs must target 64 or 88 virtual layers"
         if "stages/" in path.replace("\\", "/") or "eval/" in path.replace("\\", "/"):
             assert loop.per_pass_router is True
-            assert (cfg.get("gdn2") or {}).get("enabled") is True
+            assert (cfg.get("gdn2") or {}).get("enabled") is True or (cfg.get("hssd") or {}).get("enabled") is True
             sync = (cfg.get("checkpoint") or {}).get("sync") or {}
             assert sync.get("hf_repo") == "TassP0lar/Qwen3.6-35B-A3B-Loop64"
             assert sync.get("private") is False

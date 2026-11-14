@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import torch
@@ -25,10 +25,11 @@ from ..model.experts import (
     freeze_all_but,
 )
 from ..model.gdn2 import GDN2Manager, install_gdn2
+from ..model.hssd import HSSDConfig, HSSDHandle, apply_hssd
 from ..model.introspect import ModelParts, inspect_model
 from ..model.loading import load_model
-from ..model.loop import LoopController, apply_loop
-from ..model.lsa import LSAManager, install_lsa
+from ..model.loop import LoopController, LoopSpec, apply_loop, sha256_frozen_experts
+from ..model.lsa import LSAConfig, LSAManager, install_lsa
 from .checkpoint import collect_trainable, stable_names
 
 log = logging.getLogger("qloop")
@@ -41,6 +42,7 @@ class Stack:
     parts: ModelParts
     loop: LoopController | None = None
     gdn2: GDN2Manager | None = None
+    hssd: HSSDHandle | None = None
     lsa: LSAManager | None = None
     deltas: HotExpertDeltas | None = None
     named_trainable: dict[str, nn.Parameter] = field(default_factory=dict)
@@ -48,7 +50,9 @@ class Stack:
     carried_params: dict[str, nn.Parameter] = field(default_factory=dict)
     passthrough_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     carried_gdn2_cfg: dict[str, Any] | None = None
+    carried_hssd_cfg: dict[str, Any] | None = None
     carried_lsa_cfg: dict[str, Any] | None = None
+    frozen_experts_sha256: str | None = None
     _folded_experts: set[tuple[int, int]] = field(default_factory=set)
     load_info: dict[str, Any] = field(default_factory=dict)
     hot_map: dict[int, list[int]] | None = None
@@ -74,6 +78,8 @@ class Stack:
             a = self.loop.aux_loss()
             if a is not None:
                 out["loop_aux"] = a
+        if self.hssd is not None:
+            out["hssd_budget"] = self.hssd.aux_loss()
         if self.lsa is not None:
             a = self.lsa.aux_loss()
             if a is not None:
@@ -86,9 +92,22 @@ class Stack:
             s.update(self.loop.stats())
         if self.gdn2 is not None:
             s.update(self.gdn2.stats())
+        if self.hssd is not None:
+            s.update(self.hssd.stats())
         if self.lsa is not None:
             s.update(self.lsa.stats())
         return s
+
+    def verify_frozen_experts(self) -> str:
+        digest = sha256_frozen_experts(self.model)
+        if self.frozen_experts_sha256 is not None:
+            require(
+                digest == self.frozen_experts_sha256,
+                "frozen MoE expert parameters mutated during stage",
+                expected=self.frozen_experts_sha256,
+                actual=digest,
+            )
+        return digest
 
     def checkpoint_params(self) -> dict[str, torch.Tensor]:
         """Cumulative diff relative to the pristine HF base model (`passthrough + carried + trainable`)."""
@@ -110,6 +129,8 @@ class Stack:
         if prior_stack_meta:
             if self.gdn2 is None and isinstance(prior_stack_meta.get("gdn2"), dict):
                 self.carried_gdn2_cfg = dict(prior_stack_meta["gdn2"])
+            if self.hssd is None and isinstance(prior_stack_meta.get("hssd"), dict):
+                self.carried_hssd_cfg = dict(prior_stack_meta["hssd"])
             if self.lsa is None and isinstance(prior_stack_meta.get("lsa"), dict):
                 self.carried_lsa_cfg = dict(prior_stack_meta["lsa"])
             if self.deltas is None and prior_stack_meta.get("expert_delta_scale") is not None:
@@ -148,6 +169,12 @@ class Stack:
             skip=self._folded_experts,
         )
         self._folded_experts |= folded
+        if self.frozen_experts_sha256 is not None:
+            if folded:
+                self.frozen_experts_sha256 = sha256_frozen_experts(self.model)
+                self.load_info["frozen_experts_sha256"] = self.frozen_experts_sha256
+            else:
+                self.verify_frozen_experts()
         return {
             "trainable": n_train,
             "carried": len(self.carried_params),
@@ -156,12 +183,19 @@ class Stack:
         }
 
     def describe(self) -> dict[str, Any]:
+        hssd_desc: dict[str, Any] | None = None
+        if self.hssd is not None:
+            hssd_desc = {**asdict(self.hssd.cfg), "mu_max": list(self.hssd.cfg.mu_max)}
+        elif self.carried_hssd_cfg is not None:
+            hssd_desc = dict(self.carried_hssd_cfg)
         return {
             "loop": None if self.loop is None else self.loop.spec.__dict__,
             "gdn2": (self.gdn2.cfg.__dict__ if self.gdn2 is not None else self.carried_gdn2_cfg),
+            "hssd": hssd_desc,
             "lsa": (self.lsa.cfg.__dict__ if self.lsa is not None else self.carried_lsa_cfg),
             "hot_experts": None if self.hot_map is None else {str(k): v for k, v in self.hot_map.items()},
             "expert_delta_scale": None if self.deltas is None else self.deltas.scale,
+            "frozen_experts_sha256": self.frozen_experts_sha256,
             "n_trainable": sum(p.numel() for p in self.named_trainable.values()),
         }
 
@@ -198,14 +232,33 @@ def build_stack(cfg: dict[str, Any]) -> Stack:
     st = Stack(model, tok, inspect_model(model), load_info=info)
 
     gcfg = dict(cfg.get("gdn2") or {})
-    if gcfg.pop("enabled", False):
+    gdn2_on = bool(gcfg.pop("enabled", False))
+    hcfg = dict(cfg.get("hssd") or {})
+    hssd_on = bool(hcfg.pop("enabled", False))
+    if hssd_on:
+        if gdn2_on:
+            log.info("both hssd.enabled and gdn2.enabled are true; using Track-B HSSD v3 (skipping GDN-2)")
+        with stage("model:hssd"):
+            st.hssd = apply_hssd(model, HSSDConfig.from_dict(hcfg))
+    elif gdn2_on:
         with stage("model:gdn2"):
             st.gdn2 = install_gdn2(model, gcfg)
 
+    loop_cfg = dict(cfg.get("loop") or {})
+    loop_on = bool(loop_cfg.pop("enabled", False))
+    loop_spec_pre = LoopSpec.from_dict(loop_cfg) if loop_on else None
+
     lcfg = dict(cfg.get("lsa") or {})
     if lcfg.pop("enabled", False):
+        raw_nqp = lcfg.get("num_query_passes")
+        if loop_spec_pre is not None and (raw_nqp == "auto" or (isinstance(raw_nqp, int) and int(raw_nqp) > 1)):
+            lcfg["num_query_passes"] = (
+                int(loop_spec_pre.num_passes)
+                if raw_nqp == "auto"
+                else max(int(raw_nqp), int(loop_spec_pre.num_passes))
+            )
         with stage("model:lsa"):
-            st.lsa = install_lsa(model, lcfg)
+            st.lsa = install_lsa(model, LSAConfig.from_dict(lcfg))
 
     ecfg = dict(cfg.get("experts") or {})
     if ecfg.get("enabled", False):
@@ -226,6 +279,10 @@ def build_stack(cfg: dict[str, Any]) -> Stack:
         patterns.append(r"gdn2_adapter\.")
         if allowed_groups is not None and "gdn2_adapters" not in allowed_groups:
             allowed_groups.append("gdn2_adapters")
+    if st.hssd is not None and st.hssd.adapters and tcfg.get("train_hssd", True):
+        patterns.append(r"hssd_adapter\.")
+        if allowed_groups is not None and "hssd_adapters" not in allowed_groups:
+            allowed_groups.append("hssd_adapters")
     if st.lsa is not None and tcfg.get("train_lsa", True):
         patterns.append(r"lsa_indexer\.")
     if st.deltas is not None and tcfg.get("train_expert_deltas", True):
@@ -239,13 +296,20 @@ def build_stack(cfg: dict[str, Any]) -> Stack:
             for p in model.parameters():
                 p.requires_grad_(False)
 
-    loop_cfg = dict(cfg.get("loop") or {})
-    if loop_cfg.pop("enabled", False):
+    check_sha = bool(tcfg.get("sha256_frozen_experts", False))
+    if check_sha:
+        st.frozen_experts_sha256 = sha256_frozen_experts(model)
+        st.load_info["frozen_experts_sha256"] = st.frozen_experts_sha256
+
+    if loop_on and loop_spec_pre is not None:
         with stage("model:loop"):
-            st.loop = apply_loop(model, loop_cfg)
+            st.loop = apply_loop(model, loop_spec_pre)
             for n, p in st.loop.adapters.named_parameters():
                 names[id(p)] = f"loop_adapters.{n}"
                 p.requires_grad_(bool(tcfg.get("train_loop_adapters", True)))
+
+    if check_sha:
+        st.verify_frozen_experts()
 
     params = {id(p): p for p in model.parameters()}
     if st.loop is not None:

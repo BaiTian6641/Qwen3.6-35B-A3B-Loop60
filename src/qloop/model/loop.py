@@ -24,6 +24,7 @@ How it is wired (no re-implementation of the HF forward):
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import random
@@ -66,12 +67,17 @@ class LoopSpec:
     kv_share: bool = True
     bridge_init: tuple[float, ...] = (0.6, 0.2, 0.2)
     bridge_rank: int = 0
+    bridge_mode: str = "concat"
+    bridge_up_std: float = 0.01
     step_embedding: bool = True
     gate_init: float = 0.0
     per_pass_router: bool = True
     router_adapter_rank: int = 32
     router_repel_init: float = 0.0
     router_diversity_weight: float = 0.0
+    attn_adapter_rank: int = 0
+    attn_adapter_alpha: float | None = None
+    attn_proj_names: tuple[str, ...] = ("q_proj", "o_proj")
     mor: bool = False
     mor_target_depth: float | None = None
     mor_aux_weight: float = 0.01
@@ -91,7 +97,7 @@ class LoopSpec:
         unknown = set(d) - known - {"enabled"}
         if unknown:
             raise ValueError(f"unknown loop.* keys: {sorted(unknown)}; valid: {sorted(known)}")
-        for k in ("bridge_init", "kv_proj_names", "write_zero_names", "write_neg_names"):
+        for k in ("bridge_init", "kv_proj_names", "attn_proj_names", "write_zero_names", "write_neg_names"):
             if k in d and isinstance(d[k], list):
                 d[k] = tuple(d[k])
         d.pop("enabled", None)
@@ -110,6 +116,16 @@ class LoopSpec:
             raise ValueError(f"need 0 <= prelude_end < core_end <= {n}, got {self.prelude_end}, {self.core_end}")
         if self.num_passes < 1:
             raise ValueError("num_passes must be >= 1")
+        if self.bridge_mode not in ("concat", "subspace"):
+            raise ValueError(f"bridge_mode must be 'concat' or 'subspace', got {self.bridge_mode!r}")
+        if self.bridge_up_std < 0:
+            raise ValueError(f"bridge_up_std must be >= 0, got {self.bridge_up_std}")
+        if self.attn_adapter_rank < 0:
+            raise ValueError(f"attn_adapter_rank must be >= 0, got {self.attn_adapter_rank}")
+        if self.kv_share and self.attn_adapter_rank > 0 and (set(self.attn_proj_names) & set(self.kv_proj_names)):
+            raise ValueError(
+                f"attn_proj_names {self.attn_proj_names} overlaps kv_proj_names {self.kv_proj_names} with kv_share=True"
+            )
         v = self.virtual_layers(n)
         if self.target_virtual_layers is not None and v != self.target_virtual_layers:
             raise ValueError(
@@ -245,14 +261,117 @@ class PassRouterAdapters(nn.Module):
         return d
 
 
+def _linear_dims(mod: nn.Module) -> tuple[int, int]:
+    in_f = getattr(mod, "in_features", None)
+    out_f = getattr(mod, "out_features", None)
+    if isinstance(in_f, int) and isinstance(out_f, int):
+        return in_f, out_f
+    w = getattr(mod, "weight", None)
+    if isinstance(w, torch.Tensor) and w.ndim == 2:
+        return int(w.shape[1]), int(w.shape[0])
+    raise RuntimeError(f"cannot determine (in_features, out_features) on {type(mod).__name__}")
+
+
+class _PassLoRAProj(nn.Module):
+    """Per-extra-pass zero-initialised rank-r LoRA delta `scale * (x @ down^T) @ up^T`."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        extra_passes: int,
+        rank: int,
+        scale: float,
+        seed_base: int,
+    ):
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.extra_passes = int(extra_passes)
+        self.rank = int(rank)
+        self.scale = float(scale)
+        down = torch.empty(self.extra_passes, self.rank, self.in_features)
+        bound = 1.0 / math.sqrt(self.in_features)
+        for p in range(self.extra_passes):
+            gen = torch.Generator().manual_seed(seed_base + p * 1009)
+            down[p].uniform_(-bound, bound, generator=gen)
+        self.down = nn.Parameter(down)
+        self.up = nn.Parameter(torch.zeros(self.extra_passes, self.out_features, self.rank))
+
+    def is_zero(self, pass_idx: int) -> bool:
+        with torch.no_grad():
+            return bool((self.up[pass_idx] == 0).all())
+
+    def delta(self, x_in: torch.Tensor, pass_idx: int) -> torch.Tensor:
+        x = upcast(x_in).to(self.down.dtype)
+        h = F.linear(x, self.down[pass_idx])
+        return F.linear(h, self.up[pass_idx]) * self.scale
+
+
+class PassAttnAdapters(nn.Module):
+    """Per-(pass r>=2, core full-attn layer) zero-init LoRA residuals on Q/O projections (Fix A5).
+
+    Keeps `k_proj` and `v_proj` shared with Pass 1 (`kv_share=True` => 1.0x KV cache footprint)
+    while letting Passes 2..R specialise query addressing and output mixing independently.
+    """
+
+    def __init__(
+        self,
+        proj_specs: dict[int, dict[str, tuple[int, int]]],
+        extra_passes: int,
+        rank: int,
+        alpha: float | None = None,
+    ):
+        super().__init__()
+        self.extra_passes = int(extra_passes)
+        self.rank = int(rank)
+        self.scale = float(alpha if alpha is not None else self.rank) / max(self.rank, 1)
+        self.layers = nn.ModuleDict()
+        for phys in sorted(proj_specs):
+            pdict = nn.ModuleDict()
+            for j, (pname, (in_f, out_f)) in enumerate(sorted(proj_specs[phys].items())):
+                seed = 4099 + phys * 131 + j * 37
+                pdict[pname] = _PassLoRAProj(in_f, out_f, self.extra_passes, self.rank, self.scale, seed)
+            self.layers[f"L{phys}"] = pdict
+
+    def is_zero(self, phys: int, pname: str, pass_idx: int) -> bool:
+        proj: _PassLoRAProj = self.layers[f"L{phys}"][pname]  # type: ignore[assignment]
+        return proj.is_zero(pass_idx)
+
+    def delta(self, x_in: torch.Tensor, phys: int, pname: str, pass_idx: int) -> torch.Tensor:
+        proj: _PassLoRAProj = self.layers[f"L{phys}"][pname]  # type: ignore[assignment]
+        return proj.delta(x_in, pass_idx)
+
+    def up_abs_mean(self, pass_idx: int) -> float:
+        vals = []
+        for pdict in self.layers.values():
+            for proj in pdict.values():
+                vals.append(float(proj.up[pass_idx].detach().float().abs().mean()))
+        return sum(vals) / max(len(vals), 1)
+
+
 class LoopAdapters(nn.Module):
     """All new parameters (kept fp32; tiny). Attached as `text_model.loop_adapters`."""
 
-    def __init__(self, hidden: int, spec: LoopSpec, num_experts: int | None = None):
+    def __init__(
+        self,
+        hidden: int,
+        spec: LoopSpec,
+        num_experts: int | None = None,
+        attn_proj_specs: dict[int, dict[str, tuple[int, int]]] | None = None,
+    ):
         super().__init__()
         extra = max(spec.num_passes - 1, 1)
         self.gates = nn.Parameter(torch.full((extra, hidden), float(spec.gate_init)))
-        self.bridge = LoopBridge(hidden, extra, spec.bridge_init, spec.bridge_rank, spec.step_embedding)
+        self.bridge = LoopBridge(
+            hidden,
+            extra,
+            spec.bridge_init,
+            spec.bridge_rank,
+            spec.step_embedding,
+            adapter_mode=spec.bridge_mode,
+            up_init_std=spec.bridge_up_std,
+        )
         self.pass_router: PassRouterAdapters | None = None
         if spec.per_pass_router and spec.num_passes > 1 and num_experts is not None and spec.core_len > 0:
             self.pass_router = PassRouterAdapters(
@@ -263,6 +382,14 @@ class LoopAdapters(nn.Module):
                 rank=spec.router_adapter_rank,
                 repel_init=spec.router_repel_init,
             )
+        self.pass_attn: PassAttnAdapters | None = None
+        if spec.attn_adapter_rank > 0 and spec.num_passes > 1 and attn_proj_specs:
+            self.pass_attn = PassAttnAdapters(
+                proj_specs=attn_proj_specs,
+                extra_passes=extra,
+                rank=spec.attn_adapter_rank,
+                alpha=spec.attn_adapter_alpha,
+            )
         self.mor_router: nn.Linear | None = None
         if spec.mor:
             self.mor_router = nn.Linear(hidden, spec.num_passes)
@@ -270,6 +397,10 @@ class LoopAdapters(nn.Module):
             with torch.no_grad():  # start with every token taking the full depth
                 self.mor_router.bias.zero_()
                 self.mor_router.bias[-1] = 2.0
+
+    @property
+    def pass_gates(self) -> nn.Parameter:
+        return self.gates
 
 
 # ============================================================================ virtual layer
@@ -293,7 +424,7 @@ class VirtualLayer(nn.Module):
         if s.vidx == 0:
             ctl._begin_forward()
         if s.r > ctl.active_passes:  # depth sampling / test-time depth < trained depth
-            return (hidden_states,) if ctl._tuple_out else hidden_states
+            return (hidden_states, *([None] * ctl._tuple_extra)) if ctl._tuple_out else hidden_states
         ctx = ctl.ctx
         x = hidden_states
         if s.entry:
@@ -310,15 +441,22 @@ class VirtualLayer(nn.Module):
             kwargs = dict(kwargs)
             kwargs["past_key_values"] = SharedKVView(pkv)
         r, idx_mods, cache_idx, inner = s.r, self._idx_mods, s.cache_idx, self.inner
+        attn_mod = getattr(inner, "self_attn", None)
 
         def run(inp: torch.Tensor) -> Any:
             prev = ctl._cur
             ctl._cur = (ctx, r)
             for m in idx_mods:
                 m.layer_idx = cache_idx
+            lsa_ix = getattr(attn_mod, "lsa_indexer", None) if attn_mod is not None else None
+            set_pass = getattr(lsa_ix, "set_current_pass", None) if lsa_ix is not None else None
+            if callable(set_pass):
+                set_pass(max(r, 1))
             try:
                 return inner(inp, *args, **kwargs)
             finally:
+                if callable(set_pass):
+                    set_pass(1)
                 ctl._cur = prev
 
         if ctl.spec.checkpoint and self.training and torch.is_grad_enabled():
@@ -327,6 +465,7 @@ class VirtualLayer(nn.Module):
             out = run(x)
         is_tuple = isinstance(out, tuple)
         ctl._tuple_out = is_tuple
+        ctl._tuple_extra = (len(out) - 1) if is_tuple else 0
         h = out[0] if is_tuple else out
         if s.exit and r >= 2:
             h = ctl._combine(ctx, h, r)
@@ -356,26 +495,46 @@ class LoopController:
         self._num_experts: int | None = int(num_experts) if num_experts is not None else None
         self._top_k: int = int(getattr(cfg, "num_experts_per_tok", 8))
         self._norm_topk: bool = bool(getattr(cfg, "norm_topk_prob", True))
+        attn_proj_specs: dict[int, dict[str, tuple[int, int]]] = {}
+        self._attn_proj_mods: list[tuple[int, str, nn.Module]] = []
+        if spec.attn_adapter_rank > 0 and spec.num_passes > 1:
+            for phys, layer in self._core_layers(FULL):
+                attn = attention_module(layer, FULL)
+                found = find_children(attn, list(spec.attn_proj_names))
+                if len(found) != len(spec.attn_proj_names):
+                    raise RuntimeError(
+                        f"attn_adapter_rank: layer {phys} attention lacks {spec.attn_proj_names}; children: "
+                        f"{[n for n, _ in attn.named_children()]}"
+                    )
+                attn_proj_specs[phys] = {}
+                for name, mod in found.items():
+                    key = name.replace(".", "__")
+                    attn_proj_specs[phys][key] = _linear_dims(mod)
+                    self._attn_proj_mods.append((phys, key, mod))
         ref = tm.embed_tokens.weight
         adapter_dtype = torch.float64 if ref.dtype == torch.float64 else torch.float32
-        self.adapters = LoopAdapters(cfg.hidden_size, spec, num_experts=self._num_experts).to(
-            device=ref.device, dtype=adapter_dtype
-        )
+        self.adapters = LoopAdapters(
+            cfg.hidden_size, spec, num_experts=self._num_experts, attn_proj_specs=attn_proj_specs
+        ).to(device=ref.device, dtype=adapter_dtype)
         tm.loop_adapters = self.adapters
         self.active_passes = spec.num_passes
         self.ctx = LoopContext()
         self._cur: tuple[LoopContext, int] | None = None
         self._tuple_out = False
+        self._tuple_extra = 0
         self._hooks: list[Any] = []
         self._is_probs_cache: dict[int, bool] = {}
         tm.layers = nn.ModuleList(VirtualLayer(self, s, parts.layers[s.phys]) for s in self.schedule)
         cfg.num_hidden_layers = len(self.schedule)
         cfg.layer_types = [s.layer_type for s in self.schedule]
         self._register_hooks()
-        log.info("loop retrofit: %d physical -> %d virtual layers (prelude %d | core %d x %d | coda %d), "
-                 "kv_share=%s per_pass_router=%s mor=%s checkpoint=%s", parts.num_layers, len(self.schedule),
-                 spec.prelude_end, spec.core_len, spec.num_passes, parts.num_layers - spec.core_end, spec.kv_share,
-                 self.adapters.pass_router is not None, spec.mor, spec.checkpoint)
+        log.info(
+            "loop retrofit: %d physical -> %d virtual layers (prelude %d | core %d x %d | coda %d), "
+            "kv_share=%s bridge_mode=%s attn_lora=%s per_pass_router=%s mor=%s checkpoint=%s",
+            parts.num_layers, len(self.schedule), spec.prelude_end, spec.core_len, spec.num_passes,
+            parts.num_layers - spec.core_end, spec.kv_share, spec.bridge_mode,
+            self.adapters.pass_attn is not None, self.adapters.pass_router is not None, spec.mor, spec.checkpoint,
+        )
 
     # ------------------------------------------------------------------ hooks
     def _core_layers(self, layer_type: str) -> list[tuple[int, nn.Module]]:
@@ -392,6 +551,9 @@ class LoopController:
                                        f"{[n for n, _ in attention_module(layer, FULL).named_children()]}")
                 for name, mod in found.items():
                     self._hooks.append(mod.register_forward_hook(self._kv_hook(phys, name)))
+        if self.adapters.pass_attn is not None:
+            for phys, key, mod in self._attn_proj_mods:
+                self._hooks.append(mod.register_forward_hook(self._attn_lora_hook(phys, key)))
         if spec.mor and spec.write_mask and spec.num_passes > 1:
             for phys, layer in self._core_layers(LINEAR):
                 attn = attention_module(layer, LINEAR)
@@ -438,6 +600,22 @@ class LoopController:
                 raise RuntimeError(f"kv_share: missing/mismatched pass-1 {name} for layer {phys} at pass {r} "
                                    f"(stash={None if stash is None else tuple(stash.shape)}, now={tuple(out.shape)})")
             return stash
+        return hook
+
+    def _attn_lora_hook(self, phys: int, key: str):
+        pa_mod = self.adapters.pass_attn
+        assert pa_mod is not None
+
+        def hook(mod: nn.Module, inp: Any, out: torch.Tensor):
+            cur = self._cur
+            if cur is None or cur[1] < 2:
+                return None
+            p_idx = cur[1] - 2
+            if not torch.is_grad_enabled() and pa_mod.is_zero(phys, key, p_idx):
+                return None
+            delta = pa_mod.delta(inp[0], phys, key, p_idx)
+            return out + delta.to(out.dtype).view_as(out)
+
         return hook
 
     def _write_hook(self, neg_value: float | None):
@@ -515,12 +693,15 @@ class LoopController:
                 probs_r = F.softmax(upcast(new_out.reshape(-1, e)), dim=-1)
                 if not _in_backward():
                     ctx.routing[(phys, r)] = probs_r.detach().topk(k, dim=-1).indices
-                if div_w > 0 and (phys, 1) in ctx.router_probs:
-                    p1 = ctx.router_probs[(phys, 1)]
-                    if p1.shape == probs_r.shape:
-                        div_term = (p1.to(probs_r.dtype) * probs_r).sum(dim=-1).mean()
-                        if not _in_backward():
-                            ctx.div_terms.append(div_term)
+                    if div_w > 0:
+                        ctx.router_probs[(phys, r)] = probs_r.detach()
+                if div_w > 0:
+                    for pr in range(1, r):
+                        p_prev = ctx.router_probs.get((phys, pr))
+                        if p_prev is not None and p_prev.shape == probs_r.shape:
+                            div_term = (p_prev.to(probs_r.dtype) * probs_r).sum(dim=-1).mean()
+                            if not _in_backward():
+                                ctx.div_terms.append(div_term)
                 return new_out
 
             # Tuple/list router (e.g. HF>=5 Qwen3_5MoeTopKRouter returning (probs, scores, indices))
@@ -540,12 +721,15 @@ class LoopController:
                 top_w = top_w / top_w.sum(-1, keepdim=True)
             if not _in_backward():
                 ctx.routing[(phys, r)] = top_idx.detach()
-            if div_w > 0 and (phys, 1) in ctx.router_probs:
-                p1 = ctx.router_probs[(phys, 1)]
-                if p1.shape == probs_r.shape:
-                    div_term = (p1.to(probs_r.dtype) * probs_r).sum(dim=-1).mean()
-                    if not _in_backward():
-                        ctx.div_terms.append(div_term)
+                if div_w > 0:
+                    ctx.router_probs[(phys, r)] = probs_r.detach()
+            if div_w > 0:
+                for pr in range(1, r):
+                    p_prev = ctx.router_probs.get((phys, pr))
+                    if p_prev is not None and p_prev.shape == probs_r.shape:
+                        div_term = (p_prev.to(probs_r.dtype) * probs_r).sum(dim=-1).mean()
+                        if not _in_backward():
+                            ctx.div_terms.append(div_term)
             new_full = (probs_r if is_probs else new_logits).to(full.dtype).view_as(full)
             rebuilt = []
             for item in out:
@@ -578,14 +762,15 @@ class LoopController:
                 probs = upcast(full.reshape(-1, e)) if is_probs else F.softmax(upcast(full.reshape(-1, e)), dim=-1)
                 if not _in_backward():
                     ctx.routing[(phys, r)] = probs.detach().topk(k, dim=-1).indices
-                    if div_w > 0 and r == 1:
-                        ctx.router_probs[(phys, 1)] = probs.detach()
-                if div_w > 0 and r >= 2 and (phys, 1) in ctx.router_probs:
-                    p1 = ctx.router_probs[(phys, 1)]
-                    if p1.shape == probs.shape:
-                        div_term = (p1.to(probs.dtype) * probs).sum(dim=-1).mean()
-                        if not _in_backward():
-                            ctx.div_terms.append(div_term)
+                    if div_w > 0 and r >= 1:
+                        ctx.router_probs[(phys, r)] = probs.detach()
+                if div_w > 0 and r >= 2:
+                    for pr in range(1, r):
+                        p_prev = ctx.router_probs.get((phys, pr))
+                        if p_prev is not None and p_prev.shape == probs.shape:
+                            div_term = (p_prev.to(probs.dtype) * probs).sum(dim=-1).mean()
+                            if not _in_backward():
+                                ctx.div_terms.append(div_term)
             return None
         return hook
 
@@ -604,7 +789,7 @@ class LoopController:
             ctx.keep[r] = keep
             ctx.coef[r] = (keep * (1.0 + soft - soft.detach())).unsqueeze(-1)  # value=keep, grad via soft
         exp_depth = (p * torch.arange(1, p.shape[-1] + 1, device=p.device, dtype=p.dtype)).sum(-1)
-        ctx.stats["mor/mean_depth_hard"] = float(depth.float().mean())
+        ctx.stats["mor/mean_depth_hard"] = float(depth.clamp(max=self.active_passes).float().mean())
         if self.spec.mor_target_depth is not None:
             ctx.aux["mor_depth"] = self.spec.mor_aux_weight * (exp_depth.mean() - self.spec.mor_target_depth) ** 2
 
@@ -616,6 +801,14 @@ class LoopController:
         return start + coef * (h - start)
 
     # ------------------------------------------------------------------ public API
+    @property
+    def active_virtual_layers(self) -> int:
+        return (
+            self.spec.prelude_end
+            + self.spec.core_len * self.active_passes
+            + (self.parts.num_layers - self.spec.core_end)
+        )
+
     def set_active_passes(self, r: int) -> None:
         if not 1 <= r <= self.spec.num_passes:
             raise ValueError(f"active passes must be in [1, {self.spec.num_passes}], got {r}")
@@ -645,13 +838,13 @@ class LoopController:
     def trainable_parameters(self) -> list[nn.Parameter]:
         return list(self.adapters.parameters())
 
-    def routing_overlap(self) -> dict[int, float]:
-        """Mean per-token Jaccard of top-k expert sets between pass 1 and pass 2, per core layer."""
+    def routing_overlap(self, pass_a: int = 1, pass_b: int = 2) -> dict[int, float]:
+        """Mean per-token Jaccard of top-k expert sets between `pass_a` and `pass_b`, per core layer."""
         out = {}
         for (phys, r), idx2 in self.ctx.routing.items():
-            if r != 2 or (phys, 1) not in self.ctx.routing:
+            if r != pass_b or (phys, pass_a) not in self.ctx.routing:
                 continue
-            idx1 = self.ctx.routing[(phys, 1)]
+            idx1 = self.ctx.routing[(phys, pass_a)]
             if idx1.shape != idx2.shape:
                 continue
             inter = (idx1.unsqueeze(-1) == idx2.unsqueeze(-2)).any(-1).sum(-1).float()
@@ -659,18 +852,19 @@ class LoopController:
             out[phys] = float((inter / (2 * k - inter).clamp_min(1.0)).mean())
         return out
 
-    def reroute_rates(self) -> dict[int, float]:
-        """Fraction of pass-2 top-k slots routed to experts NOT selected in pass 1, per core layer."""
+    def reroute_rates(self, pass_r: int = 2) -> dict[int, float]:
+        """Fraction of `pass_r` top-k slots routed to experts NOT selected in passes `1..pass_r-1`."""
         out = {}
-        for (phys, r), idx2 in self.ctx.routing.items():
-            if r != 2 or (phys, 1) not in self.ctx.routing:
+        for (phys, r), idx_r in self.ctx.routing.items():
+            if r != pass_r:
                 continue
-            idx1 = self.ctx.routing[(phys, 1)]
-            if idx1.shape != idx2.shape:
+            prev_sets = [self.ctx.routing[(phys, pr)] for pr in range(1, pass_r) if (phys, pr) in self.ctx.routing]
+            if not prev_sets or any(ps.shape != idx_r.shape for ps in prev_sets):
                 continue
-            inter = (idx1.unsqueeze(-1) == idx2.unsqueeze(-2)).any(-1).sum(-1).float()
-            k = max(int(idx1.shape[-1]), 1)
-            out[phys] = float(((k - inter) / k).mean())
+            prev_cat = torch.cat(prev_sets, dim=-1)
+            reused = (idx_r.unsqueeze(-1) == prev_cat.unsqueeze(-2)).any(-1).sum(-1).float()
+            k = max(int(idx_r.shape[-1]), 1)
+            out[phys] = float(((k - reused) / k).mean())
         return out
 
     def unique_experts_per_layer(self) -> dict[int, float]:
@@ -701,14 +895,26 @@ class LoopController:
                 w = self.adapters.bridge.weights(i)
                 for j, nm in enumerate(LoopBridge.STREAMS):
                     s[f"loop/bridge_w_{nm}_p{i + 2}"] = float(w[j])
+                if self.adapters.pass_attn is not None:
+                    s[f"loop/attn_lora_abs_mean_p{i + 2}"] = self.adapters.pass_attn.up_abs_mean(i)
             if self.adapters.pass_router is not None:
                 s["loop/router_repel_mean"] = float(self.adapters.pass_router.repel.mean())
-            ov = self.routing_overlap()
+            ov = self.routing_overlap(1, 2)
             if ov:
                 s["loop/expert_jaccard_p12"] = sum(ov.values()) / len(ov)
-            rr = self.reroute_rates()
+            rr = self.reroute_rates(2)
             if rr:
                 s["loop/reroute_rate"] = sum(rr.values()) / len(rr)
+            if self.active_passes >= 3:
+                ov13 = self.routing_overlap(1, 3)
+                if ov13:
+                    s["loop/expert_jaccard_p13"] = sum(ov13.values()) / len(ov13)
+                ov23 = self.routing_overlap(2, 3)
+                if ov23:
+                    s["loop/expert_jaccard_p23"] = sum(ov23.values()) / len(ov23)
+                rr3 = self.reroute_rates(3)
+                if rr3:
+                    s["loop/reroute_rate_p3"] = sum(rr3.values()) / len(rr3)
             uniq = self.unique_experts_per_layer()
             if uniq:
                 mean_u = sum(uniq.values()) / len(uniq)
@@ -721,6 +927,7 @@ class LoopController:
                 divs = [t.detach().float() for t in self.ctx.div_terms]
                 s["loop/router_prob_overlap"] = float(torch.stack(divs).mean())
         s["loop/active_passes"] = float(self.active_passes)
+        s["loop/active_virtual_layers"] = float(self.active_virtual_layers)
         return s
 
     def unwrap(self) -> None:
@@ -736,6 +943,65 @@ class LoopController:
         if hasattr(tm, "loop_adapters"):
             del tm.loop_adapters
         log.info("loop retrofit removed (adapters kept on controller.adapters)")
+
+
+def _iter_canonical_params(mod: nn.Module, prefix: str, seen: set[int]) -> list[tuple[str, nn.Parameter]]:
+    out: list[tuple[str, nn.Parameter]] = []
+    for pname, p in mod._parameters.items():
+        if p is not None and id(p) not in seen:
+            seen.add(id(p))
+            full = f"{prefix}.{pname}" if prefix else pname
+            out.append((full, p))
+    for cname, child in mod._modules.items():
+        if child is None:
+            continue
+        slot = getattr(child, "slot", None)
+        inner = getattr(child, "inner", None)
+        if slot is not None and isinstance(inner, nn.Module) and hasattr(slot, "phys"):
+            c_prefix = f"{prefix}.{slot.phys}" if prefix else str(slot.phys)
+            out.extend(_iter_canonical_params(inner, c_prefix, seen))
+        else:
+            c_prefix = f"{prefix}.{cname}" if prefix else cname
+            out.extend(_iter_canonical_params(child, c_prefix, seen))
+    return out
+
+
+_EXPERT_PATH_PARTS = frozenset({"experts", "shared_expert", "shared_experts"})
+
+
+def _is_expert_param_path(name: str) -> bool:
+    parts = name.split(".")
+    if "expert_deltas" in parts:
+        return False
+    for seg in parts:
+        if seg in _EXPERT_PATH_PARTS:
+            return True
+        if seg.startswith(("experts_", "shared_expert_")) and not seg.endswith("_gate"):
+            return True
+    return False
+
+
+def sha256_frozen_experts(model: nn.Module) -> str:
+    """Compute a deterministic SHA-256 digest over frozen MoE expert parameters.
+
+    Covers all `experts` and `shared_expert` parameters with `requires_grad == False`,
+    canonicalising `VirtualLayer` wrappers back to physical layer indices so the digest is
+    identical before, during, and after `apply_loop`.
+    """
+    seen: set[int] = set()
+    items = [
+        (name, p)
+        for name, p in _iter_canonical_params(model, "", seen)
+        if not p.requires_grad and _is_expert_param_path(name)
+    ]
+    items.sort(key=lambda kv: kv[0])
+    digest = hashlib.sha256()
+    for name, p in items:
+        header = f"{name}|{p.dtype}|{tuple(p.shape)}|".encode()
+        digest.update(header)
+        raw = p.detach().contiguous().cpu().reshape(-1).view(torch.uint8).numpy().tobytes()
+        digest.update(raw)
+    return digest.hexdigest()
 
 
 def apply_loop(model: nn.Module, spec: LoopSpec | dict[str, Any]) -> LoopController:

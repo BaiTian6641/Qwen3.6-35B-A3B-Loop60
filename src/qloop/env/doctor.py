@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.metadata
 import logging
 import os
 import subprocess
@@ -34,7 +35,13 @@ def _version(mod: str) -> str | None:
         m = importlib.import_module(mod)
     except Exception:
         return None
-    return getattr(m, "__version__", "installed")
+    v = getattr(m, "__version__", None)
+    if v:
+        return str(v)
+    try:
+        return importlib.metadata.version(mod)
+    except Exception:
+        return "installed"
 
 
 def check_python() -> Check:
@@ -107,6 +114,59 @@ def check_torch_gpu() -> list[Check]:
     return out
 
 
+def check_finegrained_fp8_kernel() -> Check:
+    from ..colab import _resolve_hf_kernels_pip_spec
+
+    cuda_available = False
+    try:
+        import torch
+
+        cuda_available = bool(torch.cuda.is_available())
+    except Exception:
+        cuda_available = False
+
+    try:
+        importlib.import_module("transformers.integrations.finegrained_fp8")
+        has_fg_mod = True
+    except Exception:
+        has_fg_mod = False
+
+    ok, pip_spec = _resolve_hf_kernels_pip_spec()
+    if ok:
+        kv = _version("kernels") or "installed"
+        return Check("finegrained_fp8", PASS, f"native kernel loadable (kernels {kv})")
+
+    if not cuda_available or sys.platform != "linux":
+        plat = "macOS" if sys.platform == "darwin" else sys.platform
+        mode = f"CPU/{plat}" if not cuda_available else plat
+        return Check(
+            "finegrained_fp8",
+            PASS,
+            f"{mode} runtime: native CUDA FP8 kernel inactive (Colab CUDA uses {pip_spec})",
+        )
+
+    if not has_fg_mod:
+        return Check(
+            "finegrained_fp8",
+            WARN,
+            "transformers.integrations.finegrained_fp8 unavailable",
+            f'pip install -U "transformers>=5.0" "{pip_spec}"',
+        )
+
+    kv = _version("kernels")
+    reason = (
+        f"incompatible kernels={kv} (requires {pip_spec})"
+        if kv
+        else f"missing compatible kernels ({pip_spec})"
+    )
+    return Check(
+        "finegrained_fp8",
+        WARN,
+        f"{reason}; PyTorch FP8 fallback active",
+        f'pip install "{pip_spec}"',
+    )
+
+
 def check_packages() -> list[Check]:
     out = []
     tv = _version("transformers")
@@ -127,6 +187,8 @@ def check_packages() -> list[Check]:
             out.append(Check("transformers", FAIL, f"{tv} lacks qwen3_5_moe/qwen3_6_moe",
                              "pip install -U transformers"))
     specs: list[tuple[str, str, str, str]] = [
+        ("kernels", '"kernels>=0.18.2,<0.19.0"', WARN,
+         "HF finegrained_fp8 native Blackwell FP8 kernels (PyTorch fallback used otherwise)"),
         ("compressed_tensors", "compressed-tensors", WARN,
          "needed for NVFP4 checkpoints (unsloth/Qwen3.6-35B-A3B-NVFP4-Fast); FP8 works natively without it"),
         ("fla", "flash-linear-attention", WARN, "Gated DeltaNet fast kernels; without them HF uses a slow torch path"),
@@ -140,6 +202,7 @@ def check_packages() -> list[Check]:
     for mod, pip, sev, why in specs:
         v = _version(mod)
         out.append(Check(mod, PASS if v else sev, v or f"missing - {why}", "" if v else f"pip install {pip}"))
+    out.append(check_finegrained_fp8_kernel())
     return out
 
 
@@ -266,6 +329,7 @@ __all__ = [
     "DEFAULT_MODEL",
     "Check",
     "build_parser",
+    "check_finegrained_fp8_kernel",
     "check_hf_access",
     "check_packages",
     "check_python",

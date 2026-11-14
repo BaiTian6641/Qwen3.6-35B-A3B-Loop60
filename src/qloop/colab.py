@@ -19,8 +19,12 @@ Design:
 from __future__ import annotations
 
 import glob
+import importlib
+import importlib.metadata
+import importlib.util
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -30,6 +34,7 @@ from typing import Any
 
 DEFAULT_HF_REPO = "TassP0lar/Qwen3.6-35B-A3B-Loop64"
 DEFAULT_PACK_REPO = "TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack"
+DEFAULT_HF_KERNELS_PIP_SPEC = "kernels>=0.18.2,<0.19.0"
 BASE_MODEL_BY_PRECISION: dict[str, str] = {
     "fp8": "Qwen/Qwen3.6-35B-A3B-FP8",
     "nvfp4": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
@@ -113,12 +118,338 @@ def _subprocess_env() -> dict[str, str]:
     return env
 
 
+def _parse_hf_kernels_pip_spec_strict(text: str) -> str | None:
+    """Parse an explicit `kernels` version range/pin from `text`, or return `None` if absent."""
+    if not text:
+        return None
+    m_range = re.search(
+        r"([0-9]+(?:\.[0-9a-zA-Z]+)+)\s*(<=|<)\s*version\s*(<=|<)\s*([0-9]+(?:\.[0-9a-zA-Z]+)+)",
+        text,
+    )
+    if m_range:
+        lo_ver, lo_cmp, hi_cmp, hi_ver = m_range.groups()
+        lo_op = ">=" if lo_cmp == "<=" else ">"
+        return f"kernels{lo_op}{lo_ver},{hi_cmp}{hi_ver}"
+    m_compound = re.search(
+        r"kernels\s*((?:>=|<=|==|!=|~=|>|<)\s*[0-9][0-9a-zA-Z.*+-]*"
+        r"(?:\s*,\s*(?:>=|<=|==|!=|~=|>|<)\s*[0-9][0-9a-zA-Z.*+-]*)+)",
+        text,
+    )
+    if m_compound:
+        cleaned = re.sub(r"\s+", "", m_compound.group(1))
+        return f"kernels{cleaned}"
+    m_ver_right = re.search(r"version\s*(>=|<=|==|!=|~=|>|<)\s*([0-9]+(?:\.[0-9a-zA-Z]+)+)", text)
+    if m_ver_right:
+        return f"kernels{m_ver_right.group(1)}{m_ver_right.group(2)}"
+    m_ver_left = re.search(r"([0-9]+(?:\.[0-9a-zA-Z]+)+)\s*(<=|<)\s*version\b", text)
+    if m_ver_left:
+        lo_op = ">=" if m_ver_left.group(2) == "<=" else ">"
+        return f"kernels{lo_op}{m_ver_left.group(1)}"
+    m_pin = re.search(r"kernels\s*(==|>=|<=|!=|~=|>|<)\s*([0-9]+(?:\.[0-9a-zA-Z]+)+)", text)
+    if m_pin:
+        return f"kernels{m_pin.group(1)}{m_pin.group(2)}"
+    return None
+
+
+def _parse_hf_kernels_pip_spec(text: str) -> str:
+    """Parse HF `finegrained_fp8` missing-kernel message into a valid `pip` requirement string."""
+    return _parse_hf_kernels_pip_spec_strict(text) or DEFAULT_HF_KERNELS_PIP_SPEC
+
+
+def _import_utils_kernels_bounds_hint(fg_fp8: Any = None) -> str:
+    min_v: Any = None
+    max_v: Any = None
+    if fg_fp8 is not None:
+        min_v = getattr(fg_fp8, "KERNELS_MIN_VERSION", None)
+        max_v = getattr(fg_fp8, "KERNELS_MAX_VERSION", None)
+    try:
+        imp_utils = importlib.import_module("transformers.utils.import_utils")
+        min_v = min_v or getattr(imp_utils, "KERNELS_MIN_VERSION", None)
+        max_v = max_v or getattr(imp_utils, "KERNELS_MAX_VERSION", None)
+    except Exception:
+        pass
+    s_min = str(min_v).strip() if min_v is not None else ""
+    s_max = str(max_v).strip() if max_v is not None else ""
+    if s_min and s_max:
+        return f"({s_min} <= version < {s_max})"
+    if s_min:
+        return f"version >= {s_min}"
+    if s_max:
+        return f"version < {s_max}"
+    return ""
+
+
+def _refresh_runtime_import_caches() -> None:
+    """Invalidate import finders and clear HF `transformers` `@lru_cache` package availability checks."""
+    importlib.invalidate_caches()
+    imp_utils = sys.modules.get("transformers.utils.import_utils")
+    if imp_utils is None and "transformers" in sys.modules:
+        try:
+            imp_utils = importlib.import_module("transformers.utils.import_utils")
+        except Exception:
+            imp_utils = None
+    if imp_utils is not None:
+        for attr in ("is_kernels_available", "_is_package_available", "is_compressed_tensors_available"):
+            fn = getattr(imp_utils, attr, None)
+            clear_fn = getattr(fn, "cache_clear", None)
+            if callable(clear_fn):
+                clear_fn()
+    fg_fp8 = sys.modules.get("transformers.integrations.finegrained_fp8")
+    if fg_fp8 is not None:
+        for attr in ("load_finegrained_fp8_kernel", "_load_finegrained_fp8_kernel"):
+            fn = getattr(fg_fp8, attr, None)
+            clear_fn = getattr(fn, "cache_clear", None)
+            if callable(clear_fn):
+                clear_fn()
+
+
+def _version_tuple(ver: str) -> tuple[int, ...]:
+    core = ver.split("+", 1)[0].split("-", 1)[0]
+    nums = [int(p) for p in re.findall(r"\d+", core)]
+    return tuple(nums) if nums else (0,)
+
+
+def _installed_kernels_matches_spec(pip_spec: str) -> bool:
+    if importlib.util.find_spec("kernels") is None:
+        return False
+    ver: str | None = None
+    try:
+        ver = importlib.metadata.version("kernels")
+    except Exception:
+        try:
+            mod = importlib.import_module("kernels")
+            ver = getattr(mod, "__version__", None)
+        except Exception:
+            return False
+    if not ver:
+        return True
+    got = _version_tuple(str(ver))
+    tail = pip_spec[len("kernels") :] if pip_spec.startswith("kernels") else pip_spec
+    for op, target_str in re.findall(r"(>=|<=|==|!=|>|<)\s*([0-9]+(?:\.[0-9a-zA-Z]+)*)", tail):
+        want = _version_tuple(target_str)
+        width = max(len(got), len(want))
+        g_pad = got + (0,) * (width - len(got))
+        w_pad = want + (0,) * (width - len(want))
+        if op == ">=" and g_pad < w_pad:
+            return False
+        if op == ">" and g_pad <= w_pad:
+            return False
+        if op == "<=" and g_pad > w_pad:
+            return False
+        if op == "<" and g_pad >= w_pad:
+            return False
+        if op == "==" and g_pad != w_pad:
+            return False
+        if op == "!=" and g_pad == w_pad:
+            return False
+    return True
+
+
+def _resolve_hf_kernels_pip_spec(message: str | None = None) -> tuple[bool, str]:
+    """Inspect `transformers.integrations.finegrained_fp8` and resolve compatible `kernels` pip spec."""
+    if message is not None:
+        return False, _parse_hf_kernels_pip_spec(message)
+    try:
+        fg_fp8 = importlib.import_module("transformers.integrations.finegrained_fp8")
+    except Exception:
+        fallback_hint = _import_utils_kernels_bounds_hint()
+        pip_spec = _parse_hf_kernels_pip_spec(fallback_hint)
+        if _installed_kernels_matches_spec(pip_spec):
+            return True, "kernels"
+        return False, pip_spec
+
+    missing_msg = str(getattr(fg_fp8, "_MISSING_KERNELS_MESSAGE", "") or "")
+    if not missing_msg:
+        missing_msg = _import_utils_kernels_bounds_hint(fg_fp8)
+    loader = getattr(fg_fp8, "load_finegrained_fp8_kernel", None) or getattr(
+        fg_fp8, "_load_finegrained_fp8_kernel", None
+    )
+    if callable(loader):
+        try:
+            loader()
+            return True, "kernels"
+        except ImportError as exc:
+            pip_spec = (
+                _parse_hf_kernels_pip_spec_strict(str(exc))
+                or _parse_hf_kernels_pip_spec_strict(missing_msg)
+                or DEFAULT_HF_KERNELS_PIP_SPEC
+            )
+            return False, pip_spec
+        except Exception as exc:
+            pip_spec = (
+                _parse_hf_kernels_pip_spec_strict(str(exc))
+                or _parse_hf_kernels_pip_spec_strict(missing_msg)
+                or DEFAULT_HF_KERNELS_PIP_SPEC
+            )
+            if _installed_kernels_matches_spec(pip_spec):
+                return True, "kernels"
+            return False, pip_spec
+
+    pip_spec = _parse_hf_kernels_pip_spec(missing_msg)
+    if _installed_kernels_matches_spec(pip_spec):
+        return True, "kernels"
+    return False, pip_spec
+
+
+def _resolve_precision_mode(base_precision: str | None) -> str:
+    """Resolve `'fp8'`, `'nvfp4'`, `'bf16'`, or an `'org/model'` HF repo ID into a precision tag."""
+    if base_precision is None:
+        return "none"
+    raw = str(base_precision).strip()
+    if not raw or raw.lower() == "toy":
+        return "none"
+    low = raw.lower()
+    if low in ("fp8", "nvfp4", "bf16"):
+        return low
+    resolved = resolve_base_model_name(raw) or raw
+    upper = resolved.upper()
+    if "-NVFP4" in upper or upper.endswith("NVFP4"):
+        return "nvfp4"
+    if upper.endswith("-FP8") or "-FP8-" in upper:
+        return "fp8"
+    return "bf16"
+
+
+def _effective_precision_arg(base_precision: str | None, overrides: Sequence[str] = ()) -> str | None:
+    for ov in reversed(list(overrides)):
+        if "=" in ov:
+            k, v = ov.split("=", 1)
+            if k.strip() == "model.name":
+                val = v.strip()
+                return None if val.lower() == "toy" else val
+    return base_precision
+
+
+def ensure_quant_runtime_packages(
+    base_precision: str | None = "fp8",
+    *,
+    auto_install: bool = True,
+) -> dict[str, str]:
+    """Verify (and on Linux when `auto_install=True`, install) `kernels` / `compressed-tensors`."""
+    precision = _resolve_precision_mode(base_precision)
+    can_install = bool(auto_install and sys.platform == "linux")
+
+    if precision == "fp8":
+        ok, pip_spec = _resolve_hf_kernels_pip_spec()
+        if ok:
+            return {
+                "precision": "fp8",
+                "package": "kernels",
+                "pip_spec": pip_spec,
+                "status": "ready",
+            }
+        if can_install:
+            cmd = [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", pip_spec]
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if res.returncode == 0:
+                    _refresh_runtime_import_caches()
+            except Exception as exc:
+                print(
+                    f"[qloop] warning: failed to install {pip_spec!r} ({exc!r}); "
+                    "continuing with PyTorch FP8 fallback",
+                    flush=True,
+                )
+                return {
+                    "precision": "fp8",
+                    "package": "kernels",
+                    "pip_spec": pip_spec,
+                    "status": f"install_failed ({exc!r})",
+                }
+            if res.returncode == 0:
+                ok_after, _ = _resolve_hf_kernels_pip_spec()
+                has_pkg = ok_after or importlib.util.find_spec("kernels") is not None
+                st = "installed" if has_pkg else "installed_pending_reload"
+                print(f"[qloop] installed {pip_spec} for native Blackwell FP8 kernels ({st})", flush=True)
+                return {
+                    "precision": "fp8",
+                    "package": "kernels",
+                    "pip_spec": pip_spec,
+                    "status": st,
+                }
+            tail = (res.stderr or res.stdout or "").strip().splitlines()
+            detail = tail[-1] if tail else f"rc={res.returncode}"
+            print(
+                f"[qloop] warning: pip install {pip_spec!r} exited with rc={res.returncode} ({detail}); "
+                "continuing with PyTorch FP8 fallback",
+                flush=True,
+            )
+            return {
+                "precision": "fp8",
+                "package": "kernels",
+                "pip_spec": pip_spec,
+                "status": f"install_failed ({detail})",
+            }
+        return {
+            "precision": "fp8",
+            "package": "kernels",
+            "pip_spec": pip_spec,
+            "status": f"missing ({pip_spec})",
+        }
+
+    if precision == "nvfp4":
+        pip_spec = "compressed-tensors"
+        if importlib.util.find_spec("compressed_tensors") is not None:
+            return {
+                "precision": "nvfp4",
+                "package": "compressed_tensors",
+                "pip_spec": pip_spec,
+                "status": "ready",
+            }
+        if can_install:
+            cmd = [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", pip_spec]
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if res.returncode == 0:
+                    _refresh_runtime_import_caches()
+            except Exception as exc:
+                print(f"[qloop] warning: failed to install {pip_spec!r} ({exc!r})", flush=True)
+                return {
+                    "precision": "nvfp4",
+                    "package": "compressed_tensors",
+                    "pip_spec": pip_spec,
+                    "status": f"install_failed ({exc!r})",
+                }
+            if res.returncode == 0:
+                print(f"[qloop] installed {pip_spec} for NVFP4 checkpoints", flush=True)
+                return {
+                    "precision": "nvfp4",
+                    "package": "compressed_tensors",
+                    "pip_spec": pip_spec,
+                    "status": "installed",
+                }
+            tail = (res.stderr or res.stdout or "").strip().splitlines()
+            detail = tail[-1] if tail else f"rc={res.returncode}"
+            print(f"[qloop] warning: pip install {pip_spec!r} failed ({detail})", flush=True)
+            return {
+                "precision": "nvfp4",
+                "package": "compressed_tensors",
+                "pip_spec": pip_spec,
+                "status": f"install_failed ({detail})",
+            }
+        return {
+            "precision": "nvfp4",
+            "package": "compressed_tensors",
+            "pip_spec": pip_spec,
+            "status": f"missing ({pip_spec})",
+        }
+
+    return {
+        "precision": precision,
+        "package": "none",
+        "pip_spec": "",
+        "status": "not_required",
+    }
+
+
 def setup_env(
     hf_repo: str = DEFAULT_HF_REPO,
     run_root: str = "/content/runs",
     hf_home: str = "/content/hf_cache",
     *,
     require_hf_token: bool = True,
+    base_precision: str | None = "fp8",
+    auto_install_runtime_deps: bool = True,
 ) -> dict[str, str]:
     """Load Colab Secrets into `os.environ`, configure HF Hub sync + local SSD paths, and print disk budget."""
     found: dict[str, str] = {}
@@ -159,6 +490,11 @@ def setup_env(
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+    quant_rt = ensure_quant_runtime_packages(
+        base_precision=base_precision,
+        auto_install=auto_install_runtime_deps,
+    )
+
     from .hub import disk_report
 
     rep = disk_report(run_root, hf_home=hf_home)
@@ -168,6 +504,10 @@ def setup_env(
     print(
         f"Disk (230G cap): {rep['free_gib']:.1f} GiB free / {rep['total_gib']:.1f} GiB total "
         f"(HF base weights={rep['hf_hub_weights_gib']:.1f} GiB, runs={rep['runs_gib']:.2f} GiB)"
+    )
+    print(
+        f"Quant Runtime  : precision={quant_rt['precision']} | "
+        f"package={quant_rt['package']} ({quant_rt['status']})"
     )
     return found
 
@@ -263,6 +603,8 @@ def run_pipeline(
     overrides: Sequence[str] = (),
 ) -> int:
     """Run/resume the full end-to-end pipeline synced via HF Hub commit history."""
+    if not smoke_toy and sys.platform == "linux":
+        ensure_quant_runtime_packages(_effective_precision_arg(base_precision, overrides), auto_install=True)
     repo = hf_repo or os.environ.get("QLOOP_HF_REPO", DEFAULT_HF_REPO)
     eff_overrides = _inject_base_model_override(overrides, base_precision, smoke_toy=smoke_toy)
     parts = [
@@ -595,6 +937,8 @@ def run_probe_notebook_suite(
 ) -> dict[str, Any]:
     """Run Gate -1 (`fp64` math) + Gate 0a + Gate 0p-1..4 structured probes and return report + paths."""
     resolved_base = resolve_base_model_name(base_precision)
+    if not smoke_toy and sys.platform == "linux":
+        ensure_quant_runtime_packages(_effective_precision_arg(base_precision, overrides), auto_install=True)
     repo = hf_repo or os.environ.get("QLOOP_HF_REPO", DEFAULT_HF_REPO)
     run_root = os.environ.get("QLOOP_RUN_ROOT", "runs")
     probe_dir = os.path.join(run_root, "probe")
@@ -817,6 +1161,8 @@ def run_v3_e2e_and_ship_pack(
     """Run/resume the Loop-HSSD v3 pipeline and stream the final Whole Model Pack upon completion."""
     from .hub import HubSyncManager, resolve_stage_config_path
 
+    if not smoke_toy and sys.platform == "linux":
+        ensure_quant_runtime_packages(_effective_precision_arg(base_precision, overrides), auto_install=True)
     sync_repo = hf_repo or os.environ.get("QLOOP_HF_REPO", DEFAULT_HF_REPO)
     target_pack_repo = pack_repo if pack_repo is not None else DEFAULT_PACK_REPO
     stage_tuple = tuple(stages)

@@ -522,6 +522,14 @@ class GDN2Manager:
         log.info("GDN-2 uninstalled from %d linear-attention layers", len(self.adapters))
 
 
+_CHUNK_RULE_ATTRS: tuple[str, ...] = ("chunk_gated_delta_rule", "torch_chunk_gated_delta_rule")
+_REC_RULE_ATTRS: tuple[str, ...] = (
+    "recurrent_gated_delta_rule",
+    "fused_recurrent_gated_delta_rule",
+    "torch_recurrent_gated_delta_rule",
+)
+
+
 def _make_rule_wrapper(
     attn: nn.Module,
     adapter: GDN2Adapter,
@@ -529,65 +537,75 @@ def _make_rule_wrapper(
     orig_fn: Callable[..., Any],
     *,
     recurrent_only: bool,
+    in_rule_box: list[int] | None = None,
 ) -> Callable[..., Any]:
     def wrapped(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, *args: Any, **kwargs: Any):
-        # Fast bit-exact passthrough in eval mode (or when frozen/no_grad) while zero-initialized
-        need_ad_grad = torch.is_grad_enabled() and any(p.requires_grad for p in adapter.parameters())
-        if (not attn.training or not need_ad_grad) and adapter.is_zero():
-            adapter.last_stats["erase_write_l1"] = 0.0
-            adapter.last_stats["decay_spread"] = 0.0
+        if in_rule_box is not None and in_rule_box[0] > 0:
             return orig_fn(query, key, value, *args, **kwargs)
+        if in_rule_box is not None:
+            in_rule_box[0] += 1
+        try:
+            # Fast bit-exact passthrough in eval mode (or when frozen/no_grad) while zero-initialized
+            need_ad_grad = torch.is_grad_enabled() and any(p.requires_grad for p in adapter.parameters())
+            if (not attn.training or not need_ad_grad) and adapter.is_zero():
+                adapter.last_stats["erase_write_l1"] = 0.0
+                adapter.last_stats["decay_spread"] = 0.0
+                return orig_fn(query, key, value, *args, **kwargs)
 
-        require(bool(x_stack), f"GDN-2 layer {adapter.layer_id}: missing captured input hidden_states")
-        x_in = x_stack[-1]
-        bsz, seq_len, _ = x_in.shape
-        g, beta, init_st, out_final, use_l2, scale, csize = _extract_gdr_args(args, kwargs, adapter.cfg.chunk_size)
+            require(bool(x_stack), f"GDN-2 layer {adapter.layer_id}: missing captured input hidden_states")
+            x_in = x_stack[-1]
+            bsz, seq_len, _ = x_in.shape
+            g, beta, init_st, out_final, use_l2, scale, csize = _extract_gdr_args(args, kwargs, adapter.cfg.chunk_size)
 
-        # Normalize head_first ([B, H, T, D]) vs token-first ([B, T, H, D]) layouts seamlessly
-        head_first = bool(kwargs.get("head_first", False)) or (
-            seq_len != adapter.num_v_heads and value.shape[1] == adapter.num_v_heads and value.shape[2] == seq_len
-        )
-        if head_first:
-            query, key, value = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
-            g, beta = g.transpose(1, 2), beta.transpose(1, 2)
-        require(
-            value.shape[:2] == (bsz, seq_len),
-            f"GDN-2 layer {adapter.layer_id}: value shape {tuple(value.shape)} disagrees with input {(bsz, seq_len)}",
-        )
-
-        g_vec, b_gate, w_gate = adapter.compute_gates(x_in, g, beta)
-        if recurrent_only or seq_len == 1:
-            out, final_state = recurrent_gdn2(
-                query,
-                key,
-                value,
-                g_vec,
-                b_gate,
-                w_gate,
-                initial_state=init_st,
-                output_final_state=out_final,
-                use_qk_l2norm_in_kernel=use_l2,
-                scale=scale,
+            # Normalize head_first ([B, H, T, D]) vs token-first ([B, T, H, D]) layouts seamlessly
+            head_first = bool(kwargs.get("head_first", False)) or (
+                seq_len != adapter.num_v_heads and value.shape[1] == adapter.num_v_heads and value.shape[2] == seq_len
             )
-        else:
-            out, final_state = chunk_gdn2(
-                query,
-                key,
-                value,
-                g_vec,
-                b_gate,
-                w_gate,
-                chunk_size=csize,
-                segment_chunks=adapter.cfg.segment_chunks,
-                checkpoint_segments=adapter.cfg.checkpoint_segments,
-                initial_state=init_st,
-                output_final_state=out_final,
-                use_qk_l2norm_in_kernel=use_l2,
-                scale=scale,
+            if head_first:
+                query, key, value = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+                g, beta = g.transpose(1, 2), beta.transpose(1, 2)
+            require(
+                value.shape[:2] == (bsz, seq_len),
+                f"GDN-2 layer {adapter.layer_id}: value shape {tuple(value.shape)} disagrees with input "
+                f"{(bsz, seq_len)}",
             )
-        if head_first:
-            out = out.transpose(1, 2)
-        return out, final_state
+
+            g_vec, b_gate, w_gate = adapter.compute_gates(x_in, g, beta)
+            if recurrent_only or seq_len == 1:
+                out, final_state = recurrent_gdn2(
+                    query,
+                    key,
+                    value,
+                    g_vec,
+                    b_gate,
+                    w_gate,
+                    initial_state=init_st,
+                    output_final_state=out_final,
+                    use_qk_l2norm_in_kernel=use_l2,
+                    scale=scale,
+                )
+            else:
+                out, final_state = chunk_gdn2(
+                    query,
+                    key,
+                    value,
+                    g_vec,
+                    b_gate,
+                    w_gate,
+                    chunk_size=csize,
+                    segment_chunks=adapter.cfg.segment_chunks,
+                    checkpoint_segments=adapter.cfg.checkpoint_segments,
+                    initial_state=init_st,
+                    output_final_state=out_final,
+                    use_qk_l2norm_in_kernel=use_l2,
+                    scale=scale,
+                )
+            if head_first:
+                out = out.transpose(1, 2)
+            return out, final_state
+        finally:
+            if in_rule_box is not None:
+                in_rule_box[0] -= 1
 
     return wrapped
 
@@ -614,8 +632,13 @@ def install_gdn2(model: nn.Module, cfg: GDN2Config | dict[str, Any] | None = Non
     adapters: dict[int, GDN2Adapter] = {}
     hooks: list[Any] = []
     restorers: list[Callable[[], None]] = []
-    patched_modules: set[str] = set()
-    active_attn_stack: list[tuple[nn.Module, GDN2Adapter, list[torch.Tensor]]] = []
+    patched_mod_fns: set[tuple[str, str]] = set()
+    active_attn_stack: list[tuple[nn.Module, GDN2Adapter, list[torch.Tensor], list[int], bool, bool]] = []
+
+    rule_specs: list[tuple[str, bool]] = (
+        [(attr, False) for attr in _CHUNK_RULE_ATTRS]
+        + [(attr, True) for attr in _REC_RULE_ATTRS]
+    )
 
     for i in target_layers:
         attn = attention_module(parts.layers[i], LINEAR)
@@ -625,8 +648,53 @@ def install_gdn2(model: nn.Module, cfg: GDN2Config | dict[str, Any] | None = Non
         adapters[i] = adapter
 
         x_stack: list[torch.Tensor] = []
+        in_rule_box: list[int] = [0]
 
-        def _make_pre(mod_ref: nn.Module, ad_ref: GDN2Adapter, st_ref: list[torch.Tensor]):
+        def _del_adapter(a: nn.Module = attn, ad: GDN2Adapter = adapter) -> None:
+            if getattr(a, "gdn2_adapter", None) is ad:
+                delattr(a, "gdn2_adapter")
+
+        restorers.append(_del_adapter)
+
+        wrapped_chunk = False
+        wrapped_rec = False
+        for attr, rec_only in rule_specs:
+            orig_fn = getattr(attn, attr, None)
+            if callable(orig_fn):
+                if rec_only:
+                    wrapped_rec = True
+                else:
+                    wrapped_chunk = True
+                had_instance_attr = attr in attn.__dict__
+                setattr(
+                    attn,
+                    attr,
+                    _make_rule_wrapper(
+                        attn, adapter, x_stack, orig_fn, recurrent_only=rec_only, in_rule_box=in_rule_box
+                    ),
+                )
+
+                def _restore_attr(
+                    a: nn.Module = attn,
+                    name: str = attr,
+                    fn: Callable[..., Any] = orig_fn,
+                    had: bool = had_instance_attr,
+                ) -> None:
+                    if had:
+                        setattr(a, name, fn)
+                    elif name in a.__dict__:
+                        delattr(a, name)
+
+                restorers.append(_restore_attr)
+
+        def _make_pre(
+            mod_ref: nn.Module,
+            ad_ref: GDN2Adapter,
+            st_ref: list[torch.Tensor],
+            ir_ref: list[int],
+            wc_flag: bool,
+            wr_flag: bool,
+        ):
             def pre_hook(_mod: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
                 x_in = (
                     args[0] if args else (kwargs.get("hidden_states") if "hidden_states" in kwargs else kwargs.get("x"))
@@ -642,7 +710,7 @@ def install_gdn2(model: nn.Module, cfg: GDN2Config | dict[str, Any] | None = Non
                 ):
                     x_in = x_in * amask[:, -x_in.shape[1]:, None].to(x_in.dtype)
                 st_ref.append(x_in)
-                active_attn_stack.append((mod_ref, ad_ref, st_ref))
+                active_attn_stack.append((mod_ref, ad_ref, st_ref, ir_ref, wc_flag, wr_flag))
 
             return pre_hook
 
@@ -655,50 +723,30 @@ def install_gdn2(model: nn.Module, cfg: GDN2Config | dict[str, Any] | None = Non
 
             return post_hook
 
-        hooks.append(attn.register_forward_pre_hook(_make_pre(attn, adapter, x_stack), with_kwargs=True))
+        hooks.append(
+            attn.register_forward_pre_hook(
+                _make_pre(attn, adapter, x_stack, in_rule_box, wrapped_chunk, wrapped_rec),
+                with_kwargs=True,
+            )
+        )
         hooks.append(attn.register_forward_hook(_make_post(x_stack)))
 
-        def _del_adapter(a: nn.Module = attn, ad: GDN2Adapter = adapter) -> None:
-            if getattr(a, "gdn2_adapter", None) is ad:
-                delattr(a, "gdn2_adapter")
-
-        restorers.append(_del_adapter)
-
-        wrapped_any = False
-        for attr, rec_only in (("chunk_gated_delta_rule", False), ("fused_recurrent_gated_delta_rule", True)):
-            orig_fn = getattr(attn, attr, None)
-            if callable(orig_fn):
-                wrapped_any = True
-                had_instance_attr = attr in attn.__dict__
-                setattr(attn, attr, _make_rule_wrapper(attn, adapter, x_stack, orig_fn, recurrent_only=rec_only))
-
-                def _restore_attr(
-                    a: nn.Module = attn,
-                    name: str = attr,
-                    fn: Callable[..., Any] = orig_fn,
-                    had: bool = had_instance_attr,
-                ) -> None:
-                    if had:
-                        setattr(a, name, fn)
-                    elif name in a.__dict__:
-                        delattr(a, name)
-
-                restorers.append(_restore_attr)
-
-        # Fallback if a future transformers build calls module-level `chunk_gated_delta_rule` directly
-        if not wrapped_any:
+        # Fallback if a transformers build calls module-level chunk or recurrent rule functions directly
+        if not (wrapped_chunk and wrapped_rec):
             mod_name = type(attn).__module__
             host_mod = sys.modules.get(mod_name)
-            if host_mod is not None and mod_name not in patched_modules:
-                for fn_name, rec_only in (
-                    ("chunk_gated_delta_rule", False),
-                    ("torch_chunk_gated_delta_rule", False),
-                    ("fused_recurrent_gated_delta_rule", True),
-                    ("torch_recurrent_gated_delta_rule", True),
-                ):
+            if host_mod is not None:
+                missing_specs: list[tuple[str, bool]] = []
+                if not wrapped_chunk:
+                    missing_specs.extend((nm, False) for nm in _CHUNK_RULE_ATTRS)
+                if not wrapped_rec:
+                    missing_specs.extend((nm, True) for nm in _REC_RULE_ATTRS)
+                for fn_name, rec_only in missing_specs:
+                    if (mod_name, fn_name) in patched_mod_fns:
+                        continue
                     orig_mfn = getattr(host_mod, fn_name, None)
                     if callable(orig_mfn):
-                        patched_modules.add(mod_name)
+                        patched_mod_fns.add((mod_name, fn_name))
 
                         def _mod_dispatch(
                             query: torch.Tensor,
@@ -711,10 +759,12 @@ def install_gdn2(model: nn.Module, cfg: GDN2Config | dict[str, Any] | None = Non
                         ):
                             if not active_attn_stack:
                                 return _orig(query, key, value, *args, **kwargs)
-                            cur_mod, cur_ad, cur_st = active_attn_stack[-1]
-                            return _make_rule_wrapper(cur_mod, cur_ad, cur_st, _orig, recurrent_only=_rec)(
-                                query, key, value, *args, **kwargs
-                            )
+                            cur_mod, cur_ad, cur_st, cur_ir, cur_wc, cur_wr = active_attn_stack[-1]
+                            if cur_ir[0] > 0 or (_rec and cur_wr) or ((not _rec) and cur_wc):
+                                return _orig(query, key, value, *args, **kwargs)
+                            return _make_rule_wrapper(
+                                cur_mod, cur_ad, cur_st, _orig, recurrent_only=_rec, in_rule_box=cur_ir
+                            )(query, key, value, *args, **kwargs)
 
                         setattr(host_mod, fn_name, _mod_dispatch)
                         restorers.append(lambda hm=host_mod, n=fn_name, f=orig_mfn: setattr(hm, n, f))

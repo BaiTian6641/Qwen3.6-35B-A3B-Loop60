@@ -3274,161 +3274,182 @@ class HSSDHandle:
 HSSDManager = HSSDHandle
 
 
+_HSSD_CHUNK_RULE_ATTRS: tuple[str, ...] = ("chunk_gated_delta_rule", "torch_chunk_gated_delta_rule")
+_HSSD_REC_RULE_ATTRS: tuple[str, ...] = (
+    "recurrent_gated_delta_rule",
+    "fused_recurrent_gated_delta_rule",
+    "torch_recurrent_gated_delta_rule",
+)
+
+
 def _make_hssd_rule_wrapper(
     adapter: HSSDAdapter,
     ctx_stack: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]],
     *,
     recurrent_only: bool,
+    orig_fn: Callable[..., Any] | None = None,
+    in_rule_box: list[int] | None = None,
 ) -> Callable[..., Any]:
     def wrapped(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, *args: Any, **kwargs: Any):
-        require(bool(ctx_stack), f"HSSD layer {adapter.layer_id}: missing captured input hidden_states")
-        x_in, mor_wmask, pad_mask = ctx_stack[-1]
-        bsz, seq_len, _ = x_in.shape
-        g, beta, init_st, out_final, use_l2, scale, _csize, cu_seqlens, seq_idx = _extract_hssd_gdr_args(
-            args, kwargs, adapter.cfg.chunk_size
-        )
-
-        head_first = bool(kwargs.get("head_first", False)) or (
-            seq_len != adapter.num_v_heads and value.shape[1] == adapter.num_v_heads and value.shape[2] == seq_len
-        )
-        if head_first:
-            query, key, value = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
-            g, beta = g.transpose(1, 2), beta.transpose(1, 2)
-        require(
-            value.shape[:2] == (bsz, seq_len),
-            f"HSSD layer {adapter.layer_id}: value shape {tuple(value.shape)} disagrees with input {(bsz, seq_len)}",
-        )
-
-        proj = adapter.project_inputs(x_in, query, key, value, g, beta, use_qk_l2norm=use_l2)
-        factored_gamma = (proj["gamma_page_scale"], proj["gamma_chan_pair"])
-        c_cfg = adapter.cfg
-
-        if seq_len == 1 and cu_seqlens is None and seq_idx is None:
-            st0 = _coerce_init_state(
-                init_st,
-                bsz=bsz,
-                num_pages=c_cfg.num_pages,
-                hv=adapter.num_v_heads,
-                dk=adapter.head_k_dim,
-                dv=adapter.head_v_dim,
-                chunk_size=c_cfg.chunk_size,
-                window_chunks=c_cfg.window_chunks,
-                device=query.device,
-                dtype=torch.float64 if query.dtype == torch.float64 else torch.float32,
-            )
-            out, st_next, u_sum, cnt_sum = recurrent_hssd_step(
-                proj["query"],
-                proj["key"],
-                proj["value"],
-                factored_gamma,
-                proj["b_gate"],
-                proj["w_gate"],
-                proj["theta"],
-                proj["surprise_bias"],
-                adapter.log_surprise_slope.exp(),
-                adapter.surprise_thresh,
-                proj["write_logits"],
-                proj["read_logits"],
-                proj["q_swa"],
-                proj["k_swa"],
-                proj["v_swa"],
-                st0,
-                boltzmann_gate=adapter.boltzmann_gate,
-                top_k_pages=c_cfg.k_pages,
-                write_mask=mor_wmask,
-                pad_mask=pad_mask,
-                use_qk_l2norm_in_kernel=False,
-                scale=scale,
-                state_dtype=c_cfg.state_dtype,
-                use_swa=c_cfg.use_swa,
-                use_phase=c_cfg.use_phase,
-                use_surprise=c_cfg.use_surprise,
-                surprise_mode=c_cfg.surprise_mode,
-                return_duty_sum=True,
-            )
-            final_state = st_next if out_final else None
-            duty_vec = u_sum / cnt_sum.clamp_min(1.0)
-        elif recurrent_only:
-            out, final_state, duty_vec = recurrent_hssd(
-                proj["query"],
-                proj["key"],
-                proj["value"],
-                factored_gamma,
-                proj["b_gate"],
-                proj["w_gate"],
-                proj["theta"],
-                proj["surprise_bias"],
-                adapter.log_surprise_slope.exp(),
-                adapter.surprise_thresh,
-                proj["write_logits"],
-                proj["read_logits"],
-                proj["q_swa"],
-                proj["k_swa"],
-                proj["v_swa"],
-                boltzmann_gate=adapter.boltzmann_gate,
-                chunk_size=c_cfg.chunk_size,
-                window_chunks=c_cfg.window_chunks,
-                num_pages=c_cfg.num_pages,
-                top_k_pages=c_cfg.k_pages,
-                initial_state=init_st,
-                output_final_state=out_final,
-                write_mask=mor_wmask,
-                pad_mask=pad_mask,
-                cu_seqlens=cu_seqlens,
-                seq_idx=seq_idx,
-                use_qk_l2norm_in_kernel=False,
-                scale=scale,
-                state_dtype=c_cfg.state_dtype,
-                use_swa=c_cfg.use_swa,
-                use_phase=c_cfg.use_phase,
-                use_surprise=c_cfg.use_surprise,
-                surprise_mode=c_cfg.surprise_mode,
-                return_aux=True,
-            )
-        else:
-            out, final_state, duty_vec = chunk_hssd(
-                proj["query"],
-                proj["key"],
-                proj["value"],
-                factored_gamma,
-                proj["b_gate"],
-                proj["w_gate"],
-                proj["theta"],
-                proj["surprise_bias"],
-                adapter.log_surprise_slope.exp(),
-                adapter.surprise_thresh,
-                proj["write_logits"],
-                proj["read_logits"],
-                proj["q_swa"],
-                proj["k_swa"],
-                proj["v_swa"],
-                boltzmann_gate=adapter.boltzmann_gate,
-                chunk_size=c_cfg.chunk_size,
-                window_chunks=c_cfg.window_chunks,
-                num_pages=c_cfg.num_pages,
-                top_k_pages=c_cfg.k_pages,
-                segment_chunks=c_cfg.segment_chunks,
-                checkpoint_segments=c_cfg.checkpoint_segments,
-                initial_state=init_st,
-                output_final_state=out_final,
-                write_mask=mor_wmask,
-                pad_mask=pad_mask,
-                cu_seqlens=cu_seqlens,
-                seq_idx=seq_idx,
-                use_qk_l2norm_in_kernel=False,
-                scale=scale,
-                state_dtype=c_cfg.state_dtype,
-                use_swa=c_cfg.use_swa,
-                use_phase=c_cfg.use_phase,
-                use_surprise=c_cfg.use_surprise,
-                surprise_mode=c_cfg.surprise_mode,
-                return_aux=True,
+        if in_rule_box is not None and in_rule_box[0] > 0:
+            if orig_fn is not None:
+                return orig_fn(query, key, value, *args, **kwargs)
+            raise RuntimeError(f"HSSD layer {adapter.layer_id}: unexpected re-entrant rule call without orig_fn")
+        if in_rule_box is not None:
+            in_rule_box[0] += 1
+        try:
+            require(bool(ctx_stack), f"HSSD layer {adapter.layer_id}: missing captured input hidden_states")
+            x_in, mor_wmask, pad_mask = ctx_stack[-1]
+            bsz, seq_len, _ = x_in.shape
+            g, beta, init_st, out_final, use_l2, scale, _csize, cu_seqlens, seq_idx = _extract_hssd_gdr_args(
+                args, kwargs, adapter.cfg.chunk_size
             )
 
-        adapter.record_duty(duty_vec, write_logits=proj["write_logits"], pad_mask=pad_mask)
-        if head_first:
-            out = out.transpose(1, 2)
-        return out, final_state
+            head_first = bool(kwargs.get("head_first", False)) or (
+                seq_len != adapter.num_v_heads and value.shape[1] == adapter.num_v_heads and value.shape[2] == seq_len
+            )
+            if head_first:
+                query, key, value = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+                g, beta = g.transpose(1, 2), beta.transpose(1, 2)
+            require(
+                value.shape[:2] == (bsz, seq_len),
+                f"HSSD layer {adapter.layer_id}: value shape {tuple(value.shape)} disagrees with input "
+                f"{(bsz, seq_len)}",
+            )
+
+            proj = adapter.project_inputs(x_in, query, key, value, g, beta, use_qk_l2norm=use_l2)
+            factored_gamma = (proj["gamma_page_scale"], proj["gamma_chan_pair"])
+            c_cfg = adapter.cfg
+
+            if seq_len == 1 and cu_seqlens is None and seq_idx is None:
+                st0 = _coerce_init_state(
+                    init_st,
+                    bsz=bsz,
+                    num_pages=c_cfg.num_pages,
+                    hv=adapter.num_v_heads,
+                    dk=adapter.head_k_dim,
+                    dv=adapter.head_v_dim,
+                    chunk_size=c_cfg.chunk_size,
+                    window_chunks=c_cfg.window_chunks,
+                    device=query.device,
+                    dtype=torch.float64 if query.dtype == torch.float64 else torch.float32,
+                )
+                out, st_next, u_sum, cnt_sum = recurrent_hssd_step(
+                    proj["query"],
+                    proj["key"],
+                    proj["value"],
+                    factored_gamma,
+                    proj["b_gate"],
+                    proj["w_gate"],
+                    proj["theta"],
+                    proj["surprise_bias"],
+                    adapter.log_surprise_slope.exp(),
+                    adapter.surprise_thresh,
+                    proj["write_logits"],
+                    proj["read_logits"],
+                    proj["q_swa"],
+                    proj["k_swa"],
+                    proj["v_swa"],
+                    st0,
+                    boltzmann_gate=adapter.boltzmann_gate,
+                    top_k_pages=c_cfg.k_pages,
+                    write_mask=mor_wmask,
+                    pad_mask=pad_mask,
+                    use_qk_l2norm_in_kernel=False,
+                    scale=scale,
+                    state_dtype=c_cfg.state_dtype,
+                    use_swa=c_cfg.use_swa,
+                    use_phase=c_cfg.use_phase,
+                    use_surprise=c_cfg.use_surprise,
+                    surprise_mode=c_cfg.surprise_mode,
+                    return_duty_sum=True,
+                )
+                final_state = st_next if out_final else None
+                duty_vec = u_sum / cnt_sum.clamp_min(1.0)
+            elif recurrent_only:
+                out, final_state, duty_vec = recurrent_hssd(
+                    proj["query"],
+                    proj["key"],
+                    proj["value"],
+                    factored_gamma,
+                    proj["b_gate"],
+                    proj["w_gate"],
+                    proj["theta"],
+                    proj["surprise_bias"],
+                    adapter.log_surprise_slope.exp(),
+                    adapter.surprise_thresh,
+                    proj["write_logits"],
+                    proj["read_logits"],
+                    proj["q_swa"],
+                    proj["k_swa"],
+                    proj["v_swa"],
+                    boltzmann_gate=adapter.boltzmann_gate,
+                    chunk_size=c_cfg.chunk_size,
+                    window_chunks=c_cfg.window_chunks,
+                    num_pages=c_cfg.num_pages,
+                    top_k_pages=c_cfg.k_pages,
+                    initial_state=init_st,
+                    output_final_state=out_final,
+                    write_mask=mor_wmask,
+                    pad_mask=pad_mask,
+                    cu_seqlens=cu_seqlens,
+                    seq_idx=seq_idx,
+                    use_qk_l2norm_in_kernel=False,
+                    scale=scale,
+                    state_dtype=c_cfg.state_dtype,
+                    use_swa=c_cfg.use_swa,
+                    use_phase=c_cfg.use_phase,
+                    use_surprise=c_cfg.use_surprise,
+                    surprise_mode=c_cfg.surprise_mode,
+                    return_aux=True,
+                )
+            else:
+                out, final_state, duty_vec = chunk_hssd(
+                    proj["query"],
+                    proj["key"],
+                    proj["value"],
+                    factored_gamma,
+                    proj["b_gate"],
+                    proj["w_gate"],
+                    proj["theta"],
+                    proj["surprise_bias"],
+                    adapter.log_surprise_slope.exp(),
+                    adapter.surprise_thresh,
+                    proj["write_logits"],
+                    proj["read_logits"],
+                    proj["q_swa"],
+                    proj["k_swa"],
+                    proj["v_swa"],
+                    boltzmann_gate=adapter.boltzmann_gate,
+                    chunk_size=c_cfg.chunk_size,
+                    window_chunks=c_cfg.window_chunks,
+                    num_pages=c_cfg.num_pages,
+                    top_k_pages=c_cfg.k_pages,
+                    segment_chunks=c_cfg.segment_chunks,
+                    checkpoint_segments=c_cfg.checkpoint_segments,
+                    initial_state=init_st,
+                    output_final_state=out_final,
+                    write_mask=mor_wmask,
+                    pad_mask=pad_mask,
+                    cu_seqlens=cu_seqlens,
+                    seq_idx=seq_idx,
+                    use_qk_l2norm_in_kernel=False,
+                    scale=scale,
+                    state_dtype=c_cfg.state_dtype,
+                    use_swa=c_cfg.use_swa,
+                    use_phase=c_cfg.use_phase,
+                    use_surprise=c_cfg.use_surprise,
+                    surprise_mode=c_cfg.surprise_mode,
+                    return_aux=True,
+                )
+
+            adapter.record_duty(duty_vec, write_logits=proj["write_logits"], pad_mask=pad_mask)
+            if head_first:
+                out = out.transpose(1, 2)
+            return out, final_state
+        finally:
+            if in_rule_box is not None:
+                in_rule_box[0] -= 1
 
     return wrapped
 
@@ -3473,11 +3494,22 @@ def apply_hssd(model: nn.Module, cfg: HSSDConfig | dict[str, Any] | None = None)
     adapters: dict[int, HSSDAdapter] = {}
     hooks: list[Any] = []
     restorers: list[Callable[[], None]] = []
-    patched_modules: set[str] = set()
+    patched_mod_fns: set[tuple[str, str]] = set()
     active_attn_stack: list[
-        tuple[HSSDAdapter, list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]]]
+        tuple[
+            HSSDAdapter,
+            list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]],
+            list[int],
+            bool,
+            bool,
+        ]
     ] = []
     amask_stack: list[torch.Tensor | None] = []
+
+    rule_specs: list[tuple[str, bool]] = (
+        [(attr, False) for attr in _HSSD_CHUNK_RULE_ATTRS]
+        + [(attr, True) for attr in _HSSD_REC_RULE_ATTRS]
+    )
 
     def _capture_model_amask(_mod: nn.Module, a: tuple[Any, ...], kw: dict[str, Any]) -> None:
         am = kw.get("attention_mask")
@@ -3514,10 +3546,51 @@ def apply_hssd(model: nn.Module, cfg: HSSDConfig | dict[str, Any] | None = None)
         adapters[i] = adapter
 
         ctx_stack: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]] = []
+        in_rule_box: list[int] = [0]
+
+        def _del_adapter(a: nn.Module = attn, ad: HSSDAdapter = adapter) -> None:
+            if getattr(a, "hssd_adapter", None) is ad:
+                delattr(a, "hssd_adapter")
+
+        restorers.append(_del_adapter)
+
+        wrapped_chunk = False
+        wrapped_rec = False
+        for attr, rec_only in rule_specs:
+            orig_fn = getattr(attn, attr, None)
+            if callable(orig_fn):
+                if rec_only:
+                    wrapped_rec = True
+                else:
+                    wrapped_chunk = True
+                had_instance_attr = attr in attn.__dict__
+                setattr(
+                    attn,
+                    attr,
+                    _make_hssd_rule_wrapper(
+                        adapter, ctx_stack, recurrent_only=rec_only, orig_fn=orig_fn, in_rule_box=in_rule_box
+                    ),
+                )
+
+                def _restore_attr(
+                    a: nn.Module = attn,
+                    name: str = attr,
+                    fn: Callable[..., Any] = orig_fn,
+                    had: bool = had_instance_attr,
+                ) -> None:
+                    if had:
+                        setattr(a, name, fn)
+                    elif name in a.__dict__:
+                        delattr(a, name)
+
+                restorers.append(_restore_attr)
 
         def _make_pre(
             ad_ref: HSSDAdapter,
             st_ref: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]],
+            ir_ref: list[int],
+            wc_flag: bool,
+            wr_flag: bool,
         ):
             def pre_hook(_mod: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
                 x_in = (
@@ -3544,7 +3617,7 @@ def apply_hssd(model: nn.Module, cfg: HSSDConfig | dict[str, Any] | None = None)
                         ret_modified = True
                 x_proj = x_in * mor_wmask.to(dtype=x_in.dtype).unsqueeze(-1) if mor_wmask is not None else x_in
                 st_ref.append((x_proj, mor_wmask, pad_mask))
-                active_attn_stack.append((ad_ref, st_ref))
+                active_attn_stack.append((ad_ref, st_ref, ir_ref, wc_flag, wr_flag))
                 if ret_modified:
                     if args:
                         return (x_in, *args[1:]), kwargs
@@ -3567,49 +3640,29 @@ def apply_hssd(model: nn.Module, cfg: HSSDConfig | dict[str, Any] | None = None)
 
             return post_hook
 
-        hooks.append(attn.register_forward_pre_hook(_make_pre(adapter, ctx_stack), with_kwargs=True))
+        hooks.append(
+            attn.register_forward_pre_hook(
+                _make_pre(adapter, ctx_stack, in_rule_box, wrapped_chunk, wrapped_rec),
+                with_kwargs=True,
+            )
+        )
         hooks.append(attn.register_forward_hook(_make_post(ctx_stack)))
 
-        def _del_adapter(a: nn.Module = attn, ad: HSSDAdapter = adapter) -> None:
-            if getattr(a, "hssd_adapter", None) is ad:
-                delattr(a, "hssd_adapter")
-
-        restorers.append(_del_adapter)
-
-        wrapped_any = False
-        for attr, rec_only in (("chunk_gated_delta_rule", False), ("fused_recurrent_gated_delta_rule", True)):
-            orig_fn = getattr(attn, attr, None)
-            if callable(orig_fn):
-                wrapped_any = True
-                had_instance_attr = attr in attn.__dict__
-                setattr(attn, attr, _make_hssd_rule_wrapper(adapter, ctx_stack, recurrent_only=rec_only))
-
-                def _restore_attr(
-                    a: nn.Module = attn,
-                    name: str = attr,
-                    fn: Callable[..., Any] = orig_fn,
-                    had: bool = had_instance_attr,
-                ) -> None:
-                    if had:
-                        setattr(a, name, fn)
-                    elif name in a.__dict__:
-                        delattr(a, name)
-
-                restorers.append(_restore_attr)
-
-        if not wrapped_any:
+        if not (wrapped_chunk and wrapped_rec):
             mod_name = type(attn).__module__
             host_mod = sys.modules.get(mod_name)
-            if host_mod is not None and mod_name not in patched_modules:
-                for fn_name, rec_only in (
-                    ("chunk_gated_delta_rule", False),
-                    ("torch_chunk_gated_delta_rule", False),
-                    ("fused_recurrent_gated_delta_rule", True),
-                    ("torch_recurrent_gated_delta_rule", True),
-                ):
+            if host_mod is not None:
+                missing_specs: list[tuple[str, bool]] = []
+                if not wrapped_chunk:
+                    missing_specs.extend((nm, False) for nm in _HSSD_CHUNK_RULE_ATTRS)
+                if not wrapped_rec:
+                    missing_specs.extend((nm, True) for nm in _HSSD_REC_RULE_ATTRS)
+                for fn_name, rec_only in missing_specs:
+                    if (mod_name, fn_name) in patched_mod_fns:
+                        continue
                     orig_mfn = getattr(host_mod, fn_name, None)
                     if callable(orig_mfn):
-                        patched_modules.add(mod_name)
+                        patched_mod_fns.add((mod_name, fn_name))
 
                         def _mod_dispatch(
                             query: torch.Tensor,
@@ -3622,10 +3675,12 @@ def apply_hssd(model: nn.Module, cfg: HSSDConfig | dict[str, Any] | None = None)
                         ):
                             if not active_attn_stack:
                                 return _orig(query, key, value, *args, **kwargs)
-                            cur_ad, cur_st = active_attn_stack[-1]
-                            return _make_hssd_rule_wrapper(cur_ad, cur_st, recurrent_only=_rec)(
-                                query, key, value, *args, **kwargs
-                            )
+                            cur_ad, cur_st, cur_ir, cur_wc, cur_wr = active_attn_stack[-1]
+                            if cur_ir[0] > 0 or (_rec and cur_wr) or ((not _rec) and cur_wc):
+                                return _orig(query, key, value, *args, **kwargs)
+                            return _make_hssd_rule_wrapper(
+                                cur_ad, cur_st, recurrent_only=_rec, orig_fn=_orig, in_rule_box=cur_ir
+                            )(query, key, value, *args, **kwargs)
 
                         setattr(host_mod, fn_name, _mod_dispatch)
                         restorers.append(lambda hm=host_mod, n=fn_name, f=orig_mfn: setattr(hm, n, f))

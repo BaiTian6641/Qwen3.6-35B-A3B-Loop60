@@ -295,3 +295,189 @@ def test_profile_hssd_layer_and_ablation_matrix_schema_and_reexports():
         cfg = HSSDConfig.from_dict(entry["hssd"])
         cfg.validate()
 
+
+def test_surgery_check_max_probe_tokens_hssd_and_hf5_recurrent_rule():
+    from qloop.model.probes import surgery_check
+
+    model = build_toy(num_hidden_layers=8, hidden_size=32).double()
+    # Mimic HF>=5 Qwen3_5GatedDeltaNet (`recurrent_gated_delta_rule` instead of `fused_recurrent_gated_delta_rule`)
+    for lyr in model.model.layers:
+        la = getattr(lyr, "linear_attn", None)
+        if la is not None:
+            orig_rec = la.fused_recurrent_gated_delta_rule
+            delattr(la, "fused_recurrent_gated_delta_rule")
+            la.recurrent_gated_delta_rule = orig_rec
+            orig_fwd = la.forward
+
+            def _hf5_fwd(
+                hidden_states: torch.Tensor,
+                *fa: object,
+                _la: torch.nn.Module = la,
+                _of: object = orig_fwd,
+                **fkw: object,
+            ) -> torch.Tensor:
+                _la.fused_recurrent_gated_delta_rule = _la.recurrent_gated_delta_rule  # type: ignore[attr-defined]
+                try:
+                    return _of(hidden_states, *fa, **fkw)  # type: ignore[operator]
+                finally:
+                    delattr(_la, "fused_recurrent_gated_delta_rule")
+
+            la.forward = _hf5_fwd  # type: ignore[method-assign]
+
+    long_ids = torch.randint(0, model.config.vocab_size, (1, 320), generator=torch.Generator().manual_seed(51))
+    ref_slice = model(long_ids[:, :64]).logits.detach().clone()
+    loop_spec = {"prelude_end": 2, "core_end": 6, "num_passes": 2, "target_virtual_layers": 12}
+
+    rep_g = surgery_check(
+        model,
+        long_ids,
+        loop_spec,
+        None,
+        decode_steps=4,
+        atol=1e-9,
+        gdn2_cfg={"rank": 8, "chunk_size": 8},
+        max_probe_tokens=64,
+    )
+    assert rep_g["probe_seq_len"] == 64
+    assert rep_g["init_identity_maxdiff"] == 0.0
+    assert rep_g["decode_vs_full_maxdiff"] < 1e-10
+    assert rep_g["decode_vs_full_cosine"] > 0.999999
+    assert rep_g["decode_vs_full_top1_match"] == 1.0
+    assert rep_g["base_decode_vs_full_maxdiff"] < 1e-12
+    assert rep_g["low_precision_calibrated"] is False
+    assert torch.equal(model(long_ids[:, :64]).logits, ref_slice)
+
+    rep_h = surgery_check(
+        model,
+        long_ids,
+        loop_spec,
+        None,
+        decode_steps=4,
+        atol=1e-9,
+        hssd_cfg={"rank": 8, "chunk_size": 8, "window_chunks": 2, "checkpoint_segments": False},
+        max_probe_tokens=64,
+    )
+    assert rep_h["probe_seq_len"] == 64
+    assert rep_h["decode_vs_full_maxdiff"] < 1e-10
+    assert rep_h["decode_vs_full_cosine"] > 0.999999
+    assert torch.equal(model(long_ids[:, :64]).logits, ref_slice)
+
+
+def test_surgery_check_bf16_moe_calibration_vs_broken_cache_detection():
+    from qloop.model.probes import surgery_check
+
+    model = build_toy(num_hidden_layers=12, hidden_size=64).to(torch.bfloat16)
+    ids = torch.randint(0, model.config.vocab_size, (1, 32), generator=torch.Generator().manual_seed(93))
+    loop_spec = {"prelude_end": 4, "core_end": 8, "num_passes": 2, "target_virtual_layers": 16}
+
+    # 1A. Healthy bf16 model with baseline chunk-vs-recurrent ULP drift (`base_diff ~ 0.25`, `diff ~ 0.25 < eff_atol`,
+    #     `cosine >= 0.9985`): precision-calibrated check MUST pass!
+    orig_head_fwd = model.lm_head.forward
+
+    def _bf16_ulp_baseline_head(x: torch.Tensor) -> torch.Tensor:
+        logits = orig_head_fwd(x)
+        if x.shape[1] == 1:
+            logits = logits.clone()
+            logits[..., 0] = logits[..., 0] + torch.tensor(0.25, dtype=logits.dtype, device=logits.device)
+        return logits
+
+    model.lm_head.forward = _bf16_ulp_baseline_head  # type: ignore[method-assign]
+    try:
+        rep_ok = surgery_check(
+            model,
+            ids,
+            loop_spec,
+            None,
+            decode_steps=4,
+            atol=2e-2,
+            gdn2_cfg={"rank": 8, "chunk_size": 8},
+        )
+        assert rep_ok["low_precision_calibrated"] is True
+        assert rep_ok["decode_vs_full_maxdiff"] >= 0.20
+        assert rep_ok["decode_vs_full_cosine"] >= 0.9985
+    finally:
+        model.lm_head.forward = orig_head_fwd  # type: ignore[method-assign]
+
+    # 1B. Healthy bf16 model where ONLY 1 decode step of perturbed wrapped pass hits a rare router-tie ULP flip
+    #     (`base_diff ~ 0`, `diff ~ 0.22 > eff_atol=0.15`, `mae < 0.01`, `cosine >= 0.9995`): MUST pass!
+    tie_calls = [0]
+
+    def _bf16_rare_tie_head(x: torch.Tensor) -> torch.Tensor:
+        logits = orig_head_fwd(x)
+        if x.shape[1] == 1 and len(model.model.layers) > 12:
+            tie_calls[0] += 1
+            if tie_calls[0] == 2:
+                logits = logits.clone()
+                logits[..., 0] = logits[..., 0] + torch.tensor(0.22, dtype=logits.dtype, device=logits.device)
+        return logits
+
+    model.lm_head.forward = _bf16_rare_tie_head  # type: ignore[method-assign]
+    try:
+        rep_tie = surgery_check(
+            model,
+            ids,
+            loop_spec,
+            None,
+            decode_steps=4,
+            atol=2e-2,
+            gdn2_cfg={"rank": 8, "chunk_size": 8},
+        )
+        assert rep_tie["low_precision_calibrated"] is True
+        assert rep_tie["decode_vs_full_cosine"] >= 0.9995
+        assert rep_tie["decode_vs_full_mae"] < 0.01
+    finally:
+        model.lm_head.forward = orig_head_fwd  # type: ignore[method-assign]
+
+    # 2. Genuine broken cache / unwrapped recurrent decode (`diff > 1.0`, `base_diff ~ 0`, degraded cosine/MAE)
+    #    MUST fail loudly AND still leave `model` 100% unwrapped and restored!
+    model.train()
+    ref_clean = model.eval()(ids).logits.detach().clone()
+    model.train()
+
+    def _broken_wrapped_decode_head(x: torch.Tensor) -> torch.Tensor:
+        logits = orig_head_fwd(x)
+        if x.shape[1] == 1 and len(model.model.layers) > 12:
+            gen_c = torch.Generator().manual_seed(13)
+            corrupt = torch.randn(logits.shape, generator=gen_c, dtype=torch.float32).to(logits.dtype) * 1.1
+            logits = logits + corrupt
+        return logits
+
+    model.lm_head.forward = _broken_wrapped_decode_head  # type: ignore[method-assign]
+    try:
+        with pytest.raises(AssertionError, match="cached decode diverges from full forward"):
+            surgery_check(
+                model,
+                ids,
+                loop_spec,
+                None,
+                decode_steps=4,
+                atol=2e-2,
+                gdn2_cfg={"rank": 8, "chunk_size": 8},
+            )
+    finally:
+        model.lm_head.forward = orig_head_fwd  # type: ignore[method-assign]
+
+    assert model.training is True
+    assert len(model.model.layers) == 12
+    model.eval()
+    assert torch.equal(model(ids).logits, ref_clean)
+
+    # 3. Pure unquantized fp32 keeps strict `atol` enforcement (`0.12 > 2e-2` fails!)
+    m_fp32 = build_toy(num_hidden_layers=12, hidden_size=64).float().eval()
+    orig_fp32_head = m_fp32.lm_head.forward
+
+    def _fp32_drift_head(x: torch.Tensor) -> torch.Tensor:
+        logits = orig_fp32_head(x)
+        if x.shape[1] == 1 and len(m_fp32.model.layers) > 12:
+            logits = logits.clone()
+            logits[..., 0] = logits[..., 0] + 0.12
+        return logits
+
+    m_fp32.lm_head.forward = _fp32_drift_head  # type: ignore[method-assign]
+    try:
+        with pytest.raises(AssertionError, match="cached decode diverges from full forward"):
+            surgery_check(m_fp32, ids, loop_spec, None, decode_steps=3, atol=2e-2)
+    finally:
+        m_fp32.lm_head.forward = orig_fp32_head  # type: ignore[method-assign]
+
+

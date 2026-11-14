@@ -581,6 +581,8 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
         logits_to_keep: int | None = None,
         **kwargs: Any,
     ) -> Any:
+        if self.loop_controller is not None and past_key_values is not None:
+            self.loop_controller._sync_cache_last_linear(past_key_values)
         if logits_to_keep is not None and labels is None:
             tm_kw: dict[str, Any] = {
                 "input_ids": input_ids,
@@ -2505,7 +2507,27 @@ else:
             return object.__getattribute__(self, "_cache")[idx]
 
         def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int, *a: Any, **kw: Any) -> Any:
-            return object.__getattribute__(self, "_cache").update(k[..., :0, :], v[..., :0, :], layer_idx, *a, **kw)
+            cache = object.__getattribute__(self, "_cache")
+            if hasattr(cache, "dequantize") or type(cache).__name__ in ("QuantizedHybridCache", "_QuantizedKV"):
+                return cache.update(k[..., :0, :], v[..., :0, :], layer_idx, *a, **kw)
+            layers = getattr(cache, "layers", None)
+            if isinstance(layers, (list, tuple, nn.ModuleList)) and 0 <= layer_idx < len(layers):
+                lyr = layers[layer_idx]
+                k_t, v_t = getattr(lyr, "keys", None), getattr(lyr, "values", None)
+                if isinstance(k_t, torch.Tensor) and isinstance(v_t, torch.Tensor) and k_t.numel() > 0:
+                    return k_t, v_t
+            kc, vc = getattr(cache, "key_cache", None), getattr(cache, "value_cache", None)
+            if (
+                isinstance(kc, list)
+                and isinstance(vc, list)
+                and 0 <= layer_idx < len(kc)
+                and 0 <= layer_idx < len(vc)
+                and isinstance(kc[layer_idx], torch.Tensor)
+                and isinstance(vc[layer_idx], torch.Tensor)
+                and kc[layer_idx].numel() > 0
+            ):
+                return kc[layer_idx], vc[layer_idx]
+            return cache.update(k[..., :0, :], v[..., :0, :], layer_idx, *a, **kw)
 
     class _StandaloneDepthContext:
         def __init__(self, owner: Any, prev: int, target: int) -> None:
@@ -2624,10 +2646,17 @@ else:
                     ctx["start"][r] = x
                     assert ow._loop_adapters is not None
                     x = ow._loop_adapters.bridge(x, ctx["anchor"], r - 2)
-            pkv = kwargs.get("past_key_values")
-            if pkv is not None and cidx != vidx:
+            pkv_k = (
+                "past_key_values"
+                if "past_key_values" in kwargs
+                else ("past_key_value" if "past_key_value" in kwargs else None)
+            )
+            pkv = kwargs.get(pkv_k) if pkv_k is not None else None
+            if vidx == 0 and pkv is not None:
+                ow._sync_cache_last_linear(pkv)
+            if pkv is not None and cidx != vidx and pkv_k is not None:
                 kwargs = dict(kwargs)
-                kwargs["past_key_values"] = _SharedKVProxy(pkv)
+                kwargs[pkv_k] = _SharedKVProxy(pkv)
             prev = ow._cur_pass
             ow._cur_pass = r
             for m in self._idx_mods:
@@ -2703,10 +2732,20 @@ else:
             self._loop_adapters: _StandaloneLoopAdapters | None = None
             self._is_probs_cache: dict[int, bool] = {}
             self._amask_stack: list[torch.Tensor] = []
+            self._slot_meta: list[tuple[int, int, str]] = []
             self.active_passes = 1
             self._install_submodules(arch, hf_cfg)
             if not _defer_loop:
                 self._apply_standalone_loop(arch)
+
+        def _sync_cache_last_linear(self, pkv: Any) -> None:
+            if pkv is None or not isinstance(getattr(pkv, "last_linear_layer", None), int):
+                return
+            for vidx, r_slot, lt in reversed(self._slot_meta):
+                if lt == "linear_attention" and r_slot <= self.active_passes:
+                    if pkv.last_linear_layer != vidx:
+                        pkv.last_linear_layer = vidx
+                    return
 
         def _find_tm(self) -> nn.Module:
             for _n, mod in self.backbone.named_modules():
@@ -2726,14 +2765,23 @@ else:
         def _install_submodules(self, arch: dict[str, Any], hf_cfg: Any) -> None:
             tm = self._find_tm()
             ref_dt = torch.float64 if tm.embed_tokens.weight.dtype == torch.float64 else torch.float32
+            chunk_attrs = ("chunk_gated_delta_rule", "torch_chunk_gated_delta_rule")
+            rec_attrs = (
+                "recurrent_gated_delta_rule",
+                "fused_recurrent_gated_delta_rule",
+                "torch_recurrent_gated_delta_rule",
+            )
+            rule_specs = [(a, False) for a in chunk_attrs] + [(a, True) for a in rec_attrs]
 
             gcfg = dict(arch.get("gdn2") or {})
             if gcfg.get("enabled"):
                 rank = int(gcfg.get("rank", 64))
                 cap_g = float(gcfg.get("gate_logit_cap", 8.0))
                 cap_d = float(gcfg.get("decay_log_cap", 1.0))
-                patched_gmods: set[str] = set()
-                active_gdn2: list[tuple[_StandaloneGDN2Adapter, list[torch.Tensor]]] = []
+                patched_gmods: set[tuple[str, str]] = set()
+                active_gdn2: list[
+                    tuple[_StandaloneGDN2Adapter, list[torch.Tensor], list[int], bool, bool]
+                ] = []
 
                 def _run_gdn2_rule(
                     ad_r: _StandaloneGDN2Adapter,
@@ -2777,8 +2825,43 @@ else:
                     ad = _StandaloneGDN2Adapter(hs, hv, dk, dv, rank, cap_g, cap_d).to(dtype=ref_dt)
                     attn.gdn2_adapter = ad
                     x_box: list[torch.Tensor] = []
+                    in_g_box: list[int] = [0]
+                    g_wc = False
+                    g_wr = False
+                    for attr, rec_only in rule_specs:
+                        orig_attr_fn = getattr(attn, attr, None)
+                        if callable(orig_attr_fn):
+                            if rec_only:
+                                g_wr = True
+                            else:
+                                g_wc = True
 
-                    def _make_gpre(ad_r: _StandaloneGDN2Adapter = ad, xb: list[torch.Tensor] = x_box):
+                            def _make_grule(
+                                ad_r: _StandaloneGDN2Adapter = ad,
+                                xb: list[torch.Tensor] = x_box,
+                                ib: list[int] = in_g_box,
+                                ofn: Callable[..., Any] = orig_attr_fn,
+                            ):
+                                def _grule(q, k, v, *ra, **rkw):
+                                    if ib[0] > 0:
+                                        return ofn(q, k, v, *ra, **rkw)
+                                    ib[0] += 1
+                                    try:
+                                        return _run_gdn2_rule(ad_r, xb[-1], q, k, v, *ra, **rkw)
+                                    finally:
+                                        ib[0] -= 1
+
+                                return _grule
+
+                            setattr(attn, attr, _make_grule())
+
+                    def _make_gpre(
+                        ad_r: _StandaloneGDN2Adapter = ad,
+                        xb: list[torch.Tensor] = x_box,
+                        ib: list[int] = in_g_box,
+                        wc_f: bool = g_wc,
+                        wr_f: bool = g_wr,
+                    ):
                         def _gpre(_m: nn.Module, a: tuple[Any, ...], kw: dict[str, Any]) -> None:
                             x_in = a[0] if a else (kw["hidden_states"] if "hidden_states" in kw else kw["x"])
                             amask = kw.get("attention_mask", a[2] if len(a) >= 3 else None)
@@ -2791,7 +2874,7 @@ else:
                             ):
                                 x_in = x_in * amask[:, -x_in.shape[1] :, None].to(x_in.dtype)
                             xb.append(x_in)
-                            active_gdn2.append((ad_r, xb))
+                            active_gdn2.append((ad_r, xb, ib, wc_f, wr_f))
 
                         return _gpre
 
@@ -2806,37 +2889,41 @@ else:
 
                     attn.register_forward_pre_hook(_make_gpre(), with_kwargs=True)
                     attn.register_forward_hook(_make_gpost())
-                    g_wrapped = False
-                    for attr in ("chunk_gated_delta_rule", "fused_recurrent_gated_delta_rule"):
-                        if callable(getattr(attn, attr, None)):
-                            g_wrapped = True
-
-                            def _make_grule(ad_r: _StandaloneGDN2Adapter = ad, xb: list[torch.Tensor] = x_box):
-                                def _grule(q, k, v, *ra, **rkw):
-                                    return _run_gdn2_rule(ad_r, xb[-1], q, k, v, *ra, **rkw)
-
-                                return _grule
-
-                            setattr(attn, attr, _make_grule())
-                    if not g_wrapped:
+                    if not (g_wc and g_wr):
                         mname = type(attn).__module__
                         hmod = sys.modules.get(mname)
-                        if hmod is not None and mname not in patched_gmods:
-                            for fn_nm in (
-                                "chunk_gated_delta_rule",
-                                "torch_chunk_gated_delta_rule",
-                                "fused_recurrent_gated_delta_rule",
-                                "torch_recurrent_gated_delta_rule",
-                            ):
+                        if hmod is not None:
+                            miss_g: list[tuple[str, bool]] = []
+                            if not g_wc:
+                                miss_g.extend((nm, False) for nm in chunk_attrs)
+                            if not g_wr:
+                                miss_g.extend((nm, True) for nm in rec_attrs)
+                            for fn_nm, rec_only in miss_g:
+                                if (mname, fn_nm) in patched_gmods:
+                                    continue
                                 orig_fn = getattr(hmod, fn_nm, None)
                                 if callable(orig_fn):
-                                    patched_gmods.add(mname)
+                                    patched_gmods.add((mname, fn_nm))
 
-                                    def _gmdisp(q, k, v, *ra, _orig: Callable[..., Any] = orig_fn, **rkw):
+                                    def _gmdisp(
+                                        q,
+                                        k,
+                                        v,
+                                        *ra,
+                                        _orig: Callable[..., Any] = orig_fn,
+                                        _rec: bool = rec_only,
+                                        **rkw,
+                                    ):
                                         if not active_gdn2:
                                             return _orig(q, k, v, *ra, **rkw)
-                                        cad, cxb = active_gdn2[-1]
-                                        return _run_gdn2_rule(cad, cxb[-1], q, k, v, *ra, **rkw)
+                                        cad, cxb, cir, cwc, cwr = active_gdn2[-1]
+                                        if cir[0] > 0 or (_rec and cwr) or ((not _rec) and cwc):
+                                            return _orig(q, k, v, *ra, **rkw)
+                                        cir[0] += 1
+                                        try:
+                                            return _run_gdn2_rule(cad, cxb[-1], q, k, v, *ra, **rkw)
+                                        finally:
+                                            cir[0] -= 1
 
                                     setattr(hmod, fn_nm, _gmdisp)
 
@@ -2866,9 +2953,15 @@ else:
                     host_m.register_forward_pre_hook(_make_ampre(), with_kwargs=True)
                     host_m.register_forward_hook(_make_ampost())
 
-                patched_mods: set[str] = set()
+                patched_mods: set[tuple[str, str]] = set()
                 active_hssd: list[
-                    tuple[_StandaloneHSSDAdapter, list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]]]
+                    tuple[
+                        _StandaloneHSSDAdapter,
+                        list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]],
+                        list[int],
+                        bool,
+                        bool,
+                    ]
                 ] = []
                 for i, layer in enumerate(tm.layers):
                     attn = getattr(layer, "linear_attn", None)
@@ -2881,10 +2974,44 @@ else:
                     had = _StandaloneHSSDAdapter(hs, hv, dk, dv, hcfg, i).to(dtype=ref_dt)
                     attn.hssd_adapter = had
                     st_box: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]] = []
+                    in_h_box: list[int] = [0]
+                    h_wc = False
+                    h_wr = False
+                    for attr, rec_only in rule_specs:
+                        orig_h_fn = getattr(attn, attr, None)
+                        if callable(orig_h_fn):
+                            if rec_only:
+                                h_wr = True
+                            else:
+                                h_wc = True
+
+                            def _make_hrule(
+                                ad_r: _StandaloneHSSDAdapter = had,
+                                sb_r: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]] = st_box,
+                                ib: list[int] = in_h_box,
+                                ofn: Callable[..., Any] = orig_h_fn,
+                            ):
+                                def _hrule(q, k, v, *a, **kw):
+                                    if ib[0] > 0:
+                                        return ofn(q, k, v, *a, **kw)
+                                    ib[0] += 1
+                                    try:
+                                        return _recurrent_hssd(
+                                            ad_r, sb_r[-1][0], sb_r[-1][1], q, k, v, *a, pad_mask=sb_r[-1][2], **kw
+                                        )
+                                    finally:
+                                        ib[0] -= 1
+
+                                return _hrule
+
+                            setattr(attn, attr, _make_hrule())
 
                     def _make_hpre(
                         ad_r: _StandaloneHSSDAdapter = had,
                         sb_r: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]] = st_box,
+                        ib: list[int] = in_h_box,
+                        wc_f: bool = h_wc,
+                        wr_f: bool = h_wr,
                     ):
                         def _hpre(
                             _m: nn.Module, a: tuple[Any, ...], kw: dict[str, Any]
@@ -2916,7 +3043,7 @@ else:
                                     ret_pair = (a, nkw)
                             x_ad = x_in * wm.to(dtype=x_in.dtype).unsqueeze(-1) if wm is not None else x_in
                             sb_r.append((x_ad, wm, pm))
-                            active_hssd.append((ad_r, sb_r))
+                            active_hssd.append((ad_r, sb_r, ib, wc_f, wr_f))
                             return ret_pair
 
                         return _hpre
@@ -2935,38 +3062,43 @@ else:
                     attn.register_forward_pre_hook(_make_hpre(), with_kwargs=True)
                     attn.register_forward_hook(_make_hpost())
 
-                    wrapped_any = False
-                    for attr in ("chunk_gated_delta_rule", "fused_recurrent_gated_delta_rule"):
-                        if callable(getattr(attn, attr, None)):
-                            wrapped_any = True
-                            setattr(
-                                attn,
-                                attr,
-                                lambda q, k, v, *a, _ad=had, _sb=st_box, **kw: _recurrent_hssd(
-                                    _ad, _sb[-1][0], _sb[-1][1], q, k, v, *a, pad_mask=_sb[-1][2], **kw
-                                ),
-                            )
-                    if not wrapped_any:
+                    if not (h_wc and h_wr):
                         mname = type(attn).__module__
                         hmod = sys.modules.get(mname)
-                        if hmod is not None and mname not in patched_mods:
-                            for fn_nm in (
-                                "chunk_gated_delta_rule",
-                                "torch_chunk_gated_delta_rule",
-                                "fused_recurrent_gated_delta_rule",
-                                "torch_recurrent_gated_delta_rule",
-                            ):
+                        if hmod is not None:
+                            miss_h: list[tuple[str, bool]] = []
+                            if not h_wc:
+                                miss_h.extend((nm, False) for nm in chunk_attrs)
+                            if not h_wr:
+                                miss_h.extend((nm, True) for nm in rec_attrs)
+                            for fn_nm, rec_only in miss_h:
+                                if (mname, fn_nm) in patched_mods:
+                                    continue
                                 orig_fn = getattr(hmod, fn_nm, None)
                                 if callable(orig_fn):
-                                    patched_mods.add(mname)
+                                    patched_mods.add((mname, fn_nm))
 
-                                    def _mdisp(q, k, v, *a, _orig: Callable[..., Any] = orig_fn, **kw):
+                                    def _mdisp(
+                                        q,
+                                        k,
+                                        v,
+                                        *a,
+                                        _orig: Callable[..., Any] = orig_fn,
+                                        _rec: bool = rec_only,
+                                        **kw,
+                                    ):
                                         if not active_hssd:
                                             return _orig(q, k, v, *a, **kw)
-                                        cad, csb = active_hssd[-1]
-                                        return _recurrent_hssd(
-                                            cad, csb[-1][0], csb[-1][1], q, k, v, *a, pad_mask=csb[-1][2], **kw
-                                        )
+                                        cad, csb, cir, cwc, cwr = active_hssd[-1]
+                                        if cir[0] > 0 or (_rec and cwr) or ((not _rec) and cwc):
+                                            return _orig(q, k, v, *a, **kw)
+                                        cir[0] += 1
+                                        try:
+                                            return _recurrent_hssd(
+                                                cad, csb[-1][0], csb[-1][1], q, k, v, *a, pad_mask=csb[-1][2], **kw
+                                            )
+                                        finally:
+                                            cir[0] -= 1
 
                                     setattr(hmod, fn_nm, _mdisp)
 
@@ -3157,6 +3289,16 @@ else:
             tm.layers = nn.ModuleList(v_layers)
             tm.config.num_hidden_layers = len(v_layers)
             tm.config.layer_types = ltypes
+            self._slot_meta = [(v, r, lt) for v, ((_i, r), lt) in enumerate(zip(order, ltypes))]
+
+            def _tm_cache_pre(_m: nn.Module, _a: tuple[Any, ...], kw: dict[str, Any]) -> None:
+                pkv = kw.get("past_key_values")
+                if pkv is None:
+                    pkv = kw.get("past_key_value")
+                if pkv is not None:
+                    self._sync_cache_last_linear(pkv)
+
+            tm.register_forward_pre_hook(_tm_cache_pre, with_kwargs=True)
 
         def _make_kv_hook(self, phys: int, nm: str):
             def _hook(_m: nn.Module, _inp: Any, out: torch.Tensor):
@@ -3327,6 +3469,8 @@ else:
             **kwargs: Any,
         ) -> Any:
             try:
+                if past_key_values is not None:
+                    self._sync_cache_last_linear(past_key_values)
                 if logits_to_keep is not None and labels is None:
                     tm_kw: dict[str, Any] = {
                         "input_ids": input_ids,

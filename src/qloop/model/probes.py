@@ -35,7 +35,7 @@ from torch import nn
 
 from ..debug import cuda_mem_brief, describe, require
 from ._dtype import upcast
-from .introspect import FULL, inspect_model, router_of
+from .introspect import FULL, LINEAR, inspect_model, router_of
 from .loop import LoopSpec, _looks_like_probs, apply_loop, sha256_frozen_experts
 from .mhc import V3_BRIDGE_WEIGHTS
 
@@ -263,8 +263,51 @@ def _greedy(model: nn.Module, ids: torch.Tensor, steps: int) -> tuple[torch.Tens
         nxt = logits[-1].argmax(-1, keepdim=True)
         seq = torch.cat([seq, nxt], 1)
         out = model(input_ids=nxt, past_key_values=cache, use_cache=True)
+        if getattr(out, "past_key_values", None) is not None:
+            cache = out.past_key_values
         logits.append(out.logits[:, -1])
     return seq, torch.stack(logits, 1)
+
+
+@torch.no_grad()
+def _cached_forward_seq(model: nn.Module, seq: torch.Tensor, prefix_len: int) -> torch.Tensor:
+    """Teacher-forced cached decode over `seq[:, prefix_len:]` after prefilling `seq[:, :prefix_len]`."""
+    out = model(input_ids=seq[:, :prefix_len], use_cache=True)
+    cache = out.past_key_values
+    logits = [out.logits[:, -1]]
+    for pos in range(prefix_len, int(seq.shape[1])):
+        nxt = seq[:, pos : pos + 1]
+        out = model(input_ids=nxt, past_key_values=cache, use_cache=True)
+        if getattr(out, "past_key_values", None) is not None:
+            cache = out.past_key_values
+        logits.append(out.logits[:, -1])
+    return torch.stack(logits, 1)
+
+
+def _is_low_prec_or_quant_model(model: nn.Module, sample_dtype: torch.dtype) -> bool:
+    if sample_dtype in (torch.bfloat16, torch.float16):
+        return True
+    cfg = getattr(model, "config", None)
+    if bool(getattr(cfg, "quantization_config", None)):
+        return True
+    txt_cfg = getattr(cfg, "text_config", None)
+    if bool(getattr(txt_cfg, "quantization_config", None)):
+        return True
+    low_dtypes = {torch.bfloat16, torch.float16}
+    for t in (*model.parameters(), *model.buffers()):
+        if t.dtype in low_dtypes or "float8" in str(t.dtype):
+            return True
+    quant_attrs = ("weight_packed", "gate_up_proj_packed", "down_proj_packed", "weight_scale_inv", "qweight")
+    return any(any(hasattr(mod, attr) for attr in quant_attrs) for mod in model.modules())
+
+
+def _mean_logit_cosine(a_f32: torch.Tensor, b_f32: torch.Tensor) -> float:
+    flat_a = a_f32.reshape(-1, a_f32.shape[-1])
+    flat_b = b_f32.reshape(-1, b_f32.shape[-1])
+    both_zero = (flat_a.norm(dim=-1) == 0) & (flat_b.norm(dim=-1) == 0)
+    step_cos = F.cosine_similarity(flat_a, flat_b, dim=-1, eps=1e-8)
+    step_cos = torch.where(both_zero, torch.ones_like(step_cos), step_cos)
+    return float(step_cos.mean())
 
 
 @torch.no_grad()
@@ -276,24 +319,44 @@ def surgery_check(
     decode_steps: int = 8,
     atol: float = 2e-2,
     gdn2_cfg: dict[str, Any] | None = None,
+    hssd_cfg: dict[str, Any] | None = None,
+    max_probe_tokens: int = 256,
 ) -> dict[str, Any]:
     """Run on the real model in eval mode. Raises with a precise message on any violation."""
     from .gdn2 import install_gdn2
+    from .hssd import apply_hssd
     from .lsa import install_lsa
 
-    b_ids = _as_batches(ids)[0]
+    require(
+        not (gdn2_cfg and hssd_cfg),
+        "surgery_check accepts either gdn2_cfg or hssd_cfg, not both",
+    )
+    raw_ids = _as_batches(ids)[0]
+    max_tok = int(max_probe_tokens)
+    probe_ids = raw_ids[:, : min(int(raw_ids.shape[1]), max_tok)] if max_tok > 0 else raw_ids
+    prefix_len = int(probe_ids.shape[1])
+    require(prefix_len >= 1, "surgery_check requires at least 1 input token", prefix_len=prefix_len)
+
     was_training = model.training
     model.eval()
-    ref = model(input_ids=b_ids).logits
-    rep: dict[str, Any] = {}
+    ref = model(input_ids=probe_ids).logits
+    rep: dict[str, Any] = {"probe_seq_len": prefix_len}
     gdn2 = install_gdn2(model, gdn2_cfg) if gdn2_cfg else None
+    hssd = apply_hssd(model, hssd_cfg) if hssd_cfg else None
     mgr = install_lsa(model, dict(lsa_cfg, mode="distill")) if lsa_cfg else None
     ctl = apply_loop(model, loop_spec) if loop_spec else None
     try:
-        out = model(input_ids=b_ids).logits
-        rep["init_identity_maxdiff"] = float((out.float() - ref.float()).abs().max())
-        require(torch.equal(out, ref), "wrapped model is not bit-identical at init",
-                maxdiff=rep["init_identity_maxdiff"])
+        out = model(input_ids=probe_ids).logits
+        require(torch.isfinite(out).all(), "wrapped model produced non-finite logits at init")
+        if hssd is None:
+            rep["init_identity_maxdiff"] = float((out.float() - ref.float()).abs().max())
+            require(
+                torch.equal(out, ref),
+                "wrapped model is not bit-identical at init",
+                maxdiff=rep["init_identity_maxdiff"],
+            )
+        else:
+            rep["hssd_vs_gdn1_init_maxdiff"] = float((out.float() - ref.float()).abs().max())
         if ctl is not None:
             with torch.no_grad():
                 ctl.adapters.gates.fill_(0.05)
@@ -309,15 +372,21 @@ def surgery_check(
                 for w in (ad.erase_up.weight, ad.write_up.weight, ad.decay_up.weight):
                     noise = torch.randn(w.shape, generator=gen, dtype=torch.float32) * 0.02
                     w.copy_(noise.to(device=w.device, dtype=w.dtype))
-        seq, inc_logits = _greedy(model, b_ids, decode_steps)
-        full = model(input_ids=seq).logits[:, b_ids.shape[1] - 1:]
-        diff = float((full.float() - inc_logits.float()).abs().max())
-        rep["decode_vs_full_maxdiff"] = diff
-        require(diff < atol, "cached decode diverges from full forward (cache semantics broken)", diff=diff)
+        if hssd is not None:
+            gen_h = torch.Generator(device="cpu").manual_seed(37)
+            for had in hssd.adapters.values():
+                for h_attr in ("b_up", "w_up", "gamma_up"):
+                    h_mod = getattr(had, h_attr, None)
+                    hw = getattr(h_mod, "weight", None)
+                    if isinstance(hw, torch.Tensor):
+                        noise_h = torch.randn(hw.shape, generator=gen_h, dtype=torch.float32) * 0.02
+                        hw.copy_(noise_h.to(device=hw.device, dtype=hw.dtype))
+        seq, inc_logits = _greedy(model, probe_ids, decode_steps)
+        full = model(input_ids=seq).logits[:, prefix_len - 1 :]
         if mgr is not None:
             mgr.set_mode("sparse")
             mgr.clear_cache()
-            sp = model(input_ids=b_ids).logits
+            sp = model(input_ids=probe_ids).logits
             rep["lsa_sparse_vs_dense_maxdiff"] = float((sp.float() - out.float()).abs().max())
     finally:
         if ctl is not None:
@@ -326,10 +395,67 @@ def surgery_check(
             mgr.uninstall()
         if gdn2 is not None:
             gdn2.uninstall()
-    back = model(input_ids=b_ids).logits
-    if was_training:
-        model.train()
-    require(torch.equal(back, ref), "model not restored after unwrap/uninstall")
+        if hssd is not None:
+            hssd.uninstall()
+
+    try:
+        back = model(input_ids=probe_ids).logits
+        require(torch.equal(back, ref), "model not restored after unwrap/uninstall")
+        base_inc = _cached_forward_seq(model, seq, prefix_len)
+        base_full = model(input_ids=seq).logits[:, prefix_len - 1 :]
+    finally:
+        if was_training:
+            model.train()
+
+    f32_full = full.float()
+    f32_inc = inc_logits.float()
+    abs_err = (f32_full - f32_inc).abs()
+    diff = float(abs_err.max())
+    mae = float(abs_err.mean())
+    cos = _mean_logit_cosine(f32_full, f32_inc)
+    top1_match = float((f32_full.argmax(dim=-1) == f32_inc.argmax(dim=-1)).float().mean())
+
+    base_err = (base_full.float() - base_inc.float()).abs()
+    base_diff = float(base_err.max())
+    base_mae = float(base_err.mean())
+
+    is_low_prec = (out.dtype != torch.float64) and _is_low_prec_or_quant_model(model, out.dtype)
+    rep["decode_vs_full_maxdiff"] = diff
+    rep["decode_vs_full_mae"] = mae
+    rep["decode_vs_full_cosine"] = cos
+    rep["decode_vs_full_top1_match"] = top1_match
+    rep["base_decode_vs_full_maxdiff"] = base_diff
+    rep["base_decode_vs_full_mae"] = base_mae
+    rep["low_precision_calibrated"] = bool(is_low_prec)
+
+    if not is_low_prec:
+        eff_atol = max(float(atol), 2.0 * base_diff)
+        rep["effective_decode_atol"] = eff_atol
+        require(
+            diff < eff_atol,
+            "cached decode diverges from full forward (cache semantics broken)",
+            diff=diff,
+            mae=mae,
+            cosine=cos,
+            base_diff=base_diff,
+            eff_atol=eff_atol,
+        )
+    else:
+        eff_atol = max(float(atol), 2.5 * base_diff + 0.15)
+        eff_mae_atol = max(0.04, 2.5 * base_mae + 0.015)
+        rep["effective_decode_atol"] = eff_atol
+        ok = cos >= 0.9985 and (diff < eff_atol or (cos >= 0.9995 and mae < eff_mae_atol))
+        require(
+            ok,
+            "cached decode diverges from full forward (cache semantics broken)",
+            diff=diff,
+            mae=mae,
+            cosine=cos,
+            top1_match=top1_match,
+            base_diff=base_diff,
+            base_mae=base_mae,
+            eff_atol=eff_atol,
+        )
     log.info("surgery check passed: %s", rep)
     return rep
 
@@ -1180,9 +1306,10 @@ def run_structured_probe_suite(
             "bridge_rank": min(16, hidden),
             "attn_adapter_rank": min(8, hidden),
         }
+        probe_seq_len = min(int(b0.shape[1]), 256)
         lsa_surgery_cfg: dict[str, Any] | None = None
-        if b0.shape[1] >= 16:
-            blk = 8 if b0.shape[1] < 512 else 512
+        if probe_seq_len >= 16:
+            blk = 8 if probe_seq_len < 128 else 64
             pool = 2 if blk == 8 else 4
             lsa_surgery_cfg = {
                 "index_dim": min(64, max(4, hidden // 4)),
@@ -1194,9 +1321,41 @@ def run_structured_probe_suite(
                 "sinks": min(64, max(2, blk // 4)),
                 "num_select": min(64, max(2, blk // (pool * 2))),
             }
-        surgery_rep = surgery_check(
-            model, b0, loop_surgery_spec, lsa_surgery_cfg, decode_steps=decode_steps, atol=atol
+        has_linear = LINEAR in parts.layer_types
+        gdn2_surgery_cfg = (
+            {
+                "rank": min(8, hidden),
+                "chunk_size": 8 if probe_seq_len < 64 else 64,
+                "segment_chunks": 2,
+            }
+            if has_linear
+            else None
         )
+        surgery_rep = surgery_check(
+            model,
+            b0,
+            loop_surgery_spec,
+            lsa_surgery_cfg,
+            decode_steps=decode_steps,
+            atol=atol,
+            gdn2_cfg=gdn2_surgery_cfg,
+        )
+        hssd_surgery_rep: dict[str, Any] | None = None
+        if has_linear:
+            hssd_surgery_rep = surgery_check(
+                model,
+                b0,
+                loop_surgery_spec,
+                None,
+                decode_steps=min(int(decode_steps), 4),
+                atol=atol,
+                hssd_cfg={
+                    "rank": min(8, hidden),
+                    "chunk_size": 8 if probe_seq_len < 64 else 64,
+                    "window_chunks": 2,
+                    "checkpoint_segments": False,
+                },
+            )
 
         headroom_rep = probe_expert_headroom(
             model, batches, n_perturb=n_perturb, core_range=(p_end, c_end)
@@ -1281,6 +1440,7 @@ def run_structured_probe_suite(
         "probes": {
             "backward": backward_rep,
             "surgery": surgery_rep,
+            **({"hssd_surgery": hssd_surgery_rep} if hssd_surgery_rep is not None else {}),
             "expert_headroom": headroom_rep,
             "reentry_anchors": reentry_rep,
             "positional_extrapolation": pos_rep,

@@ -208,6 +208,27 @@ class SharedKVView:
 
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         cache = object.__getattribute__(self, "_cache")
+        if hasattr(cache, "dequantize") or type(cache).__name__ in ("QuantizedHybridCache", "_QuantizedKV"):
+            return cache.update(key_states[..., :0, :], value_states[..., :0, :], layer_idx, *args, **kwargs)
+        layers = getattr(cache, "layers", None)
+        if isinstance(layers, (list, tuple, nn.ModuleList)) and 0 <= layer_idx < len(layers):
+            lyr = layers[layer_idx]
+            k_t = getattr(lyr, "keys", None)
+            v_t = getattr(lyr, "values", None)
+            if isinstance(k_t, torch.Tensor) and isinstance(v_t, torch.Tensor) and k_t.numel() > 0:
+                return k_t, v_t
+        kc = getattr(cache, "key_cache", None)
+        vc = getattr(cache, "value_cache", None)
+        if (
+            isinstance(kc, list)
+            and isinstance(vc, list)
+            and 0 <= layer_idx < len(kc)
+            and 0 <= layer_idx < len(vc)
+            and isinstance(kc[layer_idx], torch.Tensor)
+            and isinstance(vc[layer_idx], torch.Tensor)
+            and kc[layer_idx].numel() > 0
+        ):
+            return kc[layer_idx], vc[layer_idx]
         return cache.update(key_states[..., :0, :], value_states[..., :0, :], layer_idx, *args, **kwargs)
 
 
@@ -436,10 +457,17 @@ class VirtualLayer(nn.Module):
             else:
                 ctx.start[s.r] = x
                 x = ctl.adapters.bridge(x, ctx.anchor, s.r - 2)
-        pkv = kwargs.get("past_key_values")
-        if pkv is not None and s.cache_idx != s.vidx:
+        pkv_key = (
+            "past_key_values"
+            if "past_key_values" in kwargs
+            else ("past_key_value" if "past_key_value" in kwargs else None)
+        )
+        pkv = kwargs.get(pkv_key) if pkv_key is not None else None
+        if s.vidx == 0 and pkv is not None:
+            ctl._sync_cache_last_linear(pkv)
+        if pkv is not None and s.cache_idx != s.vidx and pkv_key is not None:
             kwargs = dict(kwargs)
-            kwargs["past_key_values"] = SharedKVView(pkv)
+            kwargs[pkv_key] = SharedKVView(pkv)
         r, idx_mods, cache_idx, inner = s.r, self._idx_mods, s.cache_idx, self.inner
         attn_mod = getattr(inner, "self_attn", None)
 
@@ -541,8 +569,30 @@ class LoopController:
         lo, hi = self.spec.prelude_end, self.spec.core_end
         return [(i, self._orig["layers"][i]) for i in range(lo, hi) if self.parts.layer_types[i] == layer_type]
 
+    def _last_active_linear_vidx(self) -> int | None:
+        for s in reversed(self.schedule):
+            if s.layer_type == LINEAR and s.r <= self.active_passes:
+                return s.cache_idx
+        return None
+
+    def _sync_cache_last_linear(self, pkv: Any) -> None:
+        if pkv is None or not isinstance(getattr(pkv, "last_linear_layer", None), int):
+            return
+        last_lin = self._last_active_linear_vidx()
+        if last_lin is not None and pkv.last_linear_layer != last_lin:
+            pkv.last_linear_layer = last_lin
+
     def _register_hooks(self) -> None:
         spec = self.spec
+
+        def _tm_cache_pre(_mod: nn.Module, _args: tuple[Any, ...], kw: dict[str, Any]) -> None:
+            pkv = kw.get("past_key_values")
+            if pkv is None:
+                pkv = kw.get("past_key_value")
+            if pkv is not None:
+                self._sync_cache_last_linear(pkv)
+
+        self._hooks.append(self.parts.text_model.register_forward_pre_hook(_tm_cache_pre, with_kwargs=True))
         if spec.kv_share and spec.num_passes > 1:
             for phys, layer in self._core_layers(FULL):
                 found = find_children(attention_module(layer, FULL), list(spec.kv_proj_names))
@@ -945,20 +995,29 @@ class LoopController:
         log.info("loop retrofit removed (adapters kept on controller.adapters)")
 
 
-def _iter_canonical_params(mod: nn.Module, prefix: str, seen: set[int]) -> list[tuple[str, nn.Parameter]]:
-    out: list[tuple[str, nn.Parameter]] = []
+def _iter_canonical_params(mod: nn.Module, prefix: str, seen: set[int]) -> list[tuple[str, torch.Tensor]]:
+    out: list[tuple[str, torch.Tensor]] = []
     for pname, p in mod._parameters.items():
         if p is not None and id(p) not in seen:
             seen.add(id(p))
             full = f"{prefix}.{pname}" if prefix else pname
             out.append((full, p))
+    for bname, b in mod._buffers.items():
+        if b is not None and id(b) not in seen:
+            seen.add(id(b))
+            full = f"{prefix}.{bname}" if prefix else bname
+            out.append((full, b))
     for cname, child in mod._modules.items():
         if child is None:
             continue
         slot = getattr(child, "slot", None)
+        meta = getattr(child, "_meta", None)
         inner = getattr(child, "inner", None)
         if slot is not None and isinstance(inner, nn.Module) and hasattr(slot, "phys"):
             c_prefix = f"{prefix}.{slot.phys}" if prefix else str(slot.phys)
+            out.extend(_iter_canonical_params(inner, c_prefix, seen))
+        elif isinstance(meta, tuple) and len(meta) >= 2 and isinstance(inner, nn.Module):
+            c_prefix = f"{prefix}.{meta[1]}" if prefix else str(meta[1])
             out.extend(_iter_canonical_params(inner, c_prefix, seen))
         else:
             c_prefix = f"{prefix}.{cname}" if prefix else cname
@@ -982,24 +1041,24 @@ def _is_expert_param_path(name: str) -> bool:
 
 
 def sha256_frozen_experts(model: nn.Module) -> str:
-    """Compute a deterministic SHA-256 digest over frozen MoE expert parameters.
+    """Compute a deterministic SHA-256 digest over frozen MoE expert parameters and buffers.
 
-    Covers all `experts` and `shared_expert` parameters with `requires_grad == False`,
-    canonicalising `VirtualLayer` wrappers back to physical layer indices so the digest is
-    identical before, during, and after `apply_loop`.
+    Covers all `experts` and `shared_expert` parameters and quantized buffers with
+    `requires_grad == False`, canonicalising `VirtualLayer` wrappers back to physical layer
+    indices so the digest is identical before, during, and after `apply_loop`.
     """
     seen: set[int] = set()
     items = [
-        (name, p)
-        for name, p in _iter_canonical_params(model, "", seen)
-        if not p.requires_grad and _is_expert_param_path(name)
+        (name, t)
+        for name, t in _iter_canonical_params(model, "", seen)
+        if not t.requires_grad and _is_expert_param_path(name)
     ]
     items.sort(key=lambda kv: kv[0])
     digest = hashlib.sha256()
-    for name, p in items:
-        header = f"{name}|{p.dtype}|{tuple(p.shape)}|".encode()
+    for name, t in items:
+        header = f"{name}|{t.dtype}|{tuple(t.shape)}|".encode()
         digest.update(header)
-        raw = p.detach().contiguous().cpu().reshape(-1).view(torch.uint8).numpy().tobytes()
+        raw = t.detach().contiguous().cpu().reshape(-1).view(torch.uint8).numpy().tobytes()
         digest.update(raw)
     return digest.hexdigest()
 

@@ -1036,3 +1036,408 @@ def test_issues_5_6_chunk_vs_recurrent_fp64_forward_backward_cache_duty_parity()
             assert isinstance(tc, torch.Tensor) and isinstance(tr, torch.Tensor)
             assert tc.grad is not None and tr.grad is not None
             assert float((tc.grad - tr.grad).abs().max()) < 1e-12, f"Grad mismatch on {k_name}"
+
+
+# ==============================================================================
+# 10. HF>=5 Qwen3_5GatedDeltaNet (`recurrent_gated_delta_rule`), SharedKVView,
+#     Qwen3_5DynamicCache.last_linear_layer, & Frozen Expert Buffer SHA-256
+# ==============================================================================
+def _convert_toy_to_hf5_recurrent_attr(model: torch.nn.Module) -> None:
+    """Mimic `transformers>=5` `Qwen3_5GatedDeltaNet`: `self.recurrent_gated_delta_rule` (NO `fused_*` attr)."""
+    from qloop.model._dtype import upcast
+
+    for layer in model.model.layers:  # type: ignore[union-attr]
+        attn = getattr(layer, "linear_attn", None)
+        if attn is None:
+            continue
+        orig_rec = attn.fused_recurrent_gated_delta_rule
+        delattr(attn, "fused_recurrent_gated_delta_rule")
+        assert not hasattr(attn, "fused_recurrent_gated_delta_rule")
+        attn.recurrent_gated_delta_rule = orig_rec
+
+        def _hf5_forward(
+            x: torch.Tensor,
+            cache_params: object = None,
+            attention_mask: torch.Tensor | None = None,
+            _a: torch.nn.Module = attn,
+        ) -> torch.Tensor:
+            b, t, _ = x.shape
+            qkv = _a.in_proj_qkv(x).transpose(1, 2)
+            has_prev = bool(getattr(cache_params, "has_previous_state", True)) if cache_params is not None else False
+            prev = (
+                cache_params.conv_states[_a.layer_idx]  # type: ignore[attr-defined]
+                if (cache_params is not None and (t > 1 or has_prev))
+                else None
+            )
+            if prev is None:
+                prev = qkv.new_zeros(b, qkv.shape[1], _a.ck - 1)
+            seq = torch.cat([prev, qkv], dim=-1)
+            if cache_params is not None:
+                cache_params.conv_states[_a.layer_idx] = seq[..., -(_a.ck - 1) :]  # type: ignore[attr-defined]
+            qkv = F.silu(_a.conv1d(seq)).transpose(1, 2)
+            q, k, v = qkv.view(b, t, 3, _a.nh, _a.d).unbind(2)
+            q, k = F.normalize(upcast(q), dim=-1), F.normalize(upcast(k), dim=-1)
+            v = upcast(v)
+            bb, aa = upcast(_a.in_proj_ba(x)).chunk(2, dim=-1)
+            beta = torch.sigmoid(bb)
+            g = -upcast(_a.A_log).exp() * F.softplus(aa + upcast(_a.dt_bias))
+            init_state = (
+                cache_params.recurrent_states[_a.layer_idx]  # type: ignore[attr-defined]
+                if (cache_params is not None and (t > 1 or has_prev))
+                else None
+            )
+            rule_fn = _a.recurrent_gated_delta_rule if t == 1 else _a.chunk_gated_delta_rule
+            core_out, final_state = rule_fn(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                initial_state=init_state,
+                output_final_state=cache_params is not None,
+                use_qk_l2norm_in_kernel=False,
+                scale=1.0,
+            )
+            if cache_params is not None:
+                cache_params.recurrent_states[_a.layer_idx] = final_state  # type: ignore[attr-defined]
+            o = _a.norm(core_out.to(x.dtype))
+            return _a.out_proj(o.reshape(b, t, _a.nh * _a.d))
+
+        attn.forward = _hf5_forward  # type: ignore[method-assign]
+
+
+def test_hf5_qwen35_recurrent_gated_delta_rule_wrapping_gdn2_hssd_and_standalone():
+    import ast
+    import sys
+    import types
+
+    from qloop.infer.hf_custom_modeling import _STANDALONE_CONFIG_SRC, _STANDALONE_MODELING_SRC
+    from qloop.model.gdn2 import GDN2Config, install_gdn2
+    from qloop.model.toy import ToyConfig, ToyForCausalLM
+
+    model = build_toy(num_hidden_layers=8, hidden_size=32).double().eval()
+    _convert_toy_to_hf5_recurrent_attr(model)
+
+    gen = torch.Generator().manual_seed(202611)
+    ids = torch.randint(0, model.config.vocab_size, (2, 15), generator=gen)
+    ref_unwrapped = model(ids).logits.detach().clone()
+
+    # 10A. GDN-2 + Loop on HF5 `recurrent_gated_delta_rule` (reproducing & fixing the diff=1.0625 Colab bug)
+    gdn2 = install_gdn2(model, GDN2Config(rank=8, chunk_size=8))
+    ctl = apply_loop(model, {"prelude_end": 2, "core_end": 6, "num_passes": 2, "target_virtual_layers": 12})
+    assert torch.equal(model(ids).logits, ref_unwrapped)
+    with torch.no_grad():
+        ctl.adapters.gates.fill_(0.25)
+        for ad in gdn2.adapters.values():
+            for w in (ad.erase_up.weight, ad.write_up.weight, ad.decay_up.weight):
+                w.copy_(torch.randn(w.shape, generator=gen, dtype=w.dtype) * 0.15)
+    full_gdn2 = model(ids).logits
+    pre_gdn2 = model(ids[:, :11], use_cache=True)
+    cache_gdn2 = pre_gdn2.past_key_values
+    dec_gdn2 = [pre_gdn2.logits[:, -1:]]
+    for pos in range(11, 15):
+        step_out = model(ids[:, pos : pos + 1], past_key_values=cache_gdn2, use_cache=True)
+        dec_gdn2.append(step_out.logits)
+    assert float((torch.cat(dec_gdn2, dim=1) - full_gdn2[:, 10:]).abs().max()) < 1e-11
+    ctl.unwrap()
+    gdn2.uninstall()
+    for lyr in model.model.layers:
+        la = getattr(lyr, "linear_attn", None)
+        if la is not None:
+            assert hasattr(la, "recurrent_gated_delta_rule")
+            assert not hasattr(la, "fused_recurrent_gated_delta_rule")
+            assert not hasattr(la, "gdn2_adapter")
+    assert torch.equal(model(ids).logits, ref_unwrapped)
+
+    # 10B. HSSD v3.1 + Loop on HF5 `recurrent_gated_delta_rule`
+    h_handle = apply_hssd(model, HSSDConfig(rank=8, chunk_size=8, window_chunks=2, checkpoint_segments=False))
+    ctl_h = apply_loop(model, {"prelude_end": 2, "core_end": 6, "num_passes": 2, "target_virtual_layers": 12})
+    with torch.no_grad():
+        ctl_h.adapters.gates.fill_(0.25)
+        for had in h_handle.adapters.values():
+            for p in had.parameters():
+                p.add_(torch.randn(p.shape, generator=gen, dtype=p.dtype) * 0.05)
+    full_hssd = model(ids).logits
+    hcache = HSSDHybridCache(model.config)
+    pre_h = model(ids[:, :11], past_key_values=hcache, use_cache=True)
+    dec_h = [pre_h.logits[:, -1:]]
+    for pos in range(11, 15):
+        step_out = model(ids[:, pos : pos + 1], past_key_values=hcache, use_cache=True)
+        dec_h.append(step_out.logits)
+    assert float((torch.cat(dec_h, dim=1) - full_hssd[:, 10:]).abs().max()) < 1e-11
+    ctl_h.unwrap()
+    remove_hssd(model)
+    assert torch.equal(model(ids).logits, ref_unwrapped)
+
+    # 10C. Partial instance attr (`chunk` on instance, `recurrent` ONLY on host module) + re-entrancy guard
+    mod_OnlyRec = types.ModuleType("_mock_hf5_partial_mod")
+    la0 = model.model.layers[0].linear_attn
+    orig_rec0 = la0.recurrent_gated_delta_rule
+    mod_OnlyRec.recurrent_gated_delta_rule = orig_rec0  # type: ignore[attr-defined]
+    sys.modules["_mock_hf5_partial_mod"] = mod_OnlyRec
+    try:
+        m_part = build_toy(num_hidden_layers=4, hidden_size=32).double().eval()
+        _convert_toy_to_hf5_recurrent_attr(m_part)
+        for lyr in m_part.model.layers:
+            la = getattr(lyr, "linear_attn", None)
+            if la is None:
+                continue
+
+            class _PartialDeltaNet(type(la)):  # type: ignore[misc]
+                pass
+
+            _PartialDeltaNet.__module__ = "_mock_hf5_partial_mod"
+            la.__class__ = _PartialDeltaNet
+            delattr(la, "recurrent_gated_delta_rule")
+            orig_fwd = la.forward
+
+            def _deleg_fwd(
+                hidden_states: torch.Tensor,
+                *fa: object,
+                _la: torch.nn.Module = la,
+                _of: object = orig_fwd,
+                **fkw: object,
+            ) -> torch.Tensor:
+                _la.recurrent_gated_delta_rule = mod_OnlyRec.recurrent_gated_delta_rule  # type: ignore[attr-defined]
+                try:
+                    return _of(hidden_states, *fa, **fkw)  # type: ignore[operator]
+                finally:
+                    delattr(_la, "recurrent_gated_delta_rule")
+
+            la.forward = _deleg_fwd  # type: ignore[method-assign]
+
+        g_part = install_gdn2(m_part, GDN2Config(rank=8, chunk_size=8))
+        # Step-0 zero-init re-entrancy check + perturbed decode check
+        ref_p = m_part(ids[:, :10]).logits
+        with torch.no_grad():
+            for ad in g_part.adapters.values():
+                ad.erase_up.weight.fill_(0.08)
+                ad.write_up.weight.fill_(-0.06)
+        full_p = m_part(ids[:, :10]).logits
+        assert not torch.equal(full_p, ref_p)
+        pre_p = m_part(ids[:, :8], use_cache=True)
+        s1_p = m_part(ids[:, 8:9], past_key_values=pre_p.past_key_values, use_cache=True)
+        s2_p = m_part(ids[:, 9:10], past_key_values=pre_p.past_key_values, use_cache=True)
+        inc_p = torch.cat([pre_p.logits[:, -1:], s1_p.logits, s2_p.logits], dim=1)
+        assert float((inc_p - full_p[:, 7:]).abs().max()) < 1e-11
+        g_part.uninstall()
+        assert mod_OnlyRec.recurrent_gated_delta_rule is orig_rec0  # type: ignore[attr-defined]
+        assert torch.equal(m_part(ids[:, :10]).logits, ref_p)
+    finally:
+        sys.modules.pop("_mock_hf5_partial_mod", None)
+
+    # 10D. Standalone `_STANDALONE_MODELING_SRC` zero-`qloop` branch (AST 3.9 + GDN-2 & HSSD HF5 decode)
+    ast.parse(_STANDALONE_CONFIG_SRC, filename="configuration_qwen36_loophssd.py", feature_version=(3, 9))
+    ast.parse(_STANDALONE_MODELING_SRC, filename="modeling_qwen36_loophssd.py", feature_version=(3, 9))
+
+    mock_tf = types.ModuleType("transformers")
+
+    class _MockPretrainedConfig:
+        model_type = "qwen36_loop_hssd"
+
+        def __init__(self, **kw: object) -> None:
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    class _MockPreTrainedModel(torch.nn.Module):
+        def __init__(self, config: object) -> None:
+            super().__init__()
+            self.config = config
+
+    class _MockAutoConfig:
+        @staticmethod
+        def for_model(_mtype: str, **kw: object) -> ToyConfig:
+            known = {f for f in ToyConfig.__dataclass_fields__ if f in kw}
+            if "layer_types" in kw and isinstance(kw["layer_types"], list):
+                kw = dict(kw, layer_types=tuple(kw["layer_types"]))
+            return ToyConfig(**{k: kw[k] for k in known})  # type: ignore[arg-type]
+
+    class _MockAutoModelForCausalLM:
+        @staticmethod
+        def from_config(cfg: ToyConfig, **_kw: object) -> ToyForCausalLM:
+            m = ToyForCausalLM(cfg).double()
+            _convert_toy_to_hf5_recurrent_attr(m)
+            return m
+
+    mock_tf.PretrainedConfig = _MockPretrainedConfig  # type: ignore[attr-defined]
+    mock_tf.PreTrainedModel = _MockPreTrainedModel  # type: ignore[attr-defined]
+    mock_tf.AutoConfig = _MockAutoConfig  # type: ignore[attr-defined]
+    mock_tf.AutoModelForCausalLM = _MockAutoModelForCausalLM  # type: ignore[attr-defined]
+
+    saved_tf = sys.modules.get("transformers")
+    saved_cfg_mod = sys.modules.get("configuration_qwen36_loophssd")
+    orig_find_spec = importlib.util.find_spec
+    sys.modules["transformers"] = mock_tf
+    try:
+        importlib.util.find_spec = lambda name, *a, **kw: (  # type: ignore[assignment]
+            None if name == "qloop" else orig_find_spec(name, *a, **kw)
+        )
+        cfg_mod = types.ModuleType("configuration_qwen36_loophssd")
+        exec(compile(_STANDALONE_CONFIG_SRC, "configuration_qwen36_loophssd.py", "exec"), cfg_mod.__dict__)
+        sys.modules["configuration_qwen36_loophssd"] = cfg_mod
+
+        mod_ns = types.ModuleType("modeling_qwen36_loophssd")
+        exec(compile(_STANDALONE_MODELING_SRC, "modeling_qwen36_loophssd.py", "exec"), mod_ns.__dict__)
+        assert mod_ns._HAS_QLOOP is False
+
+        base_d = {
+            "vocab_size": 128,
+            "hidden_size": 32,
+            "moe_intermediate_size": 16,
+            "shared_expert_intermediate_size": 16,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "partial_rotary_factor": 0.5,
+            "linear_num_heads": 4,
+            "linear_head_dim": 8,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        }
+        for mode_key in ("gdn2", "hssd"):
+            arch_d: dict[str, object] = {
+                "base_model_type": "toy",
+                "base_dtype": "float64",
+                "loop": {"enabled": True, "prelude_end": 0, "core_end": 4, "num_passes": 2, "kv_share": True},
+                mode_key: {"enabled": True, "rank": 8, "chunk_size": 8, "window_chunks": 2},
+            }
+            scfg = cfg_mod.Qwen36LoopHSSDConfig(base_config=base_d, qloop_v3_arch=arch_d)
+            smodel = mod_ns.Qwen36LoopHSSDForCausalLM(scfg, _dtype_override=torch.float64).eval()
+            with torch.no_grad():
+                smodel._loop_adapters.gates.fill_(0.2)
+                for p in smodel.parameters():
+                    if p.ndim >= 2 and p.shape[0] <= 16:
+                        p.add_(torch.randn(p.shape, generator=gen, dtype=p.dtype) * 0.05)
+            tok_ids = torch.randint(0, 120, (1, 12), generator=gen)
+            s_full = smodel(input_ids=tok_ids, use_cache=False).logits
+            s_pre = smodel(input_ids=tok_ids[:, :9], use_cache=True)
+            s_dec = [s_pre.logits[:, -1:]]
+            for pos in range(9, 12):
+                s_step = smodel(
+                    input_ids=tok_ids[:, pos : pos + 1],
+                    past_key_values=s_pre.past_key_values,
+                    use_cache=True,
+                )
+                s_dec.append(s_step.logits)
+            assert float((torch.cat(s_dec, dim=1) - s_full[:, 8:]).abs().max()) < 1e-11
+    finally:
+        importlib.util.find_spec = orig_find_spec  # type: ignore[assignment]
+        if saved_tf is None:
+            sys.modules.pop("transformers", None)
+        else:
+            sys.modules["transformers"] = saved_tf
+        if saved_cfg_mod is None:
+            sys.modules.pop("configuration_qwen36_loophssd", None)
+        else:
+            sys.modules["configuration_qwen36_loophssd"] = saved_cfg_mod
+
+
+def test_hf5_shared_kv_view_zero_reinvocation_qwen35_last_linear_and_buffer_sha256():
+    from qloop.model.loop import SharedKVView, sha256_frozen_experts
+
+    # 1. HF5 `.layers[i].keys/.values` DynamicCache fast-path in SharedKVView (zero re-invocation on r >= 2)
+    class _HF5Layer:
+        def __init__(self) -> None:
+            self.keys: torch.Tensor | None = None
+            self.values: torch.Tensor | None = None
+            self.update_calls = 0
+
+        def update(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            assert k.shape[-2] > 0, "SharedKVView must NOT invoke DynamicLayer.update with empty slice"
+            self.update_calls += 1
+            self.keys = k if self.keys is None else torch.cat([self.keys, k], dim=-2)
+            self.values = v if self.values is None else torch.cat([self.values, v], dim=-2)
+            return self.keys, self.values
+
+    class _HF5HybridCache:
+        def __init__(self, n_layers: int, last_lin: int) -> None:
+            self.layers = [_HF5Layer() for _ in range(n_layers)]
+            self.conv_states: list[torch.Tensor | None] = [None] * n_layers
+            self.recurrent_states: list[torch.Tensor | None] = [None] * n_layers
+            self.last_linear_layer = last_lin
+
+        @property
+        def has_previous_state(self) -> bool:
+            return self.conv_states[self.last_linear_layer] is not None
+
+        def get_seq_length(self, layer_idx: int = 0) -> int:
+            for lyr in self.layers:
+                if lyr.keys is not None:
+                    return int(lyr.keys.shape[-2])
+            return 0
+
+        def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int, *_a: object, **_kw: object):
+            return self.layers[layer_idx].update(k, v)
+
+    # Zero-coda schedule (`prelude_end=4, core_end=8, num_passes=3 -> 16 virtual layers`, tail linear = 14)
+    model = build_toy(num_hidden_layers=8, hidden_size=32).double().eval()
+    _convert_toy_to_hf5_recurrent_attr(model)
+    ctl = apply_loop(model, {"prelude_end": 4, "core_end": 8, "num_passes": 3, "target_virtual_layers": 16})
+    with torch.no_grad():
+        ctl.adapters.gates.fill_(0.3)
+
+    gen = torch.Generator().manual_seed(777)
+    ids = torch.randint(0, model.config.vocab_size, (1, 10), generator=gen)
+
+    # Test active_passes=3: Pass-1 core full-attn is slot 7; Passes 2 & 3 (slots 11, 15) share slot 7
+    hf5_c3 = _HF5HybridCache(16, last_lin=14)
+    full_3 = model(ids).logits
+    pre_3 = model(ids[:, :7], past_key_values=hf5_c3, use_cache=True)
+    dec_3 = [pre_3.logits[:, -1:]]
+    for pos in range(7, 10):
+        dec_3.append(model(ids[:, pos : pos + 1], past_key_values=hf5_c3, use_cache=True).logits)
+    assert float((torch.cat(dec_3, dim=1) - full_3[:, 6:]).abs().max()) < 1e-12
+    # 1 prefill + 3 decode steps = 4 calls total on slot 7 (ZERO calls on slots 11 & 15 and ZERO empty updates!)
+    assert hf5_c3.layers[7].update_calls == 4
+    assert hf5_c3.layers[11].keys is None and hf5_c3.layers[15].keys is None
+
+    # Test active_passes=1 & active_passes=2 with Qwen3_5DynamicCache `last_linear_layer` (initially 14 in Pass 3!)
+    for act_r, expected_last_lin in ((1, 6), (2, 10)):
+        ctl.set_active_passes(act_r)
+        hf5_cr = _HF5HybridCache(16, last_lin=14)
+        full_r = model(ids).logits
+        pre_r = model(ids[:, :7], past_key_values=hf5_cr, use_cache=True)
+        assert hf5_cr.last_linear_layer == expected_last_lin
+        assert hf5_cr.has_previous_state is True
+        dec_r = [pre_r.logits[:, -1:]]
+        for pos in range(7, 10):
+            dec_r.append(model(ids[:, pos : pos + 1], past_key_values=hf5_cr, use_cache=True).logits)
+        assert float((torch.cat(dec_r, dim=1) - full_r[:, 6:]).abs().max()) < 1e-12
+
+    # Custom QuantizedHybridCache-style (`dequantize` attribute) still delegates to `cache.update`
+    class _MockQuantCache:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def dequantize(self) -> None:
+            pass
+
+        def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int, *_a: object, **_kw: object):
+            assert k.shape[-2] == 0 and layer_idx == 3
+            self.calls += 1
+            return torch.ones(1, 2, 5, 8), torch.ones(1, 2, 5, 8)
+
+    qc = _MockQuantCache()
+    sv = SharedKVView(qc)
+    k_ret, _ = sv.update(torch.randn(1, 2, 1, 8), torch.randn(1, 2, 1, 8), 3)
+    assert qc.calls == 1 and k_ret.shape == (1, 2, 5, 8)
+
+    ctl.unwrap()
+
+    # 2. Frozen expert quantized buffer SHA-256 invariance across `apply_loop` & mutation sensitivity
+    for p in model.parameters():
+        p.requires_grad_(False)
+    packed_buf = torch.tensor([17, 42, 99, 255], dtype=torch.uint8)
+    model.model.layers[2].mlp.experts.register_buffer("weight_packed", packed_buf)
+    sha_pre = sha256_frozen_experts(model)
+    ctl2 = apply_loop(model, {"prelude_end": 2, "core_end": 6, "num_passes": 2, "target_virtual_layers": 12})
+    sha_loop = sha256_frozen_experts(model)
+    ctl2.unwrap()
+    sha_post = sha256_frozen_experts(model)
+    assert sha_pre == sha_loop == sha_post
+    packed_buf[0] ^= 1
+    assert sha256_frozen_experts(model) != sha_pre
+

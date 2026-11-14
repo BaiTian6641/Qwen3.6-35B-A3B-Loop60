@@ -107,6 +107,7 @@ class WholeModelPackConfig:
 class LoadedModelPack(Stack):
     """Hydrated Whole Model Pack combining `Stack` ergonomics with direct `nn.Module` / depth calls."""
 
+    hssd: Any = None
     hf_model: Qwen36LoopHSSDForCausalLM | None = None
     pack_config: Qwen36LoopHSSDConfig | None = None
     manifest: dict[str, Any] | None = None
@@ -177,8 +178,12 @@ def _unwrap_source(stack_or_model: Any, tokenizer: Any = None) -> _UnwrappedSour
     if isinstance(stack_or_model, Stack):
         st = stack_or_model
         raw_model = st.model
+        hcfg_st: dict[str, Any] | None = None
         if isinstance(raw_model, Qwen36LoopHSSDForCausalLM):
             bb = raw_model.backbone
+            arch_st = raw_model.config.qloop_v3_arch or {}
+            if (arch_st.get("hssd") or {}).get("enabled"):
+                hcfg_st = dict(arch_st["hssd"])
             loop = st.loop or raw_model.loop_controller or _detect_loop_controller(bb)
             gdn2 = st.gdn2 or raw_model.gdn2_manager
             lsa = st.lsa or raw_model.lsa_manager
@@ -191,7 +196,7 @@ def _unwrap_source(stack_or_model: Any, tokenizer: Any = None) -> _UnwrappedSour
             deltas = st.deltas or _detect_hot_deltas(bb)
         tok = tokenizer if tokenizer is not None else st.tokenizer
         bname = str((st.load_info or {}).get("name") or DEFAULT_BASE_MODEL)
-        return _UnwrappedSource(bb, tok, loop, gdn2, lsa, deltas, None, st, bname)
+        return _UnwrappedSource(bb, tok, loop, gdn2, lsa, deltas, hcfg_st, st, bname)
 
     if isinstance(stack_or_model, Qwen36LoopHSSDForCausalLM):
         bb = stack_or_model.backbone
@@ -1568,6 +1573,7 @@ def load_whole_model_pack(
             "active_passes": hf_model.active_passes,
         },
     )
+    pack.hssd = hf_model.hssd_handle
     pack.hf_model = hf_model
     pack.pack_config = hf_model.config
     pack.manifest = manifest

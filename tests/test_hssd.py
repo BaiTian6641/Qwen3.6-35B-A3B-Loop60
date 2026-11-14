@@ -383,7 +383,10 @@ def _perturb_hssd_and_loop(handle, ctl, *, mor: bool, seed: int = 19) -> None:
         for ad in handle.adapters.values():
             # Push some erase channels positive so b_gate enters (1, 2) over-relaxed regime
             ad.erase_up.weight.add_(0.8)
-            ad.theta_proj.weight.normal_(0.0, 0.25, generator=gen)
+            if ad.theta_up is not None:
+                ad.theta_up.weight.normal_(0.0, 0.25, generator=gen)
+            elif ad.theta_proj is not None:
+                ad.theta_proj.weight.normal_(0.0, 0.25, generator=gen)
         for p in ctl.trainable_parameters():
             p.add_(torch.randn(p.shape, generator=gen, dtype=p.dtype) * 0.4)
         if mor and ctl.adapters.mor_router is not None:
@@ -444,7 +447,9 @@ def test_04_toy_hssd_loop_incremental_decode_and_mor_write_mask_fp64(mor: bool):
     st_p1 = cache.recurrent_states[4]
     st_p2 = cache.recurrent_states[12]
     assert isinstance(st_p1, HSSDCacheState) and isinstance(st_p2, HSSDCacheState)
-    assert st_p1.step_count == ids.shape[1] and st_p2.step_count == ids.shape[1]
+    exp_steps = torch.full((ids.shape[0],), ids.shape[1], dtype=torch.long, device=ids.device)
+    assert st_p1.step_count_int == ids.shape[1] and st_p2.step_count_int == ids.shape[1]
+    assert torch.equal(st_p1.step_count, exp_steps) and torch.equal(st_p2.step_count, exp_steps)
     assert not torch.equal(st_p1.page_states, st_p2.page_states)
 
     # Clean unwrap + remove_hssd restores exact step-0 model output

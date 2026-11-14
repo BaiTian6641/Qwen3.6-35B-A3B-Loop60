@@ -7,13 +7,17 @@ import pytest
 import torch
 
 from qloop.config import apply_overrides
+from qloop.model import hssd as hssd_mod
+from qloop.model.hssd import HSSDConfig
 from qloop.model.loop import LoopSpec, sha256_frozen_experts
 from qloop.model.probes import (
     candidate_specs,
     format_probe_report_markdown,
+    hssd_ablation_matrix,
     probe_expert_headroom,
     probe_positional_extrapolation,
     probe_reentry_anchors,
+    profile_hssd_layer,
     run_structured_probe_suite,
 )
 from qloop.model.toy import build_toy
@@ -216,3 +220,78 @@ def test_structured_probe_suite_json_markdown_and_invariance_fp64():
     # 3. Model weights, frozen-expert SHA-256, and forward logits remain 100% untouched
     assert sha256_frozen_experts(model) == sha_ref
     assert torch.equal(model(ids[0]).logits, logits_ref)
+
+
+def test_profile_hssd_layer_and_ablation_matrix_schema_and_reexports():
+    rep = profile_hssd_layer(
+        hidden_size=128,
+        num_v_heads=4,
+        head_k_dim=32,
+        head_v_dim=32,
+        seq_len=192,
+        stream_chunk_len=64,
+        state_dtype="bfloat16",
+        theta_low_rank=True,
+        rank=16,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    required_keys = {
+        "dimensions",
+        "adapter_params_per_layer",
+        "adapter_params_30_layers",
+        "theta_param_fraction",
+        "full_prefill",
+        "streamed_prefill",
+        "retained_cache",
+        "single_token_decode",
+        "training_fwd_bwd",
+        "gdn_baseline",
+    }
+    assert required_keys <= set(rep.keys())
+    parsed = json.loads(json.dumps(rep))
+    assert parsed["adapter_params_30_layers"] == 30 * parsed["adapter_params_per_layer"]
+    assert 0.0 < parsed["theta_param_fraction"] < 1.0
+    assert parsed["retained_cache"]["state_dtype"] == "bfloat16"
+    assert parsed["retained_cache"]["theta_cum_dtype"] == "float64"
+    assert parsed["retained_cache"]["has_compact_storage"] is True
+    assert parsed["single_token_decode"]["has_compact_storage"] is True
+    assert parsed["streamed_prefill"]["has_compact_storage"] is True
+    assert parsed["training_fwd_bwd"]["grad_finite"] is True
+    assert parsed["full_prefill"]["gamma_reduction_factor"] > 10.0
+    assert parsed["gdn_baseline"]["state_bytes"] > 0
+
+    rep_re = hssd_mod.profile_hssd_layer(
+        hidden_size=64,
+        num_v_heads=2,
+        head_k_dim=16,
+        head_v_dim=16,
+        seq_len=128,
+        stream_chunk_len=64,
+        state_dtype="auto",
+        theta_low_rank=True,
+        rank=8,
+        device="cpu",
+        dtype=torch.float64,
+    )
+    assert rep_re["streamed_prefill"]["max_diff_vs_full_prefill"] < 1e-12
+
+    ablations = hssd_ablation_matrix()
+    assert ablations == hssd_mod.hssd_ablation_matrix()
+    expected_ablation_keys = [
+        "1_original_gdn",
+        "2_gdn_plus_local_swa",
+        "3_multipage_no_phase",
+        "4_surprise_controlled",
+        "5_phase_enhanced",
+        "6_complete_hssd",
+    ]
+    assert list(ablations.keys()) == expected_ablation_keys
+    json.dumps(ablations)
+    assert ablations["1_original_gdn"]["enabled"] is False
+    for key in expected_ablation_keys[1:]:
+        entry = ablations[key]
+        assert entry["enabled"] is True
+        cfg = HSSDConfig.from_dict(entry["hssd"])
+        cfg.validate()
+

@@ -14,6 +14,9 @@
                                   Pass-2 routing Jaccard across anchor weights.
 * `probe_positional_extrapolation` - Gate 0p-3: NLL and synthetic passkey/needle retrieval logit
                                   margin across `("native", "yarn", "rerope")` at `factor`x context.
+* `profile_hssd_layer`          - Gate 0p-4: Single-layer HSSD v3.1 vs single-state GDN profiler
+                                  (prefill, streamed prefill, decode, fwd+bwd, compact cache bytes).
+* `hssd_ablation_matrix`        - Gate 1-Ablate: 6-way matched-budget HSSD mechanism isolation matrix.
 * `run_structured_probe_suite`  - executes `Gate 0a` + `Gate 0p-1..3` + core-range sweep, returning
                                   a JSON-serializable report dict + Markdown summary.
 """
@@ -1288,6 +1291,689 @@ def run_structured_probe_suite(
     return report
 
 
+def _sync_if_cuda(dev: torch.device) -> None:
+    if dev.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(dev)
+
+
+def _peak_cuda_bytes(dev: torch.device) -> int:
+    if dev.type == "cuda" and torch.cuda.is_available():
+        return int(torch.cuda.max_memory_allocated(dev))
+    return 0
+
+
+def _reset_cuda_peak(dev: torch.device) -> None:
+    if dev.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(dev)
+        torch.cuda.reset_peak_memory_stats(dev)
+
+
+def _chunked_gdn_baseline_prefill(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g_base: torch.Tensor,
+    beta_base: torch.Tensor,
+    *,
+    chunk_size: int = 64,
+    state_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-state (`M=1`) chunked WY Gated DeltaNet baseline for apples-to-apples layer profiling."""
+    from .hssd import _prepare_qkv_unscaled, _safe_sqrt
+
+    init_dtype = query.dtype
+    acc_dt = torch.float64 if init_dtype == torch.float64 else torch.float32
+    bsz, seq_len, hv, dv = value.shape
+    dk = key.shape[-1]
+    q, k, v = _prepare_qkv_unscaled(query, key, value, True)
+    q = q * (dk ** -0.5)
+    gf = upcast(g_base).to(acc_dt).clamp(max=0.0)
+    bf = upcast(beta_base).to(acc_dt).clamp(0.0, 2.0)
+
+    state = q.new_zeros(bsz, hv, dk, dv)
+    outs: list[torch.Tensor] = []
+    for c0 in range(0, seq_len, chunk_size):
+        c1 = min(seq_len, c0 + chunk_size)
+        c_len = c1 - c0
+        qc = q[:, c0:c1].transpose(1, 2)                         # [B, H_v, C, d_k]
+        kc = k[:, c0:c1].transpose(1, 2)                         # [B, H_v, C, d_k]
+        vc = v[:, c0:c1].transpose(1, 2)                         # [B, H_v, C, d_v]
+        gc = gf[:, c0:c1].transpose(1, 2).unsqueeze(-1)          # [B, H_v, C, 1]
+        bc = _safe_sqrt(bf[:, c0:c1].transpose(1, 2).unsqueeze(-1))
+
+        ke = kc * bc
+        ve = vc * bc
+        g_cum = torch.cumsum(gc, dim=-2)                         # [B, H_v, C, 1] <= 0
+        idx = torch.arange(c_len, device=q.device)
+        strict_tril = idx[:, None] > idx[None, :]
+        causal_tril = idx[:, None] >= idx[None, :]
+
+        diff = (g_cum[:, :, :, None, 0] - g_cum[:, :, None, :, 0]).masked_fill(~causal_tril, 0.0)
+        decay_mat = torch.exp(diff)
+        gram = kc @ kc.transpose(-1, -2)
+        strict_m = (gram * bc * bc.transpose(-1, -2) * decay_mat).masked_fill(~strict_tril, 0.0)
+        eye = torch.eye(c_len, device=q.device, dtype=acc_dt)
+        inv_l = torch.linalg.solve_triangular(eye + strict_m, eye, upper=False, unitriangular=True)
+
+        u_v = inv_l @ ve
+        w_k = inv_l @ (ke * torch.exp(g_cum))
+        q_dec = qc * torch.exp(g_cum)
+        attn = ((qc @ kc.transpose(-1, -2)) * bc.transpose(-1, -2) * decay_mat).masked_fill(~causal_tril, 0.0)
+        o_c = (q_dec @ state) + ((attn - (q_dec @ w_k.transpose(-1, -2)).masked_fill(~causal_tril, 0.0)) @ u_v)
+        outs.append(o_c.transpose(1, 2))
+
+        g_tail = g_cum[:, :, -1:, :] - g_cum
+        s_dec = state * torch.exp(g_cum[:, :, -1, :]).unsqueeze(-1)
+        u_tilde = u_v - (w_k @ state)
+        state = s_dec + (ke * torch.exp(g_tail)).transpose(-1, -2) @ u_tilde
+
+    out = torch.cat(outs, dim=1).to(init_dtype) if outs else query.new_zeros(bsz, 0, hv, dv)
+    return out, state.to(dtype=state_dtype).contiguous()
+
+
+def _gdn_baseline_decode_step(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g_base: torch.Tensor,
+    beta_base: torch.Tensor,
+    state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-token (`T=1`) single-state Gated DeltaNet decode step."""
+    from .hssd import _prepare_qkv_unscaled
+
+    init_dtype = query.dtype
+    acc_dt = torch.float64 if init_dtype == torch.float64 else torch.float32
+    dk = key.shape[-1]
+    q, k, v = _prepare_qkv_unscaled(query, key, value, True)
+    q = (q * (dk ** -0.5))[:, 0]
+    kt = k[:, 0]
+    vt = v[:, 0]
+    gf = upcast(g_base[:, 0]).to(acc_dt).clamp(max=0.0)
+    bf = upcast(beta_base[:, 0]).to(acc_dt).clamp(0.0, 2.0)
+
+    s_acc = state.to(dtype=acc_dt) * torch.exp(gf)[..., None, None]
+    mem = (s_acc * kt[..., :, None]).sum(dim=-2)
+    delta = (vt - mem) * bf[..., None]
+    s_next = s_acc + kt[..., :, None] * delta[..., None, :]
+    out = (s_next * q[..., :, None]).sum(dim=-2).unsqueeze(1).to(dtype=init_dtype)
+    return out, s_next.to(dtype=state.dtype).contiguous()
+
+
+def profile_hssd_layer(
+    *,
+    hidden_size: int = 2048,
+    num_v_heads: int = 32,
+    head_k_dim: int = 128,
+    head_v_dim: int = 128,
+    seq_len: int = 1024,
+    stream_chunk_len: int = 256,
+    state_dtype: str = "bfloat16",
+    theta_low_rank: bool = True,
+    rank: int = 64,
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> dict[str, Any]:
+    """Profile a single HSSD v3.1 linear-attention layer vs single-state GDN (`Gate 0p-4`).
+
+    Benchmarks full-sequence prefill, streamed chunk prefill, retained decode cache unique backing
+    bytes (at chunk boundaries and mid-chunk), single-token decode (`O(k)` active-page update), and
+    training forward+backward with actual sparse Top-`k` STE write-budget loss.
+    """
+    from .hssd import (
+        HSSDAdapter,
+        HSSDConfig,
+        _resolve_state_dtype,
+        chunk_hssd,
+        compute_write_budget_loss,
+        has_fla,
+        recurrent_hssd_step,
+    )
+
+    require(seq_len >= 2, "profile_hssd_layer requires seq_len >= 2", seq_len=seq_len)
+    require(
+        stream_chunk_len >= 1,
+        "profile_hssd_layer requires stream_chunk_len >= 1",
+        stream_chunk_len=stream_chunk_len,
+    )
+    require(head_k_dim >= 2 and head_k_dim % 2 == 0, "head_k_dim must be even >= 2", head_k_dim=head_k_dim)
+
+    dev = torch.device(device)
+    acc_dt = torch.float64 if dtype == torch.float64 else torch.float32
+    resolved_state_dt = _resolve_state_dtype(state_dtype, acc_dt)
+
+    cfg = HSSDConfig(
+        rank=int(rank),
+        theta_low_rank=bool(theta_low_rank),
+        state_dtype=str(state_dtype),
+        checkpoint_segments=True,
+    )
+    cfg.validate()
+
+    gen = torch.Generator(device="cpu").manual_seed(2026)
+    adapter = HSSDAdapter(
+        int(hidden_size),
+        int(num_v_heads),
+        int(head_k_dim),
+        int(head_v_dim),
+        cfg,
+        layer_id=0,
+    ).to(device=dev, dtype=dtype)
+
+    n_params = sum(p.numel() for p in adapter.parameters())
+    if adapter.theta_down is not None and adapter.theta_up is not None:
+        theta_params = adapter.theta_down.weight.numel() + adapter.theta_up.weight.numel()
+    elif adapter.theta_proj is not None:
+        theta_params = adapter.theta_proj.weight.numel()
+    else:
+        theta_params = 0
+
+    bsz = 1
+    tot_t = int(seq_len) + 1
+    x_all = (torch.randn(bsz, tot_t, hidden_size, generator=gen, dtype=torch.float32) * 0.25).to(dev, dtype)
+    q_all = torch.randn(bsz, tot_t, num_v_heads, head_k_dim, generator=gen, dtype=torch.float32).to(dev, dtype)
+    k_all = torch.randn(bsz, tot_t, num_v_heads, head_k_dim, generator=gen, dtype=torch.float32).to(dev, dtype)
+    v_all = torch.randn(bsz, tot_t, num_v_heads, head_v_dim, generator=gen, dtype=torch.float32).to(dev, dtype)
+    g_all = (-0.02 - 0.08 * torch.rand(bsz, tot_t, num_v_heads, generator=gen, dtype=torch.float32)).to(dev, dtype)
+    beta_all = (0.15 + 0.5 * torch.rand(bsz, tot_t, num_v_heads, generator=gen, dtype=torch.float32)).to(dev, dtype)
+
+    x_pre, q_pre, k_pre, v_pre = x_all[:, :seq_len], q_all[:, :seq_len], k_all[:, :seq_len], v_all[:, :seq_len]
+    g_pre, beta_pre = g_all[:, :seq_len], beta_all[:, :seq_len]
+
+    # 1. Full prefill
+    adapter.eval()
+    with torch.no_grad():
+        _reset_cuda_peak(dev)
+        t0 = time.perf_counter()
+        proj_pre = adapter.project_inputs(x_pre, q_pre, k_pre, v_pre, g_pre, beta_pre, use_qk_l2norm=True)
+        gamma_factored = (proj_pre["gamma_page_scale"], proj_pre["gamma_chan_pair"])
+        out_full, st_full = chunk_hssd(
+            proj_pre["query"],
+            proj_pre["key"],
+            proj_pre["value"],
+            gamma_factored,
+            proj_pre["b_gate"],
+            proj_pre["w_gate"],
+            proj_pre["theta"],
+            proj_pre["surprise_bias"],
+            adapter.log_surprise_slope.exp(),
+            adapter.surprise_thresh,
+            proj_pre["write_logits"],
+            proj_pre["read_logits"],
+            proj_pre["q_swa"],
+            proj_pre["k_swa"],
+            proj_pre["v_swa"],
+            boltzmann_gate=adapter.boltzmann_gate,
+            chunk_size=cfg.chunk_size,
+            window_chunks=cfg.window_chunks,
+            num_pages=cfg.num_pages,
+            top_k_pages=cfg.k_pages,
+            segment_chunks=cfg.segment_chunks,
+            checkpoint_segments=False,
+            initial_state=None,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=False,
+            state_dtype=cfg.state_dtype,
+            use_swa=cfg.use_swa,
+            use_phase=cfg.use_phase,
+            use_surprise=cfg.use_surprise,
+            surprise_mode=cfg.surprise_mode,
+        )
+        _sync_if_cuda(dev)
+        full_sec = max(time.perf_counter() - t0, 1e-9)
+        full_peak = _peak_cuda_bytes(dev)
+
+    assert st_full is not None
+    gamma_factored_bytes = int(
+        proj_pre["gamma_page_scale"].numel() * proj_pre["gamma_page_scale"].element_size()
+        + proj_pre["gamma_chan_pair"].numel() * proj_pre["gamma_chan_pair"].element_size()
+    )
+    gamma_legacy_5d_bytes = int(
+        bsz * seq_len * cfg.num_pages * num_v_heads * head_k_dim * proj_pre["gamma_chan_pair"].element_size()
+    )
+
+    # 2. Streamed prefill in `stream_chunk_len` segments
+    with torch.no_grad():
+        _reset_cuda_peak(dev)
+        t0 = time.perf_counter()
+        st_stream = None
+        stream_outs: list[torch.Tensor] = []
+        n_segs = 0
+        for s0 in range(0, seq_len, stream_chunk_len):
+            s1 = min(seq_len, s0 + stream_chunk_len)
+            n_segs += 1
+            ps = adapter.project_inputs(
+                x_pre[:, s0:s1],
+                q_pre[:, s0:s1],
+                k_pre[:, s0:s1],
+                v_pre[:, s0:s1],
+                g_pre[:, s0:s1],
+                beta_pre[:, s0:s1],
+                use_qk_l2norm=True,
+            )
+            o_seg, st_stream = chunk_hssd(
+                ps["query"],
+                ps["key"],
+                ps["value"],
+                (ps["gamma_page_scale"], ps["gamma_chan_pair"]),
+                ps["b_gate"],
+                ps["w_gate"],
+                ps["theta"],
+                ps["surprise_bias"],
+                adapter.log_surprise_slope.exp(),
+                adapter.surprise_thresh,
+                ps["write_logits"],
+                ps["read_logits"],
+                ps["q_swa"],
+                ps["k_swa"],
+                ps["v_swa"],
+                boltzmann_gate=adapter.boltzmann_gate,
+                chunk_size=cfg.chunk_size,
+                window_chunks=cfg.window_chunks,
+                num_pages=cfg.num_pages,
+                top_k_pages=cfg.k_pages,
+                segment_chunks=cfg.segment_chunks,
+                checkpoint_segments=False,
+                initial_state=st_stream,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=False,
+                state_dtype=cfg.state_dtype,
+                use_swa=cfg.use_swa,
+                use_phase=cfg.use_phase,
+                use_surprise=cfg.use_surprise,
+                surprise_mode=cfg.surprise_mode,
+            )
+            stream_outs.append(o_seg)
+        out_stream = torch.cat(stream_outs, dim=1)
+        _sync_if_cuda(dev)
+        stream_sec = max(time.perf_counter() - t0, 1e-9)
+        stream_peak = _peak_cuda_bytes(dev)
+
+    assert st_stream is not None
+    stream_diff = float((out_stream.float() - out_full.float()).abs().max().item())
+
+    # 3. Single-token decode (T = 1, active-page O(k) state update)
+    x_dec = x_all[:, seq_len : seq_len + 1]
+    q_dec = q_all[:, seq_len : seq_len + 1]
+    k_dec = k_all[:, seq_len : seq_len + 1]
+    v_dec = v_all[:, seq_len : seq_len + 1]
+    g_dec = g_all[:, seq_len : seq_len + 1]
+    beta_dec = beta_all[:, seq_len : seq_len + 1]
+
+    with torch.no_grad():
+        _reset_cuda_peak(dev)
+        t0 = time.perf_counter()
+        pd = adapter.project_inputs(x_dec, q_dec, k_dec, v_dec, g_dec, beta_dec, use_qk_l2norm=True)
+        _o_dec, st_decode = recurrent_hssd_step(
+            pd["query"],
+            pd["key"],
+            pd["value"],
+            (pd["gamma_page_scale"], pd["gamma_chan_pair"]),
+            pd["b_gate"],
+            pd["w_gate"],
+            pd["theta"],
+            pd["surprise_bias"],
+            adapter.log_surprise_slope.exp(),
+            adapter.surprise_thresh,
+            pd["write_logits"],
+            pd["read_logits"],
+            pd["q_swa"],
+            pd["k_swa"],
+            pd["v_swa"],
+            st_full,
+            boltzmann_gate=adapter.boltzmann_gate,
+            top_k_pages=cfg.k_pages,
+            use_qk_l2norm_in_kernel=False,
+            state_dtype=cfg.state_dtype,
+            use_swa=cfg.use_swa,
+            use_phase=cfg.use_phase,
+            use_surprise=cfg.use_surprise,
+            surprise_mode=cfg.surprise_mode,
+        )
+        _sync_if_cuda(dev)
+        decode_sec = max(time.perf_counter() - t0, 1e-9)
+        decode_peak = _peak_cuda_bytes(dev)
+
+    # 4. Training forward + backward with actual sparse Top-k STE write-budget loss
+    adapter.train()
+    adapter.zero_grad(set_to_none=True)
+    x_tr = x_pre.detach().clone().requires_grad_(True)
+    q_tr = q_pre.detach().clone().requires_grad_(True)
+    k_tr = k_pre.detach().clone().requires_grad_(True)
+    v_tr = v_pre.detach().clone().requires_grad_(True)
+
+    _reset_cuda_peak(dev)
+    t0 = time.perf_counter()
+    pt = adapter.project_inputs(x_tr, q_tr, k_tr, v_tr, g_pre, beta_pre, use_qk_l2norm=True)
+    out_tr, _st_tr, duty_tr = chunk_hssd(
+        pt["query"],
+        pt["key"],
+        pt["value"],
+        (pt["gamma_page_scale"], pt["gamma_chan_pair"]),
+        pt["b_gate"],
+        pt["w_gate"],
+        pt["theta"],
+        pt["surprise_bias"],
+        adapter.log_surprise_slope.exp(),
+        adapter.surprise_thresh,
+        pt["write_logits"],
+        pt["read_logits"],
+        pt["q_swa"],
+        pt["k_swa"],
+        pt["v_swa"],
+        boltzmann_gate=adapter.boltzmann_gate,
+        chunk_size=cfg.chunk_size,
+        window_chunks=cfg.window_chunks,
+        num_pages=cfg.num_pages,
+        top_k_pages=cfg.k_pages,
+        segment_chunks=cfg.segment_chunks,
+        checkpoint_segments=cfg.checkpoint_segments,
+        initial_state=None,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=False,
+        state_dtype=cfg.state_dtype,
+        use_swa=cfg.use_swa,
+        use_phase=cfg.use_phase,
+        use_surprise=cfg.use_surprise,
+        surprise_mode=cfg.surprise_mode,
+        return_aux=True,
+    )
+    mu_max_t = torch.tensor(cfg.resolved_mu_max(), device=duty_tr.device, dtype=duty_tr.dtype)
+    bud_loss = compute_write_budget_loss(duty_tr, mu_max_t, mu_min_ratio=cfg.mu_min_ratio)
+    total_loss = out_tr.float().pow(2).mean() + cfg.budget_weight * bud_loss
+    total_loss.backward()
+    _sync_if_cuda(dev)
+    train_sec = max(time.perf_counter() - t0, 1e-9)
+    train_peak = _peak_cuda_bytes(dev)
+
+    grad_finite = bool(
+        x_tr.grad is not None
+        and torch.isfinite(x_tr.grad).all()
+        and all(p.grad is None or bool(torch.isfinite(p.grad).all()) for p in adapter.parameters())
+    )
+    dead_pages = int((duty_tr.detach() < 1e-6).sum().item())
+    adapter.zero_grad(set_to_none=True)
+
+    # 5. Single-state Gated DeltaNet baseline (prefill + decode + state bytes)
+    with torch.no_grad():
+        _sync_if_cuda(dev)
+        t0 = time.perf_counter()
+        _gdn_out, gdn_state = _chunked_gdn_baseline_prefill(
+            q_pre, k_pre, v_pre, g_pre, beta_pre, chunk_size=cfg.chunk_size, state_dtype=resolved_state_dt
+        )
+        _sync_if_cuda(dev)
+        gdn_pre_sec = max(time.perf_counter() - t0, 1e-9)
+
+        t0 = time.perf_counter()
+        _gdn_dec_out, gdn_state_dec = _gdn_baseline_decode_step(
+            q_dec, k_dec, v_dec, g_dec, beta_dec, gdn_state
+        )
+        _sync_if_cuda(dev)
+        gdn_dec_sec = max(time.perf_counter() - t0, 1e-9)
+
+    gdn_state_bytes = int(gdn_state_dec.untyped_storage().nbytes())
+    retained_bytes = int(st_full.unique_storage_bytes())
+    mid_chunk_bytes = int(st_decode.unique_storage_bytes())
+
+    report = {
+        "dimensions": {
+            "batch_size": bsz,
+            "hidden_size": int(hidden_size),
+            "num_v_heads": int(num_v_heads),
+            "head_k_dim": int(head_k_dim),
+            "head_v_dim": int(head_v_dim),
+            "seq_len": int(seq_len),
+            "stream_chunk_len": int(stream_chunk_len),
+            "chunk_size": int(cfg.chunk_size),
+            "window_chunks": int(cfg.window_chunks),
+            "num_pages": int(cfg.num_pages),
+            "top_k_pages": int(cfg.k_pages),
+            "rank": int(cfg.rank),
+            "theta_low_rank": bool(cfg.theta_low_rank),
+            "state_dtype": str(cfg.state_dtype),
+            "input_dtype": str(dtype).replace("torch.", ""),
+            "device": str(dev),
+        },
+        "adapter_params_per_layer": int(n_params),
+        "adapter_params_30_layers": int(30 * n_params),
+        "theta_param_fraction": float(theta_params / max(n_params, 1)),
+        "full_prefill": {
+            "seq_len": int(seq_len),
+            "seconds": float(full_sec),
+            "ms": float(full_sec * 1000.0),
+            "tokens_per_sec": float(seq_len / full_sec),
+            "peak_cuda_bytes": int(full_peak),
+            "peak_cuda_mib": float(full_peak / (1024.0 * 1024.0)),
+            "gamma_factored_bytes": gamma_factored_bytes,
+            "gamma_legacy_5d_bytes": gamma_legacy_5d_bytes,
+            "gamma_reduction_factor": float(gamma_legacy_5d_bytes / max(gamma_factored_bytes, 1)),
+        },
+        "streamed_prefill": {
+            "seq_len": int(seq_len),
+            "stream_chunk_len": int(stream_chunk_len),
+            "num_segments": int(n_segs),
+            "seconds": float(stream_sec),
+            "ms": float(stream_sec * 1000.0),
+            "tokens_per_sec": float(seq_len / stream_sec),
+            "peak_cuda_bytes": int(stream_peak),
+            "peak_cuda_mib": float(stream_peak / (1024.0 * 1024.0)),
+            "max_diff_vs_full_prefill": stream_diff,
+            "has_compact_storage": bool(st_stream.has_compact_storage()),
+        },
+        "retained_cache": {
+            "state_dtype": str(st_full.page_states.dtype).replace("torch.", ""),
+            "theta_cum_dtype": str(st_full.theta_cum.dtype).replace("torch.", ""),
+            "theta_cum_storage_bytes": int(st_full.theta_cum.untyped_storage().nbytes()),
+            "has_compact_storage": bool(st_full.has_compact_storage() and st_decode.has_compact_storage()),
+            "unique_storage_bytes": retained_bytes,
+            "unique_storage_mib": float(retained_bytes / (1024.0 * 1024.0)),
+            "mid_chunk_unique_storage_bytes": mid_chunk_bytes,
+            "mid_chunk_unique_storage_mib": float(mid_chunk_bytes / (1024.0 * 1024.0)),
+            "30_layers_1pass_gib": float(30.0 * mid_chunk_bytes / (1024.0 ** 3)),
+            "step_count": int(st_full.step_count_int),
+        },
+        "single_token_decode": {
+            "seconds": float(decode_sec),
+            "ms": float(decode_sec * 1000.0),
+            "tokens_per_sec": float(1.0 / decode_sec),
+            "peak_cuda_bytes": int(decode_peak),
+            "active_write_pages": int(cfg.k_pages),
+            "total_pages": int(cfg.num_pages),
+            "has_compact_storage": bool(st_decode.has_compact_storage()),
+        },
+        "training_fwd_bwd": {
+            "seq_len": int(seq_len),
+            "seconds": float(train_sec),
+            "ms": float(train_sec * 1000.0),
+            "tokens_per_sec": float(seq_len / train_sec),
+            "peak_cuda_bytes": int(train_peak),
+            "peak_cuda_mib": float(train_peak / (1024.0 * 1024.0)),
+            "grad_finite": grad_finite,
+            "budget_loss": float(bud_loss.detach().cpu().item()),
+            "dead_page_count": dead_pages,
+        },
+        "gdn_baseline": {
+            "prefill_seconds": float(gdn_pre_sec),
+            "prefill_ms": float(gdn_pre_sec * 1000.0),
+            "prefill_tokens_per_sec": float(seq_len / gdn_pre_sec),
+            "decode_seconds": float(gdn_dec_sec),
+            "decode_ms": float(gdn_dec_sec * 1000.0),
+            "decode_tokens_per_sec": float(1.0 / gdn_dec_sec),
+            "state_bytes": gdn_state_bytes,
+            "state_mib": float(gdn_state_bytes / (1024.0 * 1024.0)),
+            "hssd_vs_gdn_prefill_time_ratio": float(full_sec / gdn_pre_sec),
+            "hssd_vs_gdn_decode_time_ratio": float(decode_sec / gdn_dec_sec),
+            "hssd_vs_gdn_cache_ratio": float(mid_chunk_bytes / max(gdn_state_bytes, 1)),
+            "has_fla": bool(has_fla()),
+        },
+    }
+    return _to_jsonable(report)
+
+
+def hssd_ablation_matrix() -> dict[str, dict[str, Any]]:
+    """Return the 6-way matched-budget HSSD mechanism-isolation matrix (`Gate 1-Ablate`)."""
+    eval_tasks = [
+        "short_context_lm",
+        "repeated_key_updates",
+        "distractor_resistance",
+        "state_tracking",
+        "mqar_recall_vs_interfering_writes",
+        "code_reasoning",
+    ]
+    return {
+        "1_original_gdn": {
+            "enabled": False,
+            "name": "Original GDN",
+            "description": "Unmodified single-state Gated DeltaNet baseline (no HSSD adapter installed).",
+            "hssd": {
+                "enabled": False,
+            },
+            "mechanisms": {
+                "local_swa": False,
+                "multipage": False,
+                "surprise_gate": False,
+                "phase_rotation": False,
+            },
+            "eval_tasks": list(eval_tasks),
+        },
+        "2_gdn_plus_local_swa": {
+            "enabled": True,
+            "name": "GDN + Local SWA",
+            "description": (
+                "Single-page far state (M=1, k=1) with disjoint causal local sliding-window attention "
+                "and Peak-Boltzmann branch arbiter; no phase rotation or surprise gating."
+            ),
+            "hssd": {
+                "enabled": True,
+                "rank": 64,
+                "num_pages": 1,
+                "k_pages": 1,
+                "use_swa": True,
+                "use_phase": False,
+                "use_surprise": False,
+                "surprise_mode": "page0",
+                "theta_low_rank": True,
+                "state_dtype": "bfloat16",
+            },
+            "mechanisms": {
+                "local_swa": True,
+                "multipage": False,
+                "surprise_gate": False,
+                "phase_rotation": False,
+            },
+            "eval_tasks": list(eval_tasks),
+        },
+        "3_multipage_no_phase": {
+            "enabled": True,
+            "name": "Multipage without Phase",
+            "description": (
+                "M=8 multi-timescale pages with Top-2 sparse write/read routing and disjoint local SWA, "
+                "without content-adaptive SO(2) phase rotation or surprise gating."
+            ),
+            "hssd": {
+                "enabled": True,
+                "rank": 64,
+                "num_pages": 8,
+                "k_pages": 2,
+                "use_swa": True,
+                "use_phase": False,
+                "use_surprise": False,
+                "surprise_mode": "routed",
+                "theta_low_rank": True,
+                "state_dtype": "bfloat16",
+            },
+            "mechanisms": {
+                "local_swa": True,
+                "multipage": True,
+                "surprise_gate": False,
+                "phase_rotation": False,
+            },
+            "eval_tasks": list(eval_tasks),
+        },
+        "4_surprise_controlled": {
+            "enabled": True,
+            "name": "Surprise-Controlled Memory",
+            "description": (
+                "M=8 multi-timescale pages + local SWA + routed chunk-start root-surprise gate and "
+                "actual sparse Top-2 STE write-mass budget (without phase rotation)."
+            ),
+            "hssd": {
+                "enabled": True,
+                "rank": 64,
+                "num_pages": 8,
+                "k_pages": 2,
+                "use_swa": True,
+                "use_phase": False,
+                "use_surprise": True,
+                "surprise_mode": "routed",
+                "theta_low_rank": True,
+                "state_dtype": "bfloat16",
+            },
+            "mechanisms": {
+                "local_swa": True,
+                "multipage": True,
+                "surprise_gate": True,
+                "phase_rotation": False,
+            },
+            "eval_tasks": list(eval_tasks),
+        },
+        "5_phase_enhanced": {
+            "enabled": True,
+            "name": "Phase-Enhanced Recurrence",
+            "description": (
+                "M=8 multi-timescale pages + local SWA + low-rank float64-accumulated SO(2)^(d_k/2) "
+                "phase rotation (without surprise write gating)."
+            ),
+            "hssd": {
+                "enabled": True,
+                "rank": 64,
+                "num_pages": 8,
+                "k_pages": 2,
+                "use_swa": True,
+                "use_phase": True,
+                "use_surprise": False,
+                "surprise_mode": "routed",
+                "theta_low_rank": True,
+                "state_dtype": "bfloat16",
+            },
+            "mechanisms": {
+                "local_swa": True,
+                "multipage": True,
+                "surprise_gate": False,
+                "phase_rotation": True,
+            },
+            "eval_tasks": list(eval_tasks),
+        },
+        "6_complete_hssd": {
+            "enabled": True,
+            "name": "Complete HSSD v3.1",
+            "description": (
+                "Full HSSD v3.1 combining disjoint local SWA + Peak-Boltzmann arbiter + M=8 sparse Top-2 "
+                "page bank + routed chunk-start surprise gate + float64-accumulated SO(2) phase rotation."
+            ),
+            "hssd": {
+                "enabled": True,
+                "rank": 64,
+                "num_pages": 8,
+                "k_pages": 2,
+                "use_swa": True,
+                "use_phase": True,
+                "use_surprise": True,
+                "surprise_mode": "routed",
+                "theta_low_rank": True,
+                "state_dtype": "bfloat16",
+            },
+            "mechanisms": {
+                "local_swa": True,
+                "multipage": True,
+                "surprise_gate": True,
+                "phase_rotation": True,
+            },
+            "eval_tasks": list(eval_tasks),
+        },
+    }
+
+
 def device_ids(tokenizer: Any, texts: list[str], seq_len: int, device: torch.device) -> list[torch.Tensor]:
     out = []
     for t in texts:
@@ -1303,11 +1989,13 @@ __all__ = [
     "candidate_specs",
     "device_ids",
     "format_probe_report_markdown",
+    "hssd_ablation_matrix",
     "probe_backward",
     "probe_core_ranges",
     "probe_expert_headroom",
     "probe_positional_extrapolation",
     "probe_reentry_anchors",
+    "profile_hssd_layer",
     "run_structured_probe_suite",
     "surgery_check",
 ]

@@ -1,0 +1,1066 @@
+"""Shipped Optimized On-Weight Inference Engine for Loop-HSSD v3 / Loop-GDN2 Models.
+
+Supports both `ToyForCausalLM` and `Qwen3.6-35B-A6B-LoopHSSD` Whole Model Packs with:
+  * Dynamic test-time pass depth `depth(r: int)` (`r in {1, 2, 3}` -> `40L / 64L / 88L`)
+    without reloading weights (usable both as `with engine.depth(r):` and `engine.depth(r)`),
+  * **Chunked Prefill** (`prefill_chunk_size = 4096`): streams arbitrarily long prompts
+    (`128K - 1M` tokens) chunk-by-chunk through hybrid KV + recurrent states, materializing
+    `lm_head` logits **ONLY on the final token** of the prompt,
+  * **Quantized `1.0x` SharedKV Cache**: `"native"`, `"fp8"` (`float8_e4m3fn` + `fp16` per-token-head
+    scale, ~50% full-attn KV HBM savings), and `"hadamard_int4"` (Block-64 orthogonal Walsh-Hadamard
+    packed `uint8` nibbles + `fp16` block scale, ~75% full-attn KV HBM savings), while preserving
+    `1.0x` SharedKV across passes `r >= 2`,
+  * **Causal MoR Early Exit** (`mor_early_exit=True`) & optional **`torch.compile`** decode step
+    acceleration (`compile_decode=True`),
+  * Live hardware/routing telemetry (`GenerationMetrics`) and `benchmark(...)` across depths.
+"""
+from __future__ import annotations
+
+import math
+import os
+import time
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
+from typing import TYPE_CHECKING, Any
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from ..debug import require
+from ..model.experts import physical_layers
+from ..model.introspect import find_lm_head, find_text_model
+from ..model.loop import LoopController
+from ..model.lsa import LSAManager
+from ..model.toy import ToyHybridCache
+from ..train.stack import Stack
+from .hf_custom_modeling import Qwen36LoopHSSDForCausalLM, _DepthContext
+
+if TYPE_CHECKING:
+    from ..export_pack import LoadedModelPack
+
+try:
+    from transformers.cache_utils import Cache as _HFCacheBase  # type: ignore[import-not-found]
+except ImportError:
+    _HFCacheBase = object  # type: ignore[assignment,misc]
+
+
+# ============================================================================ configs & telemetry
+
+@dataclass
+class InferenceConfig:
+    """Configuration for `OptimizedLoopInferenceEngine`."""
+
+    active_passes: int | None = None
+    prefill_chunk_size: int = 4096
+    kv_cache_quant: str = "native"            # "native" | "fp8" | "hadamard_int4"
+    fp8_kv_cache: bool | None = None          # convenience alias (`True` -> `kv_cache_quant="fp8"`)
+    compile_decode: bool = False
+    compile_backend: str | None = None        # None -> "inductor" on CUDA, "aot_eager" on CPU/MPS
+    compile_mode: str = "default"
+    mor_early_exit: bool = False
+    mor_confidence_threshold: float = 0.95
+    temperature: float = 0.0
+    top_k: int = 0
+    top_p: float = 1.0
+    max_new_tokens: int = 128
+    stop_token_ids: tuple[int, ...] = ()
+    seed: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.fp8_kv_cache is True and self.kv_cache_quant == "native":
+            self.kv_cache_quant = "fp8"
+        elif self.fp8_kv_cache is False and self.kv_cache_quant == "fp8":
+            self.kv_cache_quant = "native"
+        elif self.fp8_kv_cache is None:
+            self.fp8_kv_cache = self.kv_cache_quant == "fp8"
+
+    def validate(self) -> None:
+        require(int(self.prefill_chunk_size) >= 1, "prefill_chunk_size must be >= 1")
+        valid_q = {"native", "bf16", "fp16", "fp32", "fp8", "hadamard_int4"}
+        require(
+            self.kv_cache_quant in valid_q,
+            f"kv_cache_quant must be one of {sorted(valid_q)}, got {self.kv_cache_quant!r}",
+        )
+        require(float(self.temperature) >= 0.0, "temperature must be >= 0")
+        require(0.0 < float(self.top_p) <= 1.0, "top_p must be in (0, 1]")
+        require(int(self.top_k) >= 0, "top_k must be >= 0")
+
+
+@dataclass
+class GenerationMetrics:
+    """Live throughput, memory, depth & MoE routing telemetry for a generation run."""
+
+    prompt_tokens: int = 0
+    generated_tokens: int = 0
+    prefill_ms: float = 0.0
+    decode_ms: float = 0.0
+    total_ms: float = 0.0
+    prefill_tok_s: float = 0.0
+    decode_tok_s: float = 0.0
+    peak_vram_mb: float = 0.0
+    kv_cache_mb: float = 0.0
+    recurrent_state_mb: float = 0.0
+    active_passes: int = 1
+    mean_active_passes: float = 1.0
+    effective_layers: int = 0
+    unique_experts_per_tok: float = 0.0
+    prefill_chunks: int = 1
+    kv_cache_quant: str = "native"
+    compiled_decode: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def __getitem__(self, key: str) -> Any:
+        if hasattr(self, key):
+            return getattr(self, key)
+        raise KeyError(key)
+
+
+@dataclass
+class GenerationResult:
+    """Output of `OptimizedLoopInferenceEngine.generate`, supporting attribute and dict access."""
+
+    text: str
+    token_ids: list[int]
+    prompt_token_ids: list[int] = field(default_factory=list)
+    finish_reason: str = "length"
+    stop_token_id: int | None = None
+    logits_last: torch.Tensor | None = None
+    metrics: GenerationMetrics = field(default_factory=GenerationMetrics)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "text": self.text,
+            "token_ids": list(self.token_ids),
+            "prompt_token_ids": list(self.prompt_token_ids),
+            "finish_reason": self.finish_reason,
+            "stop_token_id": self.stop_token_id,
+            "metrics": self.metrics.to_dict(),
+        }
+
+    def keys(self) -> tuple[str, ...]:
+        return ("text", "token_ids", "prompt_token_ids", "finish_reason", "stop_token_id", "metrics")
+
+    def __getitem__(self, key: str) -> Any:
+        if hasattr(self, key):
+            return getattr(self, key)
+        if hasattr(self.metrics, key):
+            return getattr(self.metrics, key)
+        raise KeyError(key)
+
+
+# ============================================================================ FP8 & Block-64 Hadamard INT4 KV cache
+
+_FP8_DTYPE = getattr(torch, "float8_e4m3fn", torch.int8)
+_FP8_MAX = 448.0 if hasattr(torch, "float8_e4m3fn") else 127.0
+
+
+def _largest_pow2_divisor_le_64(dim: int) -> int:
+    b = 1
+    while b * 2 <= 64 and dim % (b * 2) == 0:
+        b *= 2
+    return b
+
+
+def _fwht_pow2(x: torch.Tensor) -> torch.Tensor:
+    """Orthonormal Sylvester Fast Walsh-Hadamard Transform along last dim (power-of-2 length)."""
+    n = x.shape[-1]
+    if n <= 1:
+        return x
+    h = x
+    step = 1
+    while step < n:
+        h = h.reshape(*x.shape[:-1], n // (2 * step), 2, step)
+        a = h[..., 0, :]
+        b = h[..., 1, :]
+        h = torch.stack([a + b, a - b], dim=-2)
+        step *= 2
+    return h.reshape(x.shape) * (1.0 / math.sqrt(float(n)))
+
+
+@dataclass
+class _FP8Slot:
+    q_data: torch.Tensor   # [B, G, T, D] in float8_e4m3fn
+    scale: torch.Tensor    # [B, G, T, 1] in float16
+
+    @staticmethod
+    def from_float(x: torch.Tensor) -> _FP8Slot:
+        xf = x.float()
+        amax = xf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+        sc = (amax / _FP8_MAX).to(torch.float16)
+        sc_safe = sc.float().clamp_min(1e-12)
+        q = (xf / sc_safe).clamp(-_FP8_MAX, _FP8_MAX)
+        q_t = q.to(_FP8_DTYPE) if hasattr(torch, "float8_e4m3fn") else q.round().to(torch.int8)
+        return _FP8Slot(q_data=q_t, scale=sc)
+
+    def append(self, x: torch.Tensor) -> None:
+        nxt = _FP8Slot.from_float(x)
+        self.q_data = torch.cat([self.q_data, nxt.q_data], dim=-2)
+        self.scale = torch.cat([self.scale, nxt.scale], dim=-2)
+
+    def dequantize(self, dtype: torch.dtype) -> torch.Tensor:
+        return (self.q_data.float() * self.scale.float()).to(dtype)
+
+    @property
+    def seq_len(self) -> int:
+        return int(self.q_data.shape[-2])
+
+    def nbytes(self) -> int:
+        return int(
+            self.q_data.numel() * self.q_data.element_size()
+            + self.scale.numel() * self.scale.element_size()
+        )
+
+
+@dataclass
+class _HadamardINT4Slot:
+    packed: torch.Tensor   # [B, G, T, n_blocks, block_sz // 2] in uint8 (2x INT4 nibbles/byte)
+    scale: torch.Tensor    # [B, G, T, n_blocks, 1] in float16
+    orig_dim: int
+    block_sz: int
+
+    @staticmethod
+    def from_float(x: torch.Tensor) -> _HadamardINT4Slot:
+        b, g, t, d = x.shape
+        bsz = max(2, _largest_pow2_divisor_le_64(d if d % 2 == 0 else d + 1))
+        pad = (bsz - (d % bsz)) % bsz
+        xf = F.pad(x.float(), (0, pad)) if pad else x.float()
+        d_pad = xf.shape[-1]
+        nb = d_pad // bsz
+        rot = _fwht_pow2(xf.view(b, g, t, nb, bsz))
+        amax = rot.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+        sc = (amax / 7.0).to(torch.float16)
+        q_int = (rot / sc.float().clamp_min(1e-12)).round().clamp(-7.0, 7.0).to(torch.int16) + 8
+        q_u8 = q_int.to(torch.uint8)
+        hi = q_u8[..., 0::2]
+        lo = q_u8[..., 1::2]
+        pk = (hi << 4) | (lo & 0x0F)
+        return _HadamardINT4Slot(packed=pk, scale=sc, orig_dim=d, block_sz=bsz)
+
+    def append(self, x: torch.Tensor) -> None:
+        nxt = _HadamardINT4Slot.from_float(x)
+        self.packed = torch.cat([self.packed, nxt.packed], dim=2)
+        self.scale = torch.cat([self.scale, nxt.scale], dim=2)
+
+    def dequantize(self, dtype: torch.dtype) -> torch.Tensor:
+        b, g, t, nb, half_bsz = self.packed.shape
+        hi = ((self.packed >> 4) & 0x0F).to(torch.int16) - 8
+        lo = (self.packed & 0x0F).to(torch.int16) - 8
+        unpacked = torch.stack([hi, lo], dim=-1).reshape(b, g, t, nb, half_bsz * 2).float()
+        rot = unpacked * self.scale.float()
+        rec = _fwht_pow2(rot).reshape(b, g, t, nb * self.block_sz)
+        if rec.shape[-1] != self.orig_dim:
+            rec = rec[..., : self.orig_dim]
+        return rec.to(dtype)
+
+    @property
+    def seq_len(self) -> int:
+        return int(self.packed.shape[2])
+
+    def nbytes(self) -> int:
+        return int(
+            self.packed.numel() * self.packed.element_size()
+            + self.scale.numel() * self.scale.element_size()
+        )
+
+
+class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
+    """Hybrid KV + recurrent state cache with FP8 / Block-64 Hadamard INT4 full-attn compression.
+
+    Preserves `1.0x` SharedKV across Sandwich-Loop passes (`r >= 2` pass zero-length `k[..., :0, :]`
+    via `SharedKVView` and read the pass-1 quantized slot directly with zero duplicate KV storage).
+    """
+
+    def __init__(self, num_layers: int, layer_types: Sequence[str], mode: str = "fp8") -> None:
+        if _HFCacheBase is not object:
+            try:
+                super().__init__()
+            except TypeError:
+                pass
+        self.mode = mode
+        self.num_layers = int(num_layers)
+        self.layer_types = list(layer_types)
+        self.first_full = (
+            self.layer_types.index("full_attention")
+            if "full_attention" in self.layer_types
+            else 0
+        )
+        self._k_slots: list[ Any ] = [None] * self.num_layers
+        self._v_slots: list[ Any ] = [None] * self.num_layers
+        self.key_cache: list[torch.Tensor | None] = [None] * self.num_layers
+        self.value_cache: list[torch.Tensor | None] = [None] * self.num_layers
+        self.conv_states: list[torch.Tensor | None] = [None] * self.num_layers
+        self.recurrent_states: list[torch.Tensor | None] = [None] * self.num_layers
+
+    def _encode_slot(self, x: torch.Tensor) -> Any:
+        if self.mode == "fp8":
+            return _FP8Slot.from_float(x)
+        if self.mode == "hadamard_int4":
+            return _HadamardINT4Slot.from_float(x)
+        if self.mode == "bf16":
+            return x.to(torch.bfloat16)
+        if self.mode == "fp16":
+            return x.to(torch.float16)
+        return x
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del cache_kwargs
+        out_dt = key_states.dtype
+        t_new = int(key_states.shape[-2])
+
+        if self.mode in ("fp8", "hadamard_int4"):
+            ks = self._k_slots[layer_idx]
+            vs = self._v_slots[layer_idx]
+            if t_new > 0:
+                if ks is None:
+                    ks = self._encode_slot(key_states)
+                    vs = self._encode_slot(value_states)
+                    self._k_slots[layer_idx] = ks
+                    self._v_slots[layer_idx] = vs
+                else:
+                    ks.append(key_states)
+                    vs.append(value_states)
+            require(ks is not None and vs is not None, f"empty quantized KV slot at layer {layer_idx}")
+            return ks.dequantize(out_dt), vs.dequantize(value_states.dtype)
+
+        # Native / explicit float dtype storage
+        if t_new > 0:
+            k_enc = self._encode_slot(key_states)
+            v_enc = self._encode_slot(value_states)
+            if self.key_cache[layer_idx] is None:
+                self.key_cache[layer_idx] = k_enc
+                self.value_cache[layer_idx] = v_enc
+            else:
+                self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], k_enc], dim=-2)
+                self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], v_enc], dim=-2)
+        kc = self.key_cache[layer_idx]
+        vc = self.value_cache[layer_idx]
+        require(kc is not None and vc is not None, f"empty KV slot at layer {layer_idx}")
+        assert kc is not None and vc is not None
+        return kc.to(out_dt), vc.to(value_states.dtype)
+
+    def get_seq_length(self, layer_idx: int | None = None) -> int:
+        idx = self.first_full if layer_idx is None else int(layer_idx)
+        if idx >= self.num_layers:
+            return 0
+        if self.mode in ("fp8", "hadamard_int4"):
+            sl = self._k_slots[idx]
+            return 0 if sl is None else int(sl.seq_len)
+        kc = self.key_cache[idx]
+        return 0 if kc is None else int(kc.shape[-2])
+
+    def kv_bytes(self) -> int:
+        if self.mode in ("fp8", "hadamard_int4"):
+            tot = 0
+            for ks, vs in zip(self._k_slots, self._v_slots):
+                if ks is not None:
+                    tot += ks.nbytes()
+                if vs is not None:
+                    tot += vs.nbytes()
+            return tot
+        tot = 0
+        for kt, vt in zip(self.key_cache, self.value_cache):
+            if isinstance(kt, torch.Tensor):
+                tot += int(kt.numel() * kt.element_size())
+            if isinstance(vt, torch.Tensor):
+                tot += int(vt.numel() * vt.element_size())
+        return tot
+
+    def recurrent_bytes(self) -> int:
+        seen: set[int] = set()
+        return _tensor_tree_bytes((*self.conv_states, *self.recurrent_states), seen)
+
+
+def _tensor_tree_bytes(obj: Any, seen_ptrs: set[int]) -> int:
+    """Accumulate unique storage bytes across nested tensors, tuples/lists, dicts, and `HSSDCacheState`."""
+    if obj is None:
+        return 0
+    if isinstance(obj, torch.Tensor):
+        if obj.numel() == 0:
+            return 0
+        ptr = int(obj.untyped_storage().data_ptr())
+        if ptr in seen_ptrs:
+            return 0
+        seen_ptrs.add(ptr)
+        return int(obj.numel() * obj.element_size())
+    if isinstance(obj, (list, tuple)):
+        return sum(_tensor_tree_bytes(x, seen_ptrs) for x in obj)
+    if isinstance(obj, dict):
+        return sum(_tensor_tree_bytes(v, seen_ptrs) for v in obj.values())
+    if hasattr(obj, "__dict__") and not isinstance(obj, nn.Module):
+        return sum(_tensor_tree_bytes(v, seen_ptrs) for v in vars(obj).values())
+    return 0
+
+
+def _measure_any_cache_bytes(cache: Any) -> tuple[int, int]:
+    """Return `(kv_bytes, recurrent_bytes)` for `QuantizedHybridCache`, `ToyHybridCache`, or HF `Cache`."""
+    if cache is None:
+        return 0, 0
+    if isinstance(cache, QuantizedHybridCache):
+        return cache.kv_bytes(), cache.recurrent_bytes()
+
+    kv_b = 0
+    rec_b = 0
+    seen_ptrs: set[int] = set()
+
+    for attr in ("key_cache", "value_cache"):
+        seq = getattr(cache, attr, None)
+        if isinstance(seq, (list, tuple)):
+            kv_b += _tensor_tree_bytes(seq, seen_ptrs)
+    for attr in ("conv_states", "recurrent_states"):
+        seq = getattr(cache, attr, None)
+        if isinstance(seq, (list, tuple)):
+            rec_b += _tensor_tree_bytes(seq, seen_ptrs)
+    return kv_b, rec_b
+
+
+# ============================================================================ sampling helpers
+
+def _sample_next_token(
+    logits_last: torch.Tensor,
+    *,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample `[B, 1]` token IDs from `[B, 1, V]` or `[B, V]` logits."""
+    scores = logits_last[:, -1, :].float() if logits_last.ndim == 3 else logits_last.float()
+    if temperature <= 0.0:
+        return scores.argmax(dim=-1, keepdim=True)
+
+    scores = scores / float(temperature)
+    vocab = scores.shape[-1]
+    if top_k > 0 and top_k < vocab:
+        kth = torch.topk(scores, int(top_k), dim=-1).values[..., -1, None]
+        scores = scores.masked_fill(scores < kth, float("-inf"))
+
+    if top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(scores, descending=True, dim=-1)
+        probs_sorted = F.softmax(sorted_logits, dim=-1)
+        cumprobs = torch.cumsum(probs_sorted, dim=-1)
+        drop_sorted = cumprobs - probs_sorted > float(top_p)
+        drop_sorted[..., 0] = False
+        sorted_logits = sorted_logits.masked_fill(drop_sorted, float("-inf"))
+        scores = torch.empty_like(scores).scatter(-1, sorted_idx, sorted_logits)
+
+    probs = F.softmax(scores, dim=-1)
+    return torch.multinomial(probs, num_samples=1, generator=generator)
+
+
+# ============================================================================ Inference Engine
+
+class OptimizedLoopInferenceEngine:
+    """Production on-weight inference engine for `Qwen3.6-35B-A6B-LoopHSSD` and `ToyForCausalLM`."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        tokenizer: Any = None,
+        cfg: InferenceConfig | None = None,
+        *,
+        loop_controller: LoopController | None = None,
+        lsa_manager: LSAManager | None = None,
+    ) -> None:
+        self.cfg = cfg if cfg is not None else InferenceConfig()
+        self.cfg.validate()
+
+        self.outer_model = model
+        if isinstance(model, Qwen36LoopHSSDForCausalLM):
+            self.backbone = model.backbone
+            self.loop_controller = loop_controller or model.loop_controller
+            self.lsa_manager = lsa_manager or model.lsa_manager
+        else:
+            self.backbone = model
+            self.loop_controller = loop_controller or self._detect_loop(model)
+            self.lsa_manager = lsa_manager
+
+        self.tokenizer = tokenizer
+        self.text_model = find_text_model(self.backbone)
+        self.text_config = self.text_model.config
+        head = find_lm_head(self.backbone, getattr(self.text_config, "vocab_size", None))
+        require(head is not None, "model has no lm_head module")
+        assert head is not None
+        self.lm_head = head
+
+        phys_pairs, _, _ = physical_layers(self.backbone)
+        self.num_physical_layers = len(phys_pairs)
+        mtype = str(getattr(self.text_config, "model_type", "") or "")
+        self._is_toy = mtype.startswith("toy") or type(self.backbone).__name__.startswith("Toy")
+
+        self.backbone.eval()
+        self.outer_model.eval()
+
+        if self.cfg.active_passes is not None:
+            self.set_active_passes(int(self.cfg.active_passes))
+
+        self._compiled_lm_head: Any = None
+        if self.cfg.compile_decode:
+            self._ensure_compiled_decode()
+
+    @staticmethod
+    def _detect_loop(backbone: nn.Module) -> LoopController | None:
+        tm = find_text_model(backbone)
+        layers = getattr(tm, "layers", None)
+        if isinstance(layers, nn.ModuleList) and len(layers) > 0:
+            ctl = getattr(layers[0], "_ctl", None)
+            if isinstance(ctl, LoopController):
+                return ctl
+        return None
+
+    # ------------------------------------------------------------------ constructors
+
+    @classmethod
+    def from_stack(
+        cls,
+        stack: Stack | LoadedModelPack,
+        cfg: InferenceConfig | None = None,
+    ) -> OptimizedLoopInferenceEngine:
+        """Construct an `OptimizedLoopInferenceEngine` directly from an in-memory `Stack`."""
+        hf_mod = getattr(stack, "hf_model", None)
+        model = hf_mod if isinstance(hf_mod, nn.Module) else stack.model
+        return cls(
+            model=model,
+            tokenizer=stack.tokenizer,
+            cfg=cfg,
+            loop_controller=stack.loop,
+            lsa_manager=stack.lsa,
+        )
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pack_dir_or_repo: str | os.PathLike[str],
+        cfg: InferenceConfig | None = None,
+        *,
+        token: str | None = None,
+        device: str | torch.device | None = None,
+        device_map: str | torch.device | None = None,
+        dtype: str | torch.dtype | None = "auto",
+        revision: str | None = None,
+        local_files_only: bool = False,
+        api: Any = None,
+    ) -> OptimizedLoopInferenceEngine:
+        """Load a Whole Model Pack from disk or Hugging Face Hub into an `OptimizedLoopInferenceEngine`."""
+        from ..export_pack import load_whole_model_pack
+
+        icfg = cfg if cfg is not None else InferenceConfig()
+        pack = load_whole_model_pack(
+            pack_dir_or_repo,
+            device=device,
+            device_map=device_map,
+            dtype=dtype,
+            active_passes=icfg.active_passes,
+            token=token,
+            revision=revision,
+            local_files_only=local_files_only,
+            api=api,
+        )
+        return cls.from_stack(pack, cfg=icfg)
+
+    # ------------------------------------------------------------------ dynamic depth control
+
+    @property
+    def device(self) -> torch.device:
+        return self.text_model.embed_tokens.weight.device
+
+    @property
+    def active_passes(self) -> int:
+        return 1 if self.loop_controller is None else int(self.loop_controller.active_passes)
+
+    @property
+    def max_passes(self) -> int:
+        return 1 if self.loop_controller is None else int(self.loop_controller.spec.num_passes)
+
+    @property
+    def effective_layers(self) -> int:
+        if self.loop_controller is None:
+            return self.num_physical_layers
+        core_len = int(self.loop_controller.spec.core_len)
+        return self.num_physical_layers + (self.active_passes - 1) * core_len
+
+    def set_active_passes(self, r: int) -> None:
+        """Switch active core pass count (`r in {1, 2, 3}` -> `40L / 64L / 88L`) with zero weight reload."""
+        if self.loop_controller is None:
+            require(int(r) == 1, f"model is not Loop-wrapped; cannot set active_passes={r}")
+            return
+        self.loop_controller.set_active_passes(int(r))
+
+    def depth(self, r: int) -> _DepthContext:
+        """Set active depth `r` immediately AND return a `with engine.depth(r):` context manager."""
+        prev = self.active_passes
+        self.set_active_passes(int(r))
+        return _DepthContext(self, prev, int(r))
+
+    # ------------------------------------------------------------------ cache & torch.compile helpers
+
+    def create_cache(self, quant_mode: str | None = None) -> Any:
+        """Allocate a fresh hybrid KV + recurrent state cache for prefill + decode."""
+        mode = quant_mode or self.cfg.kv_cache_quant
+        n_virt = int(getattr(self.text_model.config, "num_hidden_layers", self.num_physical_layers))
+        ltypes = list(
+            getattr(
+                self.text_model.config,
+                "layer_types",
+                ["full_attention"] * n_virt,
+            )
+        )
+        if mode in ("fp8", "hadamard_int4", "bf16", "fp16"):
+            return QuantizedHybridCache(num_layers=n_virt, layer_types=ltypes, mode=mode)
+        if self._is_toy:
+            return ToyHybridCache(self.text_model.config)
+        return None
+
+    def _ensure_compiled_decode(self) -> None:
+        if self._compiled_lm_head is not None:
+            return
+        if not hasattr(torch, "compile"):
+            self._compiled_lm_head = self.lm_head
+            return
+        try:
+            if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "config"):
+                torch._dynamo.config.allow_unspec_int_on_nn_module = True
+                torch._dynamo.config.suppress_errors = True
+            backend = self.cfg.compile_backend or ("inductor" if self.device.type == "cuda" else "aot_eager")
+
+            def _step_head(h_last: torch.Tensor) -> torch.Tensor:
+                return self.lm_head(h_last)
+
+            self._compiled_lm_head = torch.compile(_step_head, backend=backend, mode=self.cfg.compile_mode)
+        except Exception:
+            self._compiled_lm_head = self.lm_head
+
+    def _project_last_logits(self, h_last: torch.Tensor, *, is_decode: bool) -> torch.Tensor:
+        if is_decode and self.cfg.compile_decode:
+            self._ensure_compiled_decode()
+            return self._compiled_lm_head(h_last)
+        return self.lm_head(h_last)
+
+    # ------------------------------------------------------------------ routing & memory telemetry
+
+    def _model_param_bytes(self) -> int:
+        seen: set[int] = set()
+        tot = 0
+        for p in self.backbone.parameters():
+            if p.numel() == 0:
+                continue
+            ptr = int(p.untyped_storage().data_ptr())
+            if ptr not in seen:
+                seen.add(ptr)
+                tot += int(p.numel() * p.element_size())
+        return tot
+
+    def _unique_experts_last_step(self) -> float:
+        default_k = float(getattr(self.text_config, "num_experts_per_tok", 0) or 0)
+        if self.loop_controller is None:
+            return default_k
+        routing = self.loop_controller.ctx.routing
+        if not routing:
+            return default_k
+        r_max = self.active_passes
+        by_phys: dict[int, list[torch.Tensor]] = {}
+        for (phys, r), top_idx in routing.items():
+            if 1 <= r <= r_max:
+                by_phys.setdefault(phys, []).append(top_idx)
+        if not by_phys:
+            return default_k
+
+        layer_means: list[float] = []
+        for idx_list in by_phys.values():
+            base_n = idx_list[0].shape[0]
+            aligned = [t for t in idx_list if t.shape[0] == base_n]
+            cat = torch.cat(aligned, dim=-1)  # [N_tok, R_act * top_k]
+            sorted_cat, _ = torch.sort(cat, dim=-1)
+            uniq_per_tok = 1 + (sorted_cat[:, 1:] != sorted_cat[:, :-1]).sum(dim=-1).float()
+            layer_means.append(float(uniq_per_tok.mean().item()))
+        return sum(layer_means) / len(layer_means)
+
+    # ------------------------------------------------------------------ chunked prefill & causal MoR decode
+
+    def _run_text_model_step(
+        self,
+        step_ids: torch.Tensor,
+        cache: Any,
+        *,
+        allow_mor_early_exit: bool = False,
+    ) -> tuple[Any, Any, int]:
+        """Run `text_model` on `step_ids` and return `(tm_out, updated_cache, executed_passes)`."""
+        ctl = self.loop_controller
+        orig_r = self.active_passes
+        executed_r = orig_r
+        handles: list[Any] = []
+
+        if (
+            allow_mor_early_exit
+            and ctl is not None
+            and orig_r > 1
+            and step_ids.shape[0] == 1
+            and step_ids.shape[1] == 1
+        ):
+            vlayers = getattr(self.text_model, "layers", None)
+            if isinstance(vlayers, nn.ModuleList):
+                if ctl.adapters.mor_router is not None and ctl.spec.mor:
+                    # Causal MoR router decides token depth at pass-1 entry; clamp active_passes right after!
+                    for vl in vlayers:
+                        slot = getattr(vl, "slot", None)
+                        if slot is not None and slot.r == 1 and slot.entry:
+
+                            def _on_p1_entry(_m: nn.Module, _i: Any, _o: Any) -> None:
+                                non_zero_r = 1
+                                for r_chk in range(2, orig_r + 1):
+                                    kp = ctl.ctx.keep.get(r_chk)
+                                    if kp is not None and bool((kp > 0).any()):
+                                        non_zero_r = r_chk
+                                ctl.active_passes = non_zero_r
+
+                            handles.append(vl.register_forward_hook(_on_p1_entry))
+                            break
+                else:
+                    # Confidence-based causal early exit at each core pass exit (1 .. orig_r - 1)
+                    thresh = float(self.cfg.mor_confidence_threshold)
+                    norm_mod = getattr(self.text_model, "norm", None)
+                    for vl in vlayers:
+                        slot = getattr(vl, "slot", None)
+                        if slot is not None and slot.exit and 1 <= slot.r < orig_r:
+
+                            def _on_pass_exit(
+                                _m: nn.Module,
+                                _i: Any,
+                                out_val: Any,
+                                _r: int = int(slot.r),
+                            ) -> None:
+                                if _r > ctl.active_passes:
+                                    return
+                                h_cur = out_val[0] if isinstance(out_val, tuple) else out_val
+                                h_norm = norm_mod(h_cur) if callable(norm_mod) else h_cur
+                                max_p = F.softmax(self.lm_head(h_norm[:, -1:, :]).float(), dim=-1).amax()
+                                if float(max_p.item()) >= thresh:
+                                    ctl.active_passes = _r
+
+                            handles.append(vl.register_forward_hook(_on_pass_exit))
+
+        try:
+            tm_out = self.text_model(
+                input_ids=step_ids,
+                past_key_values=cache,
+                use_cache=True,
+            )
+            executed_r = 1 if ctl is None else int(ctl.active_passes)
+        finally:
+            for h in handles:
+                h.remove()
+            if ctl is not None:
+                ctl.active_passes = orig_r
+
+        next_cache = getattr(tm_out, "past_key_values", None)
+        if next_cache is None:
+            next_cache = cache
+        return tm_out, next_cache, executed_r
+
+    @torch.no_grad()
+    def prefill(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        cache: Any = None,
+        chunk_size: int | None = None,
+    ) -> tuple[torch.Tensor, Any, int]:
+        """Stream `input_ids [B, T]` in `prefill_chunk_size` chunks; materialize logits ONLY on token `T-1`."""
+        require(input_ids.ndim == 2 and input_ids.shape[1] >= 1, "input_ids must have shape [B, T >= 1]")
+        ids = input_ids.to(self.device)
+        seq_len = int(ids.shape[1])
+        csize = max(1, int(chunk_size if chunk_size is not None else self.cfg.prefill_chunk_size))
+
+        if cache is None:
+            cache = self.create_cache()
+        if self.lsa_manager is not None:
+            self.lsa_manager.clear_cache()
+
+        n_chunks = 0
+        last_hidden_final: torch.Tensor | None = None
+        for start in range(0, seq_len, csize):
+            end = min(seq_len, start + csize)
+            chunk = ids[:, start:end]
+            tm_out, cache, _ = self._run_text_model_step(chunk, cache, allow_mor_early_exit=False)
+            n_chunks += 1
+            if end == seq_len:
+                last_hidden_final = tm_out.last_hidden_state[:, -1:, :]
+            del tm_out
+
+        assert last_hidden_final is not None
+        logits_last = self._project_last_logits(last_hidden_final, is_decode=False)
+        return logits_last, cache, n_chunks
+
+    @torch.no_grad()
+    def forward_logits(self, input_ids: torch.Tensor, *, depth: int | None = None) -> torch.Tensor:
+        """Compute full-sequence logits `[B, T, V]` (convenience helper for eval/logit-equivalence checks)."""
+        ids = input_ids.to(self.device)
+        if depth is not None:
+            prev = self.active_passes
+            self.set_active_passes(int(depth))
+            try:
+                return self.outer_model(input_ids=ids, use_cache=False).logits
+            finally:
+                self.set_active_passes(prev)
+        return self.outer_model(input_ids=ids, use_cache=False).logits
+
+    # ------------------------------------------------------------------ tokenization helpers
+
+    def _encode_prompt(self, prompt: str | Sequence[int] | torch.Tensor) -> torch.Tensor:
+        if isinstance(prompt, torch.Tensor):
+            ids = prompt.long()
+            return ids.unsqueeze(0) if ids.ndim == 1 else ids
+        if isinstance(prompt, str):
+            require(self.tokenizer is not None, "string prompt passed to generate(), but engine has no tokenizer")
+            raw = self.tokenizer.encode(prompt, add_special_tokens=False)
+            if hasattr(raw, "tolist"):
+                raw = raw.tolist()
+            return torch.tensor([int(t) for t in raw], dtype=torch.long, device=self.device).unsqueeze(0)
+        return torch.tensor([int(t) for t in prompt], dtype=torch.long, device=self.device).unsqueeze(0)
+
+    def _resolve_stop_ids(self, stop_token_ids: Sequence[int] | None) -> set[int]:
+        stops: set[int] = {int(t) for t in self.cfg.stop_token_ids}
+        if stop_token_ids is not None:
+            stops.update(int(t) for t in stop_token_ids)
+        tok_eos = getattr(self.tokenizer, "eos_token_id", None)
+        if tok_eos is not None:
+            if isinstance(tok_eos, (list, tuple, set)):
+                stops.update(int(t) for t in tok_eos)
+            else:
+                stops.add(int(tok_eos))
+        cfg_eos = getattr(self.text_config, "eos_token_id", None)
+        if cfg_eos is not None and not stops:
+            if isinstance(cfg_eos, (list, tuple, set)):
+                stops.update(int(t) for t in cfg_eos)
+            else:
+                stops.add(int(cfg_eos))
+        return stops
+
+    def _sync_device(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    # ------------------------------------------------------------------ autoregressive generation
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt: str | Sequence[int] | torch.Tensor,
+        *,
+        max_new_tokens: int | None = None,
+        depth: int | None = None,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        stop_token_ids: Sequence[int] | None = None,
+        prefill_chunk_size: int | None = None,
+        seed: int | None = None,
+        ignore_eos: bool = False,
+    ) -> GenerationResult:
+        """Run chunked prefill + optimized autoregressive decode with live telemetry."""
+        prev_depth = self.active_passes
+        if depth is not None:
+            self.set_active_passes(int(depth))
+
+        try:
+            prompt_ids_2d = self._encode_prompt(prompt).to(self.device)
+            require(prompt_ids_2d.shape[0] == 1, "OptimizedLoopInferenceEngine.generate expects batch_size == 1")
+            prompt_len = int(prompt_ids_2d.shape[1])
+
+            n_new = int(self.cfg.max_new_tokens if max_new_tokens is None else max_new_tokens)
+            temp = float(self.cfg.temperature if temperature is None else temperature)
+            tk = int(self.cfg.top_k if top_k is None else top_k)
+            tp = float(self.cfg.top_p if top_p is None else top_p)
+            stops = set() if ignore_eos else self._resolve_stop_ids(stop_token_ids)
+            use_seed = self.cfg.seed if seed is None else seed
+
+            gen_rng: torch.Generator | None = None
+            if use_seed is not None and temp > 0.0:
+                gen_rng = torch.Generator(device=self.device.type if self.device.type == "cuda" else "cpu")
+                gen_rng.manual_seed(int(use_seed))
+
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
+
+            self._sync_device()
+            t0 = time.perf_counter()
+            logits_last, cache, n_chunks = self.prefill(
+                prompt_ids_2d,
+                chunk_size=prefill_chunk_size,
+            )
+            self._sync_device()
+            t_prefill_end = time.perf_counter()
+            prefill_ms = (t_prefill_end - t0) * 1000.0
+
+            expert_counts: list[float] = [self._unique_experts_last_step()]
+            pass_counts: list[int] = []
+            generated: list[int] = []
+            finish_reason = "length"
+            hit_stop_id: int | None = None
+
+            if n_new > 0:
+                nxt_tok = _sample_next_token(
+                    logits_last,
+                    temperature=temp,
+                    top_k=tk,
+                    top_p=tp,
+                    generator=gen_rng,
+                )
+                tok_val = int(nxt_tok.item())
+                generated.append(tok_val)
+                pass_counts.append(self.active_passes)
+                if tok_val in stops:
+                    finish_reason = "stop"
+                    hit_stop_id = tok_val
+
+                while len(generated) < n_new and finish_reason != "stop":
+                    tm_out, cache, exec_r = self._run_text_model_step(
+                        nxt_tok.to(self.device),
+                        cache,
+                        allow_mor_early_exit=bool(self.cfg.mor_early_exit),
+                    )
+                    h_last = tm_out.last_hidden_state[:, -1:, :]
+                    logits_last = self._project_last_logits(h_last, is_decode=True)
+                    del tm_out
+
+                    pass_counts.append(exec_r)
+                    expert_counts.append(self._unique_experts_last_step())
+
+                    nxt_tok = _sample_next_token(
+                        logits_last,
+                        temperature=temp,
+                        top_k=tk,
+                        top_p=tp,
+                        generator=gen_rng,
+                    )
+                    tok_val = int(nxt_tok.item())
+                    generated.append(tok_val)
+                    if tok_val in stops:
+                        finish_reason = "stop"
+                        hit_stop_id = tok_val
+
+            self._sync_device()
+            t_end = time.perf_counter()
+            decode_ms = (t_end - t_prefill_end) * 1000.0
+            total_ms = (t_end - t0) * 1000.0
+
+            kv_b, rec_b = _measure_any_cache_bytes(cache)
+            mib = float(1024 * 1024)
+            if self.device.type == "cuda":
+                peak_mb = float(torch.cuda.max_memory_allocated(self.device)) / mib
+            else:
+                peak_mb = float(self._model_param_bytes() + kv_b + rec_b) / mib
+
+            prefill_s = max(prefill_ms / 1000.0, 1e-9)
+            decode_s = max(decode_ms / 1000.0, 1e-9)
+            decode_steps = max(len(generated) - 1, 1) if len(generated) > 1 else len(generated)
+
+            metrics = GenerationMetrics(
+                prompt_tokens=prompt_len,
+                generated_tokens=len(generated),
+                prefill_ms=round(prefill_ms, 3),
+                decode_ms=round(decode_ms, 3),
+                total_ms=round(total_ms, 3),
+                prefill_tok_s=round(prompt_len / prefill_s, 2),
+                decode_tok_s=round(decode_steps / decode_s, 2) if generated else 0.0,
+                peak_vram_mb=round(peak_mb, 3),
+                kv_cache_mb=round(kv_b / mib, 4),
+                recurrent_state_mb=round(rec_b / mib, 4),
+                active_passes=self.active_passes,
+                mean_active_passes=round(
+                    sum(pass_counts) / len(pass_counts), 3
+                ) if pass_counts else float(self.active_passes),
+                effective_layers=self.effective_layers,
+                unique_experts_per_tok=round(sum(expert_counts) / len(expert_counts), 3),
+                prefill_chunks=n_chunks,
+                kv_cache_quant=self.cfg.kv_cache_quant,
+                compiled_decode=bool(self.cfg.compile_decode),
+            )
+
+            text = ""
+            if self.tokenizer is not None and hasattr(self.tokenizer, "decode"):
+                decode_ids = generated[:-1] if (finish_reason == "stop" and generated) else generated
+                tok_len = getattr(self.tokenizer, "vocab_size", None)
+                if hasattr(self.tokenizer, "__len__"):
+                    tok_len = max(int(tok_len or 0), len(self.tokenizer))
+                if isinstance(tok_len, int) and tok_len > 0:
+                    decode_ids = [tid for tid in decode_ids if 0 <= tid < tok_len]
+                text = str(self.tokenizer.decode(decode_ids, skip_special_tokens=True))
+
+            return GenerationResult(
+                text=text,
+                token_ids=generated,
+                prompt_token_ids=[int(x) for x in prompt_ids_2d[0].tolist()],
+                finish_reason=finish_reason,
+                stop_token_id=hit_stop_id,
+                logits_last=logits_last.detach().cpu(),
+                metrics=metrics,
+            )
+        finally:
+            if depth is not None:
+                self.set_active_passes(prev_depth)
+
+    # ------------------------------------------------------------------ structured depth benchmark
+
+    @torch.no_grad()
+    def benchmark(
+        self,
+        prompt_len: int = 512,
+        gen_len: int = 64,
+        depths: Sequence[int] = (1, 2, 3),
+    ) -> dict[str, Any]:
+        """Benchmark prefill & decode throughput, latency, KV HBM, and expert diversity across `depths`."""
+        require(int(prompt_len) >= 1 and int(gen_len) >= 1, "prompt_len and gen_len must be >= 1")
+        vocab = int(getattr(self.text_config, "vocab_size", 256))
+        rng = torch.Generator(device="cpu").manual_seed(2026)
+        synth_prompt = torch.randint(4, max(8, min(vocab, 250)), (1, int(prompt_len)), generator=rng)
+
+        # Short warmup on depth 1 to stabilize allocator / optional torch.compile cache
+        orig_passes = self.active_passes
+        try:
+            self.set_active_passes(1)
+            _ = self.generate(synth_prompt[:, : min(8, int(prompt_len))], max_new_tokens=2, ignore_eos=True)
+
+            per_depth: dict[int, dict[str, Any]] = {}
+            for r in depths:
+                r_int = int(r)
+                if r_int > self.max_passes:
+                    continue
+                res = self.generate(
+                    synth_prompt,
+                    max_new_tokens=int(gen_len),
+                    depth=r_int,
+                    temperature=0.0,
+                    ignore_eos=True,
+                )
+                per_depth[r_int] = res.metrics.to_dict()
+        finally:
+            self.set_active_passes(orig_passes)
+
+        return {
+            **per_depth,
+            "depths": per_depth,
+            "prompt_len": int(prompt_len),
+            "gen_len": int(gen_len),
+            "device": str(self.device),
+            "kv_cache_quant": self.cfg.kv_cache_quant,
+            "prefill_chunk_size": int(self.cfg.prefill_chunk_size),
+            "compiled_decode": bool(self.cfg.compile_decode),
+        }
+
+
+__all__ = [
+    "GenerationMetrics",
+    "GenerationResult",
+    "InferenceConfig",
+    "OptimizedLoopInferenceEngine",
+    "QuantizedHybridCache",
+]

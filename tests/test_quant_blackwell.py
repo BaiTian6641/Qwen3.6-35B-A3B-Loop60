@@ -22,10 +22,14 @@ Covers:
 """
 from __future__ import annotations
 
+import ast
 import copy
+import importlib.util
 import json
 import logging
 import math
+import pathlib
+import sys
 import types
 from typing import Any
 
@@ -36,7 +40,13 @@ from torch import nn
 
 from qloop.data.tokenizer import ToyTokenizer
 from qloop.export_pack import export_whole_model_pack
-from qloop.infer.hf_custom_modeling import load_safetensors_file
+from qloop.infer.hf_custom_modeling import (
+    CONFIG_FILENAME,
+    MODELING_FILENAME,
+    Qwen36LoopHSSDForCausalLM,
+    load_safetensors_file,
+    write_standalone_hf_modeling_files,
+)
 from qloop.model import quant_autograd as qa
 from qloop.model.experts import (
     _EXPERT_DELTA_KEY_RE,
@@ -54,7 +64,7 @@ from qloop.model.loading import (
     load_model,
 )
 from qloop.model.loop import LoopSpec, apply_loop
-from qloop.model.probes import probe_backward
+from qloop.model.probes import probe_backward, run_structured_probe_suite
 from qloop.model.quant_autograd import (
     auto_dequant_expert_fn,
     dequantize_fp8_tensor,
@@ -65,7 +75,7 @@ from qloop.model.quant_autograd import (
     quantize_fp8_blockwise,
     quantize_nvfp4_tensor,
 )
-from qloop.model.toy import ToyForCausalLM, build_toy
+from qloop.model.toy import ToyConfig, ToyForCausalLM, build_toy
 from qloop.train.stack import Stack
 
 # ============================================================================ mock Blackwell modules
@@ -699,10 +709,12 @@ def test_quantized_autograd_bridge_native_fast_path_and_active_only_moe(
     rep1 = install_quantized_autograd_bridge(wrapper)
     assert rep1["bridged_linear_count"] == 1
     assert rep1["bridged_moe_count"] == 1
+    assert rep1["native_fwd_ok_count"] == 2
     rep2 = install_quantized_autograd_bridge(wrapper)
     assert rep2["bridged_linear_count"] == 0
     assert rep2["bridged_moe_count"] == 0
     assert rep2["already_bridged_count"] == 2
+    assert rep2["native_fwd_ok_count"] == 2
 
     # 1) `no_grad()` / `eval()` MUST hit the fast native quantized forward (`native_call_count`++)
     qlin.native_call_count = 0  # type: ignore[attr-defined]
@@ -721,20 +733,35 @@ def test_quantized_autograd_bridge_native_fast_path_and_active_only_moe(
     assert torch.allclose(y_eval, y_nograd_inp)
     assert torch.allclose(m_eval, m_nograd_inp)
 
-    # 2) Spy on `_dequant_single_expert` to prove ONLY active routed experts are ever dequantized
-    seen_experts: list[int] = []
+    # 2) Spy on `_dequant_experts_chunk` & `_dequant_single_expert` to prove ONLY active routed
+    #    experts are dequantized in a single batched 3D chunk call (`0` unused experts touched!)
+    seen_chunks: list[list[int]] = []
+    single_calls: list[int] = []
+    orig_dequant_chunk = qa._dequant_experts_chunk
     orig_dequant_single = qa._dequant_single_expert
 
-    def _spy_dequant(
+    def _spy_chunk(
+        mod: nn.Module,
+        expert_ids: list[int],
+        dtype: torch.dtype = torch.bfloat16,
+        *,
+        nvfp4_mode_override: str | None = None,
+    ) -> tuple[torch.Tensor | list[torch.Tensor], torch.Tensor | list[torch.Tensor]]:
+        seen_chunks.append([int(e) for e in expert_ids])
+        return orig_dequant_chunk(mod, expert_ids, dtype=dtype, nvfp4_mode_override=nvfp4_mode_override)
+
+    def _spy_single(
         mod: nn.Module,
         e: int,
-        *,
         dtype: torch.dtype = torch.float32,
+        *,
+        nvfp4_mode_override: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        seen_experts.append(int(e))
-        return orig_dequant_single(mod, e, dtype=dtype)
+        single_calls.append(int(e))
+        return orig_dequant_single(mod, e, dtype=dtype, nvfp4_mode_override=nvfp4_mode_override)
 
-    monkeypatch.setattr(qa, "_dequant_single_expert", _spy_dequant)
+    monkeypatch.setattr(qa, "_dequant_experts_chunk", _spy_chunk)
+    monkeypatch.setattr(qa, "_dequant_single_expert", _spy_single)
 
     x1 = x0.detach().clone().requires_grad_(True)
     w1 = top_w0.detach().clone().requires_grad_(True)
@@ -743,14 +770,14 @@ def test_quantized_autograd_bridge_native_fast_path_and_active_only_moe(
     # Forward stayed on bridged path (`native_call_count` stayed at 2)
     assert qlin.native_call_count == 2  # type: ignore[attr-defined]
     assert qmoe.native_call_count == 2  # type: ignore[attr-defined]
-    assert set(seen_experts) == {1, 2, 5, 9}
-    assert len(seen_experts) == 4  # 8 unused experts out of 12 were NEVER dequantized!
+    assert seen_chunks == [[1, 2, 5, 9]]  # 1 batched 3D chunk call; 8 unused experts NEVER dequantized!
+    assert single_calls == []
 
     loss = (out_lin.pow(2).mean() + out_moe.pow(2).mean())
     loss.backward()
-    # Backward recomputes ONLY the 4 active experts (4 fwd + 4 bwd = 8 total calls, zero unused!)
-    assert set(seen_experts) == {1, 2, 5, 9}
-    assert len(seen_experts) == 8
+    # Backward recomputes ONLY the 4 active experts in 1 batched 3D chunk call (zero unused!)
+    assert seen_chunks == [[1, 2, 5, 9], [1, 2, 5, 9]]
+    assert single_calls == []
     assert x1.grad is not None and torch.isfinite(x1.grad).all() and float(x1.grad.norm()) > 0.0
     assert w1.grad is not None and torch.isfinite(w1.grad).all() and float(w1.grad.norm()) > 0.0
 
@@ -1337,3 +1364,651 @@ def test_freeze_all_but_keeps_fp8_and_nvfp4_weights_frozen_and_catches_typos(
         freeze_all_but(nvfp4_model, [r"nonexistent_typo_pattern_xyz\."])
     with pytest.raises(AssertionError, match="forbidden groups"):
         freeze_all_but(nvfp4_model, [r"mlp\.experts\."])
+
+
+# ========================================== 7. Missing-`kernels` FP8 Fallback & Chunked-3D MoE
+
+_MISSING_KERNELS_MSG = (
+    "finegrained-fp8 kernel unavailable: `kernels` is either not installed or uses an incompatible version. "
+    "Please install a compatible version (0.18.2 <= version < 0.19.0), e.g. `pip install kernels==0.18.2`"
+)
+
+
+class MockNoKernelsFP8Linear(nn.Linear):
+    """Simulates `transformers` `FP8Linear` on Colab when `kernels` is missing (raises even under `no_grad()`)."""
+
+    def __init__(
+        self,
+        linear: nn.Linear,
+        block_size: tuple[int, int] = (16, 16),
+        *,
+        scale_attr: str = "weight_scale_inv",
+    ) -> None:
+        super().__init__(int(linear.in_features), int(linear.out_features), bias=False, device="meta")
+        self.weight_block_size = tuple(block_size)
+        q_w, s_inv = quantize_fp8_blockwise(linear.weight.detach(), block_size=block_size)
+        self.weight = nn.Parameter(q_w, requires_grad=False)
+        self.register_buffer(scale_attr, s_inv)
+        if linear.bias is not None:
+            self.bias = nn.Parameter(linear.bias.detach().clone(), requires_grad=False)
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        del x
+        raise ImportError(_MISSING_KERNELS_MSG)
+
+
+class MockNoKernelsFP8Experts(nn.Module):
+    """Simulates `transformers` `FP8Experts` raising `ImportError` unconditionally across 3D/2D scale layouts."""
+
+    def __init__(
+        self,
+        gate_up: torch.Tensor,
+        down: torch.Tensor,
+        block_size: tuple[int, int] = (16, 16),
+        *,
+        flatten_2d_scale: bool = False,
+        scale_names: tuple[str, str] = ("gate_up_proj_scale_inv", "down_proj_scale_inv"),
+    ) -> None:
+        super().__init__()
+        self.num_experts = int(gate_up.shape[0])
+        self.weight_block_size = tuple(block_size)
+        gu_q, gu_s = quantize_fp8_blockwise(gate_up, block_size=block_size)
+        dn_q, dn_s = quantize_fp8_blockwise(down, block_size=block_size)
+        if flatten_2d_scale:
+            gu_s = gu_s.reshape(self.num_experts * gu_s.shape[1], gu_s.shape[2]).contiguous()
+            dn_s = dn_s.reshape(self.num_experts * dn_s.shape[1], dn_s.shape[2]).contiguous()
+        self.gate_up_proj = nn.Parameter(gu_q, requires_grad=False)
+        self.down_proj = nn.Parameter(dn_q, requires_grad=False)
+        self.register_buffer(scale_names[0], gu_s)
+        self.register_buffer(scale_names[1], dn_s)
+        self.act_fn = F.silu
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        del hidden_states, top_k_index, top_k_weights
+        raise ImportError(_MISSING_KERNELS_MSG)
+
+
+def _quantize_toy_model_fp8_missing_kernels(
+    base_model: ToyForCausalLM,
+    block_size: tuple[int, int] = (16, 16),
+    *,
+    flatten_2d_scale: bool = False,
+    moe_scale_names: tuple[str, str] = ("gate_up_proj_scale_inv", "down_proj_scale_inv"),
+    lin_scale_attr: str = "weight_scale_inv",
+) -> ToyForCausalLM:
+    m = copy.deepcopy(base_model)
+    m.config.quantization_config = {  # type: ignore[attr-defined]
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": list(block_size),
+    }
+    for layer in m.model.layers:
+        if hasattr(layer, "self_attn"):
+            sa = layer.self_attn
+            for attr in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                setattr(sa, attr, MockNoKernelsFP8Linear(getattr(sa, attr), block_size, scale_attr=lin_scale_attr))
+        else:
+            la = layer.linear_attn
+            for attr in ("in_proj_qkv", "in_proj_qkvz", "out_proj"):
+                if hasattr(la, attr):
+                    setattr(la, attr, MockNoKernelsFP8Linear(getattr(la, attr), block_size, scale_attr=lin_scale_attr))
+        se = layer.mlp.shared_expert
+        for attr in ("gate_proj", "up_proj", "down_proj"):
+            setattr(se, attr, MockNoKernelsFP8Linear(getattr(se, attr), block_size, scale_attr=lin_scale_attr))
+        exp = layer.mlp.experts
+        layer.mlp.experts = MockNoKernelsFP8Experts(
+            exp.gate_up_proj.detach(),
+            exp.down_proj.detach(),
+            block_size=block_size,
+            flatten_2d_scale=flatten_2d_scale,
+            scale_names=moe_scale_names,
+        )
+    for p in m.parameters():
+        p.requires_grad_(False)
+    return m
+
+
+@pytest.mark.parametrize(
+    ("flatten_2d_scale", "moe_scale_names", "lin_scale_attr"),
+    [
+        (False, ("gate_up_proj_scale_inv", "down_proj_scale_inv"), "weight_scale_inv"),
+        (True, ("gate_up_proj_scale_inv", "down_proj_scale_inv"), "weight_scale_inv"),
+        (True, ("weight_scale_up", "weight_scale_down"), "weight_scale_inv"),
+        (False, ("weight_scale_inv_up", "weight_scale_inv_down"), "scale_inv"),
+        (True, ("custom_gu_blk_buf", "custom_dn_blk_buf"), "custom_lin_blk_buf"),
+    ],
+)
+def test_fp8_missing_kernels_nograd_fallback_probe_suite_and_backward(
+    flatten_2d_scale: bool,
+    moe_scale_names: tuple[str, str],
+    lin_scale_attr: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Exact Colab Blackwell `Qwen3.6-35B-A3B-FP8` crash repro (`ImportError` under `torch.no_grad()`)."""
+    monkeypatch.setattr(logging.getLogger("qloop"), "propagate", True)
+    base_float = build_toy(
+        seed=303,
+        num_hidden_layers=6,
+        hidden_size=32,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        num_experts=6,
+        num_experts_per_tok=2,
+        layer_types=(
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "full_attention",
+        ),
+    ).eval()
+    tok = ToyTokenizer()
+    inp = torch.randint(4, 96, (2, 12))
+    with torch.no_grad():
+        float_ref_logits = base_float(inp).logits.detach().clone()
+
+    raw_fp8 = _quantize_toy_model_fp8_missing_kernels(
+        base_float,
+        block_size=(16, 16),
+        flatten_2d_scale=flatten_2d_scale,
+        moe_scale_names=moe_scale_names,
+        lin_scale_attr=lin_scale_attr,
+    )
+    # Without bridge, `torch.no_grad()` immediately crashes with `ImportError: finegrained-fp8 kernel unavailable`
+    with pytest.raises(ImportError, match="finegrained-fp8 kernel unavailable"), torch.no_grad():
+        raw_fp8(inp)
+
+    # Load through `load_model` -> installs bridge, records `native_fwd_ok_count == 0`, and emits clear hint!
+    monkeypatch.setattr("qloop.model.loading._load_hf", lambda _cfg: (raw_fp8, tok))
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="qloop"):
+        model, _loaded_tok, info = load_model({"name": "Qwen/Qwen3.6-35B-A3B-FP8", "device_map": "cpu"})
+
+    qinfo = info["quantization"]
+    assert qinfo["is_quantized"] is True
+    assert qinfo["native_fwd_ok_count"] == 0
+    assert qinfo["native_grad_ok_count"] == 0
+    assert qinfo["bridged_total"] == qinfo["total_quantized_modules"]
+    assert any("native_fwd_ok=0" in r.message for r in caplog.records)
+    assert any(
+        r.levelno == logging.WARNING and 'pip install "kernels>=0.18.2,<0.19.0"' in r.message
+        for r in caplog.records
+    )
+
+    # 1) `torch.no_grad()` forward succeeds cleanly and matches float reference (`< 1e-2` FP8 quant error)
+    with torch.no_grad():
+        nograd_logits = model(inp).logits
+        nograd_logits_2 = model(inp).logits
+    assert torch.isfinite(nograd_logits).all()
+    assert torch.equal(nograd_logits, nograd_logits_2)  # exact determinism required by probe suite!
+    # Also compute exact dequantized-FP8 float reference to verify `< 1e-5` bridge fidelity
+    deq_ref_model = copy.deepcopy(base_float).eval()
+    with torch.no_grad():
+        for ( _n, dm), (_qn, qm) in zip(
+            [(n, m) for n, m in deq_ref_model.named_modules()],
+            [(n, m) for n, m in model.named_modules()],
+        ):
+            if isinstance(qm, MockNoKernelsFP8Linear) and isinstance(dm, nn.Linear):
+                dm.weight.copy_(qa._dequant_linear_weight(qm, dtype=dm.weight.dtype))
+            elif isinstance(qm, MockNoKernelsFP8Experts) and hasattr(dm, "gate_up_proj"):
+                for ei in range(qm.num_experts):
+                    gue, dne = auto_dequant_expert_fn(qm, ei)
+                    dm.gate_up_proj[ei].copy_(gue)
+                    dm.down_proj[ei].copy_(dne)
+        exact_fp8_ref_logits = deq_ref_model(inp).logits
+    assert (nograd_logits - exact_fp8_ref_logits).abs().max().item() < 1e-5
+    # Also check bfloat16 Tensor Core path (`< 1e-2` vs bfloat16 dequantized reference)
+    model_bf16 = copy.deepcopy(model)
+    deq_ref_bf16 = copy.deepcopy(deq_ref_model)
+    for m_cast in (model_bf16, deq_ref_bf16):
+        for p_b in m_cast.parameters():
+            if p_b.is_floating_point() and p_b.dtype != torch.float8_e4m3fn:
+                p_b.data = p_b.data.to(torch.bfloat16)
+    with torch.no_grad():
+        bf16_logits = model_bf16(inp).logits.float()
+        bf16_deq_ref = deq_ref_bf16(inp).logits.float()
+    assert model_bf16(inp).logits.dtype == torch.bfloat16
+    assert (bf16_logits - bf16_deq_ref).abs().max().item() < 1e-2
+    cos = F.cosine_similarity(nograd_logits.reshape(-1), float_ref_logits.reshape(-1), dim=0).item()
+    assert cos > 0.95
+
+    # 2) Full `run_structured_probe_suite` (where Colab crashed at `ref_logits = model(input_ids=b0)`)
+    if flatten_2d_scale and moe_scale_names == ("gate_up_proj_scale_inv", "down_proj_scale_inv"):
+        suite_out = run_structured_probe_suite(
+            model,
+            [inp],
+            target_virtual=64,
+            n_perturb=2,
+            subspace_rank=16,
+            decode_steps=3,
+        )
+        assert suite_out["summary"]["all_critical_ok"] is True
+        assert suite_out["gates"]["0a_backward"]["passed"] is True
+        assert suite_out["gates"]["0a_surgery"]["passed"] is True
+
+    # 3) Autograd backward propagates exact `dL/dh` and `dL/d(top_k_weights)` through quantized layers!
+    x_grad = torch.randn(3, 32, requires_grad=True)
+    top_idx = torch.tensor([[0, 3], [2, 5], [1, 4]], dtype=torch.long)
+    top_w = torch.softmax(torch.randn(3, 2), dim=-1).detach().requires_grad_(True)
+    qlin0 = model.model.layers[0].mlp.shared_expert.gate_proj
+    qmoe0 = model.model.layers[0].mlp.experts
+    y_lin = qlin0(x_grad)
+    y_moe = qmoe0(x_grad, top_idx, top_w)
+    (y_lin.pow(2).mean() + y_moe.pow(2).mean()).backward()
+
+    x_ref = x_grad.detach().clone().requires_grad_(True)
+    w_ref = top_w.detach().clone().requires_grad_(True)
+    dlin0 = deq_ref_model.model.layers[0].mlp.shared_expert.gate_proj
+    dmoe0 = deq_ref_model.model.layers[0].mlp.experts
+    y_lin_r = dlin0(x_ref)
+    y_moe_r = torch.zeros_like(x_ref)
+    for eid in range(6):
+        t_i, s_i = (top_idx == eid).nonzero(as_tuple=True)
+        if t_i.numel() > 0:
+            gt, up = F.linear(x_ref[t_i], dmoe0.gate_up_proj[eid]).chunk(2, dim=-1)
+            ye = F.linear(F.silu(gt) * up, dmoe0.down_proj[eid])
+            y_moe_r.index_add_(0, t_i, ye * w_ref[t_i, s_i, None])
+    (y_lin_r.pow(2).mean() + y_moe_r.pow(2).mean()).backward()
+
+    assert x_grad.grad is not None and x_ref.grad is not None
+    assert top_w.grad is not None and w_ref.grad is not None
+    assert (y_lin - y_lin_r).abs().max().item() < 1e-5
+    assert (y_moe - y_moe_r).abs().max().item() < 1e-5
+    assert (x_grad.grad - x_ref.grad).abs().max().item() < 1e-5
+    assert (top_w.grad - w_ref.grad).abs().max().item() < 1e-5
+
+
+def test_dynamic_runtime_kernel_failure_fallback_nvfp4_warning_and_unscaled_fp8_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify runtime kernel failure recovery, NVFP4 warning hint, and missing-scale FP8 RuntimeError."""
+    monkeypatch.setattr(logging.getLogger("qloop"), "propagate", True)
+    torch.manual_seed(404)
+
+    # 1) Dynamic runtime `ImportError` after probe initially succeeded (`native_fwd_ok=True`)
+    fail_flag = {"fail": False}
+
+    class FlakyRuntimeFP8Linear(MockFineGrainedFP8Linear):
+        @torch.no_grad()
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            if fail_flag["fail"]:
+                raise ImportError("lazy runtime kernel load failed mid-run")
+            return super().forward(x)
+
+    class FlakyRuntimeFP8Experts(MockFP8FusedExperts):
+        @torch.no_grad()
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            top_k_index: torch.Tensor,
+            top_k_weights: torch.Tensor,
+        ) -> torch.Tensor:
+            if fail_flag["fail"]:
+                raise NotImplementedError("sm_120 runtime shape unsupported")
+            return super().forward(hidden_states, top_k_index, top_k_weights)
+
+    lin_a = FlakyRuntimeFP8Linear(nn.Linear(32, 24, bias=False), block_size=(16, 16))
+    lin_b = FlakyRuntimeFP8Linear(nn.Linear(32, 24, bias=False), block_size=(16, 16))
+    gu = torch.randn(4, 32, 32) * 0.2
+    dn = torch.randn(4, 32, 16) * 0.2
+    moe_a = FlakyRuntimeFP8Experts(gu, dn, block_size=(16, 16))
+    box = nn.ModuleDict({"la": lin_a, "lb": lin_b, "ma": moe_a})
+
+    rep = install_quantized_autograd_bridge(box)
+    assert rep["native_fwd_ok_count"] == 3
+    assert lin_a._qloop_native_fwd_ok is True  # type: ignore[attr-defined]
+    assert moe_a._qloop_native_fwd_ok is True  # type: ignore[attr-defined]
+
+    x = torch.randn(4, 32)
+    idx = torch.tensor([[0, 2], [1, 3], [2, 0], [3, 1]], dtype=torch.long)
+    tw = torch.softmax(torch.randn(4, 2), dim=-1)
+    with torch.no_grad():
+        ref_la = lin_a(x)
+        ref_lb = lin_b(x)
+        ref_ma = moe_a(x, idx, tw)
+
+    # Now trigger runtime kernel failure -> must catch, flip `_qloop_native_fwd_ok=False`, warn ONCE per class!
+    fail_flag["fail"] = True
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="qloop"), torch.no_grad():
+        fb_la = lin_a(x)
+        fb_lb = lin_b(x)
+        fb_ma = moe_a(x, idx, tw)
+    assert lin_a._qloop_native_fwd_ok is False  # type: ignore[attr-defined]
+    assert lin_b._qloop_native_fwd_ok is False  # type: ignore[attr-defined]
+    assert moe_a._qloop_native_fwd_ok is False  # type: ignore[attr-defined]
+    assert torch.allclose(fb_la, ref_la, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(fb_lb, ref_lb, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(fb_ma, ref_ma, atol=1e-5, rtol=1e-5)
+    lin_warns = [r for r in caplog.records if "FlakyRuntimeFP8Linear" in r.message]
+    moe_warns = [r for r in caplog.records if "FlakyRuntimeFP8Experts" in r.message]
+    assert len(lin_warns) == 1  # deduplicated across `lin_a` & `lin_b`!
+    assert len(moe_warns) == 1
+
+    # 2) NVFP4 `load_model` missing-kernel warning advises `pip install compressed-tensors`
+    nvfp4_broken = _quantize_toy_model_nvfp4(build_toy(seed=405, num_hidden_layers=2, hidden_size=32), group_size=16)
+    for mod in nvfp4_broken.modules():
+        if isinstance(mod, (MockCompressedNVFP4Linear, MockNVFP4FusedExperts)):
+            def _raise_nvfp4(*_a: Any, **_kw: Any) -> Any:
+                raise ImportError("compressed_tensors kernel missing")
+            mod.forward = _raise_nvfp4  # type: ignore[method-assign]
+    monkeypatch.setattr("qloop.model.loading._load_hf", lambda _cfg: (nvfp4_broken, ToyTokenizer()))
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="qloop"):
+        _, _, nv_info = load_model({"name": "unsloth/Qwen3.6-35B-A3B-NVFP4", "device_map": "cpu"})
+    assert nv_info["quantization"]["native_fwd_ok_count"] == 0
+    assert any("pip install compressed-tensors" in r.message for r in caplog.records)
+
+    # 3) Missing FP8 scale guard: `dequantize_fp8_tensor(w, None)` stays identity, while module-level raises!
+    w_raw = torch.randn(16, 16)
+    w_fp8 = w_raw.to(torch.float8_e4m3fn)
+    assert torch.equal(dequantize_fp8_tensor(w_fp8, None, dtype=torch.float32), w_fp8.float())
+
+    unscaled_lin = MockNoKernelsFP8Linear(nn.Linear(16, 16, bias=False), block_size=(16, 16))
+    unscaled_lin._buffers.pop("weight_scale_inv", None)
+    install_quantized_autograd_bridge(unscaled_lin)
+    with pytest.raises(RuntimeError, match=r"(no|missing) scale tensor.*parameters="):
+        unscaled_lin(torch.randn(2, 16))
+    unscaled_lin._qloop_allow_unscaled_fp8 = True  # type: ignore[attr-defined]
+    out_allowed = unscaled_lin(torch.randn(2, 16))
+    assert out_allowed.shape == (2, 16)
+
+    unscaled_moe = MockNoKernelsFP8Experts(torch.randn(3, 16, 16), torch.randn(3, 16, 8), block_size=(16, 16))
+    unscaled_moe._buffers.pop("down_proj_scale_inv", None)
+    install_quantized_autograd_bridge(unscaled_moe)
+    with pytest.raises(RuntimeError, match=r"missing scale tensor.*parameters="):
+        unscaled_moe(torch.randn(2, 16), torch.tensor([[0, 1], [1, 2]]), torch.ones(2, 2) * 0.5)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["fp8_3d", "fp8_flat2d", "nvfp4"],
+)
+def test_chunked_3d_moe_dispatch_exact_parity_across_40_experts_with_padding_and_dups(
+    variant: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify batched chunked-3D (`E=40 > 32`) MoE forward + backward parity (`< 1e-5`) with `-1` & dup slots."""
+    torch.manual_seed(505)
+    num_experts, h_dim, inter_dim = 40, 32, 16
+    n_tokens, top_k = 29, 4
+    gu_ref = torch.randn(num_experts, 2 * inter_dim, h_dim) / math.sqrt(h_dim)
+    dn_ref = torch.randn(num_experts, h_dim, inter_dim) / math.sqrt(inter_dim)
+
+    if variant == "fp8_3d":
+        qmoe: nn.Module = MockNoKernelsFP8Experts(gu_ref, dn_ref, block_size=(16, 16), flatten_2d_scale=False)
+    elif variant == "fp8_flat2d":
+        qmoe = MockNoKernelsFP8Experts(gu_ref, dn_ref, block_size=(16, 16), flatten_2d_scale=True)
+    else:
+        qmoe = MockNVFP4FusedExperts(gu_ref, dn_ref, group_size=16)
+        def _fail_nvfp4(*_a: Any, **_kw: Any) -> Any:
+            raise ImportError("force fallback")
+        qmoe.forward = _fail_nvfp4  # type: ignore[method-assign]
+
+    rep = install_quantized_autograd_bridge(qmoe)
+    assert rep["native_fwd_ok_count"] == 0
+    assert rep["bridged_moe_count"] == 1
+
+    # Construct routing covering 37 unique experts (> 32 chunk boundary -> 2 chunks: 32 + 5!),
+    # PLUS `-1` masked padding slots AND duplicate expert IDs on the same token!
+    top_idx = torch.arange(n_tokens * top_k, dtype=torch.long).reshape(n_tokens, top_k) % 37
+    top_idx[0] = torch.tensor([7, 7, 35, -1], dtype=torch.long)  # duplicate expert 7 + `-1` masked slot!
+    top_idx[5] = torch.tensor([-1, -1, 19, 36], dtype=torch.long)
+    top_idx[11] = torch.tensor([-1, -1, -1, -1], dtype=torch.long)  # fully masked token!
+    top_idx[17] = torch.tensor([33, 33, 33, 2], dtype=torch.long)  # triple duplicate expert 33!
+    raw_w = torch.rand(n_tokens, top_k, dtype=torch.float32) * 0.6 + 0.1
+
+    # Spy on `_dequant_experts_chunk` to verify chunking (`[32, 5]`) and 0 unused experts
+    chunk_lens: list[int] = []
+    seen_eids: set[int] = set()
+    orig_chunk_fn = qa._dequant_experts_chunk
+
+    def _spy_chunk_40(
+        mod: nn.Module,
+        expert_ids: list[int],
+        dtype: torch.dtype = torch.bfloat16,
+        *,
+        nvfp4_mode_override: str | None = None,
+    ) -> tuple[torch.Tensor | list[torch.Tensor], torch.Tensor | list[torch.Tensor]]:
+        chunk_lens.append(len(expert_ids))
+        seen_eids.update(expert_ids)
+        return orig_chunk_fn(mod, expert_ids, dtype=dtype, nvfp4_mode_override=nvfp4_mode_override)
+
+    monkeypatch.setattr(qa, "_dequant_experts_chunk", _spy_chunk_40)
+
+    x_base = torch.randn(n_tokens, h_dim, dtype=torch.float32)
+    with torch.no_grad():
+        y_nograd = qmoe(x_base, top_idx, raw_w)
+    assert chunk_lens == [32, 5]
+    assert 37 not in seen_eids and 38 not in seen_eids and 39 not in seen_eids
+
+    chunk_lens.clear()
+    x_grad = x_base.detach().clone().requires_grad_(True)
+    w_grad = raw_w.detach().clone().requires_grad_(True)
+    y_grad = qmoe(x_grad, top_idx, w_grad)
+    loss_target = torch.linspace(-0.7, 1.1, steps=y_grad.numel(), dtype=torch.float32).reshape_as(y_grad)
+    loss = (y_grad * loss_target).sum()
+    loss.backward()
+    assert chunk_lens == [32, 5, 32, 5]  # 2 chunks in forward + 2 chunks in backward
+
+    # Naive per-(token, slot) SwiGLU reference in fp32
+    x_ref = x_base.detach().clone().requires_grad_(True)
+    w_ref = raw_w.detach().clone().requires_grad_(True)
+    deq_cache = {e: auto_dequant_expert_fn(qmoe, e) for e in range(37)}
+    y_ref = torch.zeros_like(x_ref)
+    for t in range(n_tokens):
+        acc_t = torch.zeros(h_dim, dtype=torch.float32)
+        for s in range(top_k):
+            eid = int(top_idx[t, s].item())
+            if 0 <= eid < num_experts:
+                gu_e, dn_e = deq_cache[eid]
+                gt, up = F.linear(x_ref[t : t + 1], gu_e).chunk(2, dim=-1)
+                ye = F.linear(F.silu(gt) * up, dn_e).squeeze(0)
+                acc_t = acc_t + ye * w_ref[t, s]
+        y_ref[t] = acc_t
+    (y_ref * loss_target).sum().backward()
+
+    assert x_grad.grad is not None and x_ref.grad is not None
+    assert w_grad.grad is not None and w_ref.grad is not None
+    assert (y_nograd - y_ref.detach()).abs().max().item() < 1e-5
+    assert (y_grad.detach() - y_ref.detach()).abs().max().item() < 1e-5
+    assert (x_grad.grad - x_ref.grad).abs().max().item() < 1e-5
+    assert (w_grad.grad - w_ref.grad).abs().max().item() < 1e-5
+    # Masked `-1` slots MUST receive exact 0.0 gradient!
+    assert float(w_grad.grad[0, 3].abs().item()) == 0.0
+    assert torch.all(w_grad.grad[11] == 0.0)
+
+
+def test_standalone_whole_model_pack_fp8_missing_kernels_safety_both_paths(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify both `_HAS_QLOOP=True` and emitted `_HAS_QLOOP=False` packs survive missing `kernels`."""
+    tok = ToyTokenizer()
+    tcfg = ToyConfig(
+        vocab_size=tok.vocab_size,
+        hidden_size=32,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        partial_rotary_factor=0.5,
+        linear_num_heads=4,
+        linear_head_dim=8,
+        linear_conv_kernel_dim=4,
+        num_experts=4,
+        num_experts_per_tok=2,
+        layer_types=("linear_attention", "full_attention", "linear_attention", "full_attention"),
+    )
+    torch.manual_seed(606)
+    base_float = ToyForCausalLM(tcfg).eval()
+    fp8_bb = _quantize_toy_model_fp8_missing_kernels(
+        base_float,
+        block_size=(16, 16),
+        flatten_2d_scale=True,
+        moe_scale_names=("weight_scale_up", "weight_scale_down"),
+    )
+    install_quantized_autograd_bridge(fp8_bb)
+    loop_spec = LoopSpec(
+        prelude_end=1,
+        core_end=3,
+        num_passes=3,
+        target_virtual_layers=None,
+        per_pass_router=True,
+        router_adapter_rank=4,
+    )
+    loop_ctrl = apply_loop(fp8_bb, loop_spec)
+    with torch.no_grad():
+        loop_ctrl.adapters.gates.copy_(torch.tensor([[0.35], [-0.25]]).expand_as(loop_ctrl.adapters.gates))
+        assert loop_ctrl.adapters.pass_router is not None
+        loop_ctrl.adapters.pass_router.up.normal_(0.0, 0.2)
+
+    pack_dir = tmp_path / "fp8_nokernels_pack"
+    stack = Stack(
+        model=fp8_bb,
+        tokenizer=tok,
+        parts=inspect_model(fp8_bb),
+        loop=loop_ctrl,
+        load_info={"name": "Qwen/Qwen3.6-35B-A3B-FP8"},
+    )
+    export_whole_model_pack(stack, pack_dir, max_shard_size_bytes=65536)
+
+    # Mark exported config as non-toy HF backbone so both `_HAS_QLOOP=True` and `_HAS_QLOOP=False`
+    # construct via `AutoModelForCausalLM.from_config(...)` returning a fresh `MockNoKernelsFP8` backbone!
+    cfg_path = pack_dir / "config.json"
+    cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg_data["base_config"]["model_type"] = "qwen3_5_moe"
+    cfg_data["qloop_v3_arch"]["backbone_kind"] = "hf"
+    cfg_data["qloop_v3_arch"]["base_model_type"] = "qwen3_5_moe"
+    cfg_path.write_text(json.dumps(cfg_data, indent=2), encoding="utf-8")
+    write_standalone_hf_modeling_files(pack_dir)
+    for py_fn in (CONFIG_FILENAME, MODELING_FILENAME):
+        ast.parse((pack_dir / py_fn).read_text(encoding="utf-8"), filename=py_fn, feature_version=(3, 9))
+
+    def _fresh_fp8_nokernels_backbone() -> ToyForCausalLM:
+        return _quantize_toy_model_fp8_missing_kernels(
+            ToyForCausalLM(tcfg).eval(),
+            block_size=(16, 16),
+            flatten_2d_scale=True,
+            moe_scale_names=("weight_scale_up", "weight_scale_down"),
+        )
+
+    stub_tf = types.ModuleType("transformers")
+    stub_tf.__version__ = "5.23.0"  # type: ignore[attr-defined]
+
+    class _PreTrainedConfig:
+        model_type = "qwen36_loophssd"
+
+        def __init__(self, **kw: Any) -> None:
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+        @classmethod
+        def from_pretrained(cls, local_dir: Any, **_kw: Any) -> Any:
+            raw = json.loads((pathlib.Path(local_dir) / "config.json").read_text(encoding="utf-8"))
+            return cls(**raw)
+
+    class _PreTrainedModel(nn.Module):
+        config_class: Any = None
+
+        def __init__(self, config: Any) -> None:
+            super().__init__()
+            self.config = config
+
+        def post_init(self) -> None:
+            pass
+
+    class _GenerationMixin:
+        pass
+
+    class _AutoConfig:
+        @staticmethod
+        def for_model(_model_type: str, **kw: Any) -> ToyConfig:
+            valid = {f for f in ToyConfig.__dataclass_fields__ if f in kw}
+            clean = {k: kw[k] for k in valid}
+            if isinstance(clean.get("layer_types"), list):
+                clean["layer_types"] = tuple(clean["layer_types"])
+            return ToyConfig(**clean)
+
+    class _AutoModelForCausalLM:
+        @staticmethod
+        def from_config(_cfg: Any, **_kw: Any) -> ToyForCausalLM:
+            return _fresh_fp8_nokernels_backbone()
+
+    stub_tf.PretrainedConfig = _PreTrainedConfig  # type: ignore[attr-defined]
+    stub_tf.PreTrainedConfig = _PreTrainedConfig  # type: ignore[attr-defined]
+    stub_tf.PreTrainedModel = _PreTrainedModel  # type: ignore[attr-defined]
+    stub_tf.GenerationMixin = _GenerationMixin  # type: ignore[attr-defined]
+    stub_tf.AutoConfig = _AutoConfig  # type: ignore[attr-defined]
+    stub_tf.AutoModelForCausalLM = _AutoModelForCausalLM  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "transformers", stub_tf)
+
+    prompt = torch.tensor([[7, 19, 31, 43, 55, 67, 79, 91, 103, 115]], dtype=torch.long)
+    orig_refs: dict[int, torch.Tensor] = {}
+    with torch.no_grad():
+        for r in (1, 2, 3):
+            loop_ctrl.set_active_passes(r)
+            orig_refs[r] = fp8_bb(prompt, use_cache=False).logits.detach().clone()
+
+    # Path A: `_HAS_QLOOP=True` `Qwen36LoopHSSDForCausalLM.from_pretrained`
+    qloop_loaded = Qwen36LoopHSSDForCausalLM.from_pretrained(pack_dir, strict=True)
+    with torch.no_grad():
+        for r in (1, 2, 3):
+            with qloop_loaded.depth(r):
+                out_q = qloop_loaded(prompt, use_cache=False).logits
+                assert (out_q - orig_refs[r]).abs().max().item() < 1e-5
+
+    # Path B: Emitted standalone `modeling_qwen36_loophssd.py` with `qloop` hidden (`_HAS_QLOOP=False`)
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name, *a, **kw: (
+            None if (name == "qloop" or name.startswith("qloop.")) else real_find_spec(name, *a, **kw)
+        ),
+    )
+    for k_mod in [k for k in list(sys.modules) if k == "qloop" or k.startswith("qloop.")]:
+        monkeypatch.delitem(sys.modules, k_mod, raising=False)
+
+    pkg_name = "_standalone_fp8_nokernels_pkg"
+    pkg = types.ModuleType(pkg_name)
+    pkg.__path__ = [str(pack_dir)]  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, pkg_name, pkg)
+
+    spec_c = importlib.util.spec_from_file_location(
+        f"{pkg_name}.configuration_qwen36_loophssd",
+        pack_dir / CONFIG_FILENAME,
+    )
+    assert spec_c is not None and spec_c.loader is not None
+    mod_c = importlib.util.module_from_spec(spec_c)
+    monkeypatch.setitem(sys.modules, spec_c.name, mod_c)
+    spec_c.loader.exec_module(mod_c)
+
+    spec_m = importlib.util.spec_from_file_location(
+        f"{pkg_name}.modeling_qwen36_loophssd",
+        pack_dir / MODELING_FILENAME,
+    )
+    assert spec_m is not None and spec_m.loader is not None
+    mod_m = importlib.util.module_from_spec(spec_m)
+    monkeypatch.setitem(sys.modules, spec_m.name, mod_m)
+    spec_m.loader.exec_module(mod_m)
+    assert mod_m._HAS_QLOOP is False
+
+    standalone_loaded = mod_m.Qwen36LoopHSSDForCausalLM.from_pretrained(str(pack_dir), strict=True)
+    with torch.no_grad():
+        for r in (1, 2, 3):
+            with standalone_loaded.depth(r):
+                out_st = standalone_loaded(prompt, use_cache=False).logits
+                assert (out_st - orig_refs[r]).abs().max().item() < 1e-5

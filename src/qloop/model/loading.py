@@ -312,15 +312,37 @@ def load_model(mcfg: dict[str, Any]):
     if quant_info.get("is_quantized"):
         log.info(
             "quantized base model ready: method=%s format=%s bridged=%d/%d modules "
-            "(linear=%d, moe=%d, native_grad_ok=%d)",
+            "(linear=%d, moe=%d, native_fwd_ok=%d, native_grad_ok=%d)",
             quant_info.get("quant_method"),
             quant_info.get("format"),
             quant_info.get("bridged_total", 0),
             quant_info.get("total_quantized_modules", 0),
             quant_info.get("bridged_linear_count", 0),
             quant_info.get("bridged_moe_count", 0),
+            quant_info.get("native_fwd_ok_count", 0),
             quant_info.get("native_grad_ok_count", 0),
         )
+        if int(quant_info.get("native_fwd_ok_count", 0)) == 0:
+            qmethod = str(quant_info.get("quant_method") or "").lower()
+            qfmt = str(quant_info.get("format") or "").lower()
+            has_nvfp4 = (
+                (int(quant_info.get("linear_nvfp4_count", 0)) + int(quant_info.get("moe_nvfp4_count", 0))) > 0
+                or "nvfp4" in qfmt
+                or qmethod == "compressed-tensors"
+            )
+            install_cmd = (
+                "pip install compressed-tensors"
+                if has_nvfp4
+                else 'pip install "kernels>=0.18.2,<0.19.0"'
+            )
+            log.warning(
+                "native quantized inference kernels unavailable (native_fwd_ok=0/%d for method=%s); "
+                "continuing via transient bf16 fallback. For native Blackwell kernel acceleration, "
+                "run `%s`.",
+                quant_info.get("total_quantized_modules", 0),
+                quant_info.get("quant_method"),
+                install_cmd,
+            )
     elif info["quantized_module_types"]:
         log.warning("quantized modules present %s: run `qloop probe --backward` once to confirm gradients flow "
                     "through frozen quantized experts on this transformers/kernel version",

@@ -1,0 +1,95 @@
+# Gate 1 (S1b v3) - Track-B HSSD v3 Horizon-Split Surprise-Gated Delta Memory KL Distillation (4K -> 32K).
+# Upgrades all 30 linear-attention layers from Track-A GDN-2 to HSSD v3:
+#   * Strictly disjoint horizon partition `k_far = max(0, n - 8)` -> `[513, 576]` exact local SWA (Fix B1)
+#   * Peak-augmented size-free Boltzmann miss gate `PeakBoltzmannGate` (Fix B5)
+#   * 2D phase counter-rotation compiled to real symmetric WY `chunk_kda` (Theorem 1)
+#   * Smooth parallel chunk-start root-surprise `g in (0, 1)` with `s = g^2`, zero `sqrt(s)` singularity (Fixes B3, B4)
+#   * Tiered M=8 multi-page state router (Top-2 active pages) + enforced cumulative write-mass budget loss (Fixes B2, B6)
+# Fallback guarantee: if HSSD < +8% over GDN-2 on 32K-64K RULER/MQAR, Gate 2a seamlessly retains `s1_loop_a6b` Track-A.
+_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+stage: s1b_hssd_distill
+stage_type: lm
+run: {name: s1b_hssd_distill}
+
+loop:
+  enabled: true
+  prelude_end: 8
+  core_end: 32
+  num_passes: 3
+  target_virtual_layers: 88
+  kv_share: true
+  bridge_init: [0.05, 0.85, 0.10]
+  bridge_rank: 256
+  bridge_mode: subspace
+  bridge_up_std: 0.01
+  attn_adapter_rank: 64
+  step_embedding: true
+  gate_init: 0.0
+  per_pass_router: true
+  router_adapter_rank: 32
+  router_repel_init: 0.0
+  router_diversity_weight: 0.0
+  checkpoint: true
+  train_pass_probs: [0.15, 0.50, 0.35]
+
+gdn2:
+  enabled: false                        # student swaps Track-A GDN-2 for Track-B HSSD v3
+
+hssd:
+  enabled: true
+  chunk_size: 64
+  window_chunks: 8                      # Fix B1: k_far = max(0, n - 8), |I_loc| in [513, 576], 0 overlap
+  num_pages: 8                          # Fix B2: M=8 log-spaced multi-timescale memory pages
+  k_pages: 2                            # Fixes B2, B6: Top-2 sparse active write/read pages per chunk
+  budget_weight: 1.0                    # Fix B2: two-sided write-mass budget regularizer B_m <= 0.4 * d_k
+  segment_chunks: 16                    # Fix B6: 16 x 64 = 1024-token checkpointed WY macro-segments
+  checkpoint_segments: true
+
+distill:
+  enabled: true
+  teacher_ckpt: runs/s1_loop_a6b
+  teacher_track: gdn2                   # chunked-vocab KL(p_teacher || p_student) + hidden MSE via HSSDDistiller
+  temperature: 1.0
+  kl_weight: 1.0
+  hidden_mse_weight: 0.1
+  vocab_chunk_size: 4096                # avoids materializing [B, T, 248320] fp32 logits simultaneously
+
+lsa:
+  enabled: false
+
+experts:
+  enabled: false                        # 32.338B MoE experts stay 100% frozen (SHA-256 verified)
+
+train:
+  init_from: runs/s1_loop_a6b
+  steps: 1500                           # 1500 x 4 x 16384 ≈ 98.3M tokens (~12-15h on single Colab G4)
+  micro_batch: 1
+  grad_accum: 4
+  sha256_frozen_experts: true
+  train_loop_adapters: true
+  train_hssd: true
+  trainable:
+    - "input_layernorm|post_attention_layernorm"
+  allowed_groups: [loop_adapters, hssd_adapters, deltanet, norms]
+  aux_weights: {loop_aux: 1.0, hssd_budget: 1.0, distill_kl: 1.0}
+  optim:
+    lr: 4.0e-5
+    warmup_steps: 60
+    lr_mult:
+      hssd_adapter: 10.0
+      loop_adapters: 5.0
+
+data:
+  seq_len: 16384                        # mid-horizon working memory curriculum (4K -> 32K)
+  respect_doc_boundaries: false
+  sources:
+    - {name: finepdfs_mix, weight: 0.30}
+    - {name: fineweb_edu, weight: 0.20}
+    - {name: openthoughts3, weight: 0.20}
+    - {name: nemotron_post, weight: 0.15}
+    - {name: fable51, weight: 0.15}
+  decontaminate: {enabled: true, ngram: 13, groups: [aime_2026, gpqa, hle, arc_agi_2, kernelbench], on_missing: warn}
+
+eval_quick:
+  n_batches: 8
+  depths: [1, 2, 3]

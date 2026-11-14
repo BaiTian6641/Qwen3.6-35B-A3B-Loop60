@@ -1,0 +1,121 @@
+# Gate 3 (S2 v3) - Joint 32K High-Density CoT SFT + 4x32K (128K) Differentiable K/V-Replay Truncated BPTT.
+# Resolves Fix E3 (`src/qloop/train/bptt.py`):
+#   * Splits 128K sequences into `4 x 32,768` segments carrying live HSSD/GDN-2 states across segment boundaries
+#   * Caches compact pre-attention hidden states (`< 1.92 GiB` across 10 full-attn layers) and re-projects ONLY the
+#     D-LSA selected Top-2,048 prior-segment keys/values with `requires_grad=True`, restoring exact cross-segment
+#     retrieval gradients into `k_proj`, `v_proj`, and `W_k_idx` at `< 6%` compute overhead!
+#   * Base 32.338B MoE experts stay 100% frozen; optional rank-64 `HotExpertDeltas` on top 2.5% Pass-2/3 experts
+#     can be enabled post-scan via `-s experts.enabled=true` (folded cleanly during Whole Model Pack export).
+_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+stage: s2_joint_bptt
+stage_type: lm
+run: {name: s2_joint_bptt}
+
+model:
+  yarn_target_len: 1048576
+
+loop:
+  enabled: true
+  prelude_end: 8
+  core_end: 32
+  num_passes: 3
+  target_virtual_layers: 88
+  kv_share: true
+  bridge_init: [0.05, 0.85, 0.10]
+  bridge_rank: 256
+  bridge_mode: subspace
+  bridge_up_std: 0.01
+  attn_adapter_rank: 64
+  step_embedding: true
+  gate_init: 0.0
+  per_pass_router: true
+  router_adapter_rank: 32
+  router_repel_init: 0.0
+  router_diversity_weight: 0.0
+  checkpoint: true
+  train_pass_probs: [0.15, 0.50, 0.35]
+
+gdn2:
+  enabled: false
+
+hssd:
+  enabled: true
+  chunk_size: 64
+  window_chunks: 8
+  num_pages: 8
+  k_pages: 2
+  budget_weight: 1.0
+  segment_chunks: 16
+  checkpoint_segments: true
+
+lsa:
+  enabled: true
+  mode: sparse                          # sparse D-LSA active during 4x32K = 128K K/V-replayed BPTT
+  num_query_passes: 3
+  index_dim: 64
+  index_on: nope
+  pool: 4
+  block_size: 512
+  avg_bucket_keys: 8
+  max_bucket_keys: 32
+  num_select: 64
+  window: 512
+  sinks: 64
+  search: flat
+  temperature: 0.1
+  query_chunk: 256
+
+bptt:
+  enabled: true                         # Fix E3: SegmentedKVBPTTRunner (`4 x 32K = 128K`)
+  n_segments: 4
+  seg_len: 32768
+  replay_k: 2048                        # differentiable re-projection on Top-2048 selected prior-segment tokens
+  offload_prior_hidden: true            # CPU/HBM pre-attention hidden buffer (< 2 GiB VRAM)
+
+experts:
+  enabled: false                        # optional: pass `-s experts.enabled=true` after `qloop scan-experts`
+  stats_path: runs/s1_loop_a6b/esft_stats_looped.json
+  fraction: 0.025                       # top 2.5% Pass-2/3 reasoning experts (~256 of 10,240 experts, +96.5M LoRA)
+  by: affinity
+  per_pass: union
+  rank: 64
+
+train:
+  init_from: runs/s3_long_1m_lsa
+  steps: 1200                           # ~100M tokens (32K CoT SFT + 4x32K K/V-replay BPTT, ~12-16h on Colab G4)
+  micro_batch: 1
+  grad_accum: 2
+  sha256_frozen_experts: true
+  train_loop_adapters: true
+  train_hssd: true
+  train_lsa: true
+  trainable:
+    - "self_attn\\.(k_proj|v_proj|o_proj|q_norm|k_norm)"
+    - "input_layernorm|post_attention_layernorm"
+  allowed_groups: [loop_adapters, hssd_adapters, gdn2_adapters, lsa_indexers, deltanet, attention, norms, expert_deltas]
+  aux_weights: {loop_aux: 1.0, hssd_budget: 1.0, lsa_kl: 0.2}
+  optim:
+    lr: 2.0e-5
+    warmup_steps: 50
+    lr_mult:
+      loop_adapters: 10.0
+      lsa_indexer: 5.0
+      hssd_adapter: 5.0
+
+data:
+  seq_len: 131072                       # 4 x 32,768 tokens streamed across segments
+  respect_doc_boundaries: true
+  sources:                              # 100% Apache-2.0 / ODC-By / CC-BY-4.0 clean-room sources (13-gram decontam)
+    - {name: openthoughts3, weight: 0.25}
+    - {name: nemotron_post, weight: 0.20}
+    - {name: fable51, weight: 0.20}
+    - {name: opus46_3000x, weight: 0.10}
+    - {name: opus46_traceinv, weight: 0.10}
+    - {name: ot_agent_sft, weight: 0.05}
+    - {name: arc_agi2_train, weight: 0.05}
+    - {name: finepdfs_mix, weight: 0.05}
+  decontaminate: {enabled: true, ngram: 13, groups: [aime_2026, gpqa, hle, arc_agi_2, kernelbench], on_missing: warn}
+
+eval_quick:
+  n_batches: 8
+  depths: [1, 2, 3]

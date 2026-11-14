@@ -14,10 +14,12 @@
 """
 from __future__ import annotations
 
+import copy
 import gc
 import logging
 import time
 from collections import Counter
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -25,6 +27,7 @@ from torch import nn
 
 from ..debug import cuda_mem_brief, stage
 from .introspect import inspect_model, summarize
+from .quant_autograd import install_quantized_autograd_bridge, is_quantized_module
 
 log = logging.getLogger("qloop")
 
@@ -59,8 +62,12 @@ def param_report(model: nn.Module) -> dict[str, Any]:
                 "lm_head" if "lm_head" in name else "visual" if "visual" in name else "other")
         by_kind[kind] += p.numel()
         trainable += p.numel() if p.requires_grad else 0
-    quant_modules = Counter(type(m).__name__ for m in model.modules()
-                            if any(t in type(m).__name__.lower() for t in ("fp8", "fp4", "quant", "4bit", "8bit")))
+    quant_modules = Counter(
+        type(m).__name__
+        for m in model.modules()
+        if is_quantized_module(m)
+        or any(t in type(m).__name__.lower() for t in ("fp8", "fp4", "quant", "4bit", "8bit", "compressed"))
+    )
     return {"params_by_dtype": dict(by_dtype), "params_by_kind": dict(by_kind),
             "trainable": trainable, "quantized_module_types": dict(quant_modules)}
 
@@ -105,6 +112,103 @@ def _prune_visual_tower(model: nn.Module) -> int:
     return freed
 
 
+_IGNORE_LIST_KEYS = ("ignore", "modules_to_not_convert", "skip_modules", "llm_int8_skip_modules")
+
+
+def _is_visual_ignore_pattern(entry: str) -> bool:
+    pat = entry[3:] if entry.startswith("re:") else entry
+    pat_l = pat.lstrip("^")
+    if pat_l in ("visual", "model.visual", r"model\.visual"):
+        return True
+    if pat_l.startswith(("visual.", "visual*", r"visual\.", "model.visual.", "model.visual*", r"model\.visual\.")):
+        return True
+    return entry.startswith("re:") and pat in (".*visual.*", ".*visual", r".*\.visual\..*")
+
+
+def _normalize_text_only_ignore_entry(entry: str) -> str | None:
+    if _is_visual_ignore_pattern(entry):
+        return None
+    if entry.startswith("re:"):
+        body = entry[3:]
+        body = body.replace(r"model\.language_model\.", r"model\.")
+        body = body.replace("model.language_model.", "model.")
+        if body.startswith(r"^language_model\."):
+            body = r"^model\." + body[len(r"^language_model\."):]
+        elif body.startswith("language_model."):
+            body = "model." + body[len("language_model."):]
+        return "re:" + body
+    if entry in ("model.language_model", "language_model"):
+        return "model"
+    if entry.startswith("model.language_model."):
+        return "model." + entry[len("model.language_model."):]
+    if entry.startswith("language_model.model."):
+        return "model." + entry[len("language_model.model."):]
+    if entry.startswith("language_model."):
+        return "model." + entry[len("language_model."):]
+    return entry
+
+
+def _normalize_text_only_ignore_list(items: Iterable[Any]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        if not isinstance(raw, str):
+            continue
+        norm = _normalize_text_only_ignore_entry(raw)
+        if norm is not None and norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+def _normalize_quant_config_for_text_only(qcfg: Any) -> Any:
+    if isinstance(qcfg, dict):
+        qcopy: Any = copy.deepcopy(qcfg)
+    elif hasattr(qcfg, "to_dict") and callable(qcfg.to_dict):
+        qcopy = copy.deepcopy(dict(qcfg.to_dict()))
+    else:
+        qcopy = copy.deepcopy(qcfg)
+
+    if isinstance(qcopy, dict):
+        for k in _IGNORE_LIST_KEYS:
+            if isinstance(qcopy.get(k), (list, tuple)):
+                qcopy[k] = _normalize_text_only_ignore_list(qcopy[k])
+        cgroups = qcopy.get("config_groups")
+        if isinstance(cgroups, dict):
+            for grp in cgroups.values():
+                if isinstance(grp, dict) and isinstance(grp.get("ignore"), (list, tuple)):
+                    grp["ignore"] = _normalize_text_only_ignore_list(grp["ignore"])
+        return qcopy
+
+    for k in _IGNORE_LIST_KEYS:
+        val = getattr(qcopy, k, None)
+        if isinstance(val, (list, tuple)):
+            setattr(qcopy, k, _normalize_text_only_ignore_list(val))
+    cgroups = getattr(qcopy, "config_groups", None)
+    if isinstance(cgroups, dict):
+        for grp in cgroups.values():
+            if isinstance(grp, dict) and isinstance(grp.get("ignore"), (list, tuple)):
+                grp["ignore"] = _normalize_text_only_ignore_list(grp["ignore"])
+            elif hasattr(grp, "ignore") and isinstance(getattr(grp, "ignore", None), (list, tuple)):
+                grp.ignore = _normalize_text_only_ignore_list(grp.ignore)
+    return qcopy
+
+
+def _propagate_quantization_config_to_text_config(config: Any, text_cfg: Any) -> Any:
+    """Copy & path-normalize top-level `quantization_config` onto `text_cfg` when missing."""
+    if text_cfg is config:
+        return text_cfg
+    top_qcfg = getattr(config, "quantization_config", None)
+    cur_qcfg = getattr(text_cfg, "quantization_config", None)
+    has_top = top_qcfg is not None and (not isinstance(top_qcfg, dict) or len(top_qcfg) > 0)
+    has_cur = cur_qcfg is not None and (not isinstance(cur_qcfg, dict) or len(cur_qcfg) > 0)
+    if not has_top or has_cur:
+        return text_cfg
+    text_cfg_copy = copy.deepcopy(text_cfg)
+    text_cfg_copy.quantization_config = _normalize_quant_config_for_text_only(top_qcfg)
+    return text_cfg_copy
+
+
 def _load_hf(mcfg: dict[str, Any]):
     try:
         import transformers
@@ -114,14 +218,20 @@ def _load_hf(mcfg: dict[str, Any]):
                            "Run scripts/colab_setup.sh or `pip install -e .[colab]`.") from e
     name = mcfg["name"]
     common = {"revision": mcfg.get("revision"), "trust_remote_code": bool(mcfg.get("trust_remote_code", False))}
+    text_only = bool(mcfg.get("text_only", True))
     with stage("load config"):
         config = AutoConfig.from_pretrained(name, **common)
         mt = getattr(config, "model_type", "?")
         log.info("model_type=%s transformers=%s", mt, transformers.__version__)
-        text_cfg = getattr(config, "text_config", config)
+        raw_text_cfg = getattr(config, "text_config", config)
+        text_cfg = _propagate_quantization_config_to_text_config(config, raw_text_cfg) if text_only else raw_text_cfg
         for k in ("num_hidden_layers", "hidden_size", "num_experts", "num_experts_per_tok", "num_attention_heads",
                   "num_key_value_heads", "head_dim", "full_attention_interval", "max_position_embeddings"):
             log.info("  text_config.%s = %s", k, getattr(text_cfg, k, "?"))
+        if getattr(text_cfg, "quantization_config", None) is not None:
+            qraw = text_cfg.quantization_config
+            qm = qraw.get("quant_method") if isinstance(qraw, dict) else getattr(qraw, "quant_method", "?")
+            log.info("  text_config.quantization_config.quant_method = %s", qm)
         if mcfg.get("yarn_target_len"):
             from .lsa import apply_yarn
 
@@ -139,7 +249,6 @@ def _load_hf(mcfg: dict[str, Any]):
         t0 = time.time()
         model = None
         errors = []
-        text_only = bool(mcfg.get("text_only", True))
         if text_only:
             try:
                 res = AutoModelForCausalLM.from_pretrained(name, config=text_cfg, output_loading_info=True, **kwargs)
@@ -193,12 +302,26 @@ def load_model(mcfg: dict[str, Any]):
         model = model.to(resolve_device(mcfg.get("device_map", "cpu")))
     for p in model.parameters():
         p.requires_grad_(False)
+    quant_info = install_quantized_autograd_bridge(model)
     parts = inspect_model(model)
     info = param_report(model)
+    info["quantization"] = quant_info
     log.info("%s", summarize(parts))
     for k, v in info.items():
         log.info("  %s: %s", k, v)
-    if info["quantized_module_types"]:
+    if quant_info.get("is_quantized"):
+        log.info(
+            "quantized base model ready: method=%s format=%s bridged=%d/%d modules "
+            "(linear=%d, moe=%d, native_grad_ok=%d)",
+            quant_info.get("quant_method"),
+            quant_info.get("format"),
+            quant_info.get("bridged_total", 0),
+            quant_info.get("total_quantized_modules", 0),
+            quant_info.get("bridged_linear_count", 0),
+            quant_info.get("bridged_moe_count", 0),
+            quant_info.get("native_grad_ok_count", 0),
+        )
+    elif info["quantized_module_types"]:
         log.warning("quantized modules present %s: run `qloop probe --backward` once to confirm gradients flow "
                     "through frozen quantized experts on this transformers/kernel version",
                     info["quantized_module_types"])

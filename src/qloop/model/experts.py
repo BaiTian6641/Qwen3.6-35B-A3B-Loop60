@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -45,6 +46,7 @@ from qloop.debug import describe, require
 
 from ._dtype import upcast
 from .introspect import find_text_model
+from .quant_autograd import auto_dequant_expert_fn
 
 log = logging.getLogger("qloop")
 
@@ -403,6 +405,20 @@ def _is_plain_float(w: Any) -> bool:
     return type(w) in (torch.Tensor, nn.Parameter) and w.dtype in _FLOAT
 
 
+def _experts_are_plain_float(experts: nn.Module) -> bool:
+    gu = getattr(experts, "gate_up_proj", None)
+    dn = getattr(experts, "down_proj", None)
+    return bool(gu is not None and dn is not None and _is_plain_float(gu) and _is_plain_float(dn))
+
+
+def _first_module_device(mod: nn.Module) -> torch.device:
+    for p in mod.parameters():
+        return p.device
+    for b in mod.buffers():
+        return b.device
+    return torch.device("cpu")
+
+
 class _LayerDeltas(nn.Module):
     def __init__(self, experts: list[int], i2: int, h: int, i: int, rank: int, dtype: torch.dtype,
                  device: torch.device):
@@ -469,8 +485,8 @@ class HotExpertDeltas(nn.Module):
             info = self._layer_info(mlp, layer, hidden)
             infos[layer] = info
             ref = mlp.gate.weight if isinstance(getattr(mlp.gate, "weight", None), torch.Tensor) else None
-            dev = ref.device if ref is not None else torch.device("cpu")
-            gu = info.experts.gate_up_proj
+            dev = ref.device if ref is not None else _first_module_device(mlp)
+            gu = getattr(info.experts, "gate_up_proj", None)
             ddt = dtype or (gu.dtype if _is_plain_float(gu) else torch.float32)
             self.deltas[f"L{layer}"] = _LayerDeltas(experts, info.i2, info.h, info.i, self.rank, ddt, dev)
             self.hot[layer] = experts
@@ -485,18 +501,18 @@ class HotExpertDeltas(nn.Module):
     # ---------------------------------------------------------------- base weight access
     def _layer_info(self, mlp: nn.Module, layer: int, hidden: int | None) -> _LayerInfo:
         experts = mlp.experts
-        gu, dn = getattr(experts, "gate_up_proj", None), getattr(experts, "down_proj", None)
-        require(gu is not None and dn is not None,
-                f"layer {layer}: experts module lacks fused `gate_up_proj`/`down_proj`",
-                children=[n for n, _ in experts.named_parameters(recurse=False)])
-        if not (_is_plain_float(gu) and _is_plain_float(dn)):
-            require(self.dequant_fn is not None,
-                    f"layer {layer}: expert base weights are not plain float tensors "
-                    f"({type(gu).__name__}, {getattr(gu, 'dtype', '?')}); pass dequant_fn(experts, e) -> "
-                    "(gate_up [2I,H], down [H,I])", gate_up_proj=gu)
-            assert self.dequant_fn is not None
-            g0, d0 = self.dequant_fn(experts, 0)
-            return _LayerInfo(mlp, experts, False, g0.shape[0], g0.shape[1], d0.shape[1])
+        if not _experts_are_plain_float(experts):
+            if self.dequant_fn is None:
+                self.dequant_fn = auto_dequant_expert_fn
+            with torch.no_grad():
+                g0, d0 = self.dequant_fn(experts, 0)
+            require(
+                g0.ndim == 2 and d0.ndim == 2 and g0.shape[1] == d0.shape[0] and g0.shape[0] == 2 * d0.shape[1],
+                f"layer {layer}: dequant_fn returned incompatible shapes gate_up={tuple(g0.shape)}, "
+                f"down={tuple(d0.shape)}",
+            )
+            return _LayerInfo(mlp, experts, False, int(g0.shape[0]), int(g0.shape[1]), int(d0.shape[1]))
+        gu, dn = experts.gate_up_proj, experts.down_proj
         h = hidden or int(dn.shape[1])
         if gu.shape[-1] == h and dn.shape[-2] == h:
             return _LayerInfo(mlp, experts, False, int(gu.shape[-2]), h, int(dn.shape[-1]))
@@ -507,10 +523,11 @@ class HotExpertDeltas(nn.Module):
     def base_weights(self, layer: int, e: int) -> tuple[torch.Tensor, torch.Tensor]:
         """(gate_up [2I, H], down [H, I]) of the frozen base expert (dequantised if needed)."""
         info = self._infos[layer]
-        gu, dn = info.experts.gate_up_proj, info.experts.down_proj
-        if not (_is_plain_float(gu) and _is_plain_float(dn)):
-            assert self.dequant_fn is not None
+        if not _experts_are_plain_float(info.experts):
+            if self.dequant_fn is None:
+                self.dequant_fn = auto_dequant_expert_fn
             return self.dequant_fn(info.experts, e)
+        gu, dn = info.experts.gate_up_proj, info.experts.down_proj
         if info.transposed:
             return gu[e].t(), dn[e].t()
         return gu[e], dn[e]
@@ -617,10 +634,12 @@ class HotExpertDeltas(nn.Module):
         n = 0
         for layer, experts in self.hot.items():
             info = self._infos[layer]
-            gu, dn = info.experts.gate_up_proj, info.experts.down_proj
+            gu = getattr(info.experts, "gate_up_proj", None)
+            dn = getattr(info.experts, "down_proj", None)
             require(_is_plain_float(gu) and _is_plain_float(dn),
                     f"layer {layer}: cannot merge into non-float (quantised) base weights; export the compact "
                     "delta state_dict and merge on a dequantised copy", gate_up_proj=gu)
+            assert gu is not None and dn is not None
             for e in experts:
                 dgu, ddn = self.delta_weights(layer, e)
                 if info.transposed:
@@ -691,6 +710,9 @@ def attach_hot_expert_deltas(model: nn.Module, hot: dict[int, list[int]], regist
     return deltas
 
 
+install_hot_experts = attach_hot_expert_deltas
+
+
 _EXPERT_DELTA_KEY_RE = re.compile(
     r"(?:^|\.)expert_deltas\.deltas\.L(\d+)\.(gate_up|down|gate_up_A|gate_up_B|down_A|down_B)\.(\d+)$"
 )
@@ -730,10 +752,12 @@ def fold_expert_deltas_state_into_base_(
         if layer not in by_idx:
             continue
         mlp = _moe_of(by_idx[layer], layer)
-        gu, dn = mlp.experts.gate_up_proj, mlp.experts.down_proj
+        gu = getattr(mlp.experts, "gate_up_proj", None)
+        dn = getattr(mlp.experts, "down_proj", None)
         if not (_is_plain_float(gu) and _is_plain_float(dn)):
             log.warning("layer %d: skipping fold of expert %d into non-float base weights", layer, e)
             continue
+        assert gu is not None and dn is not None
         if "gate_up" in parts and "down" in parts:
             dgu = parts["gate_up"].to(device=gu.device, dtype=torch.float32)
             ddn = parts["down"].to(device=dn.device, dtype=torch.float32)
@@ -870,3 +894,89 @@ def freeze_all_but(model: nn.Module, patterns: Iterable[str], extra_params: Iter
     rep = FreezeReport(groups, trainable, n_tr, n_tot)
     log.info("freeze_all_but:\n%s", rep)
     return rep
+
+
+# ============================================================================ frozen expert SHA-256 tripwire
+
+_EXPERT_PATH_PARTS = frozenset({"experts", "shared_expert", "shared_experts"})
+
+
+def _is_expert_tensor_path(name: str) -> bool:
+    parts = name.split(".")
+    if "expert_deltas" in parts:
+        return False
+    for seg in parts:
+        if seg in _EXPERT_PATH_PARTS:
+            return True
+        if seg.startswith(("experts_", "shared_expert_")) and not seg.endswith("_gate"):
+            return True
+    return False
+
+
+def _iter_canonical_expert_tensors(
+    mod: nn.Module,
+    prefix: str,
+    visited_mods: set[tuple[str, int]],
+    seen_names: set[str],
+) -> list[tuple[str, torch.Tensor]]:
+    visit_key = (prefix, id(mod))
+    if visit_key in visited_mods:
+        return []
+    visited_mods.add(visit_key)
+
+    out: list[tuple[str, torch.Tensor]] = []
+    for pname, p in mod._parameters.items():
+        if p is None or p.requires_grad:
+            continue
+        full = f"{prefix}.{pname}" if prefix else pname
+        if _is_expert_tensor_path(full) and full not in seen_names:
+            seen_names.add(full)
+            out.append((full, p))
+
+    for bname, buf in mod._buffers.items():
+        if buf is None:
+            continue
+        full = f"{prefix}.{bname}" if prefix else bname
+        if _is_expert_tensor_path(full) and full not in seen_names:
+            seen_names.add(full)
+            out.append((full, buf))
+
+    for aname, aval in vars(mod).items():
+        if aname.startswith("_") or isinstance(aval, nn.Parameter) or not isinstance(aval, torch.Tensor):
+            continue
+        full = f"{prefix}.{aname}" if prefix else aname
+        if _is_expert_tensor_path(full) and full not in seen_names:
+            seen_names.add(full)
+            out.append((full, aval))
+
+    for cname, child in mod._modules.items():
+        if child is None:
+            continue
+        slot = getattr(child, "slot", None)
+        inner = getattr(child, "inner", None)
+        if slot is not None and isinstance(inner, nn.Module) and hasattr(slot, "phys"):
+            c_prefix = f"{prefix}.{slot.phys}" if prefix else str(slot.phys)
+            out.extend(_iter_canonical_expert_tensors(inner, c_prefix, visited_mods, seen_names))
+        else:
+            c_prefix = f"{prefix}.{cname}" if prefix else cname
+            out.extend(_iter_canonical_expert_tensors(child, c_prefix, visited_mods, seen_names))
+    return out
+
+
+def sha256_frozen_experts(model: nn.Module) -> str:
+    """Deterministic SHA-256 over frozen MoE expert parameters AND scale/packed buffers.
+
+    Hashes raw bytes (`.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()`)
+    of all frozen parameters and registered buffers on `mlp.experts` / `shared_expert` (sorted by
+    canonical physical path), working seamlessly across `bfloat16`, `float8_e4m3fn`, and `uint8`
+    packed `NVFP4` tensors.
+    """
+    items = _iter_canonical_expert_tensors(model, "", set(), set())
+    items.sort(key=lambda kv: kv[0])
+    digest = hashlib.sha256()
+    for name, t in items:
+        header = f"{name}|{t.dtype}|{tuple(t.shape)}|".encode()
+        digest.update(header)
+        raw = t.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
+        digest.update(raw)
+    return digest.hexdigest()

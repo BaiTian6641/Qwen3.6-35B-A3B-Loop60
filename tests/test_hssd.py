@@ -612,3 +612,82 @@ def test_06_stage_yaml_config_schema_compatibility():
     dcfg.validate()
     assert dcfg.chunk_size == 4096 and dcfg.vocab_chunk_size == 4096
 
+
+def test_07_loop_checkpoint_and_distiller_backward_grad_parity_fp64():
+    """Verify nested Loop checkpointing + HSSD segment checkpointing + MoR + HSSDDistiller backward."""
+    teacher = build_toy(seed=17, num_hidden_layers=12, hidden_size=32, vocab_size=97).double()
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+
+    base_student = build_toy(seed=23, num_hidden_layers=12, hidden_size=32, vocab_size=97).double()
+    ids = torch.randint(0, 97, (2, 24), generator=torch.Generator().manual_seed(77))
+    loop_base = {
+        "prelude_end": 4,
+        "core_end": 8,
+        "num_passes": 2,
+        "target_virtual_layers": 16,
+        "mor": True,
+        "write_mask": True,
+        "mor_target_depth": 1.5,
+        "per_pass_router": True,
+        "router_diversity_weight": 0.1,
+    }
+
+    grads_by_ckpt: list[dict[str, torch.Tensor]] = []
+    losses_by_ckpt: list[float] = []
+    for ckpt_loop, ckpt_hssd in ((False, False), (True, False), (True, True)):
+        torch.manual_seed(4242)
+        student = copy.deepcopy(base_student)
+        handle = apply_hssd(
+            student,
+            HSSDConfig(rank=16, chunk_size=8, window_chunks=2, segment_chunks=1, checkpoint_segments=ckpt_hssd),
+        )
+        ctl = apply_loop(student, dict(loop_base, checkpoint=ckpt_loop))
+        _perturb_hssd_and_loop(handle, ctl, mor=True, seed=99)
+        student.train()
+
+        distiller = HSSDDistiller(
+            teacher,
+            student,
+            handle=handle,
+            chunk_size=16,
+            temperature=1.5,
+            hidden_mse_weight=0.1,
+            aux_loss_weight=0.5,
+            ce_loss_weight=0.1,
+        )
+        out = distiller(ids, labels=ids)
+        # Ensure MoR actually mixed exited and continuing tokens during checkpointed forward/backward
+        keep = ctl.ctx.keep[2]
+        assert 0 < keep.sum() < keep.numel()
+        out.loss.backward()
+
+        losses_by_ckpt.append(float(out.loss.detach()))
+        grads_by_ckpt.append({n: p.grad.detach().clone() for n, p in student.named_parameters() if p.grad is not None})
+
+    for idx in (1, 2):
+        assert abs(losses_by_ckpt[0] - losses_by_ckpt[idx]) < 1e-12
+        assert grads_by_ckpt[0].keys() == grads_by_ckpt[idx].keys() and len(grads_by_ckpt[0]) > 20
+        for name in grads_by_ckpt[0]:
+            g0, g_ck = grads_by_ckpt[0][name], grads_by_ckpt[idx][name]
+            assert torch.isfinite(g_ck).all(), f"Non-finite gradient in {name} (mode {idx})"
+            assert float((g0 - g_ck).abs().max()) < 1e-11, f"Checkpoint grad mismatch on {name} (mode {idx})"
+
+    # Also verify bfloat16 nested checkpoint + MoR + distiller backward runs cleanly
+    torch.manual_seed(4242)
+    bf16_teacher = build_toy(seed=17, num_hidden_layers=12, hidden_size=32, vocab_size=97).to(torch.bfloat16).eval()
+    bf16_student = build_toy(seed=23, num_hidden_layers=12, hidden_size=32, vocab_size=97).to(torch.bfloat16)
+    bf16_handle = apply_hssd(
+        bf16_student, HSSDConfig(rank=16, chunk_size=8, window_chunks=2, segment_chunks=1, checkpoint_segments=True)
+    )
+    bf16_ctl = apply_loop(bf16_student, dict(loop_base, checkpoint=True))
+    _perturb_hssd_and_loop(bf16_handle, bf16_ctl, mor=True, seed=99)
+    bf16_student.train()
+    bf16_out = HSSDDistiller(bf16_teacher, bf16_student, bf16_handle, chunk_size=16, hidden_mse_weight=0.1)(
+        ids, labels=ids
+    )
+    bf16_out.loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in bf16_handle.trainable_parameters())
+
+

@@ -1495,14 +1495,14 @@ class HSSDAdapter(nn.Module):
         }
 
     def record_duty(self, duty_vec: torch.Tensor) -> None:
-        if _in_backward():
-            return
         bud_loss = compute_write_budget_loss(
             duty_vec,
             self.mu_max,
             mu_min_ratio=self.cfg.mu_min_ratio,
             budget_weight=self.cfg.budget_weight,
         )
+        if _in_backward():
+            return
         self._pending_aux.append(bud_loss)
         with torch.no_grad():
             det = duty_vec.detach()

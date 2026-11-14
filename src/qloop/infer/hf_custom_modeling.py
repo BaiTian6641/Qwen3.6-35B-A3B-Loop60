@@ -33,6 +33,7 @@ from ..model.introspect import find_lm_head, find_text_model
 from ..model.loading import resolve_device, resolve_dtype
 from ..model.loop import LoopController, LoopSpec, apply_loop
 from ..model.lsa import LSAConfig, LSAManager, apply_yarn, install_lsa
+from ..model.quant_autograd import install_quantized_autograd_bridge
 
 log = logging.getLogger("qloop")
 
@@ -450,6 +451,7 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
         super().__init__(config)
         self.config = config
         self.backbone: nn.Module = _build_physical_backbone(config, dtype_override=_dtype_override)
+        install_quantized_autograd_bridge(self.backbone)
         self.gdn2_manager: GDN2Manager | None = None
         self.hssd_handle: Any = None
         self.lsa_manager: LSAManager | None = None
@@ -796,6 +798,7 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
             target_dev = kwargs["device"]
 
         instance.to(target_dev)
+        install_quantized_autograd_bridge(instance.backbone)
         for p in instance.parameters():
             p.requires_grad_(False)
         instance.eval()
@@ -908,6 +911,7 @@ Supports `AutoModelForCausalLM.from_pretrained(pack_dir_or_repo, trust_remote_co
 from __future__ import annotations
 
 import copy
+import functools
 import importlib.util
 import json
 import math
@@ -2577,12 +2581,480 @@ else:
 
     def _linear_dims(mod: nn.Module) -> tuple[int, int]:
         inf, outf = getattr(mod, "in_features", None), getattr(mod, "out_features", None)
-        if isinstance(inf, int) and isinstance(outf, int):
+        if isinstance(inf, int) and isinstance(outf, int) and inf > 0 and outf > 0:
             return inf, outf
+        wp = getattr(mod, "weight_packed", None)
+        if isinstance(wp, torch.Tensor) and wp.ndim == 2:
+            return int(wp.shape[1]) * int(wp.element_size()) * 2, int(wp.shape[0])
         w = getattr(mod, "weight", None)
         if isinstance(w, torch.Tensor) and w.ndim == 2:
+            if w.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64) and isinstance(
+                getattr(mod, "weight_scale", None), torch.Tensor
+            ):
+                return int(w.shape[1]) * int(w.element_size()) * 2, int(w.shape[0])
             return int(w.shape[1]), int(w.shape[0])
         raise RuntimeError(f"cannot determine linear dims on {type(mod).__name__}")
+
+    _FP8_DTYPES: tuple[torch.dtype, ...] = tuple(
+        getattr(torch, nm)
+        for nm in ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz")
+        if hasattr(torch, nm)
+    )
+    _PACKED_INT_DTYPES: tuple[torch.dtype, ...] = (
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    )
+    _E2M1_TABLE: tuple[float, ...] = (
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    )
+    _ST_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
+    _ST_LIN_S_ATTRS: tuple[str, ...] = ("weight_scale_inv", "scale_inv", "weight_scale", "scale", "weight_scales")
+    _ST_GU_S_ATTRS: tuple[str, ...] = (
+        "gate_up_proj_scale_inv",
+        "gate_up_proj_weight_scale_inv",
+        "gate_up_proj_scale",
+        "gate_up_proj_scales",
+        "gate_up_scale_inv",
+        "gate_up_scale",
+        "weight_scale_inv_up",
+        "weight_scale_up",
+        "scale_inv_up",
+        "scale_up",
+        "w13_weight_scale_inv",
+        "w13_weight_scale",
+    )
+    _ST_DN_S_ATTRS: tuple[str, ...] = (
+        "down_proj_scale_inv",
+        "down_proj_weight_scale_inv",
+        "down_proj_scale",
+        "down_proj_scales",
+        "down_scale_inv",
+        "down_scale",
+        "weight_scale_inv_down",
+        "weight_scale_down",
+        "scale_inv_down",
+        "scale_down",
+        "w2_weight_scale_inv",
+        "w2_weight_scale",
+    )
+
+    def _st_first_tensor(mod: nn.Module, names: tuple[str, ...]) -> tuple[str | None, torch.Tensor | None]:
+        for nm in names:
+            v = getattr(mod, nm, None)
+            if isinstance(v, torch.Tensor):
+                return nm, v
+        return None, None
+
+    def _st_infer_bdim(dim_sz: int, s_sz: int, hint: int | None) -> int:
+        if s_sz <= 0:
+            raise ValueError(f"invalid scale dim {s_sz}")
+        if s_sz == dim_sz:
+            return 1
+        if s_sz == 1:
+            return dim_sz
+        if hint is not None and hint > 0 and math.ceil(dim_sz / hint) == s_sz:
+            return hint
+        for c in (128, 64, 32, 16, 256, 512):
+            if math.ceil(dim_sz / c) == s_sz:
+                return c
+        b = math.ceil(dim_sz / s_sz)
+        if math.ceil(dim_sz / b) == s_sz:
+            return b
+        raise ValueError(f"cannot infer FP8 block dim for dim={dim_sz}, scale_dim={s_sz}")
+
+    def _st_bsize_of(mod: nn.Module) -> tuple[int, int] | None:
+        for nm in ("weight_block_size", "block_size"):
+            v = getattr(mod, nm, None)
+            if isinstance(v, (tuple, list)) and len(v) == 2:
+                return int(v[0]), int(v[1])
+        return None
+
+    def _st_resolve_fp8_scale(
+        mod: nn.Module,
+        w: torch.Tensor,
+        names: tuple[str, ...],
+        role: str,
+    ) -> torch.Tensor:
+        _, s = _st_first_tensor(mod, names)
+        if s is None:
+            seen: set[str] = set()
+            cands: list[tuple[str, torch.Tensor]] = []
+            for d in (mod._parameters, mod._buffers, vars(mod)):
+                for k, v in d.items():
+                    if not k.startswith("_") and k not in seen and isinstance(v, torch.Tensor):
+                        seen.add(k)
+                        cands.append((k, v))
+            bs = _st_bsize_of(mod)
+            b0, b1 = (bs[0], bs[1]) if bs is not None else (128, 128)
+            neg = ("down", "w2") if role == "gu" else (("gate_up", "up", "w13") if role == "dn" else ())
+            pos = ("gate_up", "up", "w13", "gu") if role == "gu" else (("down", "dn", "w2") if role == "dn" else ())
+            best_sc = 0
+            for k, t in cands:
+                kl = k.lower()
+                if t is w or "bias" in kl or not t.is_floating_point() or t.dtype in _FP8_DTYPES:
+                    continue
+                if any(nt in kl for nt in neg):
+                    continue
+                sc = 0
+                if w.ndim == 2:
+                    es0, es1 = math.ceil(int(w.shape[0]) / b0), math.ceil(int(w.shape[1]) / b1)
+                    if t.ndim == 2 and tuple(t.shape) == (es0, es1):
+                        sc = 4 if "scale" in kl else 2
+                    elif "scale" in kl:
+                        sc = 1
+                elif w.ndim == 3:
+                    ec, m, n = int(w.shape[0]), int(w.shape[1]), int(w.shape[2])
+                    es0, es1 = math.ceil(m / b0), math.ceil(n / b1)
+                    rm = any(pt in kl for pt in pos)
+                    if (t.ndim == 3 and tuple(t.shape) == (ec, es0, es1)) or (
+                        t.ndim == 2 and tuple(t.shape) == (ec * es0, es1)
+                    ):
+                        sc = 5 if rm else (4 if "scale" in kl else 2)
+                    elif rm and "scale" in kl:
+                        sc = 2
+                if sc > best_sc:
+                    best_sc = sc
+                    s = t
+        if s is None and not getattr(mod, "_qloop_allow_unscaled_fp8", False):
+            avail = sorted(k for k, v in mod._parameters.items() if v is not None) + sorted(
+                k for k, v in mod._buffers.items() if v is not None
+            )
+            raise RuntimeError(f"FP8 module {type(mod).__name__} missing scale tensor (available={avail})")
+        return s  # type: ignore[return-value]
+
+    def _st_deq_fp8(
+        weight: torch.Tensor,
+        scale_inv: torch.Tensor | None,
+        dtype: torch.dtype,
+        block_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        w = weight.to(torch.float32)
+        if scale_inv is None:
+            return w.to(dtype=dtype)
+        s = scale_inv.to(device=weight.device, dtype=torch.float32)
+        h0 = block_size[0] if block_size is not None else None
+        h1 = block_size[1] if block_size is not None else None
+        if w.ndim == 2:
+            m, k = int(w.shape[0]), int(w.shape[1])
+            if s.ndim == 0 or s.numel() == 1:
+                res = w * s.reshape(())
+            elif s.ndim == 1:
+                res = w * (s[:, None] if s.shape[0] == m else s[None, :])
+            else:
+                s0, s1 = int(s.shape[0]), int(s.shape[1])
+                if s0 in (1, m) and s1 in (1, k):
+                    res = w * s
+                else:
+                    b0, b1 = _st_infer_bdim(m, s0, h0), _st_infer_bdim(k, s1, h1)
+                    if m == s0 * b0 and k == s1 * b1:
+                        res = (w.reshape(s0, b0, s1, b1) * s.reshape(s0, 1, s1, 1)).reshape(m, k)
+                    else:
+                        se = s if b0 == 1 else s.repeat_interleave(b0, dim=0)[:m, :]
+                        se = se if b1 == 1 else se.repeat_interleave(b1, dim=1)[:, :k]
+                        res = w * se
+            return res.to(dtype=dtype)
+        ec, m, k = int(w.shape[0]), int(w.shape[1]), int(w.shape[2])
+        if s.ndim == 2 and ec > 1 and s.shape not in ((ec, m), (ec, k)) and int(s.shape[0]) % ec == 0:
+            s = s.reshape(ec, int(s.shape[0]) // ec, int(s.shape[1]))
+        if s.ndim == 0 or s.numel() == 1:
+            res = w * s.reshape(())
+        elif s.ndim == 1 and s.shape[0] == ec:
+            res = w * s.reshape(ec, 1, 1)
+        elif s.ndim == 2:
+            res = w * (s[:, :, None] if s.shape == (ec, m) else s[:, None, :])
+        else:
+            es, s0, s1 = int(s.shape[0]), int(s.shape[1]), int(s.shape[2])
+            if s0 in (1, m) and s1 in (1, k):
+                res = w * s
+            else:
+                b0, b1 = _st_infer_bdim(m, s0, h0), _st_infer_bdim(k, s1, h1)
+                if m == s0 * b0 and k == s1 * b1:
+                    res = (w.reshape(ec, s0, b0, s1, b1) * s.reshape(es, s0, 1, s1, 1)).reshape(ec, m, k)
+                else:
+                    se = s if b0 == 1 else s.repeat_interleave(b0, dim=1)[:, :m, :]
+                    se = se if b1 == 1 else se.repeat_interleave(b1, dim=2)[:, :, :k]
+                    res = w * se
+        return res.to(dtype=dtype)
+
+    def _st_deq_nvfp4(
+        wp: torch.Tensor,
+        ws: torch.Tensor,
+        gs: torch.Tensor | None,
+        dtype: torch.dtype,
+        gsize: int = 16,
+        mul_gs: bool = False,
+    ) -> torch.Tensor:
+        u8 = wp if wp.dtype == torch.uint8 else wp.contiguous().view(torch.uint8)
+        lut = _ST_LUT_CACHE.get(u8.device)
+        if lut is None:
+            with torch.inference_mode(False), torch.no_grad():
+                lut = torch.tensor(_E2M1_TABLE, dtype=torch.float32, device=u8.device)
+            _ST_LUT_CACHE[u8.device] = lut
+        ku = int(u8.shape[-1]) * 2
+        nib = torch.stack((u8 & 0x0F, (u8 >> 4) & 0x0F), dim=-1).reshape(*u8.shape[:-1], ku)
+        fv = lut[nib.long()]
+        s = ws.to(device=u8.device, dtype=torch.float32)
+        ng = int(s.shape[-1]) if s.ndim > 0 else 1
+        if s.ndim == 0 or s.numel() == 1:
+            deq = fv * s.reshape(())
+        elif ng == 1:
+            deq = fv * (s.unsqueeze(-1) if s.ndim < fv.ndim else s)
+        elif ng * gsize == ku:
+            deq = (fv.reshape(*s.shape, gsize) * s.unsqueeze(-1)).reshape(fv.shape)
+        else:
+            deq = fv * s.repeat_interleave(gsize, dim=-1)[..., :ku]
+        if isinstance(gs, torch.Tensor):
+            gf = gs.to(device=u8.device, dtype=torch.float32)
+            if gf.ndim == 1 and gf.shape[0] == deq.shape[0]:
+                gf = gf.reshape(deq.shape[0], *([1] * (deq.ndim - 1)))
+            elif deq.ndim == 3 and gf.ndim == 2 and gf.shape[0] == deq.shape[0] and gf.shape[1] in (1, deq.shape[1]):
+                gf = gf.unsqueeze(-1)
+            deq = deq * gf if mul_gs else deq / gf
+        return deq.to(dtype=dtype)
+
+    def _st_quant_kind(mod: nn.Module) -> str | None:
+        if isinstance(mod, (nn.Embedding, nn.ModuleList, nn.ModuleDict, nn.Sequential)):
+            return None
+        gu_p = getattr(mod, "gate_up_proj_packed", None)
+        dn_p = getattr(mod, "down_proj_packed", None)
+        gu_s = getattr(mod, "gate_up_proj_scale", None)
+        if (
+            isinstance(gu_p, torch.Tensor)
+            and isinstance(dn_p, torch.Tensor)
+            and gu_p.ndim == 3
+            and gu_p.dtype in _PACKED_INT_DTYPES
+            and isinstance(gu_s, torch.Tensor)
+        ):
+            return "moe_nvfp4"
+        gu = getattr(mod, "gate_up_proj", None)
+        dn = getattr(mod, "down_proj", None)
+        if isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor) and gu.ndim == 3 and dn.ndim == 3:
+            if gu.dtype in _FP8_DTYPES and dn.dtype in _FP8_DTYPES:
+                return "moe_fp8"
+            if gu.dtype in _PACKED_INT_DTYPES and isinstance(gu_s, torch.Tensor):
+                return "moe_nvfp4"
+        wp = getattr(mod, "weight_packed", None)
+        ws = getattr(mod, "weight_scale", None)
+        if isinstance(wp, torch.Tensor) and wp.ndim == 2 and wp.dtype in _PACKED_INT_DTYPES and isinstance(
+            ws, torch.Tensor
+        ):
+            return "linear_nvfp4"
+        w = getattr(mod, "weight", None)
+        if isinstance(w, torch.Tensor) and w.ndim == 2:
+            if w.dtype in _FP8_DTYPES:
+                return "linear_fp8"
+            if w.dtype in _PACKED_INT_DTYPES and isinstance(ws, torch.Tensor):
+                return "linear_nvfp4"
+        return None
+
+    def _st_slice_scale_batch(
+        s: torch.Tensor | None,
+        eids: torch.Tensor,
+        n_exp: int,
+        m_dim: int,
+    ) -> torch.Tensor | None:
+        if s is None or s.ndim == 0 or s.numel() == 1:
+            return s
+        ei = eids.to(device=s.device, dtype=torch.long)
+        if s.ndim == 2 and n_exp > 0:
+            r, c = int(s.shape[0]), int(s.shape[1])
+            if r != n_exp and r % n_exp == 0:
+                return s.reshape(n_exp, r // n_exp, c).index_select(0, ei)
+            if r == n_exp and c != m_dim:
+                return s.reshape(n_exp, 1, c).index_select(0, ei)
+            if r == n_exp:
+                return s.index_select(0, ei)
+        if s.shape[0] == n_exp and s.ndim in (1, 3):
+            return s.index_select(0, ei)
+        return s
+
+    def _st_deq_lin(mod: nn.Module, dt: torch.dtype) -> torch.Tensor:
+        kind = _st_quant_kind(mod)
+        if kind == "linear_fp8":
+            s = _st_resolve_fp8_scale(mod, mod.weight, _ST_LIN_S_ATTRS, "lin")
+            return _st_deq_fp8(mod.weight, s, dt, _st_bsize_of(mod))
+        wp = getattr(mod, "weight_packed", None)
+        if not isinstance(wp, torch.Tensor):
+            wp = mod.weight
+        gs_nm, gs = _st_first_tensor(mod, ("weight_global_scale", "global_scale", "weight_scale_2"))
+        gsize = int(getattr(mod, "group_size", None) or 16)
+        return _st_deq_nvfp4(wp, mod.weight_scale, gs, dt, gsize, mul_gs=(gs_nm == "weight_scale_2"))
+
+    def _st_moe_fallback(mod: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> torch.Tensor:
+        pos_t = [a for a in args if isinstance(a, torch.Tensor)]
+        hidden = pos_t[0] if pos_t else next(
+            kwargs[k] for k in ("hidden_states", "x", "input") if isinstance(kwargs.get(k), torch.Tensor)
+        )
+        rem = pos_t[1:] + [
+            v for k, v in kwargs.items() if k not in ("hidden_states", "x", "input") and isinstance(v, torch.Tensor)
+        ]
+        top_idx = next(
+            (kwargs[k] for k in ("top_k_index", "selected_experts", "router_indices") if k in kwargs),
+            None,
+        )
+        top_w = next(
+            (kwargs[k] for k in ("top_k_weights", "routing_weights", "router_scores") if k in kwargs),
+            None,
+        )
+        for t in rem:
+            if top_idx is None and not t.is_floating_point() and not t.is_complex():
+                top_idx = t
+            elif top_w is None and t.is_floating_point():
+                top_w = t
+        assert isinstance(top_idx, torch.Tensor) and isinstance(top_w, torch.Tensor)
+        orig_sh = hidden.shape
+        fh = hidden.reshape(-1, orig_sh[-1])
+        if fh.numel() == 0 or top_idx.numel() == 0:
+            return torch.zeros_like(hidden)
+        idx2 = top_idx.reshape(fh.shape[0], -1).long()
+        w2 = top_w.reshape(fh.shape[0], -1)
+        ks = int(idx2.shape[1])
+        kind = _st_quant_kind(mod)
+        gu_raw = getattr(mod, "gate_up_proj_packed", None)
+        if not isinstance(gu_raw, torch.Tensor):
+            gu_raw = mod.gate_up_proj
+        n_exp = int(gu_raw.shape[0])
+        fidx = idx2.reshape(-1)
+        safe = torch.where((fidx >= 0) & (fidx < n_exp), fidx, fidx.new_full((), n_exp))
+        se, perm = safe.sort(dim=0, stable=True)
+        cnts = torch.bincount(se, minlength=n_exp + 1).tolist()
+        spans: list[tuple[int, int, int]] = []
+        off = 0
+        for eid in range(n_exp):
+            c = int(cnts[eid])
+            if c > 0:
+                spans.append((eid, off, c))
+                off += c
+        out = torch.zeros_like(fh)
+        if not spans:
+            return out.reshape(orig_sh)
+        pv = perm[:off]
+        tv = torch.div(pv, ks, rounding_mode="floor")
+        sv = pv % ks
+        xs = fh.index_select(0, tv)
+        ws_tok = w2[tv, sv]
+        act = getattr(mod, "act_fn", None) or F.silu
+        bs = _st_bsize_of(mod)
+        for c0 in range(0, len(spans), 32):
+            csp = spans[c0 : c0 + 32]
+            eids_t = torch.tensor([e for e, _, _ in csp], device=gu_raw.device, dtype=torch.long)
+            if kind == "moe_fp8":
+                gu_a, dn_a = mod.gate_up_proj, mod.down_proj
+                gu_s = _st_resolve_fp8_scale(mod, gu_a, _ST_GU_S_ATTRS, "gu")
+                dn_s = _st_resolve_fp8_scale(mod, dn_a, _ST_DN_S_ATTRS, "dn")
+                guc = _st_deq_fp8(
+                    gu_a.index_select(0, eids_t),
+                    _st_slice_scale_batch(gu_s, eids_t, n_exp, int(gu_a.shape[1])),
+                    fh.dtype,
+                    bs,
+                )
+                dnc = _st_deq_fp8(
+                    dn_a.index_select(0, eids_t),
+                    _st_slice_scale_batch(dn_s, eids_t, n_exp, int(dn_a.shape[1])),
+                    fh.dtype,
+                    bs,
+                )
+            else:
+                dn_raw = getattr(mod, "down_proj_packed", None)
+                if not isinstance(dn_raw, torch.Tensor):
+                    dn_raw = mod.down_proj
+                gs_nm, gu_gs = _st_first_tensor(
+                    mod, ("gate_up_proj_global_scale", "gate_up_global_scale", "gate_up_proj_scale_2")
+                )
+                dn_nm, dn_gs = _st_first_tensor(
+                    mod, ("down_proj_global_scale", "down_global_scale", "down_proj_scale_2")
+                )
+                gsz = int(getattr(mod, "group_size", None) or 16)
+                gu_s_b = _st_slice_scale_batch(mod.gate_up_proj_scale, eids_t, n_exp, int(gu_raw.shape[1]))
+                dn_s_b = _st_slice_scale_batch(mod.down_proj_scale, eids_t, n_exp, int(dn_raw.shape[1]))
+                assert gu_s_b is not None and dn_s_b is not None
+                guc = _st_deq_nvfp4(
+                    gu_raw.index_select(0, eids_t),
+                    gu_s_b,
+                    _st_slice_scale_batch(gu_gs, eids_t, n_exp, -1),
+                    fh.dtype,
+                    gsz,
+                    mul_gs=(gs_nm == "gate_up_proj_scale_2"),
+                )
+                dnc = _st_deq_nvfp4(
+                    dn_raw.index_select(0, eids_t),
+                    dn_s_b,
+                    _st_slice_scale_batch(dn_gs, eids_t, n_exp, -1),
+                    fh.dtype,
+                    gsz,
+                    mul_gs=(dn_nm == "down_proj_scale_2"),
+                )
+            if guc.shape[1] == dnc.shape[2] and guc.shape[2] == 2 * dnc.shape[1]:
+                guc = guc.transpose(1, 2).contiguous()
+                dnc = dnc.transpose(1, 2).contiguous()
+            for li, (_eid, o0, cn) in enumerate(csp):
+                xe = xs[o0 : o0 + cn]
+                we = ws_tok[o0 : o0 + cn]
+                gue = guc[li].to(device=xe.device, dtype=xe.dtype)
+                dne = dnc[li].to(device=xe.device, dtype=xe.dtype)
+                gt, up = F.linear(xe, gue).chunk(2, dim=-1)
+                ye = F.linear(act(gt) * up, dne)
+                out.index_add_(0, tv[o0 : o0 + cn], ye * we.unsqueeze(-1).to(ye.dtype))
+            del guc, dnc
+        return out.reshape(orig_sh)
+
+    def _st_install_quant_fallback(root: nn.Module) -> None:
+        seen: set[int] = set()
+        for mod in root.modules():
+            if id(mod) in seen:
+                continue
+            seen.add(id(mod))
+            kind = _st_quant_kind(mod)
+            if kind is None:
+                continue
+            if kind in ("linear_fp8", "linear_nvfp4"):
+                inf, outf = _linear_dims(mod)
+                if not isinstance(getattr(mod, "in_features", None), int):
+                    mod.in_features = inf  # type: ignore[attr-defined]
+                if not isinstance(getattr(mod, "out_features", None), int):
+                    mod.out_features = outf  # type: ignore[attr-defined]
+            if getattr(mod, "_qloop_standalone_qfb", False):
+                continue
+            orig_fwd = mod.forward
+            if kind in ("linear_fp8", "linear_nvfp4"):
+
+                def _make_qlin(m: nn.Module = mod, ofn: Callable[..., Any] = orig_fwd):
+                    @functools.wraps(ofn)
+                    def _qlin(*a: Any, **kw: Any) -> Any:
+                        if not getattr(m, "_qloop_fb_only", False):
+                            try:
+                                return ofn(*a, **kw)
+                            except (ImportError, ModuleNotFoundError, NotImplementedError):
+                                m._qloop_fb_only = True  # type: ignore[attr-defined]
+                        x = a[0] if a else next(v for v in kw.values() if isinstance(v, torch.Tensor))
+                        wd = _st_deq_lin(m, x.dtype)
+                        b = getattr(m, "bias", None)
+                        bc = b.to(device=x.device, dtype=x.dtype) if isinstance(b, torch.Tensor) else None
+                        return F.linear(x, wd, bc)
+
+                    return _qlin
+
+                mod.forward = _make_qlin()  # type: ignore[method-assign]
+            else:
+
+                def _make_qmoe(m: nn.Module = mod, ofn: Callable[..., Any] = orig_fwd):
+                    @functools.wraps(ofn)
+                    def _qmoe(*a: Any, **kw: Any) -> Any:
+                        if not getattr(m, "_qloop_fb_only", False):
+                            try:
+                                return ofn(*a, **kw)
+                            except (ImportError, ModuleNotFoundError, NotImplementedError):
+                                m._qloop_fb_only = True  # type: ignore[attr-defined]
+                        return _st_moe_fallback(m, a, kw)
+
+                    return _qmoe
+
+                mod.forward = _make_qmoe()  # type: ignore[method-assign]
+            mod._qloop_standalone_qfb = True  # type: ignore[attr-defined]
 
     def _router_of(layer: nn.Module) -> nn.Module | None:
         mlp = getattr(layer, "mlp", None)
@@ -2724,6 +3196,7 @@ else:
             except TypeError:
                 self.backbone = AutoModelForCausalLM.from_config(hf_cfg, attn_implementation=attn_impl)
                 self.backbone.to(dtype=base_dt)
+            _st_install_quant_fallback(self.backbone)
             self._cur_pass = 0
             self._tuple_out = False
             self._tuple_extra = 0
@@ -3634,6 +4107,7 @@ else:
                             if ek.endswith("lm_head.weight"):
                                 loaded_bb.add(ek)
 
+            _st_install_quant_fallback(inst.backbone)
             inst._apply_standalone_loop(config.qloop_v3_arch or {})
             missing_loop: list[str] = []
             unexpected_loop: list[str] = []

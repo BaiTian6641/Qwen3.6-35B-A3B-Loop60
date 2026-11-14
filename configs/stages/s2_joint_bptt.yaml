@@ -44,6 +44,9 @@ hssd:
   window_chunks: 8
   num_pages: 8
   k_pages: 2
+  theta_low_rank: true
+  surprise_mode: routed
+  state_dtype: bfloat16
   budget_weight: 1.0
   segment_chunks: 16
   checkpoint_segments: true

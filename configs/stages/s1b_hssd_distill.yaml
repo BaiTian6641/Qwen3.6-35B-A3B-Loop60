@@ -1,10 +1,11 @@
-# Gate 1 (S1b v3) - Track-B HSSD v3 Horizon-Split Surprise-Gated Delta Memory KL Distillation (4K -> 32K).
-# Upgrades all 30 linear-attention layers from Track-A GDN-2 to HSSD v3:
+# Gate 1 (S1b v3.1) - Track-B HSSD v3.1 Horizon-Split Surprise-Gated Delta Memory KL Distillation (4K -> 32K).
+# Upgrades all 30 linear-attention layers from Track-A GDN-2 to HSSD v3.1:
 #   * Strictly disjoint horizon partition `k_far = max(0, n - 8)` -> `[513, 576]` exact local SWA (Fix B1)
-#   * Peak-augmented size-free Boltzmann miss gate `PeakBoltzmannGate` (Fix B5)
-#   * 2D phase counter-rotation compiled to real symmetric WY `chunk_kda` (Theorem 1)
-#   * Smooth parallel chunk-start root-surprise `g in (0, 1)` with `s = g^2`, zero `sqrt(s)` singularity (Fixes B3, B4)
-#   * Tiered M=8 multi-page state router (Top-2 active pages) + enforced cumulative write-mass budget loss (Fixes B2, B6)
+#   * Learned `PeakBoltzmannGate` local/far branch-selection heuristic (Fix B5)
+#   * Low-rank 2D phase (`theta_low_rank: true`, ~1.95M/layer) + post-rotation WY `chunk_hssd` & linear-beta `sqrt(w_t)` (Theorem 1)
+#   * Multi-page routed chunk-start root-surprise (`surprise_mode: routed` against `boundary_ring[-1]`, zero `sqrt(s)` singularity)
+#   * Tiered M=8 multi-page router (Top-2 active pages) + STE actual sparse Top-k write-mass budget regularizer
+#   * Compact `state_dtype: bfloat16` retained cache (`81-89 MiB/layer`, `fp32` WY updates + `fp64` `theta_cum`)
 # Fallback guarantee: if HSSD < +8% over GDN-2 on 32K-64K RULER/MQAR, Gate 2a seamlessly retains `s1_loop_a6b` Track-A.
 _base_: [../base.yaml, ../model/qwen36_bf16.yaml]
 stage: s1b_hssd_distill
@@ -41,7 +42,10 @@ hssd:
   window_chunks: 8                      # Fix B1: k_far = max(0, n - 8), |I_loc| in [513, 576], 0 overlap
   num_pages: 8                          # Fix B2: M=8 log-spaced multi-timescale memory pages
   k_pages: 2                            # Fixes B2, B6: Top-2 sparse active write/read pages per chunk
-  budget_weight: 1.0                    # Fix B2: two-sided write-mass budget regularizer B_m <= 0.4 * d_k
+  theta_low_rank: true                  # Pure linear theta_down + theta_up (~1.95M/layer, ~58.5M/30L vs 176.5M)
+  surprise_mode: routed                 # Multi-page chunk-start surprise against Top-k write pages of boundary_ring[-1]
+  state_dtype: bfloat16                 # 81-89 MiB/layer decode cache (fp32 WY updates + fp64 theta_cum)
+  budget_weight: 1.0                    # Audit 3C: STE actual sparse Top-k write-mass budget regularizer
   segment_chunks: 16                    # Fix B6: 16 x 64 = 1024-token checkpointed WY macro-segments
   checkpoint_segments: true
 

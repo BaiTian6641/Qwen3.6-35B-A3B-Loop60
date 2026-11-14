@@ -343,23 +343,58 @@ def _json_clean(obj: Any) -> Any:
     return obj
 
 
+def _extract_hssd_mod_meta(mod: nn.Module) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    cfg_obj = getattr(mod, "cfg", None)
+    if cfg_obj is not None:
+        if hasattr(cfg_obj, "__dataclass_fields__"):
+            meta.update(asdict(cfg_obj))
+        elif hasattr(cfg_obj, "__dict__"):
+            meta.update({k: v for k, v in vars(cfg_obj).items() if not k.startswith("_")})
+    else:
+        attr_map = (
+            ("num_pages", "num_pages"),
+            ("k_pages", "k_pages"),
+            ("chunk_size", "chunk_size"),
+            ("window_chunks", "window_chunks"),
+            ("rank", "rank"),
+            ("gate_logit_cap", "cap_g"),
+            ("decay_log_cap", "cap_d"),
+            ("theta_low_rank", "theta_low_rank"),
+            ("state_dtype", "state_dtype"),
+            ("paired_b_gate", "paired_b_gate"),
+            ("use_swa", "use_swa"),
+            ("use_phase", "use_phase"),
+            ("use_surprise", "use_surprise"),
+            ("surprise_mode", "surprise_mode"),
+        )
+        for out_k, attr_k in attr_map:
+            if hasattr(mod, attr_k):
+                meta[out_k] = getattr(mod, attr_k)
+    if "theta_low_rank" not in meta:
+        meta["theta_low_rank"] = bool(hasattr(mod, "theta_down"))
+    return meta
+
+
+def _with_hssd_v31_defaults(cfg_d: dict[str, Any], first_mod: nn.Module | None) -> dict[str, Any]:
+    defaults: dict[str, Any] = {
+        "theta_low_rank": bool(hasattr(first_mod, "theta_down")) if first_mod is not None else True,
+        "state_dtype": "auto",
+        "paired_b_gate": False,
+        "use_swa": True,
+        "use_phase": True,
+        "use_surprise": True,
+        "surprise_mode": "routed",
+    }
+    merged = {**defaults, **cfg_d}
+    merged["enabled"] = True
+    return _json_clean(merged)
+
+
 def _infer_hssd_arch(src: _UnwrappedSource) -> dict[str, Any]:
-    if src.hssd_cfg is not None:
-        return _json_clean({"enabled": True, **copy.deepcopy(src.hssd_cfg)})
-    h_handle = getattr(src.stack, "hssd", None) if src.stack is not None else None
-    if h_handle is None:
-        h_handle = getattr(src.backbone, "_hssd_handle", None)
-    if h_handle is not None and hasattr(h_handle, "cfg"):
-        cfg_d = asdict(h_handle.cfg) if hasattr(h_handle.cfg, "__dataclass_fields__") else dict(vars(h_handle.cfg))
-        if hasattr(h_handle, "adapters") and isinstance(h_handle.adapters, dict):
-            cfg_d["layers"] = sorted(int(i) for i in h_handle.adapters)
-        return _json_clean({"enabled": True, **cfg_d})
-    carried_hssd = getattr(src.stack, "carried_hssd_cfg", None) if src.stack is not None else None
-    if isinstance(carried_hssd, dict):
-        return _json_clean({"enabled": True, **copy.deepcopy(carried_hssd)})
     phys_pairs, _, _ = physical_layers(src.backbone)
     hssd_layers: list[int] = []
-    meta: dict[str, Any] = {}
+    first_mod: nn.Module | None = None
     for idx, layer in phys_pairs:
         lin = getattr(layer, "linear_attn", None)
         if lin is None:
@@ -368,11 +403,41 @@ def _infer_hssd_arch(src: _UnwrappedSource) -> dict[str, Any]:
             mod = getattr(lin, attr, None)
             if isinstance(mod, nn.Module):
                 hssd_layers.append(int(idx))
-                if not meta and hasattr(mod, "cfg") and hasattr(mod.cfg, "__dict__"):
-                    meta = {k: v for k, v in vars(mod.cfg).items() if not k.startswith("_")}
+                if first_mod is None:
+                    first_mod = mod
                 break
+
+    mod_meta = _extract_hssd_mod_meta(first_mod) if first_mod is not None else {}
+
+    h_handle = getattr(src.stack, "hssd", None) if src.stack is not None else None
+    if h_handle is None:
+        h_handle = getattr(src.backbone, "_hssd_handle", None)
+    handle_meta: dict[str, Any] = {}
+    if h_handle is not None and hasattr(h_handle, "cfg"):
+        handle_meta = (
+            asdict(h_handle.cfg) if hasattr(h_handle.cfg, "__dataclass_fields__") else dict(vars(h_handle.cfg))
+        )
+        if hasattr(h_handle, "adapters") and isinstance(h_handle.adapters, dict):
+            handle_meta["layers"] = sorted(int(i) for i in h_handle.adapters)
+
+    if src.hssd_cfg is not None:
+        combined = {**mod_meta, **handle_meta, **copy.deepcopy(src.hssd_cfg)}
+        if "layers" not in combined and hssd_layers:
+            combined["layers"] = hssd_layers
+        return _with_hssd_v31_defaults(combined, first_mod)
+
+    if handle_meta:
+        return _with_hssd_v31_defaults({**mod_meta, **handle_meta}, first_mod)
+
+    carried_hssd = getattr(src.stack, "carried_hssd_cfg", None) if src.stack is not None else None
+    if isinstance(carried_hssd, dict):
+        combined = {**mod_meta, **copy.deepcopy(carried_hssd)}
+        if "layers" not in combined and hssd_layers:
+            combined["layers"] = hssd_layers
+        return _with_hssd_v31_defaults(combined, first_mod)
+
     if hssd_layers:
-        return _json_clean({"enabled": True, "layers": hssd_layers, **meta})
+        return _with_hssd_v31_defaults({"layers": hssd_layers, **mod_meta}, first_mod)
     return {"enabled": False}
 
 

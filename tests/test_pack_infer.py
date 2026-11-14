@@ -778,7 +778,11 @@ def test_standalone_hf_modeling_no_qloop_v3_hssd_subspace_pass_attn_and_dlsa(tmp
                 ad.erase_up.weight.normal_(0.0, 0.08, generator=gen)
                 ad.write_up.weight.normal_(0.0, 0.08, generator=gen)
                 ad.decay_up.weight.normal_(0.0, 0.06, generator=gen)
-                ad.theta_proj.weight.normal_(0.0, 0.08, generator=gen)
+                if hasattr(ad, "theta_down") and hasattr(ad, "theta_up"):
+                    ad.theta_down.weight.normal_(0.0, 0.08, generator=gen)
+                    ad.theta_up.weight.normal_(0.0, 0.08, generator=gen)
+                else:
+                    ad.theta_proj.weight.normal_(0.0, 0.08, generator=gen)
                 ad.swa_q_up.weight.normal_(0.0, 0.08, generator=gen)
                 ad.swa_k_up.weight.normal_(0.0, 0.08, generator=gen)
                 ad.swa_v_up.weight.normal_(0.0, 0.08, generator=gen)
@@ -927,7 +931,8 @@ def test_standalone_hf_modeling_no_qloop_v3_hssd_subspace_pass_attn_and_dlsa(tmp
         all_tensors[f"{pfx}.erase_up.weight"] = torch.randn(n_v * d_k, rank, generator=gen) * 0.08
         all_tensors[f"{pfx}.write_up.weight"] = torch.randn(n_v * d_k, rank, generator=gen) * 0.08
         all_tensors[f"{pfx}.decay_up.weight"] = torch.randn(n_v * half_k, rank, generator=gen) * 0.06
-        all_tensors[f"{pfx}.theta_proj.weight"] = torch.randn(n_v * half_k, hidden, generator=gen) * 0.08
+        all_tensors[f"{pfx}.theta_down.weight"] = torch.randn(rank, hidden, generator=gen) * 0.08
+        all_tensors[f"{pfx}.theta_up.weight"] = torch.randn(n_v * half_k, rank, generator=gen) * 0.08
         all_tensors[f"{pfx}.surprise_proj.weight"] = torch.randn(n_v, hidden, generator=gen) * 0.08
         all_tensors[f"{pfx}.surprise_proj.bias"] = torch.zeros(n_v)
         all_tensors[f"{pfx}.log_surprise_slope"] = torch.zeros(n_v)
@@ -998,4 +1003,743 @@ def test_standalone_hf_modeling_no_qloop_v3_hssd_subspace_pass_attn_and_dlsa(tmp
     (synth_dir / SAFETENSORS_INDEX_FILE).write_text(json.dumps(new_idx, indent=2), encoding="utf-8")
     with pytest.raises(RuntimeError, match=r"missing_loop=.*bridge\.ups\.0\.weight"):
         mod_synth.Qwen36LoopHSSDForCausalLM.from_pretrained(str(synth_dir), strict=True)
+
+
+def _populate_hssd_v31_adapter_weights(ad: Any, gen: torch.Generator) -> None:
+    with torch.no_grad():
+        ad.down.weight.normal_(0.0, 0.08, generator=gen)
+        ad.erase_up.weight.normal_(0.0, 0.08, generator=gen)
+        ad.write_up.weight.normal_(0.0, 0.08, generator=gen)
+        ad.decay_up.weight.normal_(0.0, 0.06, generator=gen)
+        if hasattr(ad, "theta_down") and hasattr(ad, "theta_up"):
+            ad.theta_down.weight.normal_(0.0, 0.09, generator=gen)
+            ad.theta_up.weight.normal_(0.0, 0.09, generator=gen)
+        elif hasattr(ad, "theta_proj"):
+            ad.theta_proj.weight.normal_(0.0, 0.09, generator=gen)
+        ad.surprise_proj.weight.normal_(0.0, 0.08, generator=gen)
+        ad.surprise_proj.bias.normal_(0.0, 0.04, generator=gen)
+        ad.write_router.weight.normal_(0.0, 0.12, generator=gen)
+        ad.write_router.bias.normal_(0.0, 0.05, generator=gen)
+        ad.read_router.weight.normal_(0.0, 0.12, generator=gen)
+        ad.read_router.bias.normal_(0.0, 0.05, generator=gen)
+        ad.log_page_gamma.normal_(0.0, 0.15, generator=gen)
+        ad.swa_q_up.weight.normal_(0.0, 0.08, generator=gen)
+        ad.swa_k_up.weight.normal_(0.0, 0.08, generator=gen)
+        ad.swa_v_up.weight.normal_(0.0, 0.08, generator=gen)
+
+
+def test_hssd_v31_pack_standalone_parity_multichunk_decode_and_left_pad(tmp_path, monkeypatch) -> None:
+    """Verify HSSD v3.1 Whole Model Pack standalone parity across R=1,2,3, multi-chunk + decode, and left-pad."""
+    gen = torch.Generator().manual_seed(20261114)
+    tok = ToyTokenizer()
+
+    # 1) Unconditional linear-attn + 3-pass Loop + MoR Whole Model Pack with HSSD v3.1 (`chunk_size=4, window_chunks=1`)
+    torch.manual_seed(314)
+    lin_tcfg = ToyConfig(
+        vocab_size=tok.vocab_size,
+        hidden_size=48,
+        moe_intermediate_size=24,
+        shared_expert_intermediate_size=24,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        partial_rotary_factor=0.5,
+        linear_num_heads=4,
+        linear_head_dim=12,
+        linear_conv_kernel_dim=4,
+        num_experts=8,
+        num_experts_per_tok=2,
+        layer_types=("linear_attention", "linear_attention", "linear_attention", "linear_attention"),
+    )
+    lin_base = ToyForCausalLM(lin_tcfg).eval()
+    lin_loop = apply_loop(
+        lin_base,
+        LoopSpec(
+            prelude_end=1,
+            core_end=3,
+            num_passes=3,
+            target_virtual_layers=8,
+            kv_share=False,
+            gate_init=0.35,
+            bridge_rank=8,
+            step_embedding=True,
+            per_pass_router=True,
+            router_adapter_rank=8,
+            router_repel_init=1.1,
+            mor=True,
+        ),
+    )
+    with torch.no_grad():
+        lin_loop.adapters.gates[0].fill_(0.35)
+        lin_loop.adapters.gates[1].fill_(0.42)
+        if hasattr(lin_loop.adapters.bridge, "ups"):
+            for u in lin_loop.adapters.bridge.ups:
+                u.weight.normal_(0.0, 0.08, generator=gen)
+        if lin_loop.adapters.pass_router is not None:
+            lin_loop.adapters.pass_router.up.normal_(0.0, 0.12, generator=gen)
+            lin_loop.adapters.pass_router.bias.normal_(0.0, 0.06, generator=gen)
+        if lin_loop.adapters.mor_router is not None:
+            lin_loop.adapters.mor_router.weight.normal_(0.0, 0.30, generator=gen)
+            lin_loop.adapters.mor_router.bias.copy_(torch.tensor([0.0, 0.20, 0.10]))
+
+    lin_stack = Stack(
+        model=lin_base,
+        tokenizer=tok,
+        parts=inspect_model(lin_base),
+        loop=lin_loop,
+        load_info={"name": "toy"},
+    )
+    lin_pack_dir = tmp_path / "lin_hssd_v31_pack"
+    export_whole_model_pack(lin_stack, lin_pack_dir, max_shard_size_bytes=65536)
+
+    cfg_lin = json.loads((lin_pack_dir / "config.json").read_text(encoding="utf-8"))
+    cfg_lin["qloop_v3_arch"]["hssd"] = {
+        "enabled": True,
+        "num_pages": 4,
+        "k_pages": 2,
+        "rank": 8,
+        "chunk_size": 4,
+        "window_chunks": 1,
+        "gate_logit_cap": 8.0,
+        "decay_log_cap": 2.0,
+        "theta_low_rank": True,
+        "state_dtype": "auto",
+        "paired_b_gate": False,
+        "use_swa": True,
+        "use_phase": True,
+        "use_surprise": True,
+        "surprise_mode": "routed",
+    }
+    (lin_pack_dir / "config.json").write_text(json.dumps(cfg_lin, indent=2), encoding="utf-8")
+
+    idx_lin = json.loads((lin_pack_dir / SAFETENSORS_INDEX_FILE).read_text(encoding="utf-8"))
+    lin_tensors: dict[str, torch.Tensor] = {}
+    for sf in sorted(set(idx_lin["weight_map"].values())):
+        lin_tensors.update(load_safetensors_file(str(lin_pack_dir / sf)))
+        (lin_pack_dir / sf).unlink()
+
+    hidden, rank, n_v, d_k, n_pages = 48, 8, 4, 12, 4
+    half_k = d_k // 2
+    for li in range(4):
+        pfx = f"model.layers.{li}.linear_attn.hssd_adapter"
+        lin_tensors[f"{pfx}.down.weight"] = torch.randn(rank, hidden, generator=gen) * 0.08
+        lin_tensors[f"{pfx}.erase_up.weight"] = torch.randn(n_v * d_k, rank, generator=gen) * 0.08
+        lin_tensors[f"{pfx}.write_up.weight"] = torch.randn(n_v * d_k, rank, generator=gen) * 0.08
+        lin_tensors[f"{pfx}.decay_up.weight"] = torch.randn(n_v * half_k, rank, generator=gen) * 0.06
+        lin_tensors[f"{pfx}.theta_down.weight"] = torch.randn(rank, hidden, generator=gen) * 0.09
+        lin_tensors[f"{pfx}.theta_up.weight"] = torch.randn(n_v * half_k, rank, generator=gen) * 0.09
+        lin_tensors[f"{pfx}.surprise_proj.weight"] = torch.randn(n_v, hidden, generator=gen) * 0.08
+        lin_tensors[f"{pfx}.surprise_proj.bias"] = torch.randn(n_v, generator=gen) * 0.04
+        lin_tensors[f"{pfx}.log_surprise_slope"] = torch.full((n_v,), 1.1)
+        lin_tensors[f"{pfx}.surprise_thresh"] = torch.full((n_v,), 0.75)
+        lin_tensors[f"{pfx}.write_router.weight"] = torch.randn(n_pages, hidden, generator=gen) * 0.12
+        lin_tensors[f"{pfx}.write_router.bias"] = torch.randn(n_pages, generator=gen) * 0.05
+        lin_tensors[f"{pfx}.read_router.weight"] = torch.randn(n_pages, n_v * d_k, generator=gen) * 0.12
+        lin_tensors[f"{pfx}.read_router.bias"] = torch.randn(n_pages, generator=gen) * 0.05
+        lin_tensors[f"{pfx}.log_page_gamma"] = torch.randn(n_pages, generator=gen) * 0.15
+        lin_tensors[f"{pfx}.swa_q_up.weight"] = torch.randn(n_v * d_k, rank, generator=gen) * 0.08
+        lin_tensors[f"{pfx}.swa_k_up.weight"] = torch.randn(n_v * d_k, rank, generator=gen) * 0.08
+        lin_tensors[f"{pfx}.swa_v_up.weight"] = torch.randn(n_v * d_k, rank, generator=gen) * 0.08
+        lin_tensors[f"{pfx}.swa_q_norm"] = torch.ones(d_k)
+        lin_tensors[f"{pfx}.swa_k_norm"] = torch.ones(d_k)
+        lin_tensors[f"{pfx}.boltzmann_gate.log_kappa"] = torch.full((n_v,), 0.65)
+        lin_tensors[f"{pfx}.boltzmann_gate.tau"] = torch.full((n_v,), 1.9)
+
+    lin_shard = "model-00001-of-00001.safetensors"
+    save_safetensors_file(lin_tensors, str(lin_pack_dir / lin_shard))
+    lin_idx_new = {
+        "metadata": {"total_size": sum(t.numel() * t.element_size() for t in lin_tensors.values())},
+        "weight_map": {k: lin_shard for k in sorted(lin_tensors)},
+    }
+    (lin_pack_dir / SAFETENSORS_INDEX_FILE).write_text(json.dumps(lin_idx_new, indent=2), encoding="utf-8")
+
+    mod_sa = _load_standalone_modeling_without_qloop(lin_pack_dir, monkeypatch)
+    sm_lin = mod_sa.Qwen36LoopHSSDForCausalLM.from_pretrained(str(lin_pack_dir), strict=True)
+
+    seq_23 = torch.tensor([[((i * 17 + 7) % 240) + 4 for i in range(23)]], dtype=torch.long)
+    row0_valid = torch.tensor([[((i * 11 + 5) % 240) + 4 for i in range(19)]], dtype=torch.long)
+    row1_valid = torch.tensor([[((i * 19 + 9) % 240) + 4 for i in range(22)]], dtype=torch.long)
+    dec_toks = torch.tensor([[31, 47], [53, 61]], dtype=torch.long)
+
+    # Batch of 2 left-padded rows: row0 has 5 leading pad tokens, row1 has 2 leading pad tokens
+    pad_ids = torch.cat(
+        [
+            torch.cat([torch.full((1, 5), 99, dtype=torch.long), row0_valid], dim=1),
+            torch.cat([torch.full((1, 2), 88, dtype=torch.long), row1_valid], dim=1),
+        ],
+        dim=0,
+    )
+    pad_mask = torch.ones((2, 24), dtype=torch.long)
+    pad_mask[0, :5] = 0
+    pad_mask[1, :2] = 0
+
+    from qloop.infer.engine import QuantizedHybridCache
+
+    with torch.no_grad():
+        for r in (1, 2, 3):
+            with sm_lin.depth(r):
+                # (a) Multi-chunk prefill (7 + 6 + 6) + 4 decode steps vs full 23-token uncached forward
+                full_23 = sm_lin(seq_23, use_cache=False).logits
+                pkv_mc = QuantizedHybridCache(
+                    num_layers=8, layer_types=["linear_attention"] * 8, mode="native"
+                )
+                c1 = sm_lin(seq_23[:, :7], past_key_values=pkv_mc, use_cache=True)
+                c2 = sm_lin(seq_23[:, 7:13], past_key_values=c1.past_key_values, use_cache=True)
+                c3 = sm_lin(seq_23[:, 13:19], past_key_values=c2.past_key_values, use_cache=True)
+                chunks_logits = [c1.logits, c2.logits, c3.logits]
+                pkv = c3.past_key_values
+                for step in range(19, 23):
+                    d_out = sm_lin(seq_23[:, step : step + 1], past_key_values=pkv, use_cache=True)
+                    chunks_logits.append(d_out.logits)
+                    pkv = d_out.past_key_values
+                cat_23 = torch.cat(chunks_logits, dim=1)
+                assert (cat_23 - full_23).abs().max().item() < 1e-5
+
+                # (b) Left-padded batch prefill + 2 decode steps vs independent unpadded B=1 runs
+                r0_full = sm_lin(torch.cat([row0_valid, dec_toks[0:1]], dim=1), use_cache=False).logits
+                r1_full = sm_lin(torch.cat([row1_valid, dec_toks[1:2]], dim=1), use_cache=False).logits
+
+                pkv_lp = QuantizedHybridCache(
+                    num_layers=8, layer_types=["linear_attention"] * 8, mode="native"
+                )
+                lp_out = sm_lin(pad_ids, attention_mask=pad_mask, past_key_values=pkv_lp, use_cache=True)
+                lp_pkv = lp_out.past_key_values
+                checked_slots = 0
+                for st_slot in lp_pkv.recurrent_states:
+                    if st_slot is not None:
+                        assert torch.equal(st_slot.step_count, torch.tensor([19, 22], dtype=torch.long))
+                        checked_slots += 1
+                assert checked_slots == (4 if r == 1 else (6 if r == 2 else 8))
+                assert (lp_out.logits[0:1, 5:, :] - r0_full[:, :19, :]).abs().max().item() < 1e-5
+                assert (lp_out.logits[1:2, 2:, :] - r1_full[:, :22, :]).abs().max().item() < 1e-5
+
+                cur_mask = pad_mask
+                dec_outs = []
+                for step in range(2):
+                    cur_mask = torch.cat([cur_mask, torch.ones((2, 1), dtype=torch.long)], dim=1)
+                    d_lp = sm_lin(
+                        dec_toks[:, step : step + 1],
+                        attention_mask=cur_mask,
+                        past_key_values=lp_pkv,
+                        use_cache=True,
+                    )
+                    dec_outs.append(d_lp.logits)
+                    lp_pkv = d_lp.past_key_values
+                for st_slot in lp_pkv.recurrent_states:
+                    if st_slot is not None:
+                        assert torch.equal(st_slot.step_count, torch.tensor([21, 24], dtype=torch.long))
+                dec_cat = torch.cat(dec_outs, dim=1)
+                assert (dec_cat[0:1] - r0_full[:, 19:21, :]).abs().max().item() < 1e-5
+                assert (dec_cat[1:2] - r1_full[:, 22:24, :]).abs().max().item() < 1e-5
+
+    # 2) Full native Stack / Qwen36LoopHSSDForCausalLM vs standalone `< 1e-5` parity when HSSD v3.1 is installed
+    from qloop.model.hssd import HSSDConfig, apply_hssd
+
+    if "theta_low_rank" in HSSDConfig.__dataclass_fields__:
+        torch.manual_seed(777)
+        hyb_tcfg = ToyConfig(
+            vocab_size=tok.vocab_size,
+            hidden_size=48,
+            moe_intermediate_size=24,
+            shared_expert_intermediate_size=24,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            partial_rotary_factor=0.5,
+            linear_num_heads=4,
+            linear_head_dim=12,
+            linear_conv_kernel_dim=4,
+            num_experts=8,
+            num_experts_per_tok=2,
+            layer_types=(
+                "linear_attention",
+                "full_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+                "full_attention",
+            ),
+        )
+        nat_model = ToyForCausalLM(hyb_tcfg).eval()
+        hcfg_v31 = HSSDConfig(
+            num_pages=4,
+            k_pages=2,
+            rank=8,
+            chunk_size=4,
+            window_chunks=1,
+            theta_low_rank=True,
+            surprise_mode="routed",
+        )
+        nat_hssd = apply_hssd(nat_model, hcfg_v31)
+        for ad in nat_hssd.adapters.values():
+            _populate_hssd_v31_adapter_weights(ad, gen)
+
+        nat_lsa = install_lsa(
+            nat_model,
+            LSAConfig(
+                mode="sparse",
+                index_dim=16,
+                block_size=8,
+                pool=2,
+                avg_bucket_keys=4,
+                max_bucket_keys=8,
+                num_select=2,
+                window=8,
+                sinks=2,
+                query_chunk=8,
+                num_query_passes=3,
+            ),
+        )
+        with torch.no_grad():
+            for ix in nat_lsa.indexers.values():
+                ix.wk.normal_(0.0, 0.12, generator=gen)
+                ix.wq.normal_(0.0, 0.12, generator=gen)
+                for qp in getattr(ix, "q_proj_extra", ()):
+                    qp.weight.normal_(0.0, 0.10, generator=gen)
+
+        nat_loop = apply_loop(
+            nat_model,
+            LoopSpec(
+                prelude_end=2,
+                core_end=5,
+                num_passes=3,
+                target_virtual_layers=12,
+                kv_share=True,
+                gate_init=0.35,
+                bridge_rank=8,
+                bridge_mode="subspace",
+                attn_adapter_rank=8,
+                step_embedding=True,
+                per_pass_router=True,
+                router_adapter_rank=8,
+                router_repel_init=1.2,
+                mor=True,
+            ),
+        )
+        with torch.no_grad():
+            nat_loop.adapters.gates[0].fill_(0.33)
+            nat_loop.adapters.gates[1].fill_(0.44)
+            for u in nat_loop.adapters.bridge.ups:
+                u.weight.normal_(0.0, 0.08, generator=gen)
+            if nat_loop.adapters.pass_attn is not None:
+                for pdict in nat_loop.adapters.pass_attn.layers.values():
+                    for proj in pdict.values():
+                        proj.up.normal_(0.0, 0.08, generator=gen)
+            if nat_loop.adapters.pass_router is not None:
+                nat_loop.adapters.pass_router.up.normal_(0.0, 0.12, generator=gen)
+                nat_loop.adapters.pass_router.bias.normal_(0.0, 0.06, generator=gen)
+            if nat_loop.adapters.mor_router is not None:
+                nat_loop.adapters.mor_router.weight.normal_(0.0, 0.30, generator=gen)
+                nat_loop.adapters.mor_router.bias.copy_(torch.tensor([0.0, 0.15, 0.05]))
+
+        stack_kw_v31: dict[str, Any] = dict(
+            model=nat_model,
+            tokenizer=tok,
+            parts=inspect_model(nat_model),
+            loop=nat_loop,
+            lsa=nat_lsa,
+            load_info={"name": "toy"},
+        )
+        if "hssd" in Stack.__dataclass_fields__:
+            stack_kw_v31["hssd"] = nat_hssd
+        nat_stack = Stack(**stack_kw_v31)
+        nat_stack.hssd = nat_hssd  # type: ignore[attr-defined]
+
+        v31_pack_dir = tmp_path / "native_hssd_v31_full_pack"
+        export_whole_model_pack(nat_stack, v31_pack_dir, max_shard_size_bytes=65536)
+        loaded_nat = load_whole_model_pack(v31_pack_dir)
+        mod_v31 = _load_standalone_modeling_without_qloop(v31_pack_dir, monkeypatch)
+        sm_v31 = mod_v31.Qwen36LoopHSSDForCausalLM.from_pretrained(str(v31_pack_dir), strict=True)
+
+        with torch.no_grad():
+            for r in (1, 2, 3):
+                nat_loop.set_active_passes(r)
+                raw_ref_23 = nat_model(seq_23, use_cache=False).logits
+                with loaded_nat.depth(r), sm_v31.depth(r):
+                    # Full uncached parity vs Stack.model AND loaded Qwen36LoopHSSDForCausalLM
+                    nat_full_23 = loaded_nat(seq_23, use_cache=False).logits
+                    sa_full_23 = sm_v31(seq_23, use_cache=False).logits
+                    assert (sa_full_23 - raw_ref_23).abs().max().item() < 1e-5
+                    assert (sa_full_23 - nat_full_23).abs().max().item() < 1e-5
+
+                    # Multi-chunk prefill (7 + 6 + 6) + 4 decode steps parity
+                    nc1 = loaded_nat(seq_23[:, :7], use_cache=True)
+                    nc2 = loaded_nat(seq_23[:, 7:13], past_key_values=nc1.past_key_values, use_cache=True)
+                    nc3 = loaded_nat(seq_23[:, 13:19], past_key_values=nc2.past_key_values, use_cache=True)
+                    sc1 = sm_v31(seq_23[:, :7], use_cache=True)
+                    sc2 = sm_v31(seq_23[:, 7:13], past_key_values=sc1.past_key_values, use_cache=True)
+                    sc3 = sm_v31(seq_23[:, 13:19], past_key_values=sc2.past_key_values, use_cache=True)
+                    npkv, spkv = nc3.past_key_values, sc3.past_key_values
+                    n_parts = [nc1.logits, nc2.logits, nc3.logits]
+                    s_parts = [sc1.logits, sc2.logits, sc3.logits]
+                    for step in range(19, 23):
+                        nd = loaded_nat(seq_23[:, step : step + 1], past_key_values=npkv, use_cache=True)
+                        sd = sm_v31(seq_23[:, step : step + 1], past_key_values=spkv, use_cache=True)
+                        n_parts.append(nd.logits)
+                        s_parts.append(sd.logits)
+                        npkv, spkv = nd.past_key_values, sd.past_key_values
+                    assert (torch.cat(s_parts, dim=1) - torch.cat(n_parts, dim=1)).abs().max().item() < 1e-5
+                    for n_st, s_st in zip(npkv.recurrent_states, spkv.recurrent_states):
+                        if s_st is not None:
+                            assert s_st.state_equal(n_st, atol=1e-5, rtol=1e-4)
+
+                    # Left-padded prefill + decode continuation parity
+                    nlp = loaded_nat(pad_ids, attention_mask=pad_mask, use_cache=True)
+                    slp = sm_v31(pad_ids, attention_mask=pad_mask, use_cache=True)
+                    assert (slp.logits - nlp.logits).abs().max().item() < 1e-5
+                    cmask = torch.cat([pad_mask, torch.ones((2, 1), dtype=torch.long)], dim=1)
+                    nd1 = loaded_nat(
+                        dec_toks[:, :1], attention_mask=cmask, past_key_values=nlp.past_key_values, use_cache=True
+                    )
+                    sd1 = sm_v31(
+                        dec_toks[:, :1], attention_mask=cmask, past_key_values=slp.past_key_values, use_cache=True
+                    )
+                    assert (sd1.logits - nd1.logits).abs().max().item() < 1e-5
+
+
+def test_standalone_hssd_cache_state_ops_storage_and_cu_seqlens(tmp_path, monkeypatch) -> None:
+    """Verify standalone `_HSSDCacheState` torch ops, compact storage, ablations, and `cu_seqlens`."""
+    base_stack = _build_full_v3_toy_stack(seed=29, mor=False)
+    pack_dir = tmp_path / "sa_cache_ops_pack"
+    export_whole_model_pack(base_stack, pack_dir, max_shard_size_bytes=65536)
+    mod = _load_standalone_modeling_without_qloop(pack_dir, monkeypatch)
+
+    gen = torch.Generator().manual_seed(4242)
+    hs, hv, dk, dv = 32, 3, 8, 8
+    hcfg = {
+        "num_pages": 4,
+        "k_pages": 2,
+        "rank": 8,
+        "chunk_size": 8,
+        "window_chunks": 2,
+        "theta_low_rank": True,
+        "paired_b_gate": True,
+        "state_dtype": "auto",
+        "surprise_mode": "routed",
+    }
+    ad = mod._StandaloneHSSDAdapter(hs, hv, dk, dv, hcfg, 0).to(dtype=torch.float64)
+    _populate_hssd_v31_adapter_weights(ad, gen)
+
+    bsz, t_non_bound, t_bound, t_long = 3, 17, 16, 73
+    x_long = torch.randn(bsz, t_long, hs, dtype=torch.float64, generator=gen)
+    q_long = torch.randn(bsz, t_long, hv, dk, dtype=torch.float64, generator=gen)
+    k_long = torch.randn(bsz, t_long, hv, dk, dtype=torch.float64, generator=gen)
+    v_long = torch.randn(bsz, t_long, hv, dv, dtype=torch.float64, generator=gen)
+    g_long = -torch.rand(bsz, t_long, hv, dtype=torch.float64, generator=gen) * 0.4
+    b_long = torch.rand(bsz, t_long, hv, dtype=torch.float64, generator=gen)
+
+    # Factored decay & paired_b_gate verification
+    proj = ad.project_inputs(x_long[:, :5], q_long[:, :5], k_long[:, :5], v_long[:, :5], g_long[:, :5], b_long[:, :5])
+    assert "gamma" not in proj
+    assert proj["gamma_page_scale"].shape == (4,)
+    assert proj["gamma_chan_pair"].shape == (bsz, 5, hv, dk // 2)
+    bg_pairs = proj["b_gate"].view(bsz, 5, hv, dk // 2, 2)
+    assert torch.allclose(bg_pairs[..., 0], bg_pairs[..., 1], atol=0.0, rtol=0.0)
+
+    # Compact storage + torch ops across T=17, T=16 (chunk boundary), and T=73 (multi-wrap)
+    with torch.no_grad():
+        _, st17 = mod._recurrent_hssd(
+            ad,
+            x_long[:, :t_non_bound],
+            None,
+            q_long[:, :t_non_bound],
+            k_long[:, :t_non_bound],
+            v_long[:, :t_non_bound],
+            g_long[:, :t_non_bound],
+            b_long[:, :t_non_bound],
+            output_final_state=True,
+        )
+        _, st16 = mod._recurrent_hssd(
+            ad,
+            x_long[:, :t_bound],
+            None,
+            q_long[:, :t_bound],
+            k_long[:, :t_bound],
+            v_long[:, :t_bound],
+            g_long[:, :t_bound],
+            b_long[:, :t_bound],
+            output_final_state=True,
+        )
+        _, st73 = mod._recurrent_hssd(
+            ad, x_long, None, q_long, k_long, v_long, g_long, b_long, output_final_state=True
+        )
+
+    from qloop.infer.engine import _tensor_tree_bytes
+
+    for st, expected_steps in ((st17, 17), (st16, 16), (st73, 73)):
+        assert "s_chunk_start" not in vars(st)
+        assert torch.equal(st.s_chunk_start, st.boundary_ring[-1][:, 0])
+        assert st.step_count.shape == (bsz,) and st.step_count.dtype == torch.long
+        assert torch.equal(st.step_count, torch.full((bsz,), expected_steps, dtype=torch.long))
+        assert st.theta_cum.dtype == torch.float64
+        assert st.has_compact_storage()
+        seen_p: set[int] = set()
+        expected_bytes = 0
+        for t in st._iter_tensors():
+            p = int(t.untyped_storage().data_ptr())
+            if p not in seen_p:
+                seen_p.add(p)
+                expected_bytes += int(t.numel() * t.element_size())
+        assert st.unique_storage_bytes() == expected_bytes
+        assert _tensor_tree_bytes(st, set()) == expected_bytes
+
+    # `torch.zeros_like(st)`, `torch.empty_like(st)`, `st2.copy_(st)` (including onto chunk-boundary state `st16`!)
+    st2 = torch.zeros_like(st17)
+    assert not st2.state_equal(st17)
+    st2.copy_(st17)
+    assert st2.state_equal(st17, atol=1e-12, rtol=1e-12)
+
+    st_emp = torch.empty_like(st73)
+    st_emp.copy_(st73)
+    assert st_emp.state_equal(st73, atol=1e-12, rtol=1e-12)
+
+    st16_copy = st16.clone()
+    st16_copy.copy_(st17)
+    assert st16_copy.state_equal(st17, atol=1e-12, rtol=1e-12)
+
+    # Mutating a valid `swa_v_ring` slot must flip `state_equal` to False
+    st_mut = torch.clone(st17)
+    assert st_mut.state_equal(st17, atol=1e-12, rtol=1e-12)
+    valid_pos = st_mut.swa_valid_ring.nonzero(as_tuple=False)[0]
+    st_mut.swa_v_ring[int(valid_pos[0].item()), int(valid_pos[1].item())] += 0.5
+    assert not st_mut.state_equal(st17, atol=1e-5, rtol=1e-4)
+
+    # `st[beam_idx]`, `torch.index_select`, `reorder_cache`, `torch.cat`
+    beam_idx = torch.tensor([2, 0, 2, 1], dtype=torch.long)
+    st_sub = st73[beam_idx]
+    st_isel = torch.index_select(st73, 0, beam_idx)
+    st_reord = st73.clone().reorder_cache(beam_idx)
+    st_cat = torch.cat([st73[2:3], st73[0:1], st73[2:3], st73[1:2]], dim=0)
+    assert st_sub.has_compact_storage()
+    assert st_sub.state_equal(st_isel, atol=1e-12, rtol=1e-12)
+    assert st_sub.state_equal(st_reord, atol=1e-12, rtol=1e-12)
+    assert st_sub.state_equal(st_cat, atol=1e-12, rtol=1e-12)
+
+    # `.to(torch.bfloat16)` and `state_dtype="bfloat16"` preserve `theta_cum.dtype == torch.float64`
+    st_bf16 = st73.to(torch.bfloat16)
+    assert st_bf16.page_states.dtype == torch.bfloat16
+    assert st_bf16.theta_cum.dtype == torch.float64
+    ad_bf16 = mod._StandaloneHSSDAdapter(hs, hv, dk, dv, {**hcfg, "state_dtype": "bfloat16"}, 0).to(dtype=torch.float32)
+    with torch.no_grad():
+        _, st_ret_bf16 = mod._recurrent_hssd(
+            ad_bf16,
+            x_long[:1, :9].float(),
+            None,
+            q_long[:1, :9].float(),
+            k_long[:1, :9].float(),
+            v_long[:1, :9].float(),
+            g_long[:1, :9].float(),
+            b_long[:1, :9].float(),
+            output_final_state=True,
+        )
+    assert st_ret_bf16.page_states.dtype == torch.bfloat16
+    assert st_ret_bf16.theta_cum.dtype == torch.float64
+
+    # Ablation flags (`theta_low_rank=False`, `use_swa=False`, `use_phase=False`, `use_surprise=False`, `page0`)
+    for ab_cfg in (
+        {**hcfg, "theta_low_rank": False},
+        {**hcfg, "use_swa": False},
+        {**hcfg, "use_phase": False},
+        {**hcfg, "use_surprise": False},
+        {**hcfg, "surprise_mode": "page0"},
+    ):
+        ad_ab = mod._StandaloneHSSDAdapter(hs, hv, dk, dv, ab_cfg, 0).to(dtype=torch.float64)
+        _populate_hssd_v31_adapter_weights(ad_ab, gen)
+        with torch.no_grad():
+            o_ab, st_ab = mod._recurrent_hssd(
+                ad_ab,
+                x_long[:1, :12],
+                None,
+                q_long[:1, :12],
+                k_long[:1, :12],
+                v_long[:1, :12],
+                g_long[:1, :12],
+                b_long[:1, :12],
+                output_final_state=True,
+            )
+        assert torch.isfinite(o_ab).all()
+        assert st_ab is not None and st_ab.has_compact_storage()
+
+    # Packed sequences via `cu_seqlens=[0, 3, 6]` and `[0, 5, 14]`
+    for cu in ([0, 3, 6], [0, 5, 14]):
+        tot = cu[-1]
+        with torch.no_grad():
+            o_pack, st_pack = mod._recurrent_hssd(
+                ad,
+                x_long[:1, :tot],
+                None,
+                q_long[:1, :tot],
+                k_long[:1, :tot],
+                v_long[:1, :tot],
+                g_long[:1, :tot],
+                b_long[:1, :tot],
+                output_final_state=True,
+                cu_seqlens=cu,
+            )
+            o_a, _ = mod._recurrent_hssd(
+                ad,
+                x_long[:1, cu[0] : cu[1]],
+                None,
+                q_long[:1, cu[0] : cu[1]],
+                k_long[:1, cu[0] : cu[1]],
+                v_long[:1, cu[0] : cu[1]],
+                g_long[:1, cu[0] : cu[1]],
+                b_long[:1, cu[0] : cu[1]],
+                output_final_state=False,
+            )
+            o_b, st_b = mod._recurrent_hssd(
+                ad,
+                x_long[:1, cu[1] : cu[2]],
+                None,
+                q_long[:1, cu[1] : cu[2]],
+                k_long[:1, cu[1] : cu[2]],
+                v_long[:1, cu[1] : cu[2]],
+                g_long[:1, cu[1] : cu[2]],
+                b_long[:1, cu[1] : cu[2]],
+                output_final_state=True,
+            )
+        assert (o_pack - torch.cat([o_a, o_b], dim=1)).abs().max().item() < 1e-13
+        assert st_pack.state_equal(st_b, atol=1e-12, rtol=1e-12)
+
+    # Invalid `cu_seqlens` combinations must raise ValueError
+    with pytest.raises(ValueError, match="B == 1"):
+        mod._recurrent_hssd(
+            ad,
+            x_long[:2, :6],
+            None,
+            q_long[:2, :6],
+            k_long[:2, :6],
+            v_long[:2, :6],
+            g_long[:2, :6],
+            b_long[:2, :6],
+            cu_seqlens=[0, 3, 6],
+        )
+    with pytest.raises(ValueError, match="initial_state"):
+        mod._recurrent_hssd(
+            ad,
+            x_long[:1, :6],
+            None,
+            q_long[:1, :6],
+            k_long[:1, :6],
+            v_long[:1, :6],
+            g_long[:1, :6],
+            b_long[:1, :6],
+            initial_state=st17[:1],
+            cu_seqlens=[0, 3, 6],
+        )
+    with pytest.raises(ValueError, match="Invalid cu_seqlens"):
+        mod._recurrent_hssd(
+            ad,
+            x_long[:1, :6],
+            None,
+            q_long[:1, :6],
+            k_long[:1, :6],
+            v_long[:1, :6],
+            g_long[:1, :6],
+            b_long[:1, :6],
+            cu_seqlens=[0, 4, 5],
+        )
+
+
+def test_engine_backing_storage_bytes_quantized_cache_reorder_reset_and_hssd_export(
+    tmp_path, monkeypatch
+) -> None:
+    """Verify `_tensor_tree_bytes` backing-storage accounting, `QuantizedHybridCache` ops, and HSSD export."""
+    from qloop.infer.engine import QuantizedHybridCache, _tensor_tree_bytes
+
+    # 1) `_tensor_tree_bytes` measures actual unique backing storage (catching slice storage leaks!)
+    backing = torch.zeros(1024, dtype=torch.float32)
+    tiny_slice_a = backing[:4]
+    tiny_slice_b = backing[4:8]
+    assert _tensor_tree_bytes(tiny_slice_a, set()) == 1024 * 4
+    assert _tensor_tree_bytes((tiny_slice_a, tiny_slice_b), set()) == 1024 * 4
+
+    # 2) `QuantizedHybridCache.reorder_cache` + `reset` with `_HSSDCacheState` in `recurrent_states`
+    base_stack = _build_full_v3_toy_stack(seed=61, mor=False)
+    pack_dir = tmp_path / "eng_cache_pack"
+    export_whole_model_pack(base_stack, pack_dir, max_shard_size_bytes=65536)
+
+    # Python 3.9 AST check on emitted standalone files
+    for fname in (CONFIG_FILENAME, MODELING_FILENAME):
+        src_txt = (pack_dir / fname).read_text(encoding="utf-8")
+        ast.parse(src_txt, filename=fname, feature_version=(3, 9))
+
+    mod = _load_standalone_modeling_without_qloop(pack_dir, monkeypatch)
+    beam_idx = torch.tensor([2, 0, 1], dtype=torch.long)
+    k_in = torch.randn(3, 2, 5, 16, dtype=torch.float32)
+    v_in = torch.randn(3, 2, 5, 16, dtype=torch.float32)
+    conv_in = torch.randn(3, 24, 3, dtype=torch.float32)
+
+    st_init = mod._HSSDCacheState.zeros(
+        3, 4, 3, 8, 8, chunk_size=8, window_chunks=2, device=torch.device("cpu"), dtype=torch.float32
+    )
+    st_init.step_count.copy_(torch.tensor([3, 7, 11], dtype=torch.long))
+    st_init.page_states.normal_(0.0, 0.5)
+    st_init.theta_cum.uniform_(0.1, 1.5)
+    st_init.swa_valid_ring[:, :3] = True
+    st_init.swa_k_ring[:, :3].normal_(0.0, 0.5)
+    st_init.swa_v_ring[:, :3].normal_(0.0, 0.5)
+    st_expected = st_init[beam_idx]
+
+    for qmode in ("fp8", "hadamard_int4", "bf16"):
+        qcache = QuantizedHybridCache(
+            num_layers=2,
+            layer_types=["linear_attention", "full_attention"],
+            mode=qmode,
+        )
+        qcache.conv_states[0] = conv_in.clone()
+        qcache.recurrent_states[0] = st_init.clone()
+        k_deq_before, v_deq_before = qcache.update(k_in, v_in, 1)
+        assert qcache.get_seq_length() == 5
+        assert qcache.kv_bytes() > 0
+        assert qcache.recurrent_bytes() > st_init.unique_storage_bytes()
+
+        qcache.reorder_cache(beam_idx)
+        assert torch.allclose(qcache.conv_states[0], conv_in[beam_idx])
+        assert qcache.recurrent_states[0].state_equal(st_expected, atol=1e-6, rtol=1e-6)
+        k_deq_after, v_deq_after = qcache.update(
+            k_in.new_zeros(3, 2, 0, 16), v_in.new_zeros(3, 2, 0, 16), 1
+        )
+        assert torch.allclose(k_deq_after, k_deq_before[beam_idx], atol=1e-5, rtol=1e-5)
+        assert torch.allclose(v_deq_after, v_deq_before[beam_idx], atol=1e-5, rtol=1e-5)
+
+        qcache.reset()
+        assert qcache.get_seq_length() == 0
+        assert qcache.kv_bytes() == 0
+        assert qcache.recurrent_bytes() == 0
+        assert all(x is None for x in qcache.recurrent_states)
+
+    # 3) `export_whole_model_pack` preserves all HSSD v3.1 fields cleanly in `config.json`
+    tok = ToyTokenizer()
+    t_model = ToyForCausalLM(ToyConfig(vocab_size=tok.vocab_size, hidden_size=32, num_hidden_layers=2)).eval()
+    custom_hssd_cfg = {
+        "num_pages": 6,
+        "k_pages": 2,
+        "rank": 8,
+        "chunk_size": 16,
+        "window_chunks": 3,
+        "theta_low_rank": True,
+        "state_dtype": "bfloat16",
+        "paired_b_gate": True,
+        "use_swa": False,
+        "use_phase": True,
+        "use_surprise": False,
+        "surprise_mode": "page0",
+    }
+    h_stack = Stack(
+        model=t_model,
+        tokenizer=tok,
+        parts=inspect_model(t_model),
+        carried_hssd_cfg=custom_hssd_cfg,
+        load_info={"name": "toy"},
+    )
+    exp_dir = tmp_path / "hssd_v31_cfg_export_pack"
+    export_whole_model_pack(h_stack, exp_dir, max_shard_size_bytes=65536)
+    exported_hssd = json.loads((exp_dir / "config.json").read_text(encoding="utf-8"))["qloop_v3_arch"]["hssd"]
+    assert exported_hssd["enabled"] is True
+    for k_field, v_expected in custom_hssd_cfg.items():
+        assert exported_hssd[k_field] == v_expected
+
 

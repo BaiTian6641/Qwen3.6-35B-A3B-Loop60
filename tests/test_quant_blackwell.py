@@ -39,13 +39,16 @@ from qloop.export_pack import export_whole_model_pack
 from qloop.infer.hf_custom_modeling import load_safetensors_file
 from qloop.model import quant_autograd as qa
 from qloop.model.experts import (
+    _EXPERT_DELTA_KEY_RE,
     HotExpertDeltas,
     attach_hot_expert_deltas,
+    freeze_all_but,
     install_hot_experts,
     sha256_frozen_experts,
 )
 from qloop.model.gdn2 import GDN2Config, install_gdn2
 from qloop.model.hssd import HSSDConfig, apply_hssd
+from qloop.model.introspect import inspect_model
 from qloop.model.loading import (
     _propagate_quantization_config_to_text_config,
     load_model,
@@ -63,6 +66,7 @@ from qloop.model.quant_autograd import (
     quantize_nvfp4_tensor,
 )
 from qloop.model.toy import ToyForCausalLM, build_toy
+from qloop.train.stack import Stack
 
 # ============================================================================ mock Blackwell modules
 
@@ -1102,6 +1106,7 @@ def test_export_whole_model_pack_preserves_quantized_buffers_config_and_sidecar_
     scheme: str,
     tmp_path: Any,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base = build_toy(
         seed=88,
@@ -1128,6 +1133,7 @@ def test_export_whole_model_pack_preserves_quantized_buffers_config_and_sidecar_
     )
 
     out_dir = tmp_path / f"pack_{scheme}"
+    monkeypatch.setattr(logging.getLogger("qloop"), "propagate", True)
     with caplog.at_level(logging.INFO, logger="qloop"):
         res = export_whole_model_pack(
             model,
@@ -1157,9 +1163,10 @@ def test_export_whole_model_pack_preserves_quantized_buffers_config_and_sidecar_
     for shard_file in sorted(set(weight_map.values())):
         loaded_tensors.update(load_safetensors_file(str(out_dir / shard_file)))
 
-    # Sidecar hot-expert delta keys present in exported pack
-    ed_keys = [k for k in loaded_tensors if "expert_deltas.deltas." in k]
+    # Sidecar hot-expert delta keys present in exported pack & matching `_EXPERT_DELTA_KEY_RE`
+    ed_keys = sorted(k for k in loaded_tensors if "expert_deltas.deltas." in k)
     assert len(ed_keys) == 3 * 4  # 3 hot experts x 4 LoRA matrices (gate_up_A/B, down_A/B)
+    assert all(_EXPERT_DELTA_KEY_RE.search(k) is not None for k in ed_keys)
 
     if scheme == "fp8":
         gu_t = loaded_tensors["model.layers.0.mlp.experts.gate_up_proj"]
@@ -1187,3 +1194,146 @@ def test_export_whole_model_pack_preserves_quantized_buffers_config_and_sidecar_
         assert lin_gs.dtype == torch.float32
 
     assert detect_model_quantization(model)["is_quantized"] is True
+
+
+@pytest.mark.parametrize("scheme", ["fp8", "nvfp4"])
+def test_export_pack_passthrough_tensors_sidecar_keys_on_quantized_stack(
+    scheme: str,
+    tmp_path: Any,
+) -> None:
+    base = build_toy(
+        seed=91,
+        num_hidden_layers=4,
+        hidden_size=32,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        num_experts=4,
+    )
+    model = (
+        _quantize_toy_model_fp8(base, block_size=(16, 16))
+        if scheme == "fp8"
+        else _quantize_toy_model_nvfp4(base, group_size=16)
+    )
+    install_quantized_autograd_bridge(model)
+
+    # Generate canonical `HotExpertDeltas` state_dict keys on a throwaway handle, then export via
+    # `Stack.passthrough_tensors` with `deltas=None` (prior-stage checkpoint carry-over).
+    ref_deltas = HotExpertDeltas(model, {0: [2], 2: [1]}, rank=4)
+    passthrough = {
+        f"model.expert_deltas.{k}": v.detach().clone()
+        for k, v in ref_deltas.state_dict().items()
+    }
+    expected_ed_keys = sorted(passthrough.keys())
+    assert all(_EXPERT_DELTA_KEY_RE.search(k) is not None for k in expected_ed_keys)
+
+    stack = Stack(
+        model=model,
+        tokenizer=ToyTokenizer(),
+        parts=inspect_model(model),
+        deltas=None,
+        passthrough_tensors=passthrough,
+    )
+    out_dir = tmp_path / f"pt_pack_{scheme}"
+    res = export_whole_model_pack(stack, out_dir, merge_hot_experts=True)
+    assert res["merged_hot_experts"] == 0
+
+    cfg_json = json.loads((out_dir / "config.json").read_text(encoding="utf-8"))
+    he_cfg = cfg_json["qloop_v3_arch"]["hot_experts"]
+    assert he_cfg["enabled"] is True
+    assert he_cfg["merged_into_base"] is False
+    assert he_cfg["rank"] == 4
+    assert he_cfg["hot_map"] == {"0": [2], "2": [1]}
+
+    idx_json = json.loads((out_dir / "model.safetensors.index.json").read_text(encoding="utf-8"))
+    loaded_tensors: dict[str, torch.Tensor] = {}
+    for shard_file in sorted(set(idx_json["weight_map"].values())):
+        loaded_tensors.update(load_safetensors_file(str(out_dir / shard_file)))
+
+    exported_ed_keys = sorted(k for k in loaded_tensors if "expert_deltas.deltas." in k)
+    assert exported_ed_keys == expected_ed_keys
+    assert all(_EXPERT_DELTA_KEY_RE.search(k) is not None for k in exported_ed_keys)
+    for k in expected_ed_keys:
+        assert torch.equal(loaded_tensors[k], passthrough[k])
+
+
+def test_freeze_all_but_keeps_fp8_and_nvfp4_weights_frozen_and_catches_typos(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(logging.getLogger("qloop"), "propagate", True)
+
+    # 1) FP8 backbone: `s2_joint_bptt` (`self_attn.(k_proj|v_proj|o_proj|q_norm|k_norm)`),
+    #    `s1_loop_heal` / `s2_sft` / `s4_rl` (`shared_expert\.`, `linear_attn\.(in_proj|out_proj)`).
+    fp8_model = _quantize_toy_model_fp8(
+        build_toy(
+            seed=101,
+            num_hidden_layers=4,
+            hidden_size=32,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            num_experts=4,
+        ),
+        block_size=(16, 16),
+    )
+    sha_fp8_before = sha256_frozen_experts(fp8_model)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="qloop"):
+        rep_fp8_se = freeze_all_but(fp8_model, [r"shared_expert\."])
+    assert rep_fp8_se.n_trainable == 0
+    assert any("keeping quantized non-float weights frozen" in r.message for r in caplog.records)
+    assert all(
+        not p.requires_grad
+        for p in fp8_model.parameters()
+        if p.dtype == torch.float8_e4m3fn
+    )
+    assert sha256_frozen_experts(fp8_model) == sha_fp8_before
+
+    rep_fp8_s2 = freeze_all_but(
+        fp8_model,
+        [
+            r"self_attn\.(k_proj|v_proj|o_proj|q_norm|k_norm)",
+            r"linear_attn\.(in_proj|out_proj)",
+            r"shared_expert\.",
+        ],
+    )
+    # Float `q_norm`, `k_norm`, and `in_proj_ba` are trainable; all FP8 weights remain frozen!
+    assert rep_fp8_s2.n_trainable > 0
+    for pname, p in fp8_model.named_parameters():
+        if p.requires_grad:
+            assert p.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64), pname
+        if p.dtype == torch.float8_e4m3fn:
+            assert not p.requires_grad, pname
+    assert sha256_frozen_experts(fp8_model) == sha_fp8_before
+
+    with pytest.raises(AssertionError, match="matched no parameter"):
+        freeze_all_but(fp8_model, [r"nonexistent_typo_pattern_xyz\."])
+    with pytest.raises(AssertionError, match="forbidden groups"):
+        freeze_all_but(fp8_model, [r"mlp\.experts\."])
+
+    # 2) NVFP4 backbone: `CompressedLinear` has `uint8` `weight_packed` buffers and NO `weight` param.
+    nvfp4_model = _quantize_toy_model_nvfp4(
+        build_toy(
+            seed=102,
+            num_hidden_layers=4,
+            hidden_size=32,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            num_experts=4,
+        ),
+        group_size=16,
+    )
+    sha_nvfp4_before = sha256_frozen_experts(nvfp4_model)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="qloop"):
+        rep_nvfp4_se = freeze_all_but(nvfp4_model, [r"shared_expert\."])
+    assert rep_nvfp4_se.n_trainable == 0
+    assert any("keeping quantized non-float weights frozen" in r.message for r in caplog.records)
+    assert sha256_frozen_experts(nvfp4_model) == sha_nvfp4_before
+
+    # Genuine unmatched typo MUST still raise under `strict_patterns=True`!
+    with pytest.raises(AssertionError, match="matched no parameter"):
+        freeze_all_but(nvfp4_model, [r"nonexistent_typo_pattern_xyz\."])
+    with pytest.raises(AssertionError, match="forbidden groups"):
+        freeze_all_but(nvfp4_model, [r"mlp\.experts\."])

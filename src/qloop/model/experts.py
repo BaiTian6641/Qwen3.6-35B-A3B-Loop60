@@ -46,7 +46,7 @@ from qloop.debug import describe, require
 
 from ._dtype import upcast
 from .introspect import find_text_model
-from .quant_autograd import auto_dequant_expert_fn
+from .quant_autograd import auto_dequant_expert_fn, is_quantized_module
 
 log = logging.getLogger("qloop")
 
@@ -825,17 +825,35 @@ class FreezeReport:
                 f"({100 * self.n_trainable / max(self.n_total, 1):.4f}%)\n" + "\n".join(rows))
 
 
+def _quantized_target_paths(model: nn.Module) -> list[str]:
+    """Collect canonical target paths for quantized weights/buffers (including buffer-only NVFP4)."""
+    paths: set[str] = set()
+    for pname, p in model.named_parameters():
+        if p.dtype not in _FLOAT:
+            paths.add(pname)
+    quant_mod_prefixes: set[str] = set()
+    for mname, sub in model.named_modules():
+        if is_quantized_module(sub):
+            quant_mod_prefixes.add(mname)
+            paths.add(f"{mname}.weight" if mname else "weight")
+            if hasattr(sub, "gate_up_proj") or hasattr(sub, "gate_up_proj_packed"):
+                paths.add(f"{mname}.gate_up_proj" if mname else "gate_up_proj")
+            if hasattr(sub, "down_proj") or hasattr(sub, "down_proj_packed"):
+                paths.add(f"{mname}.down_proj" if mname else "down_proj")
+    for bname, buf in model.named_buffers():
+        parent = bname.rsplit(".", 1)[0] if "." in bname else ""
+        if buf.dtype not in _FLOAT or parent in quant_mod_prefixes:
+            paths.add(bname)
+    return sorted(paths)
+
+
 def freeze_all_but(model: nn.Module, patterns: Iterable[str], extra_params: Iterable[Any] | None = None,
                    allowed_groups: Iterable[str] | None = None, forbid_groups: Iterable[str] = ("expert_base",),
                    strict_patterns: bool = True) -> FreezeReport:
-    """Freeze every parameter except those whose name matches one of the `patterns` (re.search)
-    plus `extra_params` (by identity; may live outside `model`). `extra_params` items are
-    parameters or `(name, parameter)` pairs (e.g. `deltas.named_parameters(prefix="expert_deltas")`);
-    unnamed extras outside the model are reported as group "extra".
-
-    Safety: a pattern that matches nothing raises (typo guard, `strict_patterns`); a trainable
-    parameter in `forbid_groups` raises (default: the fused expert base tensors - use
-    HotExpertDeltas instead); if `allowed_groups` is given, any trainable group outside it raises.
+    """Freeze every parameter except float parameters whose name matches one of `patterns` (`re.search`)
+    plus `extra_params` (by identity; may live outside `model`). Quantized non-float parameters
+    (e.g. `float8_e4m3fn` FP8 weights) and buffer-backed `NVFP4` modules (`CompressedLinear`) are
+    NEVER set `requires_grad=True`; patterns matching them warn concisely and keep them frozen.
     """
     pats = [re.compile(p) for p in patterns]
     extra: list[tuple[str | None, nn.Parameter]] = []
@@ -846,6 +864,9 @@ def freeze_all_but(model: nn.Module, patterns: Iterable[str], extra_params: Iter
             extra.append((None, item))
     extra_ids = {id(p) for _, p in extra}
     hits = dict.fromkeys(range(len(pats)), 0)
+    quant_warn_pats: set[str] = set()
+    quant_skipped_total = 0
+    matched_quant_groups: dict[str, list[str]] = {}
     groups: dict[str, dict[str, int]] = {}
     trainable: list[str] = []
     tgroup: dict[str, str] = {}
@@ -868,24 +889,64 @@ def freeze_all_but(model: nn.Module, patterns: Iterable[str], extra_params: Iter
 
     for name, p in model.named_parameters():
         seen.add(id(p))
-        on = id(p) in extra_ids
+        is_float_param = p.dtype in _FLOAT
+        on = (id(p) in extra_ids) and is_float_param
+        matched_here = False
         for i, pat in enumerate(pats):
             if pat.search(name):
                 hits[i] += 1
-                on = True
+                matched_here = True
+                if is_float_param:
+                    on = True
+                else:
+                    quant_warn_pats.add(pat.pattern)
+        if matched_here and not is_float_param:
+            quant_skipped_total += 1
+            matched_quant_groups.setdefault(param_group_of(name), []).append(name)
         p.requires_grad_(on)
         account(name, p, on)
     for j, (name, p) in enumerate(extra):
         if id(p) not in seen:
             seen.add(id(p))
-            p.requires_grad_(True)
-            account(name or f"extra.{j}", p, True, None if name else "extra")
+            can_train = p.dtype in _FLOAT
+            if not can_train:
+                quant_skipped_total += 1
+            p.requires_grad_(can_train)
+            account(name or f"extra.{j}", p, can_train, None if name else "extra")
+
+    unmatched_idxs = [i for i, c in hits.items() if c == 0]
+    if unmatched_idxs:
+        qpaths = _quantized_target_paths(model)
+        for i in unmatched_idxs:
+            qmatched = [qp for qp in qpaths if pats[i].search(qp)]
+            if qmatched:
+                hits[i] += len(qmatched)
+                quant_warn_pats.add(pats[i].pattern)
+                quant_skipped_total += len(qmatched)
+                for qp in qmatched:
+                    matched_quant_groups.setdefault(param_group_of(qp), []).append(qp)
+
+    if quant_warn_pats:
+        log.warning(
+            "freeze_all_but: keeping quantized non-float weights frozen for pattern(s) %s "
+            "(matched %d quantized target(s))",
+            sorted(quant_warn_pats),
+            quant_skipped_total,
+        )
     if strict_patterns:
         dead = [pats[i].pattern for i, c in hits.items() if c == 0]
         require(not dead, f"freeze_all_but: patterns matched no parameter: {dead}")
-    bad = sorted({g for g, v in groups.items() if v["trainable"] and g in set(forbid_groups)})
-    require(not bad, f"freeze_all_but: forbidden groups would be trainable: {bad}",
-            names=[n for n in trainable if tgroup[n] in bad][:10])
+    forbid_set = set(forbid_groups)
+    bad = sorted(
+        {g for g, v in groups.items() if v["trainable"] and g in forbid_set}
+        | (set(matched_quant_groups) & forbid_set)
+    )
+    if bad:
+        bad_names = [n for n in trainable if tgroup[n] in bad]
+        for g in bad:
+            bad_names.extend(matched_quant_groups.get(g, ()))
+        require(False, f"freeze_all_but: forbidden groups would be trainable: {bad}",
+                names=bad_names[:10])
     if allowed_groups is not None:
         allowed = set(allowed_groups)
         unexpected = sorted(set(tgroup.values()) - allowed)

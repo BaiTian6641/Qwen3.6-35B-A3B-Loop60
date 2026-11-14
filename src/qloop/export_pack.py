@@ -964,7 +964,7 @@ def _prepare_canonical_entries(
             pair = (int(m.group(1)), int(m.group(3)))
             if pair in src.stack._folded_experts:
                 continue
-            canon_k = _tm_key(f"expert_deltas.deltas.{pair[0]}_{pair[1]}.{m.group(2)}")
+            canon_k = _tm_key(f"expert_deltas.deltas.L{pair[0]}.{m.group(2)}.{pair[1]}")
             if canon_k in emitted_keys:
                 continue
             emitted_keys.add(canon_k)

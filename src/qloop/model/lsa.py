@@ -46,6 +46,43 @@ from .introspect import FULL, attention_module, find_text_model, inspect_model
 log = logging.getLogger("qloop")
 
 LSA_IMPL_NAME = "qloop_lsa"
+_LSA_FP8_DTYPES: tuple[torch.dtype, ...] = tuple(
+    dt
+    for dt in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dt is not None
+)
+
+
+def _ensure_attn_kv_dtype(
+    module: nn.Module,
+    t: torch.Tensor,
+    target_dtype: torch.dtype,
+    *,
+    is_key: bool,
+) -> torch.Tensor:
+    if t.dtype in _LSA_FP8_DTYPES or not t.is_floating_point():
+        scale_attr = "k_scale" if is_key else "v_scale"
+        kvc = getattr(module, "kv_cache", None)
+        sc = getattr(kvc, scale_attr, None) if kvc is not None else None
+        if not isinstance(sc, torch.Tensor):
+            sc = getattr(module, scale_attr, None)
+        if isinstance(sc, torch.Tensor):
+            sf = sc.to(device=t.device, dtype=torch.float32)
+            if sf.numel() == 1:
+                sf = sf.reshape(())
+            elif sf.ndim == 1 and t.ndim == 4 and sf.shape[0] == t.shape[1]:
+                sf = sf.view(1, -1, 1, 1)
+            elif sf.ndim < t.ndim:
+                while sf.ndim < t.ndim:
+                    sf = sf.unsqueeze(-1)
+            return (t.to(torch.float32) * sf).to(target_dtype)
+        return t.to(target_dtype)
+    return t
 
 
 # ============================================================================ config
@@ -579,6 +616,8 @@ def lsa_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor, val
     dense = _DENSE_FN[0]
     if dense is None:
         raise RuntimeError("lsa_attention called before install_lsa() registered a dense fallback")
+    key = _ensure_attn_kv_dtype(module, key, query.dtype, is_key=True)
+    value = _ensure_attn_kv_dtype(module, value, query.dtype, is_key=False)
     if idx is None or idx.cfg.mode == "dense":
         return dense(module, query, key, value, attention_mask, scaling=scaling, dropout=dropout, **kwargs)
     cfg = idx.cfg
@@ -720,10 +759,14 @@ def _resolve_dense_and_register(model: nn.Module, text_config: Any) -> tuple[str
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
     except Exception as e:  # pragma: no cover - requires transformers
         raise RuntimeError(f"LSA on a HF model needs transformers with AttentionInterface: {e!r}") from e
-    if prev not in ALL_ATTENTION_FUNCTIONS:
+    if prev in ALL_ATTENTION_FUNCTIONS:
+        dense_key = prev
+    elif "sdpa" in ALL_ATTENTION_FUNCTIONS and ("quant" in prev.lower() or "compressed" in prev.lower()):
+        dense_key = "sdpa"
+    else:
         raise RuntimeError(f"cannot use attn_implementation={prev!r} as LSA dense fallback; load the model with "
                            f"attn_implementation='sdpa' (or one of {list(ALL_ATTENTION_FUNCTIONS.keys())})")
-    _DENSE_FN[0] = ALL_ATTENTION_FUNCTIONS[prev]
+    _DENSE_FN[0] = ALL_ATTENTION_FUNCTIONS[dense_key]
     try:
         AttentionInterface.register(LSA_IMPL_NAME, lsa_attention)
     except Exception:
@@ -732,11 +775,12 @@ def _resolve_dense_and_register(model: nn.Module, text_config: Any) -> tuple[str
         from transformers import AttentionMaskInterface
         from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 
-        if prev in ALL_MASK_ATTENTION_FUNCTIONS:
+        mask_key = prev if prev in ALL_MASK_ATTENTION_FUNCTIONS else dense_key
+        if mask_key in ALL_MASK_ATTENTION_FUNCTIONS:
             try:
-                AttentionMaskInterface.register(LSA_IMPL_NAME, ALL_MASK_ATTENTION_FUNCTIONS[prev])
+                AttentionMaskInterface.register(LSA_IMPL_NAME, ALL_MASK_ATTENTION_FUNCTIONS[mask_key])
             except Exception:
-                ALL_MASK_ATTENTION_FUNCTIONS[LSA_IMPL_NAME] = ALL_MASK_ATTENTION_FUNCTIONS[prev]
+                ALL_MASK_ATTENTION_FUNCTIONS[LSA_IMPL_NAME] = ALL_MASK_ATTENTION_FUNCTIONS[mask_key]
     except Exception:
         pass
 
@@ -751,8 +795,18 @@ def _resolve_dense_and_register(model: nn.Module, text_config: Any) -> tuple[str
         root_cfg = getattr(model, "config", None)
         if root_cfg is not None and getattr(root_cfg, "text_config", None) is None:
             targets.append(root_cfg)
-        for cfg in {id(c): c for c in targets if c is not None}.values():
-            cfg._attn_implementation = name
+        tm_layers = getattr(tm, "layers", None)
+        if isinstance(tm_layers, (list, tuple, nn.ModuleList)):
+            for lyr in tm_layers:
+                inner_lyr = getattr(lyr, "inner", lyr)
+                s_attn = getattr(inner_lyr, "self_attn", None)
+                if s_attn is not None and getattr(s_attn, "config", None) is not None:
+                    targets.append(s_attn.config)
+        for cfg_obj in {id(c): c for c in targets if c is not None}.values():
+            try:
+                cfg_obj._attn_implementation = name
+            except Exception:
+                pass
     return prev, set_impl
 
 

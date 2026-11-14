@@ -36,6 +36,7 @@ import importlib.util
 import logging
 import math
 import sys
+import types
 from collections.abc import Sequence
 from dataclasses import dataclass, fields
 from typing import Any, Callable
@@ -3840,7 +3841,7 @@ def apply_hssd(model: nn.Module, cfg: HSSDConfig | dict[str, Any] | None = None)
                 kfwd: Any = saved_kfwd,
                 krepo: Any = saved_krepo,
             ) -> None:
-                a.__dict__["forward"] = kfwd
+                a.forward = kfwd  # type: ignore[method-assign]
                 a.__dict__["_kernel_repo"] = krepo
 
             restorers.append(_restore_kernel_fwd)
@@ -3855,24 +3856,37 @@ def apply_hssd(model: nn.Module, cfg: HSSDConfig | dict[str, Any] | None = None)
                 else:
                     wrapped_chunk = True
                 had_instance_attr = attr in attn.__dict__
-                setattr(
-                    attn,
-                    attr,
-                    _make_hssd_rule_wrapper(
-                        adapter, ctx_stack, recurrent_only=rec_only, orig_fn=orig_fn, in_rule_box=in_rule_box
-                    ),
+                orig_inst_attr = attn.__dict__.get(attr)
+                rule_w = _make_hssd_rule_wrapper(
+                    adapter, ctx_stack, recurrent_only=rec_only, orig_fn=orig_fn, in_rule_box=in_rule_box
                 )
+                if isinstance(orig_fn, types.MethodType) and getattr(orig_fn, "__self__", None) is attn:
+                    raw_rfn = getattr(orig_fn, "__func__", orig_fn)
+
+                    @functools.wraps(raw_rfn)
+                    def _bound_hssd_rule(
+                        _self: nn.Module,
+                        *r_args: Any,
+                        _rw: Callable[..., Any] = rule_w,
+                        **r_kwargs: Any,
+                    ) -> Any:
+                        return _rw(*r_args, **r_kwargs)
+
+                    rule_patch: Any = types.MethodType(_bound_hssd_rule, attn)
+                else:
+                    rule_patch = rule_w
+                setattr(attn, attr, rule_patch)
 
                 def _restore_attr(
                     a: nn.Module = attn,
                     name: str = attr,
-                    fn: Callable[..., Any] = orig_fn,
+                    fn: Any = orig_inst_attr,
                     had: bool = had_instance_attr,
                 ) -> None:
                     if had:
                         setattr(a, name, fn)
-                    elif name in a.__dict__:
-                        delattr(a, name)
+                    else:
+                        a.__dict__.pop(name, None)
 
                 restorers.append(_restore_attr)
 

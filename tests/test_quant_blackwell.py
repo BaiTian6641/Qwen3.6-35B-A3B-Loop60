@@ -60,8 +60,10 @@ from qloop.model.gdn2 import GDN2Config, install_gdn2
 from qloop.model.hssd import HSSDConfig, apply_hssd
 from qloop.model.introspect import inspect_model
 from qloop.model.loading import (
+    _flush_deferred_quant_hooks,
     _propagate_quantization_config_to_text_config,
     load_model,
+    param_report,
 )
 from qloop.model.loop import LoopSpec, apply_loop
 from qloop.model.probes import probe_backward, run_structured_probe_suite
@@ -74,6 +76,8 @@ from qloop.model.quant_autograd import (
     is_quantized_module,
     quantize_fp8_blockwise,
     quantize_nvfp4_tensor,
+    repack_decompressed_nvfp4_moe_experts,
+    unwrap_quantized_autograd_bridge,
 )
 from qloop.model.toy import ToyConfig, ToyForCausalLM, build_toy
 from qloop.train.stack import Stack
@@ -2012,3 +2016,586 @@ def test_standalone_whole_model_pack_fp8_missing_kernels_safety_both_paths(
             with standalone_loaded.depth(r):
                 out_st = standalone_loaded(prompt, use_cache=False).logits
                 assert (out_st - orig_refs[r]).abs().max().item() < 1e-5
+
+
+# ================================== 8. ct_decompress_hook + OffloadCache + 3D NVFP4 MoE Repack
+
+
+class MockOffloadCache(dict):  # type: ignore[type-arg]
+    """Simulates `compressed_tensors.offload.cache.OffloadCache` dict subclass on `_parameters`/`_buffers`."""
+
+    def __init__(self, initial: dict[str, Any] | None = None, *, reject_non_float_param: bool = False) -> None:
+        super().__init__()
+        self.offload_map: dict[str, Any] = {}
+        self.del_history: list[str] = []
+        self.reject_non_float_param = bool(reject_non_float_param)
+        if initial:
+            for k, v in initial.items():
+                self[k] = v
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if (
+            self.reject_non_float_param
+            and isinstance(value, nn.Parameter)
+            and (not value.is_floating_point() or value.dtype in qa.FP8_DTYPES)
+        ):
+            raise TypeError(f"MockOffloadCache rejects non-float Parameter {key} ({value.dtype})")
+        self.offload_map[key] = value
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key: str) -> None:
+        self.del_history.append(key)
+        self.offload_map.pop(key, None)
+        super().__delitem__(key)
+
+
+def _mock_ct_offload_module(module: nn.Module, *, reject_non_float_param: bool = False) -> None:
+    """Exact replica of `compressed_tensors.offload.module.offload_module` accessing `module.forward.__func__`."""
+    original_forward_func = module.forward.__func__  # AttributeError if `module.forward` is a plain function!
+    module._parameters = MockOffloadCache(module._parameters, reject_non_float_param=reject_non_float_param)  # type: ignore[assignment]
+    module._buffers = MockOffloadCache(module._buffers, reject_non_float_param=False)  # type: ignore[assignment]
+
+    def offloaded_forward(self: nn.Module, *args: Any, **kwargs: Any) -> Any:
+        self._ct_offload_calls = int(getattr(self, "_ct_offload_calls", 0)) + 1  # type: ignore[attr-defined]
+        return original_forward_func(self, *args, **kwargs)
+
+    module.forward = types.MethodType(offloaded_forward, module)  # type: ignore[method-assign]
+
+
+class MockDeferredCompressedLinear(nn.Linear):
+    """Simulates `CompressedLinear` (`COMPRESSED`, `run_compressed=False`) before `ct_decompress_hook`."""
+
+    def __init__(
+        self,
+        linear: nn.Linear,
+        *,
+        group_size: int = 16,
+        decompress_dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__(int(linear.in_features), int(linear.out_features), bias=False, device="meta")
+        self._parameters.pop("weight", None)
+        self.group_size = int(group_size)
+        self.decompress_dtype = decompress_dtype
+        self.quantization_status = "COMPRESSED"
+        self.run_compressed = False
+        packed, w_scale, w_gs = quantize_nvfp4_tensor(linear.weight.detach(), group_size=group_size)
+        self.weight_packed = nn.Parameter(packed, requires_grad=False)
+        self.weight_scale = nn.Parameter(w_scale, requires_grad=False)
+        self.weight_global_scale = nn.Parameter(w_gs, requires_grad=False)
+        if linear.bias is not None:
+            self.bias = nn.Parameter(linear.bias.detach().clone(), requires_grad=False)
+        else:
+            self.register_parameter("bias", None)
+
+    def decompress(self) -> None:
+        if self.quantization_status == "DECOMPRESSED":
+            return
+        w_deq = dequantize_nvfp4_tensor(
+            self.weight_packed,
+            self.weight_scale,
+            self.weight_global_scale,
+            dtype=self.decompress_dtype,
+            group_size=self.group_size,
+        )
+        for attr in ("weight_packed", "weight_scale", "weight_global_scale"):
+            delattr(self, attr)
+        self.weight = nn.Parameter(w_deq, requires_grad=False)
+        self.quantization_status = "DECOMPRESSED"
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.quantization_status != "DECOMPRESSED":
+            raise NotImplementedError("CompressedLinear(run_compressed=False) requires ct_decompress_hook first")
+        b = self.bias.to(device=x.device, dtype=x.dtype) if isinstance(self.bias, torch.Tensor) else None
+        return F.linear(x, self.weight.to(device=x.device, dtype=x.dtype), b)
+
+
+def _register_mock_ct_decompress_hook(model: nn.Module) -> dict[str, int]:
+    """Attach one-shot `ct_decompress_hook` that decompresses linears + runs `_mock_ct_offload_module`."""
+    stats = {"hook_calls": 0, "offloaded_modules": 0, "decompressed_linears": 0}
+    handle_ref: list[Any] = []
+
+    def ct_decompress_hook(mod: nn.Module, _args: Any) -> None:
+        stats["hook_calls"] += 1
+        for sub in mod.modules():
+            if isinstance(sub, MockDeferredCompressedLinear):
+                sub.decompress()
+                stats["decompressed_linears"] += 1
+        for sub in mod.modules():
+            _mock_ct_offload_module(sub)
+            stats["offloaded_modules"] += 1
+        if handle_ref:
+            handle_ref[0].remove()
+
+    handle_ref.append(model.register_forward_pre_hook(ct_decompress_hook))
+    return stats
+
+
+def _synthesize_split_nvfp4_decompressed_experts(
+    num_experts: int,
+    inter_dim: int,
+    h_dim: int,
+    *,
+    group_size: int = 16,
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 707,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create `[E, 2I, H]` & `[E, H, I]` weights decompressed from separate per-expert `gate` vs `up` NVFP4 scales."""
+    g = torch.Generator().manual_seed(seed)
+    gu_deq = torch.empty((num_experts, 2 * inter_dim, h_dim), dtype=dtype)
+    dn_deq = torch.empty((num_experts, h_dim, inter_dim), dtype=dtype)
+    for e in range(num_experts):
+        # Deliberately give `up_proj` a 12.5x larger dynamic range than `gate_proj` per expert!
+        gate_scale_factor = 0.0012 + 0.00015 * e
+        up_scale_factor = 0.015 + 0.001875 * e
+        dn_scale_factor = 0.005 + 0.0006 * e
+        w_gate = torch.randn((inter_dim, h_dim), generator=g, dtype=torch.float32) * gate_scale_factor
+        w_up = torch.randn((inter_dim, h_dim), generator=g, dtype=torch.float32) * up_scale_factor
+        w_dn = torch.randn((h_dim, inter_dim), generator=g, dtype=torch.float32) * dn_scale_factor
+
+        gp, gs, ggs = quantize_nvfp4_tensor(w_gate, group_size=group_size)
+        up, us, ugs = quantize_nvfp4_tensor(w_up, group_size=group_size)
+        dp, ds, dgs = quantize_nvfp4_tensor(w_dn, group_size=group_size)
+
+        gu_deq[e, :inter_dim] = dequantize_nvfp4_tensor(gp, gs, ggs, dtype=dtype, group_size=group_size)
+        gu_deq[e, inter_dim:] = dequantize_nvfp4_tensor(up, us, ugs, dtype=dtype, group_size=group_size)
+        dn_deq[e] = dequantize_nvfp4_tensor(dp, ds, dgs, dtype=dtype, group_size=group_size)
+    return gu_deq, dn_deq
+
+
+def test_methodtype_forward_wrappers_unwrap_and_post_bridge_ct_decompress_survival() -> None:
+    """Reproduce `module.forward.__func__` crash & verify survival if `ct_decompress_hook` fires post-bridge."""
+    torch.manual_seed(808)
+    h_dim, inter_dim, n_exp = 32, 16, 4
+
+    # Part A: Verify `MethodType` binding & exact descriptor/instance restoration on `unwrap_quantized_autograd_bridge`
+    lin_pristine = MockCompressedNVFP4Linear(nn.Linear(h_dim, 24, bias=True), group_size=16)
+    moe_pre_offloaded = MockNVFP4FusedExperts(
+        torch.randn(n_exp, 2 * inter_dim, h_dim) * 0.1,
+        torch.randn(n_exp, h_dim, inter_dim) * 0.1,
+        group_size=16,
+    )
+    _mock_ct_offload_module(moe_pre_offloaded)
+    pre_wrap_moe_fwd = moe_pre_offloaded.__dict__["forward"]
+    assert "forward" not in lin_pristine.__dict__
+    assert isinstance(pre_wrap_moe_fwd, types.MethodType)
+
+    box = nn.ModuleDict({"lin": lin_pristine, "moe": moe_pre_offloaded})
+    install_quantized_autograd_bridge(box)
+
+    assert isinstance(lin_pristine.forward, types.MethodType)
+    assert hasattr(lin_pristine.forward, "__func__")
+    assert lin_pristine._qloop_had_inst_forward is False  # type: ignore[attr-defined]
+
+    assert isinstance(moe_pre_offloaded.forward, types.MethodType)
+    assert hasattr(moe_pre_offloaded.forward, "__func__")
+    assert moe_pre_offloaded._qloop_had_inst_forward is True  # type: ignore[attr-defined]
+
+    n_restored = unwrap_quantized_autograd_bridge(box)
+    assert n_restored == 2
+    assert "forward" not in lin_pristine.__dict__
+    assert isinstance(lin_pristine.forward, types.MethodType)
+    assert moe_pre_offloaded.__dict__["forward"] is pre_wrap_moe_fwd
+
+    # Part B: Install bridge BEFORE `ct_decompress_hook` fires, then fire `ct_decompress_hook` + `offload_module`!
+    raw_lin = nn.Linear(h_dim, 24, bias=True)
+    deferred_lin = MockDeferredCompressedLinear(raw_lin, group_size=16, decompress_dtype=torch.bfloat16)
+    ref_deq_w = dequantize_nvfp4_tensor(
+        deferred_lin.weight_packed,
+        deferred_lin.weight_scale,
+        deferred_lin.weight_global_scale,
+        dtype=torch.bfloat16,
+        group_size=16,
+    )
+    ref_bias = raw_lin.bias.detach().clone()
+
+    class _MiniModel(nn.Module):
+        def __init__(self, proj: nn.Module) -> None:
+            super().__init__()
+            self.emb = nn.Embedding(32, h_dim)
+            self.proj = proj
+
+        def forward(self, input_ids: torch.Tensor, **_kw: Any) -> torch.Tensor:
+            return self.proj(self.emb(input_ids))
+
+    mini = _MiniModel(deferred_lin)
+    hook_stats = _register_mock_ct_decompress_hook(mini)
+
+    # Bridge runs while `deferred_lin` is still COMPRESSED (`run_compressed=False` -> `native_fwd_ok=0`)
+    rep = install_quantized_autograd_bridge(mini)
+    assert rep["bridged_linear_count"] == 1
+    assert rep["native_fwd_ok_count"] == 0
+    assert isinstance(deferred_lin.forward, types.MethodType)
+    assert hasattr(deferred_lin.forward, "__func__")
+
+    # First forward triggers `ct_decompress_hook` -> `decompress()` + `_mock_ct_offload_module` (`forward.__func__`!)
+    ids = torch.tensor([[1, 5, 9]], dtype=torch.long)
+    with torch.no_grad():
+        out_nograd = mini(ids)
+    assert out_nograd.shape == (1, 3, 24) and torch.isfinite(out_nograd).all()
+    assert hook_stats["hook_calls"] == 1
+    assert hook_stats["decompressed_linears"] == 1
+    assert deferred_lin.quantization_status == "DECOMPRESSED"
+    assert not hasattr(deferred_lin, "weight_packed")
+    assert qa._classify_quant_module(deferred_lin) is None
+    assert getattr(deferred_lin, "_ct_offload_calls", 0) >= 1
+
+    # Verify post-decompression `no_grad` AND `enable_grad` (`dL/dx` + `dL/dbias` + direct `_QuantLinearAutogradFn`)
+    x_test = torch.randn(4, h_dim, dtype=torch.float32)
+    with torch.no_grad():
+        y_ng = deferred_lin(x_test)
+        y_ng_ref = F.linear(x_test, ref_deq_w.float(), ref_bias.float())
+    assert torch.allclose(y_ng, y_ng_ref, atol=1e-5, rtol=1e-5)
+
+    deferred_lin.bias.requires_grad_(True)
+    x_grad = x_test.detach().clone().requires_grad_(True)
+    y_eg = deferred_lin(x_grad)
+    y_eg.pow(2).sum().backward()
+
+    x_ref = x_test.detach().clone().requires_grad_(True)
+    b_ref = ref_bias.detach().clone().requires_grad_(True)
+    y_ref = F.linear(x_ref, ref_deq_w.float(), b_ref)
+    y_ref.pow(2).sum().backward()
+    assert x_grad.grad is not None and x_ref.grad is not None
+    assert deferred_lin.bias.grad is not None and b_ref.grad is not None
+    assert torch.allclose(y_eg, y_ref, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(x_grad.grad, x_ref.grad, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(deferred_lin.bias.grad, b_ref.grad, atol=1e-5, rtol=1e-5)
+
+    # Also test `_QuantLinearAutogradFn` directly on the decompressed module
+    x_fn = x_test.detach().clone().requires_grad_(True)
+    b_fn = ref_bias.detach().clone().requires_grad_(True)
+    y_fn = qa._QuantLinearAutogradFn.apply(x_fn, b_fn, deferred_lin)
+    y_fn.pow(2).sum().backward()
+    assert x_fn.grad is not None and torch.allclose(x_fn.grad, x_ref.grad, atol=1e-5, rtol=1e-5)
+    assert b_fn.grad is not None and torch.allclose(b_fn.grad, b_ref.grad, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("transposed_src", [False, True])
+@pytest.mark.parametrize("reject_non_float_param", [False, True])
+def test_repack_decompressed_nvfp4_moe_experts_lossless_split_gate_up_and_offload_cache(
+    transposed_src: bool,
+    reject_non_float_param: bool,
+) -> None:
+    """Verify `>3.4x` byte drop, `<1e-3` lossless split-`gate`/`up` lattice recovery, and `OffloadCache` safety."""
+    num_experts, inter_dim, h_dim = 10, 64, 128
+    gu_lattice, dn_lattice = _synthesize_split_nvfp4_decompressed_experts(
+        num_experts,
+        inter_dim,
+        h_dim,
+        group_size=16,
+        dtype=torch.bfloat16,
+        seed=909,
+    )
+
+    class _DecompressedHF5Experts(nn.Module):
+        def __init__(self, gu: torch.Tensor, dn: torch.Tensor, *, tr: bool) -> None:
+            super().__init__()
+            self.num_experts = int(gu.shape[0])
+            self.hidden_size = h_dim
+            self.intermediate_size = inter_dim
+            gu_init = gu.transpose(1, 2).contiguous() if tr else gu.clone()
+            dn_init = dn.transpose(1, 2).contiguous() if tr else dn.clone()
+            self.gate_up_proj = nn.Parameter(gu_init, requires_grad=False)
+            self.down_proj = nn.Parameter(dn_init, requires_grad=False)
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            top_k_index: torch.Tensor,
+            top_k_weights: torch.Tensor,
+        ) -> torch.Tensor:
+            raise AssertionError("decompressed forward should be replaced by quantized autograd bridge")
+
+    class _Holder(nn.Module):
+        def __init__(self, exp: nn.Module) -> None:
+            super().__init__()
+            self.config = types.SimpleNamespace(
+                quantization_config={
+                    "quant_method": "compressed-tensors",
+                    "config_groups": {
+                        "group_0": {
+                            "targets": ["Linear"],
+                            "weights": {"num_bits": 4, "type": "float", "group_size": 16},
+                        }
+                    },
+                }
+            )
+            self.layers = nn.ModuleList([nn.ModuleDict({"mlp": nn.ModuleDict({"experts": exp})})])
+
+    exp_mod = _DecompressedHF5Experts(gu_lattice, dn_lattice, tr=transposed_src)
+    _mock_ct_offload_module(exp_mod, reject_non_float_param=reject_non_float_param)
+    holder = _Holder(exp_mod)
+
+    bytes_pre = _persistent_state_bytes(holder)
+    rep = repack_decompressed_nvfp4_moe_experts(holder, group_size=16, expert_batch=3)
+    bytes_post = _persistent_state_bytes(holder)
+
+    assert rep["repacked_moe_modules"] == 1
+    assert rep["bytes_before"] == bytes_pre
+    assert rep["bytes_after"] == bytes_post
+    assert rep["bytes_before"] / rep["bytes_after"] > 3.4
+
+    # Verify OffloadCache `__delitem__` freed old bf16 expert tensors
+    assert isinstance(exp_mod._parameters, MockOffloadCache)
+    assert "gate_up_proj" in exp_mod._parameters.del_history
+    assert "down_proj" in exp_mod._parameters.del_history
+    assert "gate_up_proj" not in exp_mod._parameters.offload_map
+    assert "down_proj" not in exp_mod._parameters.offload_map
+    assert not hasattr(exp_mod, "gate_up_proj")
+    assert not hasattr(exp_mod, "down_proj")
+
+    # Verify canonical shapes & dtypes
+    assert qa._classify_quant_module(exp_mod) == "moe_nvfp4"
+    assert exp_mod.gate_up_proj_packed.shape == (num_experts, 2 * inter_dim, h_dim // 2)
+    assert exp_mod.gate_up_proj_packed.dtype == torch.uint8
+    assert exp_mod.gate_up_proj_scale.shape == (num_experts, 2 * inter_dim, h_dim // 16)
+    assert exp_mod.gate_up_proj_scale.dtype == torch.float8_e4m3fn
+    assert exp_mod.gate_up_proj_global_scale.shape == (num_experts, 2 * inter_dim)
+    assert exp_mod.gate_up_proj_global_scale.dtype == torch.float32
+    # Verify split-`gate`/`up` global scales reflect >10x dynamic range ratio (`gs_gate > 8 * gs_up`)
+    gs_gate = exp_mod.gate_up_proj_global_scale[:, :inter_dim]
+    gs_up = exp_mod.gate_up_proj_global_scale[:, inter_dim:]
+    assert torch.all(gs_gate[:, 0] > 8.0 * gs_up[:, 0])
+    assert torch.allclose(gs_gate, gs_gate[:, :1].expand_as(gs_gate))
+    assert torch.allclose(gs_up, gs_up[:, :1].expand_as(gs_up))
+    assert exp_mod.down_proj_packed.shape == (num_experts, h_dim, inter_dim // 2)
+    assert exp_mod.down_proj_packed.dtype == torch.uint8
+    assert exp_mod.down_proj_scale.shape == (num_experts, h_dim, inter_dim // 16)
+    assert exp_mod.down_proj_scale.dtype == torch.float8_e4m3fn
+    assert exp_mod.down_proj_global_scale.shape == (num_experts,)
+    assert exp_mod.down_proj_global_scale.dtype == torch.float32
+
+    if reject_non_float_param:
+        assert "gate_up_proj_packed" in exp_mod._buffers
+        prep = param_report(holder)
+        assert prep["params_by_dtype"].get("uint8", 0) > 0
+        assert prep["params_by_dtype"].get("float8_e4m3fn", 0) > 0
+        assert prep["params_by_kind"].get("experts", 0) > 0
+    else:
+        assert isinstance(exp_mod.gate_up_proj_packed, nn.Parameter)
+        assert not exp_mod.gate_up_proj_packed.requires_grad
+
+    # Verify lossless round-trip recovery (`< 1e-3` max diff across single-expert, chunked-3D, and full-3D!)
+    for eid in range(num_experts):
+        gu_e, dn_e = auto_dequant_expert_fn(exp_mod, eid)
+        assert (gu_e.to(torch.bfloat16).float() - gu_lattice[eid].float()).abs().max().item() < 1e-3
+        assert (dn_e.to(torch.bfloat16).float() - dn_lattice[eid].float()).abs().max().item() < 1e-3
+
+    gu_chunk, dn_chunk = qa._dequant_experts_chunk(exp_mod, [0, 3, 7, 9], dtype=torch.bfloat16)
+    assert isinstance(gu_chunk, torch.Tensor) and isinstance(dn_chunk, torch.Tensor)
+    assert (gu_chunk.float() - gu_lattice[[0, 3, 7, 9]].float()).abs().max().item() < 1e-3
+    assert (dn_chunk.float() - dn_lattice[[0, 3, 7, 9]].float()).abs().max().item() < 1e-3
+
+    # Verify bridged `forward` + `backward` (`dL/dx` and `dL/drouter`) match pre-repack bf16 weights!
+    b_rep = install_quantized_autograd_bridge(holder)
+    assert b_rep["bridged_moe_count"] == 1
+    assert isinstance(exp_mod.forward, types.MethodType)
+    assert hasattr(exp_mod.forward, "__func__")
+
+    router = nn.Linear(h_dim, num_experts, bias=False, dtype=torch.float32)
+    x_in = torch.randn(6, h_dim, dtype=torch.float32, requires_grad=True)
+    upstream = torch.randn(6, h_dim, dtype=torch.float32)
+    r_probs = F.softmax(router(x_in), dim=-1)
+    top_w, top_idx = r_probs.topk(2, dim=-1)
+    top_w = top_w / top_w.sum(dim=-1, keepdim=True)
+    y_out = exp_mod(x_in.to(torch.bfloat16), top_idx, top_w)
+    (y_out.float() * upstream).sum().backward()
+
+    assert x_in.grad is not None and torch.isfinite(x_in.grad).all() and float(x_in.grad.norm()) > 0.0
+    assert router.weight.grad is not None and float(router.weight.grad.norm()) > 0.0
+
+    # Compare against exact pre-repack bf16 SwiGLU reference
+    x_ref = x_in.detach().clone().requires_grad_(True)
+    router_ref = copy.deepcopy(router)
+    router_ref.zero_grad(set_to_none=True)
+    r_probs_ref = F.softmax(router_ref(x_ref), dim=-1)
+    top_w_ref, top_idx_ref = r_probs_ref.topk(2, dim=-1)
+    top_w_ref = top_w_ref / top_w_ref.sum(dim=-1, keepdim=True)
+    x_bf16_ref = x_ref.to(torch.bfloat16)
+    y_ref = torch.zeros_like(x_bf16_ref)
+    for eid in range(num_experts):
+        tok, slot = (top_idx_ref == eid).nonzero(as_tuple=True)
+        if tok.numel() > 0:
+            gt, up = F.linear(x_bf16_ref[tok], gu_lattice[eid]).chunk(2, dim=-1)
+            ye = F.linear(F.silu(gt) * up, dn_lattice[eid])
+            y_ref.index_add_(0, tok, ye * top_w_ref[tok, slot, None].to(torch.bfloat16))
+    (y_ref.float() * upstream).sum().backward()
+
+    assert (y_out.float() - y_ref.float()).abs().max().item() < 1e-3
+    assert x_ref.grad is not None and router_ref.weight.grad is not None
+    assert (
+        F.cosine_similarity(x_in.grad.double().reshape(-1), x_ref.grad.double().reshape(-1), dim=0, eps=1e-20).item()
+        > 0.999
+    )
+    assert F.cosine_similarity(
+        router.weight.grad.double().reshape(-1),
+        router_ref.weight.grad.double().reshape(-1),
+        dim=0,
+        eps=1e-20,
+    ).item() > 0.999
+
+
+def test_unsloth_nvfp4_e2e_load_model_flush_hook_repack_moe_probe_suite_and_warning_fix(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """End-to-end simulation of `unsloth/Qwen3.6-35B-A3B-NVFP4-Fast` through `_load_hf` + `load_model` + probes."""
+    monkeypatch.setattr(logging.getLogger("qloop"), "propagate", True)
+
+    def _build_unsloth_like_raw_model() -> tuple[ToyForCausalLM, dict[str, int]]:
+        base = build_toy(
+            seed=1010,
+            num_hidden_layers=4,
+            hidden_size=128,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            num_experts=6,
+            num_experts_per_tok=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            linear_num_heads=4,
+            linear_head_dim=32,
+            layer_types=("linear_attention", "full_attention", "linear_attention", "full_attention"),
+        ).to(torch.bfloat16)
+        qcfg = {
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {"num_bits": 4, "type": "float", "group_size": 16},
+                }
+            },
+        }
+        base.config.quantization_config = copy.deepcopy(qcfg)  # type: ignore[attr-defined]
+        base.model.config.quantization_config = copy.deepcopy(qcfg)  # type: ignore[attr-defined]
+
+        for li, layer in enumerate(base.model.layers):
+            if layer.layer_type == "linear_attention":
+                la = layer.linear_attn
+                la.in_proj_qkv = MockDeferredCompressedLinear(la.in_proj_qkv, decompress_dtype=torch.bfloat16)  # type: ignore[assignment]
+                la.out_proj = MockDeferredCompressedLinear(la.out_proj, decompress_dtype=torch.bfloat16)  # type: ignore[assignment]
+            se = layer.mlp.shared_expert
+            se.gate_proj = MockDeferredCompressedLinear(se.gate_proj, decompress_dtype=torch.bfloat16)  # type: ignore[assignment]
+            se.up_proj = MockDeferredCompressedLinear(se.up_proj, decompress_dtype=torch.bfloat16)  # type: ignore[assignment]
+            se.down_proj = MockDeferredCompressedLinear(se.down_proj, decompress_dtype=torch.bfloat16)  # type: ignore[assignment]
+
+            # 3D MoE experts were decompressed on-the-fly by HF5 into bfloat16!
+            gu_bf16, dn_bf16 = _synthesize_split_nvfp4_decompressed_experts(
+                6,
+                64,
+                128,
+                group_size=16,
+                dtype=torch.bfloat16,
+                seed=2000 + li,
+            )
+            layer.mlp.experts.gate_up_proj = nn.Parameter(gu_bf16, requires_grad=False)
+            layer.mlp.experts.down_proj = nn.Parameter(dn_bf16, requires_grad=False)
+
+        stats = _register_mock_ct_decompress_hook(base)
+        return base, stats
+
+    hook_stats_holder: dict[str, Any] = {}
+
+    class _TopCfg:
+        def __init__(self) -> None:
+            self.model_type = "qwen3_5"
+            self.text_config = types.SimpleNamespace(
+                model_type="qwen3_5_moe_text",
+                hidden_size=128,
+                num_hidden_layers=4,
+                quantization_config=None,
+            )
+            self.quantization_config = {
+                "quant_method": "compressed-tensors",
+                "format": "pack-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "targets": ["Linear"],
+                        "weights": {"num_bits": 4, "type": "float", "group_size": 16},
+                    }
+                },
+            }
+
+    def _fake_from_pretrained_model(_name: str, **_kw: Any) -> tuple[nn.Module, dict[str, Any]]:
+        m, st = _build_unsloth_like_raw_model()
+        hook_stats_holder["stats"] = st
+        return m, {"missing_keys": []}
+
+    fake_tf = types.ModuleType("transformers")
+    fake_tf.__version__ = "5.23.0"  # type: ignore[attr-defined]
+    fake_tf.AutoConfig = types.SimpleNamespace(from_pretrained=lambda *_a, **_kw: _TopCfg())  # type: ignore[attr-defined]
+    fake_tf.AutoModelForCausalLM = types.SimpleNamespace(from_pretrained=_fake_from_pretrained_model)  # type: ignore[attr-defined]
+    fake_tf.AutoTokenizer = types.SimpleNamespace(from_pretrained=lambda *_a, **_kw: ToyTokenizer())  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "transformers", fake_tf)
+
+    # Simulate `compressed_tensors` installed in environment -> MUST NOT emit false `pip install compressed-tensors`!
+    monkeypatch.setitem(sys.modules, "compressed_tensors", types.ModuleType("compressed_tensors"))
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="qloop"):
+        model, _tok, info = load_model(
+            {
+                "name": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
+                "dtype": "bfloat16",
+                "device_map": "cpu",
+                "text_only": True,
+            }
+        )
+
+    # 1) `ct_decompress_hook` was flushed cleanly inside `_load_hf` BEFORE bridging!
+    assert hook_stats_holder["stats"]["hook_calls"] == 1
+    assert hook_stats_holder["stats"]["decompressed_linears"] == 16
+    assert _flush_deferred_quant_hooks(model) is False  # one-shot hook already removed!
+
+    # 2) All 4 MoE expert layers repacked from bf16 -> NVFP4 (`> 3.4x` compression!)
+    repack_rep = info["nvfp4_moe_repack"]
+    assert repack_rep["repacked_moe_modules"] == 4
+    assert repack_rep["bytes_before"] / repack_rep["bytes_after"] > 3.4
+    assert info["quantization"]["moe_nvfp4_count"] == 4
+    assert info["quantization"]["linear_nvfp4_count"] == 0
+
+    # 3) Zero misleading `pip install compressed-tensors` warning; clear INFO message logged!
+    assert not any(
+        r.levelno >= logging.WARNING and "pip install compressed-tensors" in r.message
+        for r in caplog.records
+    )
+    assert any(
+        r.levelno == logging.INFO and "chunked-3D Tensor-Core engine" in r.message
+        for r in caplog.records
+    )
+
+    # Even when `compressed_tensors` is NOT installed, `moe_nvfp4` active with `linear_nvfp4=0` emits NO false warning!
+    monkeypatch.setitem(sys.modules, "compressed_tensors", None)  # type: ignore[arg-type]
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="qloop"):
+        _, _, info_no_ct = load_model(
+            {
+                "name": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
+                "dtype": "bfloat16",
+                "device_map": "cpu",
+                "text_only": True,
+            }
+        )
+    assert info_no_ct["quantization"]["moe_nvfp4_count"] == 4
+    assert not any(
+        r.levelno >= logging.WARNING and "pip install compressed-tensors" in r.message
+        for r in caplog.records
+    )
+
+    # 4) Run full structured probe suite (`sha256_frozen_experts`, `probe_backward`, `surgery_check`, `expert_headroom`)
+    inp = torch.randint(4, 96, (2, 12), generator=torch.Generator().manual_seed(1234))
+    suite = run_structured_probe_suite(
+        model,
+        [inp],
+        target_virtual=8,
+        n_perturb=2,
+        subspace_rank=16,
+        decode_steps=3,
+    )
+    assert suite["summary"]["all_critical_ok"] is True
+    assert suite["gates"]["0a_backward"]["passed"] is True
+    assert suite["gates"]["0a_surgery"]["passed"] is True
+    assert len(sha256_frozen_experts(model)) == 64
+

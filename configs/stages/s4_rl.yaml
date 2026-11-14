@@ -1,25 +1,102 @@
-# S4 - GRPO recursive self-improvement with verifiable rewards (+ optional teacher guidance).
-# Rollouts use the in-process cache sampler at the trained loop depth (exactly on-policy).
+# Gate 4 (S4 v3.1) - GRPO / RSI with Verifiable Rewards on Track-B Loop-HSSD v3.1 (88L A6B + 1M YaRN + Sparse D-LSA).
+# Architecture: [0,12) x1 + [12,36) xR + [36,40) x1 = 88L (`s0_probe` calibrated ETD core `[12,36)` + `w_anchor=0.85`).
+# Rollouts use the in-process cache sampler at the sampled loop depth (`R in {1, 2, 3}`, strictly on-policy).
 _base_: [../base.yaml, ../model/qwen36_fp8.yaml]
 stage: s4_rl
 stage_type: rl
 run: {name: s4_rl}
-experts:
-  enabled: true
-  stats_path: runs/s1_loop_heal/esft_stats_looped.json
-  fraction: 0.03               # narrow funnel: 2-3% core reasoning experts
+
+model:
+  yarn_target_len: 1048576
+
 loop:
-  train_pass_probs: [0.1, 0.9]
+  enabled: true
+  prelude_end: 12
+  core_end: 36
+  num_passes: 3
+  target_virtual_layers: 88
+  kv_share: true
+  bridge_init: [0.05, 0.85, 0.10]
+  bridge_rank: 256
+  bridge_mode: subspace
+  bridge_up_std: 0.01
+  attn_adapter_rank: 64
+  step_embedding: true
+  gate_init: 0.0
+  per_pass_router: true
+  router_adapter_rank: 32
+  router_repel_init: 0.0
+  router_diversity_weight: 0.0
+  mor: false
+  write_mask: true
+  checkpoint: true
+  train_pass_probs: [0.10, 0.35, 0.55]
+
+gdn2:
+  enabled: false
+
+hssd:
+  enabled: true
+  chunk_size: 64
+  window_chunks: 8
+  num_pages: 8
+  k_pages: 2
+  theta_low_rank: true
+  surprise_mode: routed
+  state_dtype: bfloat16
+  budget_weight: 1.0
+  segment_chunks: 4
+  checkpoint_segments: true
+
+lsa:
+  enabled: true
+  mode: sparse
+  num_query_passes: 3
+  index_dim: 64
+  index_on: nope
+  pool: 4
+  block_size: 512
+  avg_bucket_keys: 8
+  max_bucket_keys: 32
+  num_select: 64
+  window: 512
+  sinks: 64
+  search: flat
+  temperature: 0.1
+  query_chunk: 256
+
+experts:
+  enabled: false                        # optional: pass `-s experts.enabled=true` after `qloop scan-experts`
+  stats_path: runs/s1_loop_a6b/esft_stats_looped.json
+  fraction: 0.025
+  by: affinity
+  per_pass: union
+  rank: 64
+
 train:
-  init_from: runs/s3_long_lsa
+  init_from: runs/s2_joint_bptt
   steps: 400
   ckpt_every: 25
+  sha256_frozen_experts: true
+  train_loop_adapters: true
+  train_hssd: true
+  train_lsa: true
   trainable:
     - "mlp\\.gate\\.weight$"
     - "shared_expert\\."
-    - "self_attn\\.o_proj"
-  allowed_groups: [loop_adapters, gdn2_adapters, router, shared_expert, attention, expert_deltas]
-  optim: {lr: 1.0e-6, warmup_steps: 10, max_grad_norm_per_param: 0.5}
+    - "self_attn\\.(o_proj|q_norm|k_norm)"
+    - "input_layernorm|post_attention_layernorm"
+  allowed_groups: [loop_adapters, hssd_adapters, gdn2_adapters, lsa_indexers, router, shared_expert, deltanet, attention, norms, expert_deltas]
+  aux_weights: {loop_aux: 1.0, hssd_budget: 0.5}
+  optim:
+    lr: 1.0e-6
+    warmup_steps: 10
+    max_grad_norm_per_param: 0.5
+    lr_mult:
+      loop_adapters: 5.0
+      hssd_adapter: 2.0
+      lsa_indexer: 2.0
+
 rl:
   tasks:
     - {source: hf, name: dapo_math, hf_id: BytedTsinghua-SIA/DAPO-Math-17k, split: train,
@@ -45,10 +122,14 @@ rl:
                                #  max_calls_per_step: 2, sft_weight: 0.1}
   gate:
     every: 50
-    depth: 2
+    depth: 3
     min_delta: 0.0
     max_len_growth: 1.5
     rollback: true
     benchmarks:
       - {name: aime_2026, limit: 30, max_new_tokens: 16384}
       - {name: kernelbench_l3, limit: 20}
+
+eval_quick:
+  n_batches: 8
+  depths: [1, 2, 3]

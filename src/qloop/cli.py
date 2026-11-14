@@ -444,7 +444,11 @@ def _pipeline_stage_cmds(
     if time_budget_hours is not None:
         train_extra.extend(["-s", f"train.time_budget_hours={time_budget_hours}"])
 
-    is_v3_pipeline = any(s in _V3_STAGE_SET for s in all_stages)
+    _v2_only_stages = {"s1_loop_heal", "s1_rescan", "s2_sft", "s3_long_lsa"}
+    is_v2_pipeline = any(s in _v2_only_stages for s in all_stages)
+    is_v3_pipeline = any(s in _V3_STAGE_SET for s in all_stages) or (
+        not is_v2_pipeline and any(s in ("s4_rl", "eval") for s in all_stages)
+    )
 
     if stage_name == "s0_probe":
         cpath = resolve_stage_config_path("s0_probe", config_root)
@@ -467,6 +471,9 @@ def _pipeline_stage_cmds(
         if is_v3_pipeline:
             ov_keys = {ov.split("=", 1)[0].strip() for ov in overrides if "=" in ov}
             v3_eval_defaults = (
+                ("model.yarn_target_len", "1048576"),
+                ("loop.prelude_end", "12"),
+                ("loop.core_end", "36"),
                 ("loop.num_passes", "3"),
                 ("loop.target_virtual_layers", "88"),
                 ("loop.train_pass_probs", "[0.15,0.50,0.35]"),
@@ -476,6 +483,14 @@ def _pipeline_stage_cmds(
                 ("loop.attn_adapter_rank", "64"),
                 ("gdn2.enabled", "false"),
                 ("hssd.enabled", "true"),
+                ("hssd.chunk_size", "64"),
+                ("hssd.window_chunks", "8"),
+                ("hssd.num_pages", "8"),
+                ("hssd.k_pages", "2"),
+                ("hssd.theta_low_rank", "true"),
+                ("hssd.surprise_mode", "routed"),
+                ("hssd.state_dtype", "bfloat16"),
+                ("hssd.segment_chunks", "4"),
                 ("lsa.num_query_passes", "3"),
                 ("eval.defaults.depths", "[1,2,3]"),
             )
@@ -486,37 +501,75 @@ def _pipeline_stage_cmds(
 
     cpath = resolve_stage_config_path(stage_name, config_root)
     stage_extra = list(train_extra)
-    if stage_name == "s4_rl" and is_v3_pipeline:
+    if stage_name == "s4_rl":
         ov_keys = {ov.split("=", 1)[0].strip() for ov in overrides if "=" in ov}
-        v3_rl_defaults = [
-            ("loop.num_passes", "3"),
-            ("loop.target_virtual_layers", "88"),
-            ("loop.train_pass_probs", "[0.10,0.40,0.50]"),
-            ("loop.bridge_mode", "subspace"),
-            ("loop.bridge_rank", "256"),
-            ("loop.bridge_init", "[0.05,0.85,0.10]"),
-            ("loop.attn_adapter_rank", "64"),
-            ("gdn2.enabled", "false"),
-            ("hssd.enabled", "true"),
-            ("lsa.num_query_passes", "3"),
-            ("rl.gate.depth", "3"),
-            (
-                "train.allowed_groups",
-                '["loop_adapters","hssd_adapters","gdn2_adapters","lsa_indexers","router","shared_expert","attention","expert_deltas"]',
-            ),
-        ]
-        if "s2_joint_bptt" in all_stages:
-            v3_rl_defaults.insert(0, ("train.init_from", "runs/s2_joint_bptt"))
-        for k, v in v3_rl_defaults:
-            if k not in ov_keys:
-                stage_extra.extend(["-s", f"{k}={v}"])
-        looped_stats = os.path.join(run_root, "s1_loop_heal", "esft_stats_looped.json")
-        looped_a6b_stats = os.path.join(run_root, "s1_loop_a6b", "esft_stats_looped.json")
-        if "experts.enabled" not in ov_keys:
-            if os.path.isfile(looped_a6b_stats) and "experts.stats_path" not in ov_keys:
-                stage_extra.extend(["-s", "experts.stats_path=runs/s1_loop_a6b/esft_stats_looped.json"])
-            elif "s1_loop_heal" not in all_stages and not os.path.isfile(looped_stats):
-                stage_extra.extend(["-s", "experts.enabled=false"])
+        if is_v3_pipeline:
+            v3_rl_defaults = [
+                ("model.yarn_target_len", "1048576"),
+                ("loop.prelude_end", "12"),
+                ("loop.core_end", "36"),
+                ("loop.num_passes", "3"),
+                ("loop.target_virtual_layers", "88"),
+                ("loop.train_pass_probs", "[0.10,0.35,0.55]"),
+                ("loop.bridge_mode", "subspace"),
+                ("loop.bridge_rank", "256"),
+                ("loop.bridge_init", "[0.05,0.85,0.10]"),
+                ("loop.attn_adapter_rank", "64"),
+                ("gdn2.enabled", "false"),
+                ("hssd.enabled", "true"),
+                ("hssd.theta_low_rank", "true"),
+                ("hssd.surprise_mode", "routed"),
+                ("hssd.state_dtype", "bfloat16"),
+                ("hssd.segment_chunks", "4"),
+                ("lsa.enabled", "true"),
+                ("lsa.mode", "sparse"),
+                ("lsa.num_query_passes", "3"),
+                ("rl.gate.depth", "3"),
+                (
+                    "train.allowed_groups",
+                    '["loop_adapters","hssd_adapters","gdn2_adapters","lsa_indexers","router","shared_expert","deltanet","attention","norms","expert_deltas"]',
+                ),
+            ]
+            prior_v3 = [s for s in all_stages if s in _V3_STAGE_SET]
+            if "s2_joint_bptt" in all_stages:
+                v3_rl_defaults.insert(0, ("train.init_from", "runs/s2_joint_bptt"))
+            elif prior_v3:
+                v3_rl_defaults.insert(0, ("train.init_from", f"runs/{prior_v3[-1]}"))
+            for k, v in v3_rl_defaults:
+                if k not in ov_keys:
+                    stage_extra.extend(["-s", f"{k}={v}"])
+            looped_a6b_stats = os.path.join(run_root, "s1_loop_a6b", "esft_stats_looped.json")
+            if "experts.enabled" not in ov_keys:
+                if os.path.isfile(looped_a6b_stats) and "experts.stats_path" not in ov_keys:
+                    stage_extra.extend(["-s", "experts.stats_path=runs/s1_loop_a6b/esft_stats_looped.json"])
+                else:
+                    stage_extra.extend(["-s", "experts.enabled=false"])
+        elif is_v2_pipeline:
+            v2_rl_defaults = [
+                ("train.init_from", "runs/s3_long_lsa"),
+                ("loop.prelude_end", "8"),
+                ("loop.core_end", "32"),
+                ("loop.num_passes", "2"),
+                ("loop.target_virtual_layers", "64"),
+                ("loop.bridge_mode", "concat"),
+                ("loop.bridge_rank", "0"),
+                ("loop.bridge_init", "[0.6,0.2,0.2]"),
+                ("loop.attn_adapter_rank", "0"),
+                ("loop.train_pass_probs", "[0.1,0.9]"),
+                ("gdn2.enabled", "true"),
+                ("hssd.enabled", "false"),
+                ("lsa.enabled", "false"),
+                ("rl.gate.depth", "2"),
+                ("eval_quick.depths", "[1,2]"),
+            ]
+            for k, v in v2_rl_defaults:
+                if k not in ov_keys:
+                    stage_extra.extend(["-s", f"{k}={v}"])
+            looped_v2_stats = os.path.join(run_root, "s1_loop_heal", "esft_stats_looped.json")
+            if "experts.enabled" not in ov_keys and os.path.isfile(looped_v2_stats):
+                stage_extra.extend(["-s", "experts.enabled=true"])
+                if "experts.stats_path" not in ov_keys:
+                    stage_extra.extend(["-s", "experts.stats_path=runs/s1_loop_heal/esft_stats_looped.json"])
     return [[*py, "train", "-c", cpath, *stage_extra]]
 
 

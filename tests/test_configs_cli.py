@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import functools
 import glob
 import importlib.util
 import json
@@ -327,6 +328,101 @@ def test_resolve_hf_kernels_pip_spec_and_runtime_auto_install(tmp_path, monkeypa
     next_rc = 0
     run_pipeline(hf_repo="test/repo", base_precision="fp8", smoke_toy=False)
     assert len(pip_cmds) == 1
+
+
+def test_hf5_underscore_loader_and_lru_cache_clear_on_pip_install(monkeypatch):
+    """Reproduce transformers=5.23.0 `_load_finegrained_fp8_kernel` + `@lru_cache` `is_kernels_available`."""
+    hf_err = (
+        "finegrained-fp8 kernel unavailable: kernels is either not installed or uses an incompatible version. "
+        "Please install a compatible version (0.18.2 <= version < 0.19.0), e.g. pip install kernels==0.18.2"
+    )
+    kernels_installed = False
+    real_find_spec = importlib.util.find_spec
+
+    def _fake_find_spec(name, *a, **kw):
+        if name == "kernels":
+            return SimpleNamespace(name="kernels") if kernels_installed else None
+        return real_find_spec(name, *a, **kw)
+
+    monkeypatch.setattr(importlib.util, "find_spec", _fake_find_spec)
+
+    fake_tf = types.ModuleType("transformers")
+    fake_tf_utils = types.ModuleType("transformers.utils")
+    fake_imp_utils = types.ModuleType("transformers.utils.import_utils")
+    fake_imp_utils.KERNELS_MIN_VERSION = "0.18.2"
+    fake_imp_utils.KERNELS_MAX_VERSION = "0.19.0"
+
+    @functools.lru_cache
+    def _is_package_available(pkg_name: str):
+        if pkg_name == "kernels":
+            return (kernels_installed, "0.18.2" if kernels_installed else "N/A")
+        return (False, "N/A")
+
+    @functools.lru_cache
+    def is_kernels_available() -> bool:
+        return _is_package_available("kernels")[0]
+
+    fake_imp_utils._is_package_available = _is_package_available
+    fake_imp_utils.is_kernels_available = is_kernels_available
+
+    fake_tf_int = types.ModuleType("transformers.integrations")
+    fake_fg = types.ModuleType("transformers.integrations.finegrained_fp8")
+
+    # Underscore-only `_load_finegrained_fp8_kernel` with NO `_MISSING_KERNELS_MESSAGE` attribute
+    def _load_finegrained_fp8_kernel():
+        if not is_kernels_available():
+            raise ImportError(hf_err)
+        return SimpleNamespace(name="finegrained_fp8_triton_kernel")
+
+    fake_fg._load_finegrained_fp8_kernel = _load_finegrained_fp8_kernel
+    fake_tf.utils = fake_tf_utils
+    fake_tf_utils.import_utils = fake_imp_utils
+    fake_tf.integrations = fake_tf_int
+    fake_tf_int.finegrained_fp8 = fake_fg
+
+    monkeypatch.setitem(sys.modules, "transformers", fake_tf)
+    monkeypatch.setitem(sys.modules, "transformers.utils", fake_tf_utils)
+    monkeypatch.setitem(sys.modules, "transformers.utils.import_utils", fake_imp_utils)
+    monkeypatch.setitem(sys.modules, "transformers.integrations", fake_tf_int)
+    monkeypatch.setitem(sys.modules, "transformers.integrations.finegrained_fp8", fake_fg)
+
+    # 1. Underscore-only loader populates `@lru_cache` with False and resolves exact range spec
+    assert _resolve_hf_kernels_pip_spec() == (False, "kernels>=0.18.2,<0.19.0")
+    assert is_kernels_available() is False
+    assert is_kernels_available.cache_info().currsize == 1
+
+    # 2. Simulate runtime `pip install` on Colab Linux: must `.cache_clear()` so `ok_after` is True immediately
+    monkeypatch.setattr(sys, "platform", "linux")
+    pip_calls: list[list[str]] = []
+
+    def _sim_pip_install(cmd, *args, **kwargs):
+        nonlocal kernels_installed
+        pip_calls.append(list(cmd))
+        kernels_installed = True
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("qloop.colab.subprocess.run", _sim_pip_install)
+    first = ensure_quant_runtime_packages("fp8", auto_install=True)
+    assert len(pip_calls) == 1
+    assert pip_calls[0][-1] == "kernels>=0.18.2,<0.19.0"
+    assert first["status"] == "installed"
+    assert is_kernels_available() is True
+
+    # 3. Subsequent Cell 3 calls (`ensure_quant_runtime_packages` / `run_pipeline`) see `ok == True` -> 0 extra pip runs
+    second = ensure_quant_runtime_packages("fp8", auto_install=True)
+    assert second["status"] == "ready"
+    monkeypatch.setattr("qloop.colab.q", lambda cmd, check=True: 0)
+    run_pipeline(hf_repo="test/repo", base_precision="fp8", smoke_toy=False)
+    assert len(pip_calls) == 1
+
+    # 4. Also verify KERNELS_MIN_VERSION / KERNELS_MAX_VERSION fallback when loader is absent
+    kernels_installed = False
+    is_kernels_available.cache_clear()
+    _is_package_available.cache_clear()
+    delattr(fake_fg, "_load_finegrained_fp8_kernel")
+    fake_imp_utils.KERNELS_MIN_VERSION = "0.19.0"
+    fake_imp_utils.KERNELS_MAX_VERSION = "0.20.0"
+    assert _resolve_hf_kernels_pip_spec() == (False, "kernels>=0.19.0,<0.20.0")
 
 
 def test_doctor_blackwell_fp8_nvfp4_and_compressed_tensors(monkeypatch):

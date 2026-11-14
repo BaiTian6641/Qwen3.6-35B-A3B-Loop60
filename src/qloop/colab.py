@@ -118,10 +118,10 @@ def _subprocess_env() -> dict[str, str]:
     return env
 
 
-def _parse_hf_kernels_pip_spec(text: str) -> str:
-    """Parse HF `finegrained_fp8` missing-kernel message into a valid `pip` requirement string."""
+def _parse_hf_kernels_pip_spec_strict(text: str) -> str | None:
+    """Parse an explicit `kernels` version range/pin from `text`, or return `None` if absent."""
     if not text:
-        return DEFAULT_HF_KERNELS_PIP_SPEC
+        return None
     m_range = re.search(
         r"([0-9]+(?:\.[0-9a-zA-Z]+)+)\s*(<=|<)\s*version\s*(<=|<)\s*([0-9]+(?:\.[0-9a-zA-Z]+)+)",
         text,
@@ -148,7 +148,59 @@ def _parse_hf_kernels_pip_spec(text: str) -> str:
     m_pin = re.search(r"kernels\s*(==|>=|<=|!=|~=|>|<)\s*([0-9]+(?:\.[0-9a-zA-Z]+)+)", text)
     if m_pin:
         return f"kernels{m_pin.group(1)}{m_pin.group(2)}"
-    return DEFAULT_HF_KERNELS_PIP_SPEC
+    return None
+
+
+def _parse_hf_kernels_pip_spec(text: str) -> str:
+    """Parse HF `finegrained_fp8` missing-kernel message into a valid `pip` requirement string."""
+    return _parse_hf_kernels_pip_spec_strict(text) or DEFAULT_HF_KERNELS_PIP_SPEC
+
+
+def _import_utils_kernels_bounds_hint(fg_fp8: Any = None) -> str:
+    min_v: Any = None
+    max_v: Any = None
+    if fg_fp8 is not None:
+        min_v = getattr(fg_fp8, "KERNELS_MIN_VERSION", None)
+        max_v = getattr(fg_fp8, "KERNELS_MAX_VERSION", None)
+    try:
+        imp_utils = importlib.import_module("transformers.utils.import_utils")
+        min_v = min_v or getattr(imp_utils, "KERNELS_MIN_VERSION", None)
+        max_v = max_v or getattr(imp_utils, "KERNELS_MAX_VERSION", None)
+    except Exception:
+        pass
+    s_min = str(min_v).strip() if min_v is not None else ""
+    s_max = str(max_v).strip() if max_v is not None else ""
+    if s_min and s_max:
+        return f"({s_min} <= version < {s_max})"
+    if s_min:
+        return f"version >= {s_min}"
+    if s_max:
+        return f"version < {s_max}"
+    return ""
+
+
+def _refresh_runtime_import_caches() -> None:
+    """Invalidate import finders and clear HF `transformers` `@lru_cache` package availability checks."""
+    importlib.invalidate_caches()
+    imp_utils = sys.modules.get("transformers.utils.import_utils")
+    if imp_utils is None and "transformers" in sys.modules:
+        try:
+            imp_utils = importlib.import_module("transformers.utils.import_utils")
+        except Exception:
+            imp_utils = None
+    if imp_utils is not None:
+        for attr in ("is_kernels_available", "_is_package_available", "is_compressed_tensors_available"):
+            fn = getattr(imp_utils, attr, None)
+            clear_fn = getattr(fn, "cache_clear", None)
+            if callable(clear_fn):
+                clear_fn()
+    fg_fp8 = sys.modules.get("transformers.integrations.finegrained_fp8")
+    if fg_fp8 is not None:
+        for attr in ("load_finegrained_fp8_kernel", "_load_finegrained_fp8_kernel"):
+            fn = getattr(fg_fp8, attr, None)
+            clear_fn = getattr(fn, "cache_clear", None)
+            if callable(clear_fn):
+                clear_fn()
 
 
 def _version_tuple(ver: str) -> tuple[int, ...]:
@@ -200,21 +252,35 @@ def _resolve_hf_kernels_pip_spec(message: str | None = None) -> tuple[bool, str]
     try:
         fg_fp8 = importlib.import_module("transformers.integrations.finegrained_fp8")
     except Exception:
-        if _installed_kernels_matches_spec(DEFAULT_HF_KERNELS_PIP_SPEC):
+        fallback_hint = _import_utils_kernels_bounds_hint()
+        pip_spec = _parse_hf_kernels_pip_spec(fallback_hint)
+        if _installed_kernels_matches_spec(pip_spec):
             return True, "kernels"
-        return False, DEFAULT_HF_KERNELS_PIP_SPEC
+        return False, pip_spec
 
     missing_msg = str(getattr(fg_fp8, "_MISSING_KERNELS_MESSAGE", "") or "")
-    loader = getattr(fg_fp8, "load_finegrained_fp8_kernel", None)
+    if not missing_msg:
+        missing_msg = _import_utils_kernels_bounds_hint(fg_fp8)
+    loader = getattr(fg_fp8, "load_finegrained_fp8_kernel", None) or getattr(
+        fg_fp8, "_load_finegrained_fp8_kernel", None
+    )
     if callable(loader):
         try:
             loader()
             return True, "kernels"
         except ImportError as exc:
-            pip_spec = _parse_hf_kernels_pip_spec(f"{exc}\n{missing_msg}")
+            pip_spec = (
+                _parse_hf_kernels_pip_spec_strict(str(exc))
+                or _parse_hf_kernels_pip_spec_strict(missing_msg)
+                or DEFAULT_HF_KERNELS_PIP_SPEC
+            )
             return False, pip_spec
         except Exception as exc:
-            pip_spec = _parse_hf_kernels_pip_spec(f"{exc}\n{missing_msg}")
+            pip_spec = (
+                _parse_hf_kernels_pip_spec_strict(str(exc))
+                or _parse_hf_kernels_pip_spec_strict(missing_msg)
+                or DEFAULT_HF_KERNELS_PIP_SPEC
+            )
             if _installed_kernels_matches_spec(pip_spec):
                 return True, "kernels"
             return False, pip_spec
@@ -276,7 +342,8 @@ def ensure_quant_runtime_packages(
             cmd = [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", pip_spec]
             try:
                 res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-                importlib.invalidate_caches()
+                if res.returncode == 0:
+                    _refresh_runtime_import_caches()
             except Exception as exc:
                 print(
                     f"[qloop] warning: failed to install {pip_spec!r} ({exc!r}); "
@@ -333,7 +400,8 @@ def ensure_quant_runtime_packages(
             cmd = [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", pip_spec]
             try:
                 res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-                importlib.invalidate_caches()
+                if res.returncode == 0:
+                    _refresh_runtime_import_caches()
             except Exception as exc:
                 print(f"[qloop] warning: failed to install {pip_spec!r} ({exc!r})", flush=True)
                 return {

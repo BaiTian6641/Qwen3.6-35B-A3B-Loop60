@@ -729,3 +729,55 @@ def test_v3_07_exact_qwen36_ledger_and_two_pass_chunk_vs_decode_equivalence():
     with torch.no_grad():
         experts_up[0][5].weight[0, 0] += 1e-12
     assert (_sha256_params(experts_up) + _sha256_params(experts_dn)) != hash_before
+
+
+# ==============================================================================
+# TEST 8: Theorem 1 Operation-Order Contraction & Linear-beta Write Scaling
+# ==============================================================================
+def test_v3_08_implemented_operation_order_contraction_and_linear_beta_scaling():
+    torch.manual_seed(2026)
+    dt = torch.float64
+    dk, dv = 64, 64
+    half_d = dk // 2
+
+    # 8a: Scaling AFTER counter-rotation `e = g * sqrt(b) * R(-Theta) k` satisfies ||(I - e e^T) D||_2 <= 1
+    # unconditionally for any anisotropic b in [0, 2]^dk, ||k||_2 = 1, g in [0, 1], gamma >= 0.
+    eye = torch.eye(dk, dtype=dt)
+    for _ in range(32):
+        k_u = F.normalize(torch.randn(dk, dtype=dt), dim=-1)
+        b_aniso = torch.empty(dk, dtype=dt).uniform_(0.0, 2.0)
+        g_val = float(torch.empty((), dtype=dt).uniform_(0.0, 1.0))
+        theta = torch.empty(half_d, dtype=dt).uniform_(-math.pi, math.pi)
+        gamma = torch.empty(dk, dtype=dt).uniform_(0.0, 0.2).repeat_interleave(1)
+
+        k_rot = apply_2d_rotation(k_u, -theta)
+        e_vec = g_val * torch.sqrt(b_aniso) * k_rot
+        assert float((e_vec * e_vec).sum()) <= 2.0 + 1e-12
+
+        d_mat = torch.diag(torch.exp(-(g_val**2) * gamma))
+        t_mat = (eye - torch.outer(e_vec, e_vec)) @ d_mat
+        op_norm = float(torch.linalg.matrix_norm(t_mat, ord=2))
+        assert op_norm <= 1.0 + 1e-12
+
+        # Strict commutativity `sqrt(b) * R(-Theta) k == R(-Theta)(sqrt(b) * k)` holds iff b is pairwise tied
+        lhs_aniso = torch.sqrt(b_aniso) * apply_2d_rotation(k_u, -theta)
+        rhs_aniso = apply_2d_rotation(torch.sqrt(b_aniso) * k_u, -theta)
+        assert float((lhs_aniso - rhs_aniso).abs().max()) > 1e-3
+
+        b_paired = b_aniso.view(half_d, 2).mean(dim=-1, keepdim=True).expand(half_d, 2).reshape(dk)
+        lhs_pair = torch.sqrt(b_paired) * apply_2d_rotation(k_u, -theta)
+        rhs_pair = apply_2d_rotation(torch.sqrt(b_paired) * k_u, -theta)
+        assert float((lhs_pair - rhs_pair).abs().max()) < 1e-14
+
+    # 8b: Linear-beta write scaling `v_eff = g * sqrt(w) * v` matches linear GDN beta at `b = w = beta`
+    k_u = F.normalize(torch.randn(dk, dtype=dt), dim=-1)
+    v_u = torch.randn(dv, dtype=dt)
+    for beta in (0.05, 0.25, 0.80, 1.50):
+        b_vec = torch.full((dk,), beta, dtype=dt)
+        w_vec = torch.full((dv,), beta, dtype=dt)
+        e_lin = torch.sqrt(b_vec) * k_u
+        v_lin = torch.sqrt(w_vec) * v_u
+        write_rank1 = torch.outer(e_lin, v_lin)
+        gdn_rank1 = beta * torch.outer(k_u, v_u)
+        assert float((write_rank1 - gdn_rank1).abs().max()) < 1e-14
+

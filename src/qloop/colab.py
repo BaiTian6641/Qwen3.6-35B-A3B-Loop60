@@ -260,8 +260,8 @@ HSSD_ABLATION_EVAL_AXES: tuple[str, ...] = (
     "repeated_key_updates",
     "distractor_resistance",
     "state_tracking",
-    "mqar_interfering_writes",
-    "code_tasks",
+    "mqar_recall_vs_interfering_writes",
+    "code_reasoning",
 )
 
 
@@ -428,16 +428,27 @@ def _pick_float(mapping: dict[str, Any], keys: tuple[str, ...]) -> float | None:
 def _fmt_bench_row(name: str, entry: Any) -> str:
     if not isinstance(entry, dict) or not entry:
         return f"| `{name}` | `-` | `-` | `-` |"
-    tps = _pick_float(entry, ("tok_per_s", "tokens_per_s", "tokens_per_sec", "throughput_tok_s"))
-    ms = _pick_float(entry, ("ms", "latency_ms", "elapsed_ms"))
+    tps = _pick_float(
+        entry,
+        ("tok_per_s", "tokens_per_s", "tokens_per_sec", "throughput_tok_s", "prefill_tokens_per_sec"),
+    )
+    ms = _pick_float(entry, ("ms", "latency_ms", "elapsed_ms", "prefill_ms"))
     if ms is None:
-        sec = _pick_float(entry, ("seconds", "elapsed_s", "latency_s"))
+        sec = _pick_float(entry, ("seconds", "elapsed_s", "latency_s", "prefill_seconds"))
         if sec is not None:
             ms = sec * 1000.0
-    mem_b = _pick_float(entry, ("unique_storage_bytes", "peak_bytes", "allocated_bytes"))
-    mem_mib = _pick_float(entry, ("peak_mem_mib", "peak_mib", "unique_storage_mib", "mib", "mb"))
-    if mem_mib is None and mem_b is not None:
-        mem_mib = mem_b / (1024.0 * 1024.0)
+    mem_mib = _pick_float(entry, ("unique_storage_mib", "state_mib"))
+    if mem_mib is None:
+        stor_b = _pick_float(entry, ("unique_storage_bytes", "state_bytes"))
+        if stor_b is not None:
+            mem_mib = stor_b / (1024.0 * 1024.0)
+    if mem_mib is None:
+        peak_mib = _pick_float(entry, ("peak_mem_mib", "peak_mib", "peak_cuda_mib", "mib", "mb"))
+        peak_b = _pick_float(entry, ("peak_cuda_bytes", "peak_bytes", "allocated_bytes"))
+        if peak_mib is not None and peak_mib > 0.0:
+            mem_mib = peak_mib
+        elif peak_b is not None and peak_b > 0.0:
+            mem_mib = peak_b / (1024.0 * 1024.0)
     tps_s = f"`{tps:,.1f}`" if tps is not None else "`-`"
     ms_s = f"`{ms:.3f}`" if ms is not None else "`-`"
     mem_s = f"`{mem_mib:.2f} MiB`" if mem_mib is not None else "`-`"
@@ -462,7 +473,9 @@ def format_probe_notebook_markdown(report: dict[str, Any]) -> str:
         umib = _pick_float(rcache, ("unique_storage_mib", "mib", "mb"))
         if umib is None and ubytes is not None:
             umib = ubytes / (1024.0 * 1024.0)
+        mid_mib = _pick_float(rcache, ("mid_chunk_unique_storage_mib",))
         compact = rcache.get("has_compact_storage", rcache.get("compact_storage", True))
+        mid_note = f", `{mid_mib:.2f} MiB` mid-chunk" if mid_mib is not None else ""
         extra.extend(
             [
                 "",
@@ -474,7 +487,7 @@ def format_probe_notebook_markdown(report: dict[str, Any]) -> str:
                 f"- **Adapter Params (`theta_low_rank=True`):** `{p_layer:,}` / layer "
                 f"(`{p_30:,}` across 30L; `theta` share `{th_frac * 100.0:.1f}%`)",
                 f"- **Retained Decode Cache:** "
-                f"`{int(ubytes):,} B` (`{(umib or 0.0):.2f} MiB` / layer, "
+                f"`{int(ubytes or 0):,} B` (`{(umib or 0.0):.2f} MiB` / layer{mid_note}, "
                 f"`compact_storage={bool(compact)}`)",
                 "",
                 "| Workload | Throughput (`tok/s`) | Latency (`ms`) | Memory / Storage |",
@@ -502,10 +515,16 @@ def format_probe_notebook_markdown(report: dict[str, Any]) -> str:
             if not isinstance(v_cfg, dict):
                 continue
             label = str(v_cfg.get("label") or v_cfg.get("name") or v_key)
+            skip_keys = ("enabled", "label", "name", "description", "mechanisms", "eval_tasks", "eval_axes", "tasks")
             h_sub = v_cfg.get("hssd") if isinstance(v_cfg.get("hssd"), dict) else {
-                k: v for k, v in v_cfg.items() if k not in ("label", "name", "description", "eval_axes", "tasks")
+                k: v for k, v in v_cfg.items() if k not in skip_keys
             }
-            axes = v_cfg.get("eval_axes") or v_cfg.get("tasks") or list(HSSD_ABLATION_EVAL_AXES)
+            axes = (
+                v_cfg.get("eval_tasks")
+                or v_cfg.get("eval_axes")
+                or v_cfg.get("tasks")
+                or list(HSSD_ABLATION_EVAL_AXES)
+            )
             h_str = json.dumps(h_sub, separators=(",", ":"))
             ax_str = ", ".join(f"`{a}`" for a in axes) if isinstance(axes, (list, tuple)) else str(axes)
             extra.append(f"| `{v_key}` | {label} | `{h_str}` | {ax_str} |")

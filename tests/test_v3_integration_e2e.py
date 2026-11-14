@@ -173,7 +173,16 @@ def test_v3_probe_notebook_suite_smoke(tmp_path, monkeypatch):
         push_to_hub=False,
         debug=1,
     )
-    for key in ("summary", "gates", "recommended_overrides", "markdown", "json_path", "md_path"):
+    for key in (
+        "summary",
+        "gates",
+        "recommended_overrides",
+        "hssd_layer_profile",
+        "hssd_ablation_matrix",
+        "markdown",
+        "json_path",
+        "md_path",
+    ):
         assert key in rep, f"missing key {key!r} in probe report"
     assert rep["gates"]["gate_minus_1_math"]["passed"] is True
     assert rep["gates"]["0a_backward"]["passed"] is True
@@ -181,9 +190,15 @@ def test_v3_probe_notebook_suite_smoke(tmp_path, monkeypatch):
     assert "0p_1_expert_headroom" in rep["gates"]
     assert "0p_2_reentry_anchors" in rep["gates"]
     assert "0p_3_positional_extrapolation" in rep["gates"]
+    assert rep["gates"]["0p_4_hssd_layer_profile"]["passed"] is True
+    assert rep["hssd_layer_profile"].get("profile_source") is None
+    assert rep["hssd_layer_profile"]["retained_cache"]["has_compact_storage"] is True
+    assert len(rep["hssd_ablation_matrix"]) == 6
+    assert "eval_tasks" in rep["hssd_ablation_matrix"]["6_complete_hssd"]
     assert os.path.isfile(rep["json_path"]) and os.path.getsize(rep["json_path"]) > 0
     assert os.path.isfile(rep["md_path"]) and os.path.getsize(rep["md_path"]) > 0
-    assert "Gate" in rep["markdown"]
+    assert "Gate `0p-4`" in rep["markdown"]
+    assert "Gate `1-Ablate`" in rep["markdown"]
 
 
 def test_v3_cli_export_pack_and_inference_engine_roundtrip(tmp_path, monkeypatch):

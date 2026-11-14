@@ -29,8 +29,13 @@ else
   $PY -m pip install -q --no-cache-dir -U --upgrade-strategy only-if-needed \
       "transformers>=5.0" "huggingface_hub>=0.30" "datasets>=3.0" \
       accelerate safetensors sentencepiece psutil
-  log "installing optional kernels & NVFP4 support (failures are reported by 'qloop doctor', not fatal)"
-  $PY -m pip install -q --no-cache-dir compressed-tensors || echo "compressed-tensors unavailable -> needed only for NVFP4 checkpoints"
+  log "installing Blackwell FP8/NVFP4 & optional kernels (failures are reported by 'qloop doctor', not fatal)"
+  $PY -m pip install -q --no-cache-dir "kernels>=0.18.2,<0.19.0" || \
+    $PY -m pip install -q --no-cache-dir kernels || \
+    echo "kernels unavailable -> PyTorch FP8 fallback will be used"
+  $PY -m pip install -q --no-cache-dir "compressed-tensors>=0.9" || \
+    $PY -m pip install -q --no-cache-dir compressed-tensors || \
+    echo "compressed-tensors unavailable -> needed only for NVFP4 checkpoints"
   $PY -m pip install -q --no-cache-dir apollo-torch || echo "apollo-torch unavailable -> built-in APOLLO fallback"
   $PY -m pip install -q --no-cache-dir "cut-cross-entropy" || echo "cut-cross-entropy unavailable -> chunked CE fallback"
   $PY -m pip install -q --no-cache-dir flash-linear-attention || echo "fla unavailable -> slow DeltaNet torch path"

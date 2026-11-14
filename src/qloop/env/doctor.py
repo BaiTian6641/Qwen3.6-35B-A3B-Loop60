@@ -1,11 +1,12 @@
-"""Environment doctor: one table telling you exactly what is wrong before a 20 GB download.
+"""Environment doctor: one table telling you exactly what is wrong before a 21-35 GB download.
 
-    python -m qloop doctor [--freeze requirements/colab.lock.txt] [--datasets] [--model NAME]
+    python -m qloop doctor [--freeze requirements/colab.lock.txt] [--datasets] [--model Qwen/Qwen3.6-35B-A3B-FP8]
 
 Each check returns (status, detail, fix). FAIL => non-zero exit code.
 """
 from __future__ import annotations
 
+import argparse
 import importlib
 import logging
 import os
@@ -17,6 +18,7 @@ from typing import Callable
 log = logging.getLogger("qloop")
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
+DEFAULT_MODEL = "Qwen/Qwen3.6-35B-A3B-FP8"
 
 
 @dataclass
@@ -72,6 +74,25 @@ def check_torch_gpu() -> list[Check]:
                          "install a torch wheel built for this GPU (Blackwell sm_120 needs CUDA >= 12.8 wheels)"))
     else:
         out.append(Check("torch arch", PASS, f"{want} supported ({', '.join(matched)})"))
+    if p.major >= 10:
+        out.append(Check(
+            "fp8/nvfp4 hw",
+            PASS,
+            f"Blackwell ({sm}): native FP8 (e4m3 ~35 GiB) & NVFP4 (~21 GiB) Tensor Cores ready",
+        ))
+    elif (p.major, p.minor) >= (8, 9):
+        out.append(Check(
+            "fp8/nvfp4 hw",
+            PASS,
+            f"{sm}: native FP8 (e4m3) ready; NVFP4 uses transient dequant fallback",
+        ))
+    else:
+        out.append(Check(
+            "fp8/nvfp4 hw",
+            WARN,
+            f"{sm} (< sm_89): lacks native FP8/NVFP4 Tensor Cores",
+            "use Colab G4 (RTX PRO 6000 Blackwell sm_120) or pass base_precision='bf16'",
+        ))
     if p.major == 12:
         out.append(Check("attention kernels", PASS if _version("flash_attn") is None else WARN,
                          "Blackwell workstation (sm_120): FlashAttention-3 is Hopper-only; using SDPA/cuDNN or FA2",
@@ -106,12 +127,14 @@ def check_packages() -> list[Check]:
             out.append(Check("transformers", FAIL, f"{tv} lacks qwen3_5_moe/qwen3_6_moe",
                              "pip install -U transformers"))
     specs: list[tuple[str, str, str, str]] = [
+        ("compressed_tensors", "compressed-tensors", WARN,
+         "needed for NVFP4 checkpoints (unsloth/Qwen3.6-35B-A3B-NVFP4-Fast); FP8 works natively without it"),
         ("fla", "flash-linear-attention", WARN, "Gated DeltaNet fast kernels; without them HF uses a slow torch path"),
         ("causal_conv1d", "causal-conv1d", WARN, "short-conv kernel for DeltaNet (fallback is slower)"),
         ("apollo_torch", "apollo-torch", WARN, "APOLLO optimizer (built-in faithful fallback is used otherwise)"),
         ("cut_cross_entropy", "cut-cross-entropy", WARN, "CCE kernel (built-in chunked CE fallback otherwise)"),
         ("datasets", "datasets", WARN, "needed to stream training/eval data"),
-        ("huggingface_hub", "huggingface_hub", WARN, "downloads + checkpoint sync"),
+        ("huggingface_hub", "huggingface_hub", WARN, "downloads + checkpoint sync (HF_XET_HIGH_PERFORMANCE=1)"),
         ("triton", "triton", WARN, "required by fla / cce kernels"),
     ]
     for mod, pip, sev, why in specs:
@@ -150,6 +173,13 @@ def check_system() -> list[Check]:
         f"set (sync target: {hf_repo})" if tok else "missing",
         "" if tok else f"Colab: add write-enabled HF_TOKEN to Secrets to sync commits to {hf_repo}",
     ))
+    if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER"):
+        out.append(Check(
+            "hf xet",
+            WARN,
+            "deprecated HF_HUB_ENABLE_HF_TRANSFER is set in environment",
+            "unset HF_HUB_ENABLE_HF_TRANSFER and export HF_XET_HIGH_PERFORMANCE=1 (setup_env does this automatically)",
+        ))
     docker = os.path.exists("/var/run/docker.sock")
     docker_msg = "available" if docker else "no docker daemon (expected on Colab)"
     out.append(Check("docker", PASS if docker else WARN, docker_msg,
@@ -215,4 +245,37 @@ def run_doctor(freeze_path: str | None = None, datasets: bool = False, model: st
     return 1 if fails else 0
 
 
-__all__ = ["Check", "freeze", "run_doctor"]
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="qloop-doctor", description="qloop Blackwell/Colab environment doctor")
+    p.add_argument("--freeze", default=None, help="write pip freeze lockfile here")
+    p.add_argument("--datasets", action="store_true", help="verify dataset access on the Hub")
+    p.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"verify access to this model repo (default: {DEFAULT_MODEL})",
+    )
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return run_doctor(freeze_path=args.freeze, datasets=args.datasets, model=args.model)
+
+
+__all__ = [
+    "DEFAULT_MODEL",
+    "Check",
+    "build_parser",
+    "check_hf_access",
+    "check_packages",
+    "check_python",
+    "check_system",
+    "check_torch_gpu",
+    "freeze",
+    "main",
+    "run_doctor",
+]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,12 +1,26 @@
 """Every shipped config must load and validate; the CLI must drive the toy pipeline end-to-end."""
+from __future__ import annotations
+
+import ast
 import glob
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 
+from qloop import doctor
 from qloop.cli import main
-from qloop.config import load_config
+from qloop.colab import (
+    BASE_MODEL_BY_PRECISION,
+    _subprocess_env,
+    resolve_base_model_name,
+    run_pipeline,
+    run_probe_notebook_suite,
+    run_v3_e2e_and_ship_pack,
+    setup_env,
+)
+from qloop.config import load_config, yaml_load
 from qloop.model.gdn2 import GDN2Config
 from qloop.model.hssd import HSSDConfig
 from qloop.model.loop import LoopSpec, build_schedule
@@ -14,6 +28,21 @@ from qloop.model.lsa import LSAConfig
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QWEN_TYPES = ["full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(40)]
+EXPECTED_QWEN36_DIMS = {
+    "num_hidden_layers": 40,
+    "hidden_size": 2048,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "full_attention_interval": 4,
+    "num_experts": 256,
+    "num_experts_per_tok": 8,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+}
 
 
 @pytest.mark.parametrize("path", sorted(glob.glob(os.path.join(ROOT, "configs", "**", "*.yaml"), recursive=True)))
@@ -30,7 +59,9 @@ def test_every_config_loads_and_validates(path):
     else:
         types = QWEN_TYPES
         assert loop.virtual_layers(40) in (64, 88), f"{path}: Qwen configs must target 64 or 88 virtual layers"
-        if "stages/" in path.replace("\\", "/") or "eval/" in path.replace("\\", "/"):
+        norm_path = path.replace("\\", "/")
+        if "stages/" in norm_path or "eval/" in norm_path:
+            assert cfg.model.name == "Qwen/Qwen3.6-35B-A3B-FP8", f"{path}: stage/eval default must be FP8"
             assert loop.per_pass_router is True
             assert (cfg.get("gdn2") or {}).get("enabled") is True or (cfg.get("hssd") or {}).get("enabled") is True
             sync = (cfg.get("checkpoint") or {}).get("sync") or {}
@@ -40,6 +71,184 @@ def test_every_config_loads_and_validates(path):
     assert len(build_schedule(loop, types)) == loop.virtual_layers(len(types))
     if cfg.get("stage_type") in ("lm", "rl"):
         assert cfg.get("train"), f"{path}: training stage without train section"
+
+
+def test_blackwell_fp8_nvfp4_and_bf16_model_configs():
+    fp8 = load_config(os.path.join(ROOT, "configs", "model", "qwen36_fp8.yaml"))
+    nvfp4 = load_config(os.path.join(ROOT, "configs", "model", "qwen36_nvfp4.yaml"))
+    bf16 = load_config(os.path.join(ROOT, "configs", "model", "qwen36_bf16.yaml"))
+
+    assert fp8.model.name == "Qwen/Qwen3.6-35B-A3B-FP8"
+    assert fp8.model.dtype == "bfloat16"
+    assert fp8.model.attn_implementation == "sdpa"
+    assert fp8.model.device_map == "cuda:0"
+    assert fp8.model.text_only is True
+    assert fp8.model.trust_remote_code is False
+    assert dict(fp8.model.expected) == EXPECTED_QWEN36_DIMS
+
+    assert nvfp4.model.name == "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"
+    assert nvfp4.model.dtype == "bfloat16"
+    assert nvfp4.model.attn_implementation == "sdpa"
+    assert nvfp4.model.device_map == "cuda:0"
+    assert nvfp4.model.text_only is True
+    assert nvfp4.model.trust_remote_code is False
+    assert dict(nvfp4.model.expected) == EXPECTED_QWEN36_DIMS
+
+    assert bf16.model.name == "Qwen/Qwen3.6-35B-A3B"
+
+
+def test_resolve_base_model_name_and_colab_precision_plumbing(tmp_path, monkeypatch):
+    assert BASE_MODEL_BY_PRECISION == {
+        "fp8": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "nvfp4": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
+        "bf16": "Qwen/Qwen3.6-35B-A3B",
+    }
+    assert resolve_base_model_name(None) is None
+    assert resolve_base_model_name("fp8") == "Qwen/Qwen3.6-35B-A3B-FP8"
+    assert resolve_base_model_name("FP8") == "Qwen/Qwen3.6-35B-A3B-FP8"
+    assert resolve_base_model_name("nvfp4") == "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"
+    assert resolve_base_model_name("NVFP4") == "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"
+    assert resolve_base_model_name("bf16") == "Qwen/Qwen3.6-35B-A3B"
+    assert resolve_base_model_name("org/custom-qwen36") == "org/custom-qwen36"
+
+    for bad in ("", "  ", "int8", "fp16", "a/b/c", "/model", "org/", "org/bad space"):
+        with pytest.raises(ValueError, match="invalid base_precision"):
+            resolve_base_model_name(bad)
+
+    calls: list[str] = []
+    monkeypatch.setenv("QLOOP_RUN_ROOT", str(tmp_path))
+    monkeypatch.setattr("qloop.colab.q", lambda cmd, check=True: calls.append(cmd) or 0)
+
+    run_pipeline(hf_repo="test/repo")
+    assert "model.name=Qwen/Qwen3.6-35B-A3B-FP8" in calls[-1]
+
+    run_pipeline(hf_repo="test/repo", base_precision="nvfp4")
+    assert "model.name=unsloth/Qwen3.6-35B-A3B-NVFP4-Fast" in calls[-1]
+
+    run_pipeline(hf_repo="test/repo", base_precision="nvfp4", overrides=("model.name=custom/override",))
+    assert "model.name=custom/override" in calls[-1]
+    assert "NVFP4-Fast" not in calls[-1]
+
+    run_pipeline(hf_repo="test/repo", base_precision="nvfp4", smoke_toy=True)
+    assert "model.name=" not in calls[-1]
+
+    # Verify run_v3_e2e_and_ship_pack propagates base_precision into BOTH pipeline and export-pack
+    class _DoneManifest:
+        def is_completed(self, _stage: str) -> bool:
+            return True
+
+    monkeypatch.setattr("qloop.hub.HubSyncManager.fetch_manifest", lambda self: _DoneManifest())
+    calls.clear()
+    res = run_v3_e2e_and_ship_pack(
+        hf_repo="test/repo",
+        pack_repo="test/pack",
+        base_precision="nvfp4",
+        stages=("s0_probe", "s1_loop_a6b"),
+    )
+    assert res["pack_shipped"] is True
+    pipe_cmd = next(c for c in calls if c.startswith("sync pipeline"))
+    pack_cmd = next(c for c in calls if c.startswith("export-pack"))
+    assert "model.name=unsloth/Qwen3.6-35B-A3B-NVFP4-Fast" in pipe_cmd
+    assert "model.name=unsloth/Qwen3.6-35B-A3B-NVFP4-Fast" in pack_cmd
+
+    # Verify run_probe_notebook_suite injects base_precision when smoke_toy=False and keeps toy when smoke_toy=True
+    def _fake_probe_q(cmd: str, check: bool = True) -> int:
+        calls.append(cmd)
+        probe_dir = tmp_path / "probe"
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        (probe_dir / "probe_report.json").write_text(
+            json.dumps({"summary": {"all_critical_ok": True}, "gates": {}, "markdown": "# Probe\n"}),
+            encoding="utf-8",
+        )
+        (probe_dir / "probe_report.md").write_text("# Probe\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr("qloop.colab.q", _fake_probe_q)
+    monkeypatch.setattr("qloop.model.probes.profile_hssd_layer", None, raising=False)
+    calls.clear()
+    run_probe_notebook_suite(smoke_toy=False, base_precision="nvfp4", run_math_gate=False, push_to_hub=False)
+    assert "model.name=unsloth/Qwen3.6-35B-A3B-NVFP4-Fast" in calls[-1]
+
+    calls.clear()
+    run_probe_notebook_suite(smoke_toy=True, base_precision="nvfp4", run_math_gate=False, push_to_hub=False)
+    assert "model.name=toy" in calls[-1]
+    assert "NVFP4-Fast" not in calls[-1]
+
+
+def test_setup_env_scrubs_deprecated_hf_transfer_and_enables_xet(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    monkeypatch.delenv("HF_XET_HIGH_PERFORMANCE", raising=False)
+
+    setup_env(
+        hf_repo="TassP0lar/Qwen3.6-35B-A3B-Loop64",
+        run_root=str(tmp_path / "runs"),
+        hf_home=str(tmp_path / "hf_cache"),
+        require_hf_token=False,
+    )
+    assert "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
+    assert os.environ.get("HF_XET_HIGH_PERFORMANCE") == "1"
+
+    monkeypatch.setenv("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    monkeypatch.delenv("HF_XET_HIGH_PERFORMANCE", raising=False)
+    sub_env = _subprocess_env()
+    assert "HF_HUB_ENABLE_HF_TRANSFER" not in sub_env
+    assert sub_env.get("HF_XET_HIGH_PERFORMANCE") == "1"
+
+
+def test_doctor_blackwell_fp8_nvfp4_and_compressed_tensors(monkeypatch):
+    assert doctor.DEFAULT_MODEL == "Qwen/Qwen3.6-35B-A3B-FP8"
+    assert doctor.build_parser().parse_args([]).model == "Qwen/Qwen3.6-35B-A3B-FP8"
+
+    pkg_checks = {c.name: c for c in doctor.check_packages()}
+    assert "compressed_tensors" in pkg_checks
+    assert pkg_checks["compressed_tensors"].status in ("PASS", "WARN")
+
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _idx: SimpleNamespace(name="NVIDIA RTX PRO 6000 Blackwell", major=12, minor=0, total_memory=96 * 2**30),
+    )
+    monkeypatch.setattr(torch.cuda, "get_arch_list", lambda: ["sm_90", "sm_120"])
+    gpu_checks = {c.name: c for c in doctor.check_torch_gpu() if c.name != "cuda smoke"}
+    assert gpu_checks["gpu"].status == "PASS"
+    assert gpu_checks["torch arch"].status == "PASS"
+    assert gpu_checks["fp8/nvfp4 hw"].status == "PASS"
+    assert "Blackwell" in gpu_checks["fp8/nvfp4 hw"].detail
+
+
+def test_notebooks_and_setup_script_blackwell_conventions():
+    nb_paths = sorted(glob.glob(os.path.join(ROOT, "notebooks", "*.ipynb")))
+    assert len(nb_paths) == 4
+    for nb_path in nb_paths:
+        with open(nb_path, encoding="utf-8") as f:
+            raw = f.read()
+        assert "HF_HUB_ENABLE_HF_TRANSFER" not in raw, f"{nb_path} still references HF_HUB_ENABLE_HF_TRANSFER"
+        nb = json.loads(raw)
+        assert nb.get("nbformat") == 4
+        code_cells = ["".join(c.get("source", [])) for c in nb.get("cells", []) if c.get("cell_type") == "code"]
+        assert any('BASE_PRECISION = "fp8"' in cell for cell in code_cells), f"{nb_path} missing BASE_PRECISION"
+        for idx, cell in enumerate(code_cells):
+            lines = ["pass  # magic" if ln.lstrip().startswith(("!", "%")) else ln for ln in cell.splitlines()]
+            ast.parse("\n".join(lines), filename=f"{nb_path}#cell{idx}", feature_version=(3, 9))
+
+    with open(os.path.join(ROOT, "scripts", "colab_setup.sh"), encoding="utf-8") as f:
+        setup_sh = f.read()
+    assert "HF_XET_HIGH_PERFORMANCE=1" in setup_sh
+    assert "compressed-tensors" in setup_sh
+    assert "accelerate hf_transfer" not in setup_sh
+
+    with open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8") as f:
+        pyproj = f.read()
+    assert "hf_transfer" not in pyproj
+    assert '"compressed-tensors"' in pyproj
+    assert "\ngpu = [\n" in pyproj
+    # Ensure all stage configs parse cleanly via yaml_load as well
+    for st_yaml in glob.glob(os.path.join(ROOT, "configs", "stages", "*.yaml")):
+        with open(st_yaml, encoding="utf-8") as f:
+            assert isinstance(yaml_load(f.read()), dict)
 
 
 def test_cli_toy_pipeline(tmp_path, monkeypatch):

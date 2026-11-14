@@ -1,5 +1,5 @@
 # S2 - high-density CoT + knowledge SFT on the healed looped model (doc §4 Step 1A mixture).
-_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+_base_: [../base.yaml, ../model/qwen36_fp8.yaml]
 stage: s2_sft
 stage_type: lm
 run: {name: s2_sft}

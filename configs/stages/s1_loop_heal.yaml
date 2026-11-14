@@ -2,7 +2,7 @@
 # Starts bit-identical to stock Qwen3.6 (zero-init gates). Go/no-go signal: eval/depth_gain > 0
 # (held-out loss at depth 2 lower than at depth 1). If it stays <= 0 after ~100M tokens, stop and
 # revisit the core range (qloop probe --core-ranges) before spending more compute.
-_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+_base_: [../base.yaml, ../model/qwen36_fp8.yaml]
 stage: s1_loop_heal
 stage_type: lm
 run: {name: s1_loop_heal}

@@ -3,7 +3,7 @@
 # Step-0 bit-identity is guaranteed by zero-init PassExitGate (`gate_init: 0.0`) while ReEntryBridge (`bridge_rank: 256`,
 # `bridge_mode: subspace`, `bridge_init: [0.05, 0.85, 0.10]` -> w_anchor=0.85) provides live step-1 gradients (Fixes A1-A3).
 # Track-A GDN-2 upgrades all 30 linear layers bit-identically; all 32.338B routed/shared MoE experts stay 100% frozen.
-_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+_base_: [../base.yaml, ../model/qwen36_fp8.yaml]
 stage: s1_loop_a6b
 stage_type: lm
 run: {name: s1_loop_a6b}

@@ -12,6 +12,10 @@ Retrofits **`Qwen/Qwen3.6-35B-A3B`** (`40` physical layers = `10 × [3 Gated Del
   - **Tier 1 (`1M` GPU-Resident Primary)**: `10.00 GiB` `FP8` `SharedKV` (`1.0×` KV across `R=1..3`) + untied per-pass `D-LSA` query indexers (`num_query_passes=3`) + `ReRoPE` relative distance clamping.
   - **Tier 2 (`10M` Host-DDR5 Stretch)**: `Block64HadamardINT4Cache` (`2,304 B` 4-token micro-page, `53.64 GiB` pinned DDR5 @ `10M`) keeping `[0:64]` mRoPE strictly orthogonal to `[64:256]` NoPE for exact `ReRoPE` commutativity, prefetched 3 layers ahead.
   - **`SegmentedKVBPTTRunner` (`128K` Differentiable Retrieval)**: Streams `4 × 32K` segments while differentiably re-projecting Top-`2,048` selected prior-segment K/V tokens.
+- **Blackwell `FP8` & `NVFP4` Quantized Base Checkpoints (`sm_120` · `96 GiB` VRAM / `230 GB` SSD)**:
+  - **Default `FP8` (`Qwen/Qwen3.6-35B-A3B-FP8`, `configs/model/qwen36_fp8.yaml`)**: Official `[128, 128]` block-scaled `e4m3` checkpoint requiring **`~35 GiB` VRAM & SSD** (vs `64.6 GiB` weights / `85.1 GiB` peak VRAM for `BF16`), native in `transformers>=5` with zero extra packages.
+  - **1-Line `NVFP4` Option (`unsloth/Qwen3.6-35B-A3B-NVFP4-Fast`, `configs/model/qwen36_nvfp4.yaml`)**: Set `BASE_PRECISION = "nvfp4"` (`base_precision="nvfp4"`) for **`~21 GiB` VRAM & SSD** via `compressed-tensors` group-16 `nvfp4-pack-quantized` weights (`BASE_PRECISION = "bf16"` remains available via `qwen36_bf16.yaml`).
+  - **Full Backward & Training Support (`quant_autograd`)**: Transient on-the-fly dequantizing `dL/dx` autograd bridge preserves native Blackwell forward speed under `no_grad()` while propagating exact input & router gradients across all probing and training stages (`S0`, `S1`, `S1b`, `S2`, `S3`, `S4`), `HotExpertDeltas`, and Whole Model Pack export with zero persistent `BF16` weight copies.
 - **Self-Contained Whole Model Pack & `OptimizedLoopInferenceEngine`**: Streams sharded `model-00001-of-NNNNN.safetensors` one `~4.5 GB` shard at a time (`< 6 GB` peak temporary SSD on Colab's `230 GB` disk) alongside standalone `configuration_qwen36_loophssd.py` & `modeling_qwen36_loophssd.py`, loadable via both `OptimizedLoopInferenceEngine.from_pretrained(...)` and standard `transformers.AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)`.
 
 📄 **Formal Architecture, Implementation Plan & Research Documentation (`docs/`):**
@@ -83,11 +87,15 @@ make check    # Python 3.9 AST check (.py + .ipynb) + ruff lint + full pytest su
 
 ## End-to-End `Loop-HSSD v3.1` Colab Workflow (`Probe → Train & Ship Pack → Infer & Eval`)
 
-1. **Calibrate (`notebooks/colab_probe.ipynb`)**: Run zero-training `Gate -1` + `Gate 0a` + `Gate 0p-1..4` + `Gate 1-Ablate` probes:
+1. **Calibrate (`notebooks/colab_probe.ipynb`)**: Run zero-training `Gate -1` + `Gate 0a` + `Gate 0p-1..4` + `Gate 1-Ablate` probes (`BASE_PRECISION = "fp8"` default `~35 GiB`, or `"nvfp4"` `~21 GiB`):
    ```python
    from qloop.colab import setup_env, run_probe_notebook_suite
-   setup_env(hf_repo="TassP0lar/Qwen3.6-35B-A3B-Loop64")
-   report = run_probe_notebook_suite(config_path="configs/stages/s0_probe.yaml", push_to_hub=True)
+   setup_env(hf_repo="TassP0lar/Qwen3.6-35B-A3B-Loop64")  # sets HF_XET_HIGH_PERFORMANCE=1
+   report = run_probe_notebook_suite(
+       config_path="configs/stages/s0_probe.yaml",
+       base_precision="fp8",  # "fp8" | "nvfp4" | "bf16"
+       push_to_hub=True,
+   )
    ```
 2. **Train & Stream Whole Model Pack (`notebooks/colab_train_e2e.ipynb`)**: Self-resumes across Colab 24h sessions and streams sharded `safetensors` (`< 6 GB` peak temporary SSD) to Hugging Face Hub upon final stage completion:
    ```python
@@ -96,6 +104,7 @@ make check    # Python 3.9 AST check (.py + .ipynb) + ruff lint + full pytest su
    run_v3_e2e_and_ship_pack(
        hf_repo="TassP0lar/Qwen3.6-35B-A3B-Loop64",
        pack_repo="TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack",
+       base_precision="fp8",  # "fp8" | "nvfp4" | "bf16"
        time_budget_hours=21.5,
        stream_low_disk=True,
    )

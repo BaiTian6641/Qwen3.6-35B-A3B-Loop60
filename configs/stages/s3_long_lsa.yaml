@@ -2,7 +2,7 @@
 # Training length is capped by *activations* (not KV): a 1M-token sequence needs ~4 GiB per checkpointed
 # layer input x 64 virtual layers. Train the indexers at 128K (KV share makes pass-2 reuse pass-1 buckets),
 # then evaluate sparse attention at 1M (KV ≈ 10.24 GB FP8 for the 10 full-attention layers).
-_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+_base_: [../base.yaml, ../model/qwen36_fp8.yaml]
 stage: s3_long_lsa
 stage_type: lm
 run: {name: s3_long_lsa}

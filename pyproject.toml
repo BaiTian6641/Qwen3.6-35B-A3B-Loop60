@@ -14,7 +14,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Heavy GPU stack: installed by scripts/colab_setup.sh (versions are logged + frozen by `qloop doctor --freeze`)
+# Heavy GPU stack: installed by scripts/colab_setup.sh (Xet via HF_XET_HIGH_PERFORMANCE=1; frozen by `qloop doctor --freeze`)
+gpu = [
+  "transformers>=5.0",
+  "accelerate",
+  "datasets>=3.0",
+  "huggingface_hub>=0.30",
+  "safetensors",
+  "sentencepiece",
+  "compressed-tensors",
+  "apollo-torch",
+  "cut-cross-entropy",
+  "flash-linear-attention",
+]
 colab = [
   "transformers>=5.0",
   "accelerate",
@@ -22,6 +34,7 @@ colab = [
   "huggingface_hub>=0.30",
   "safetensors",
   "sentencepiece",
+  "compressed-tensors",
   "apollo-torch",
   "cut-cross-entropy",
   "flash-linear-attention",

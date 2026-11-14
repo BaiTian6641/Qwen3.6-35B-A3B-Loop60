@@ -7,7 +7,7 @@
 #   * Tiered M=8 multi-page router (Top-2 active pages) + STE actual sparse Top-k write-mass budget regularizer
 #   * Compact `state_dtype: bfloat16` retained cache (`81-89 MiB/layer`, `fp32` WY updates + `fp64` `theta_cum`)
 # Fallback guarantee: if HSSD < +8% over GDN-2 on 32K-64K RULER/MQAR, Gate 2a seamlessly retains `s1_loop_a6b` Track-A.
-_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+_base_: [../base.yaml, ../model/qwen36_fp8.yaml]
 stage: s1b_hssd_distill
 stage_type: lm
 run: {name: s1b_hssd_distill}

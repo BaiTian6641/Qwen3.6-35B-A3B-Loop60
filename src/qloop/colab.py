@@ -1,10 +1,10 @@
 """Notebook-side helpers (no torch import): keep the single Colab notebook concise and debuggable.
 
-    from qloop.colab import setup_env, q, hub_status, run_pipeline, tail_metrics
+    from qloop.colab import setup_env, q, hub_status, resolve_base_model_name, run_pipeline, tail_metrics
     setup_env(hf_repo="TassP0lar/Qwen3.6-35B-A3B-Loop64")
-    q("doctor --freeze requirements/colab.lock.txt --model Qwen/Qwen3.6-35B-A3B")
+    q(f"doctor --freeze requirements/colab.lock.txt --model {resolve_base_model_name('fp8')}")
     hub_status()
-    run_pipeline(debug=1, time_budget_hours=21.5)
+    run_pipeline(base_precision="fp8", debug=1, time_budget_hours=21.5)
 
 Design:
 * Zero Google Drive dependency: every stage commits its trainable checkpoint + `manifest.json` +
@@ -19,7 +19,6 @@ Design:
 from __future__ import annotations
 
 import glob
-import importlib.util
 import json
 import os
 import shlex
@@ -31,6 +30,11 @@ from typing import Any
 
 DEFAULT_HF_REPO = "TassP0lar/Qwen3.6-35B-A3B-Loop64"
 DEFAULT_PACK_REPO = "TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack"
+BASE_MODEL_BY_PRECISION: dict[str, str] = {
+    "fp8": "Qwen/Qwen3.6-35B-A3B-FP8",
+    "nvfp4": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
+    "bf16": "Qwen/Qwen3.6-35B-A3B",
+}
 SECRETS = (
     "HF_TOKEN",
     "WANDB_API_KEY",
@@ -60,8 +64,48 @@ DEFAULT_METRIC_KEYS = (
 )
 
 
+def resolve_base_model_name(base_precision: str | None) -> str | None:
+    """Resolve `'fp8'`, `'nvfp4'`, `'bf16'`, or a direct `'org/model'` HF repo ID to a model name."""
+    if base_precision is None:
+        return None
+    raw = str(base_precision).strip()
+    if not raw:
+        raise ValueError(
+            f"invalid base_precision {base_precision!r}; expected one of {sorted(BASE_MODEL_BY_PRECISION)} "
+            "or a Hugging Face repo ID like 'org/model'"
+        )
+    alias = raw.lower()
+    if alias in BASE_MODEL_BY_PRECISION:
+        return BASE_MODEL_BY_PRECISION[alias]
+    parts = raw.split("/")
+    if len(parts) == 2 and all(p and not any(ch.isspace() for ch in p) for p in parts):
+        return raw
+    raise ValueError(
+        f"invalid base_precision {base_precision!r}; expected one of {sorted(BASE_MODEL_BY_PRECISION)} "
+        "or a Hugging Face repo ID like 'org/model'"
+    )
+
+
+def _inject_base_model_override(
+    overrides: Sequence[str],
+    base_precision: str | None,
+    *,
+    smoke_toy: bool = False,
+) -> list[str]:
+    resolved = resolve_base_model_name(base_precision)
+    out = list(overrides)
+    if smoke_toy or resolved is None:
+        return out
+    caller_keys = {ov.split("=", 1)[0].strip() for ov in out if "=" in ov}
+    if "model.name" not in caller_keys:
+        return [f"model.name={resolved}", *out]
+    return out
+
+
 def _subprocess_env() -> dict[str, str]:
     env = dict(os.environ)
+    env.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+    env.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
     src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cur_pp = env.get("PYTHONPATH", "")
     if src_dir not in cur_pp.split(os.pathsep):
@@ -110,8 +154,8 @@ def setup_env(
     os.environ["QLOOP_HF_REPO"] = hf_repo
     os.environ["QLOOP_RUN_ROOT"] = run_root
     os.environ["HF_HOME"] = hf_home
-    if importlib.util.find_spec("hf_transfer") is not None:
-        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -209,6 +253,8 @@ def reclaim_disk(keep: str | None = None, pip: bool = False) -> int:
 def run_pipeline(
     *,
     hf_repo: str | None = None,
+    base_precision: str | None = "fp8",
+    smoke_toy: bool = False,
     debug: int = 1,
     time_budget_hours: float = 21.5,
     stages: Sequence[str] | None = None,
@@ -218,6 +264,7 @@ def run_pipeline(
 ) -> int:
     """Run/resume the full end-to-end pipeline synced via HF Hub commit history."""
     repo = hf_repo or os.environ.get("QLOOP_HF_REPO", DEFAULT_HF_REPO)
+    eff_overrides = _inject_base_model_override(overrides, base_precision, smoke_toy=smoke_toy)
     parts = [
         "sync",
         "pipeline",
@@ -234,7 +281,7 @@ def run_pipeline(
         parts += ["--until", shlex.quote(until)]
     if force:
         parts.append("--force")
-    for ov in overrides:
+    for ov in eff_overrides:
         parts += ["-s", shlex.quote(ov)]
     return q(" ".join(parts))
 
@@ -536,6 +583,7 @@ def run_probe_notebook_suite(
     *,
     config_path: str = "configs/stages/s0_probe.yaml",
     hf_repo: str | None = None,
+    base_precision: str | None = "fp8",
     smoke_toy: bool = False,
     seq_len: int | None = None,
     n_seqs: int | None = None,
@@ -546,6 +594,7 @@ def run_probe_notebook_suite(
     overrides: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Run Gate -1 (`fp64` math) + Gate 0a + Gate 0p-1..4 structured probes and return report + paths."""
+    resolved_base = resolve_base_model_name(base_precision)
     repo = hf_repo or os.environ.get("QLOOP_HF_REPO", DEFAULT_HF_REPO)
     run_root = os.environ.get("QLOOP_RUN_ROOT", "runs")
     probe_dir = os.path.join(run_root, "probe")
@@ -570,6 +619,8 @@ def run_probe_notebook_suite(
         for k, v in toy_defaults:
             if k not in caller_keys:
                 eff_overrides.append(f"{k}={v}")
+    elif resolved_base is not None and "model.name" not in caller_keys:
+        eff_overrides.append(f"model.name={resolved_base}")
 
     if push_to_hub:
         if "checkpoint.sync.hf_repo" not in caller_keys:
@@ -742,6 +793,8 @@ def run_v3_e2e_and_ship_pack(
     *,
     hf_repo: str | None = None,
     pack_repo: str | None = None,
+    base_precision: str | None = "fp8",
+    smoke_toy: bool = False,
     stages: Sequence[str] = (
         "s0_probe",
         "s1_loop_a6b",
@@ -767,14 +820,17 @@ def run_v3_e2e_and_ship_pack(
     sync_repo = hf_repo or os.environ.get("QLOOP_HF_REPO", DEFAULT_HF_REPO)
     target_pack_repo = pack_repo if pack_repo is not None else DEFAULT_PACK_REPO
     stage_tuple = tuple(stages)
+    eff_overrides = _inject_base_model_override(overrides, base_precision, smoke_toy=smoke_toy)
     rc = run_pipeline(
         hf_repo=sync_repo,
+        base_precision=base_precision,
+        smoke_toy=smoke_toy,
         debug=debug,
         time_budget_hours=time_budget_hours,
         stages=stage_tuple,
         until=until,
         force=force,
-        overrides=overrides,
+        overrides=eff_overrides,
     )
 
     effective_stages = stage_tuple[: stage_tuple.index(until) + 1] if until and until in stage_tuple else stage_tuple
@@ -813,10 +869,10 @@ def run_v3_e2e_and_ship_pack(
             parts.append("--stream-low-disk")
         if not merge_hot_experts:
             parts.append("--no-merge-hot-experts")
-        caller_keys = {ov.split("=", 1)[0].strip() for ov in overrides if "=" in ov}
+        caller_keys = {ov.split("=", 1)[0].strip() for ov in eff_overrides if "=" in ov}
         if "checkpoint.sync.hf_repo" not in caller_keys:
             parts += ["-s", shlex.quote(f"checkpoint.sync.hf_repo={sync_repo}")]
-        for ov in overrides:
+        for ov in eff_overrides:
             parts += ["-s", shlex.quote(ov)]
         q(" ".join(parts))
         shipped = True

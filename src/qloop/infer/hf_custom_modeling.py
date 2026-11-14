@@ -1018,6 +1018,7 @@ from typing import Any, Callable
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 try:
     from .configuration_qwen36_loophssd import Qwen36LoopHSSDConfig
@@ -1921,6 +1922,8 @@ else:
             self.k_pages = int(hcfg.get("top_k_pages") or hcfg.get("k_pages", 2))
             self.chunk_size = int(hcfg.get("chunk_size", 64))
             self.window_chunks = int(hcfg.get("window_chunks", 8))
+            self.segment_chunks = int(hcfg.get("segment_chunks", 4))
+            self.checkpoint_segments = bool(hcfg.get("checkpoint_segments", True))
             self.cap_g = float(hcfg.get("gate_logit_cap", 8.0))
             self.cap_d = float(hcfg.get("decay_log_cap", 2.0))
             self.rank = int(hcfg.get("rank", 64))
@@ -2038,6 +2041,231 @@ else:
                 "vs": vs,
             }
 
+    def _is_compiling() -> bool:
+        compiler = getattr(torch, "compiler", None)
+        fn = getattr(compiler, "is_compiling", None) if compiler is not None else None
+        return bool(fn()) if callable(fn) else False
+
+    def _disjoint_horizon_bounds(t_1based: int, chunk_size: int = 64, window_chunks: int = 8) -> tuple[int, int, int]:
+        n = (int(t_1based) - 1) // int(chunk_size)
+        k_far = max(0, n - int(window_chunks))
+        return n, k_far, k_far * int(chunk_size)
+
+    def _chunk_slices_for_span(step_offset: int, seq_len: int, chunk_size: int) -> list[tuple[int, int]]:
+        slices: list[tuple[int, int]] = []
+        cur = 0
+        while cur < seq_len:
+            g_cur = step_offset + cur
+            rem = chunk_size - (g_cur % chunk_size)
+            nxt = min(seq_len, cur + rem)
+            slices.append((cur, nxt))
+            cur = nxt
+        return slices
+
+    _WY_BLOCK_META_CACHE: dict[
+        tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = {}
+
+    def _get_wy_block_meta(
+        n_blk: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _is_compiling():
+            idx8 = torch.arange(8, device=device)
+            strict_lo_8 = idx8[:, None] > idx8[None, :]
+            diag_lin = torch.arange(n_blk, device=device, dtype=torch.long) * (n_blk + 1)
+            if n_blk >= 2:
+                tril = torch.tril_indices(n_blk, n_blk, offset=-1, device=device)
+                bi_idx = tril[0]
+                bj_idx = tril[1]
+                all_lin_idx = torch.cat([diag_lin, bi_idx * n_blk + bj_idx], dim=0)
+            else:
+                empty_l = torch.empty((0,), dtype=torch.long, device=device)
+                bi_idx, bj_idx, all_lin_idx = empty_l, empty_l, diag_lin
+            return strict_lo_8, bi_idx, bj_idx, all_lin_idx
+
+        key = (device, n_blk)
+        cached = _WY_BLOCK_META_CACHE.get(key)
+        if cached is not None:
+            return cached
+        with torch.inference_mode(False), torch.no_grad():
+            idx8 = torch.arange(8, device=device)
+            strict_lo_8 = idx8[:, None] > idx8[None, :]
+            diag_lin = torch.arange(n_blk, device=device, dtype=torch.long) * (n_blk + 1)
+            if n_blk >= 2:
+                tril = torch.tril_indices(n_blk, n_blk, offset=-1, device=device)
+                bi_idx = tril[0]
+                bj_idx = tril[1]
+                all_lin_idx = torch.cat([diag_lin, bi_idx * n_blk + bj_idx], dim=0)
+            else:
+                empty_l = torch.empty((0,), dtype=torch.long, device=device)
+                bi_idx, bj_idx, all_lin_idx = empty_l, empty_l, diag_lin
+        res = (strict_lo_8, bi_idx, bj_idx, all_lin_idx)
+        _WY_BLOCK_META_CACHE[key] = res
+        return res
+
+    def _wy_kda_state_update(
+        page_states: torch.Tensor,
+        k_eff: torch.Tensor,
+        v_eff: torch.Tensor,
+        log_a: torch.Tensor,
+    ) -> torch.Tensor:
+        log_a_neg = log_a.clamp(max=0.0)
+        c_len = k_eff.shape[-2]
+        if c_len == 1:
+            dec = log_a_neg.squeeze(-2).exp().unsqueeze(-1) * page_states
+            ke = k_eff.squeeze(-2)
+            ve = v_eff.squeeze(-2)
+            mem = (ke.unsqueeze(-2) @ dec).squeeze(-2)
+            return dec + ke.unsqueeze(-1) * (ve - mem).unsqueeze(-2)
+
+        b_sz = 8
+        n_blk = (c_len + b_sz - 1) // b_sz
+        c_pad = n_blk * b_sz
+        pad_t = c_pad - c_len
+        dk = k_eff.shape[-1]
+        lead_shape = k_eff.shape[:-2]
+
+        if pad_t > 0:
+            k_pad = F.pad(k_eff, (0, 0, 0, pad_t), value=0.0)
+            log_a_pad = F.pad(log_a_neg, (0, 0, 0, pad_t), value=0.0)
+        else:
+            k_pad = k_eff
+            log_a_pad = log_a_neg
+
+        cum_log_pad = torch.cumsum(log_a_pad, dim=-2)
+        cum_log_a = cum_log_pad[..., :c_len, :] if pad_t > 0 else cum_log_pad
+
+        k_blk = k_pad.reshape((*lead_shape, n_blk, b_sz, dk))
+        g_blk = cum_log_pad.reshape((*lead_shape, n_blk, b_sz, dk))
+        strict_lo_8, bi_idx, bj_idx, all_lin_idx = _get_wy_block_meta(n_blk, k_eff.device)
+
+        diff_d = g_blk[..., :, None, :] - g_blk[..., None, :, :]
+        safe_d = torch.where(strict_lo_8.unsqueeze(-1), diff_d, torch.zeros_like(diff_d))
+        diag_blks = (k_blk[..., :, None, :] * k_blk[..., None, :, :] * safe_d.exp()).sum(dim=-1)
+        diag_blks = torch.where(strict_lo_8, diag_blks, torch.zeros_like(diag_blks))
+
+        if n_blk == 1:
+            l_mat = diag_blks.squeeze(-3)[..., :c_len, :c_len]
+        else:
+            rhs_all = k_blk[..., :-1, :, :] * (g_blk[..., :-1, 7:8, :] - g_blk[..., :-1, :, :]).exp()
+            rhs_k = rhs_all.index_select(-3, bj_idx)
+            k_i_pairs = k_blk.index_select(-3, bi_idx)
+            g_i_pairs = g_blk.index_select(-3, bi_idx)
+            g_piv_pairs = g_blk[..., 7:8, :].index_select(-3, bj_idx)
+            lhs = k_i_pairs * (g_i_pairs - g_piv_pairs).exp()
+            off_blks = lhs @ rhs_k.transpose(-1, -2)
+
+            active_blks = torch.cat([diag_blks, off_blks], dim=-3)
+            n_act = active_blks.shape[-3]
+            idx_exp = all_lin_idx.view((*(1,) * len(lead_shape), n_act, 1, 1)).expand(
+                (*lead_shape, n_act, b_sz, b_sz)
+            )
+            grid = k_eff.new_zeros((*lead_shape, n_blk * n_blk, b_sz, b_sz)).scatter(-3, idx_exp, active_blks)
+            l_pad = grid.view((*lead_shape, n_blk, n_blk, b_sz, b_sz)).transpose(-3, -2).reshape(
+                (*lead_shape, c_pad, c_pad)
+            )
+            l_mat = l_pad[..., :c_len, :c_len] if pad_t > 0 else l_pad
+
+        gamma_from_0 = cum_log_a.exp()
+        rhs = v_eff - (gamma_from_0 * k_eff) @ page_states
+        eye = torch.eye(c_len, dtype=k_eff.dtype, device=k_eff.device)
+        u_wy = torch.linalg.solve_triangular(eye + l_mat, rhs, upper=False, unitriangular=True)
+
+        gamma_to_end = (cum_log_a[..., -1:, :] - cum_log_a).exp()
+        d_chunk = cum_log_a[..., -1, :].exp().unsqueeze(-1)
+        return d_chunk * page_states + (gamma_to_end * k_eff).transpose(-1, -2) @ u_wy
+
+    def _routed_bank_readout(
+        vec_c: torch.Tensor,
+        state_bank: torch.Tensor,
+        top_idx: torch.Tensor,
+        top_w: torch.Tensor,
+    ) -> torch.Tensor:
+        bsz, c_len, hv, dk = vec_c.shape
+        num_pages = state_bank.shape[1]
+        dv = state_bank.shape[-1]
+        k_sel = top_idx.shape[-1]
+
+        if k_sel < num_pages and c_len == 1:
+            g_idx = top_idx[:, 0, :, None, None, None].expand(bsz, k_sel, hv, dk, dv)
+            s_sel = torch.gather(state_bank, dim=1, index=g_idx)
+            if s_sel.dtype != vec_c.dtype:
+                s_sel = s_sel.to(dtype=vec_c.dtype)
+            v_q = vec_c.permute(0, 2, 1, 3).unsqueeze(1)
+            picked_1 = (v_q @ s_sel).squeeze(-2)
+            return (picked_1 * top_w[:, 0, :, None, None]).sum(dim=1, keepdim=True)
+
+        if k_sel < num_pages and c_len <= 4:
+            flat_idx = top_idx.reshape(bsz, c_len * k_sel, 1, 1, 1).expand(bsz, c_len * k_sel, hv, dk, dv)
+            s_sel = torch.gather(state_bank, dim=1, index=flat_idx).view(bsz, c_len, k_sel, hv, dk, dv)
+            if s_sel.dtype != vec_c.dtype:
+                s_sel = s_sel.to(dtype=vec_c.dtype)
+            v_q = vec_c.unsqueeze(2).unsqueeze(-2)
+            picked_s = (v_q @ s_sel).squeeze(-2)
+            return (picked_s * top_w.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
+
+        bank_f = state_bank if state_bank.dtype == vec_c.dtype else state_bank.to(dtype=vec_c.dtype)
+        v_all = vec_c.permute(0, 2, 1, 3).unsqueeze(1)
+        all_out = (v_all @ bank_f).permute(0, 3, 1, 2, 4)
+        gather_idx = top_idx.unsqueeze(-1).unsqueeze(-1).expand(bsz, c_len, k_sel, hv, dv)
+        picked = torch.gather(all_out, dim=2, index=gather_idx)
+        return (picked * top_w.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
+
+    def _far_readout(
+        q_hat_c: torch.Tensor,
+        s_far: torch.Tensor,
+        read_logits_c: torch.Tensor,
+        top_k_pages: int,
+    ) -> torch.Tensor:
+        pi_read = F.softmax(read_logits_c, dim=-1)
+        top_vals, top_idx = torch.topk(pi_read, k=top_k_pages, dim=-1)
+        top_w = top_vals / top_vals.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+        return _routed_bank_readout(q_hat_c, s_far, top_idx, top_w)
+
+    def _compute_surprise_and_routing(
+        k_hat_c: torch.Tensor,
+        v_c: torch.Tensor,
+        s_chunk_start_bank: torch.Tensor,
+        sbias_c: torch.Tensor,
+        surprise_slope: torch.Tensor,
+        surprise_thresh: torch.Tensor,
+        write_logits_c: torch.Tensor,
+        top_k_pages: int,
+        wmask_c: torch.Tensor | None,
+        *,
+        use_surprise: bool = True,
+        surprise_mode: str = "routed",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz, c_len, hv, _dk = k_hat_c.shape
+        pi_write = F.softmax(write_logits_c, dim=-1)
+        top_vals, top_idx = torch.topk(pi_write, k=top_k_pages, dim=-1)
+        top_probs = top_vals / top_vals.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+
+        if not use_surprise:
+            g_root = torch.ones(bsz, c_len, hv, device=k_hat_c.device, dtype=k_hat_c.dtype)
+        else:
+            if surprise_mode == "routed" and s_chunk_start_bank.ndim == 5:
+                pred_v = _routed_bank_readout(k_hat_c, s_chunk_start_bank, top_idx, top_probs)
+            else:
+                s0 = s_chunk_start_bank[:, 0] if s_chunk_start_bank.ndim == 5 else s_chunk_start_bank
+                if s0.dtype != k_hat_c.dtype:
+                    s0 = s0.to(dtype=k_hat_c.dtype)
+                pred_v = (k_hat_c.transpose(1, 2) @ s0).transpose(1, 2)
+            eps_err = _safe_norm(v_c - pred_v, dim=-1) / (_safe_norm(v_c, dim=-1) + 1e-6)
+            slope = surprise_slope.view(1, 1, hv)
+            thresh = surprise_thresh.view(1, 1, hv)
+            sb_eff = sbias_c.squeeze(-1) if (sbias_c.ndim == 4 and sbias_c.shape[-1] == 1) else sbias_c
+            g_root = torch.sigmoid(slope * (eps_err - thresh) + sb_eff)
+
+        if wmask_c is not None:
+            g_root = g_root * wmask_c.unsqueeze(-1)
+
+        top_roots = torch.sqrt(top_probs.clamp_min(1e-30))
+        g_active = top_roots.unsqueeze(-1) * g_root.unsqueeze(2)
+        write_root = torch.zeros_like(pi_write).scatter(-1, top_idx, top_roots)
+        g_page = write_root.unsqueeze(-1) * g_root.unsqueeze(2)
+        return g_page, top_idx, g_active
+
     def _coerce_hssd_state(
         init_st: Any,
         *,
@@ -2055,6 +2283,18 @@ else:
             return _HSSDCacheState.zeros(
                 bsz, num_pages, hv, dk, dv, chunk_size=c_size, window_chunks=w_chunks, device=device, dtype=dtype
             )
+        if isinstance(init_st, _HSSDCacheState):
+            if (
+                init_st.device == device
+                and init_st.dtype == dtype
+                and init_st.theta_cum.dtype == torch.float64
+                and init_st.swa_k_ring.dtype == dtype
+                and init_st.swa_v_ring.dtype == dtype
+                and all(t.dtype == dtype for t in init_st.boundary_ring)
+                and init_st.has_compact_storage()
+            ):
+                return init_st
+            return init_st.to(device=device, dtype=dtype)
         if hasattr(init_st, "page_states") and hasattr(init_st, "boundary_ring"):
             ps = _compact(init_st.page_states.to(device=device, dtype=dtype))
             sc_raw = init_st.step_count
@@ -2084,6 +2324,400 @@ else:
             return base
         raise TypeError(f"Unsupported HSSD initial_state: {type(init_st).__name__}")
 
+    def _recurrent_hssd_step(
+        q_in: torch.Tensor,
+        k_in: torch.Tensor,
+        v_in: torch.Tensor,
+        gamma_page_scale: torch.Tensor,
+        gamma_chan_pair: torch.Tensor,
+        b_gate: torch.Tensor,
+        w_gate: torch.Tensor,
+        theta: torch.Tensor,
+        surprise_bias: torch.Tensor,
+        surprise_slope: torch.Tensor,
+        surprise_thresh: torch.Tensor,
+        write_logits: torch.Tensor,
+        read_logits: torch.Tensor,
+        q_swa: torch.Tensor,
+        k_swa: torch.Tensor,
+        v_swa: torch.Tensor,
+        state: _HSSDCacheState,
+        *,
+        boltzmann_gate: _StandalonePeakBoltzmannGate,
+        top_k_pages: int,
+        write_mask: torch.Tensor | None,
+        scale: float | None,
+        acc_dt: torch.dtype,
+        target_dt: torch.dtype,
+        use_swa: bool,
+        use_phase: bool,
+        use_surprise: bool,
+        surprise_mode: str,
+    ) -> tuple[torch.Tensor, _HSSDCacheState]:
+        bsz, _t1, hv, dv = v_in.shape
+        dk = k_in.shape[-1]
+        m_pages = state.page_states.shape[1]
+        st = _coerce_hssd_state(
+            state,
+            bsz=bsz,
+            num_pages=m_pages,
+            hv=hv,
+            dk=dk,
+            dv=dv,
+            c_size=int(state.chunk_size),
+            w_chunks=int(state.window_chunks),
+            device=q_in.device,
+            dtype=target_dt,
+        )
+
+        q_i = q_in.to(acc_dt)
+        k_i = k_in.to(acc_dt)
+        v_i = v_in.to(acc_dt)
+        ps_gamma = gamma_page_scale.to(device=q_in.device, dtype=acc_dt).clamp_min(0.0)
+        ch_gamma = gamma_chan_pair.to(device=q_in.device, dtype=acc_dt).clamp_min(0.0)
+        bf = b_gate.to(acc_dt)
+        wf = w_gate.to(acc_dt)
+        sb = surprise_bias.to(acc_dt)
+        slp = surprise_slope.to(acc_dt)
+        thr = surprise_thresh.to(acc_dt)
+        wl = write_logits.to(acc_dt)
+        rl = read_logits.to(acc_dt)
+        qs = q_swa.to(acc_dt)
+        ks = k_swa.to(acc_dt)
+        vs = v_swa.to(acc_dt)
+
+        th64 = theta.to(dtype=torch.float64)
+        if write_mask is not None:
+            wm = write_mask.reshape(bsz, 1).to(device=q_in.device, dtype=acc_dt).clamp(0.0, 1.0)
+            valid_tok = wm.squeeze(1) > 0.5
+            th64 = th64 * wm.to(dtype=torch.float64).unsqueeze(-1).unsqueeze(-1)
+        else:
+            wm = None
+            valid_tok = torch.ones(bsz, device=q_in.device, dtype=torch.bool)
+        if not use_phase:
+            th64 = torch.zeros_like(th64)
+
+        idx0 = int(st.step_count[0].item())
+        c_size = st.chunk_size
+        w_chunks = st.window_chunks
+        s_cstart_bank = st.boundary_ring[-1]
+
+        theta_cum = _compact(torch.remainder(st.theta_cum + th64.squeeze(1), 2.0 * math.pi))
+        sc = (dk ** -0.5) if scale is None else float(scale)
+        q_hat = _apply_2d_rotation(q_i, -theta_cum.unsqueeze(1)) if use_phase else q_i
+        if sc != 1.0:
+            q_hat = q_hat * sc
+        k_hat = _apply_2d_rotation(k_i, -theta_cum.unsqueeze(1)) if use_phase else k_i
+
+        o_far = _far_readout(q_hat, st.boundary_ring[0], rl, top_k_pages)
+
+        max_win = st.max_swa_len
+        slot = idx0 % max_win
+        slot_idx = torch.tensor([slot], device=q_in.device, dtype=torch.long)
+        ks_ring = ks if ks.dtype == target_dt else ks.to(dtype=target_dt)
+        vs_ring = vs if vs.dtype == target_dt else vs.to(dtype=target_dt)
+        swa_kr = _compact(st.swa_k_ring.index_copy(1, slot_idx, ks_ring))
+        swa_vr = _compact(st.swa_v_ring.index_copy(1, slot_idx, vs_ring))
+        swa_vl = _compact(st.swa_valid_ring.index_copy(1, slot_idx, valid_tok.unsqueeze(1)))
+
+        if use_swa:
+            _n_c, _k_f, far_cut = _disjoint_horizon_bounds(idx0 + 1, c_size, w_chunks)
+            win_idx = torch.arange(far_cut, idx0 + 1, device=q_in.device) % max_win
+            if win_idx.numel() > 1:
+                prior_win = win_idx[:-1]
+                k_prior = st.swa_k_ring.index_select(1, prior_win)
+                v_prior = st.swa_v_ring.index_select(1, prior_win)
+                if k_prior.dtype != acc_dt:
+                    k_prior = k_prior.to(dtype=acc_dt)
+                if v_prior.dtype != acc_dt:
+                    v_prior = v_prior.to(dtype=acc_dt)
+                k_win = torch.cat([k_prior, ks], dim=1).transpose(1, 2)
+                v_win = torch.cat([v_prior, vs], dim=1).transpose(1, 2)
+            else:
+                k_win = ks.transpose(1, 2)
+                v_win = vs.transpose(1, 2)
+            val_win = swa_vl.index_select(1, win_idx)[:, None, None, :]
+
+            scores = (qs.transpose(1, 2) @ k_win.transpose(-1, -2)) * (dk ** -0.5)
+            has_v = val_win.any(dim=-1)
+            safe_v = torch.where(has_v.unsqueeze(-1), val_win, torch.ones_like(val_win))
+            probs = torch.softmax(scores.masked_fill(~safe_v, float("-inf")), dim=-1)
+            probs = torch.where(has_v.unsqueeze(-1), probs, torch.zeros_like(probs))
+            o_loc = (probs @ v_win).transpose(1, 2)
+            p_hit = boltzmann_gate(scores, valid_mask=val_win).transpose(1, 2).unsqueeze(-1)
+            out = p_hit * o_loc + (1.0 - p_hit) * o_far
+        else:
+            out = o_far
+
+        _g_page, top_idx, g_active = _compute_surprise_and_routing(
+            k_hat,
+            v_i,
+            s_cstart_bank,
+            sb,
+            slp,
+            thr,
+            wl,
+            top_k_pages,
+            wm,
+            use_surprise=use_surprise,
+            surprise_mode=surprise_mode,
+        )
+        sqrt_b = _safe_sqrt(bf[:, 0])
+        sqrt_w = _safe_sqrt(wf[:, 0])
+        g_sel = g_active[:, 0]
+        t_idx = top_idx[:, 0]
+        base_pages = st.page_states
+        p_idx = t_idx[:, :, None, None, None].expand(bsz, top_k_pages, hv, dk, dv)
+        s_sel = torch.gather(base_pages, dim=1, index=p_idx)
+        if s_sel.dtype != acc_dt:
+            s_sel = s_sel.to(dtype=acc_dt)
+
+        ch0 = ch_gamma[:, 0]
+        if ch0.shape[-1] == dk // 2:
+            ch0 = ch0.repeat_interleave(2, dim=-1)
+        ps_sel = ps_gamma.index_select(0, t_idx.reshape(-1)).view(bsz, top_k_pages, 1, 1)
+        gam_sel = ps_sel * ch0.unsqueeze(1)
+
+        dec_sel = (-(g_sel * g_sel).unsqueeze(-1) * gam_sel).clamp(max=0.0).exp().unsqueeze(-1) * s_sel
+        ke_sel = g_sel.unsqueeze(-1) * (sqrt_b * k_hat[:, 0]).unsqueeze(1)
+        ve_sel = g_sel.unsqueeze(-1) * (sqrt_w * v_i[:, 0]).unsqueeze(1)
+        mem_sel = (ke_sel.unsqueeze(-2) @ dec_sel).squeeze(-2)
+        updated_sel = dec_sel + ke_sel.unsqueeze(-1) * (ve_sel - mem_sel).unsqueeze(-2)
+        updated_sel_cast = updated_sel if updated_sel.dtype == target_dt else updated_sel.to(dtype=target_dt)
+        new_pages = _compact(base_pages.scatter(1, p_idx, updated_sel_cast))
+
+        new_step_int = idx0 + 1
+        new_step_vec = _compact(st.step_count + 1)
+        new_bring = (*st.boundary_ring[1:], new_pages.clone()) if new_step_int % c_size == 0 else st.boundary_ring
+
+        next_st = _HSSDCacheState(
+            step_count=new_step_vec,
+            chunk_size=c_size,
+            window_chunks=w_chunks,
+            page_states=new_pages,
+            theta_cum=theta_cum,
+            boundary_ring=new_bring,
+            swa_k_ring=swa_kr,
+            swa_v_ring=swa_vr,
+            swa_valid_ring=swa_vl,
+        )
+        return out, next_st
+
+    def _run_chunk_group(
+        chunk_bounds: list[tuple[int, int]],
+        *,
+        step_offset: int,
+        swa_base_global: int,
+        chunk_size: int,
+        window_chunks: int,
+        num_pages: int,
+        top_k_pages: int,
+        use_swa: bool,
+        use_surprise: bool,
+        surprise_mode: str,
+        q_hat: torch.Tensor,
+        k_hat: torch.Tensor,
+        v: torch.Tensor,
+        gamma_page_scale: torch.Tensor,
+        gamma_chan_seg: torch.Tensor,
+        bf: torch.Tensor,
+        wf: torch.Tensor,
+        sb: torch.Tensor,
+        slp: torch.Tensor,
+        thr: torch.Tensor,
+        wl: torch.Tensor,
+        rl: torch.Tensor,
+        qs: torch.Tensor,
+        all_ks: torch.Tensor,
+        all_vs: torch.Tensor,
+        all_valid_swa: torch.Tensor,
+        wm: torch.Tensor | None,
+        gate_log_kappa: torch.Tensor,
+        gate_tau: torch.Tensor,
+        page_states: torch.Tensor,
+        boundary_ring: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
+        bsz = q_hat.shape[0]
+        dk = k_hat.shape[-1]
+        hv = k_hat.shape[2]
+        outs: list[torch.Tensor] = []
+
+        kappa = gate_log_kappa.exp()
+        kappa_b = kappa[0] if kappa.numel() == 1 else kappa.view(1, hv, 1)
+        tau_b = gate_tau[0] if gate_tau.numel() == 1 else gate_tau.view(1, hv, 1)
+
+        n_grp = len(chunk_bounds)
+        base_l0 = chunk_bounds[0][0] if n_grp > 0 else 0
+        g_start = step_offset + base_l0
+        win_prior = window_chunks * chunk_size
+        can_batch_swa = (
+            use_swa
+            and n_grp > 1
+            and g_start % chunk_size == 0
+            and swa_base_global <= max(0, g_start - win_prior)
+            and all(
+                chunk_bounds[c][0] == base_l0 + c * chunk_size
+                and chunk_bounds[c][1] == base_l0 + (c + 1) * chunk_size
+                for c in range(n_grp)
+            )
+        )
+
+        o_loc_batched: torch.Tensor | None = None
+        p_hit_batched: torch.Tensor | None = None
+        if can_batch_swa:
+            win_full = (window_chunks + 1) * chunk_size
+            buf_len = (window_chunks + n_grp) * chunk_size
+            want_start = g_start - win_prior
+            if want_start >= swa_base_global:
+                s_off = want_start - swa_base_global
+                ks_buf = all_ks[:, s_off : s_off + buf_len]
+                vs_buf = all_vs[:, s_off : s_off + buf_len]
+                val_buf = all_valid_swa[:, s_off : s_off + buf_len]
+            else:
+                pad_left = swa_base_global - want_start
+                take_len = buf_len - pad_left
+                ks_buf = F.pad(all_ks[:, :take_len], (0, 0, 0, 0, pad_left, 0), value=0.0)
+                vs_buf = F.pad(all_vs[:, :take_len], (0, 0, 0, 0, pad_left, 0), value=0.0)
+                val_buf = F.pad(all_valid_swa[:, :take_len], (pad_left, 0), value=False)
+
+            k_win_t = ks_buf.unfold(1, win_full, chunk_size)
+            v_win_b = vs_buf.unfold(1, win_full, chunk_size).transpose(-1, -2)
+            val_win_b = val_buf.unfold(1, win_full, chunk_size)
+
+            q_loc_b = (
+                qs[:, base_l0 : base_l0 + n_grp * chunk_size]
+                .reshape(bsz, n_grp, chunk_size, hv, dk)
+                .transpose(2, 3)
+            )
+            scores_b = (q_loc_b @ k_win_t) * (dk ** -0.5)
+
+            r_idx = torch.arange(chunk_size, device=qs.device)[:, None]
+            w_idx = torch.arange(win_full, device=qs.device)[None, :]
+            causal_b = w_idx <= (win_prior + r_idx)
+            valid_mask_b = causal_b[None, None, None, :, :] & val_win_b[:, :, None, None, :]
+
+            has_valid_b = valid_mask_b.any(dim=-1)
+            safe_vm_b = torch.where(has_valid_b.unsqueeze(-1), valid_mask_b, torch.ones_like(valid_mask_b))
+            masked_sc_b = scores_b.masked_fill(~safe_vm_b, float("-inf"))
+
+            probs_b = torch.softmax(masked_sc_b, dim=-1)
+            probs_b = torch.where(has_valid_b.unsqueeze(-1), probs_b, torch.zeros_like(probs_b))
+            o_loc_batched = (probs_b @ v_win_b).transpose(2, 3)
+
+            counts_b = valid_mask_b.expand_as(scores_b).sum(dim=-1)
+            has_v_sc_b = counts_b > 0
+            n_eff_b = counts_b.clamp_min(1).to(scores_b.dtype)
+            lse_b = torch.logsumexp(masked_sc_b, dim=-1)
+            max_sc_b = masked_sc_b.max(dim=-1).values
+            stat_b = 0.5 * (lse_b - torch.log(n_eff_b)) + 0.5 * (
+                max_sc_b - torch.sqrt(2.0 * torch.log(n_eff_b.clamp_min(2.0)))
+            )
+            p_hit_b = torch.sigmoid(kappa_b * (stat_b - tau_b))
+            p_hit_batched = torch.where(has_v_sc_b, p_hit_b, torch.zeros_like(p_hit_b)).transpose(2, 3).unsqueeze(-1)
+
+        p_cur = page_states
+        ring_cur = boundary_ring
+
+        for c_i, (l0, l1) in enumerate(chunk_bounds):
+            g0 = step_offset + l0
+            g1 = step_offset + l1
+
+            q_c = q_hat[:, l0:l1]
+            k_c = k_hat[:, l0:l1]
+            v_c = v[:, l0:l1]
+            rl_c = rl[:, l0:l1]
+            wl_c = wl[:, l0:l1]
+            sb_c = sb[:, l0:l1]
+            wm_c = None if wm is None else wm[:, l0:l1]
+
+            o_far = _far_readout(q_c, ring_cur[0], rl_c, top_k_pages)
+
+            if o_loc_batched is not None and p_hit_batched is not None:
+                o_loc = o_loc_batched[:, c_i]
+                p_hit = p_hit_batched[:, c_i]
+                outs.append(p_hit * o_loc + (1.0 - p_hit) * o_far)
+            elif use_swa:
+                _n_idx, _k_far, far_cutoff = _disjoint_horizon_bounds(g0 + 1, chunk_size, window_chunks)
+                s0 = far_cutoff - swa_base_global
+                s1 = g1 - swa_base_global
+                k_win = all_ks[:, s0:s1].transpose(1, 2)
+                v_win = all_vs[:, s0:s1].transpose(1, 2)
+                val_keys = all_valid_swa[:, s0:s1]
+
+                q_pos = torch.arange(g0, g1, device=q_c.device)[:, None]
+                k_pos = torch.arange(far_cutoff, g1, device=q_c.device)[None, :]
+                valid_mask = (k_pos <= q_pos)[None, None, :, :] & val_keys[:, None, None, :]
+
+                q_loc = qs[:, l0:l1].transpose(1, 2)
+                scores = (q_loc @ k_win.transpose(-1, -2)) * (dk ** -0.5)
+                has_valid = valid_mask.any(dim=-1)
+                safe_vm = torch.where(has_valid.unsqueeze(-1), valid_mask, torch.ones_like(valid_mask))
+                masked_sc = scores.masked_fill(~safe_vm, float("-inf"))
+
+                probs = torch.softmax(masked_sc, dim=-1)
+                probs = torch.where(has_valid.unsqueeze(-1), probs, torch.zeros_like(probs))
+                o_loc = (probs @ v_win).transpose(1, 2)
+
+                counts = valid_mask.expand_as(scores).sum(dim=-1)
+                has_v_sc = counts > 0
+                n_eff = counts.clamp_min(1).to(scores.dtype)
+                lse = torch.logsumexp(masked_sc, dim=-1)
+                max_sc = masked_sc.max(dim=-1).values
+                stat = 0.5 * (lse - torch.log(n_eff)) + 0.5 * (
+                    max_sc - torch.sqrt(2.0 * torch.log(n_eff.clamp_min(2.0)))
+                )
+                p_hit = torch.sigmoid(kappa_b * (stat - tau_b))
+                p_hit = torch.where(has_v_sc, p_hit, torch.zeros_like(p_hit)).transpose(1, 2).unsqueeze(-1)
+                outs.append(p_hit * o_loc + (1.0 - p_hit) * o_far)
+            else:
+                outs.append(o_far)
+
+            g_page, top_idx, _g_act = _compute_surprise_and_routing(
+                k_c,
+                v_c,
+                ring_cur[-1],
+                sb_c,
+                slp,
+                thr,
+                wl_c,
+                top_k_pages,
+                wm_c,
+                use_surprise=use_surprise,
+                surprise_mode=surprise_mode,
+            )
+
+            chan_c = gamma_chan_seg[:, l0:l1]
+            if chan_c.shape[-1] == dk // 2:
+                chan_c = chan_c.repeat_interleave(2, dim=-1)
+            gamma_c = gamma_page_scale.view(1, 1, num_pages, 1, 1) * chan_c.unsqueeze(2)
+
+            sqrt_b = _safe_sqrt(bf[:, l0:l1])
+            sqrt_w = _safe_sqrt(wf[:, l0:l1])
+            k_eff = (g_page.unsqueeze(-1) * (sqrt_b * k_c).unsqueeze(2)).permute(0, 2, 3, 1, 4)
+            v_eff = (g_page.unsqueeze(-1) * (sqrt_w * v_c).unsqueeze(2)).permute(0, 2, 3, 1, 4)
+            log_a = (-(g_page * g_page).unsqueeze(-1) * gamma_c).permute(0, 2, 3, 1, 4)
+            if not torch.is_grad_enabled() and not _is_compiling() and top_k_pages < num_pages:
+                uniq_idx = torch.unique(top_idx)
+                n_uniq = int(uniq_idx.numel())
+                if 0 < n_uniq < num_pages:
+                    p_act = _wy_kda_state_update(
+                        p_cur.index_select(1, uniq_idx),
+                        k_eff.index_select(1, uniq_idx),
+                        v_eff.index_select(1, uniq_idx),
+                        log_a.index_select(1, uniq_idx),
+                    )
+                    p_cur = p_cur.index_copy(1, uniq_idx, p_act)
+                else:
+                    p_cur = _wy_kda_state_update(p_cur, k_eff, v_eff, log_a)
+            else:
+                p_cur = _wy_kda_state_update(p_cur, k_eff, v_eff, log_a)
+
+            if g1 % chunk_size == 0:
+                ring_cur = (*ring_cur[1:], p_cur)
+
+        seg_out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
+        return seg_out, p_cur, ring_cur
+
     def _run_hssd_homog(
         adapter: _StandaloneHSSDAdapter,
         x_in: torch.Tensor,
@@ -2101,12 +2735,17 @@ else:
         init_dtype: torch.dtype,
         acc_dt: torch.dtype,
         ret_dt: torch.dtype,
+        rec_only: bool = False,
     ) -> tuple[torch.Tensor, _HSSDCacheState | None]:
         bsz, seq_len, _ = x_in.shape
         hv, dk, dv = adapter.num_v_heads, adapter.head_k_dim, adapter.head_v_dim
         if seq_len == 0:
             empty_o = query.new_zeros(bsz, 0, hv, dv, dtype=init_dtype)
-            return empty_o, (st.to(ret_dt).compact() if out_final else None)
+            if not out_final:
+                return empty_o, None
+            if st.dtype == ret_dt and st.theta_cum.dtype == torch.float64 and st.has_compact_storage():
+                return empty_o, st
+            return empty_o, st.to(ret_dt).compact()
 
         proj = adapter.project_inputs(x_in, query, key, value, g, beta, use_qk_l2norm=use_l2)
         c_size, w_chunks, m_pages, tk_pages = (
@@ -2115,129 +2754,340 @@ else:
             adapter.num_pages,
             adapter.k_pages,
         )
-        slp = _upcast(adapter.log_surprise_slope).exp().to(acc_dt).view(1, 1, hv)
-        thr = _upcast(adapter.surprise_thresh).to(acc_dt).view(1, 1, hv)
-        pscale_acc = proj["gamma_page_scale"].to(acc_dt).view(1, 1, m_pages, 1, 1)
+        slp = _upcast(adapter.log_surprise_slope).exp().to(acc_dt)
+        thr = _upcast(adapter.surprise_thresh).to(acc_dt)
+
+        if seq_len == 1:
+            o_1, st_1 = _recurrent_hssd_step(
+                proj["q"],
+                proj["k"],
+                proj["v"],
+                proj["gamma_page_scale"],
+                proj["gamma_chan_pair"],
+                proj["b_gate"],
+                proj["w_gate"],
+                proj["theta"],
+                proj["sb"],
+                slp,
+                thr,
+                proj["wl"],
+                proj["rl"],
+                proj["qs"],
+                proj["ks"],
+                proj["vs"],
+                st,
+                boltzmann_gate=adapter.boltzmann_gate,
+                top_k_pages=tk_pages,
+                write_mask=wmask,
+                scale=scale,
+                acc_dt=acc_dt,
+                target_dt=ret_dt,
+                use_swa=adapter.use_swa,
+                use_phase=adapter.use_phase,
+                use_surprise=adapter.use_surprise,
+                surprise_mode=adapter.surprise_mode,
+            )
+            return o_1.to(init_dtype), (st_1 if out_final else None)
+
+        if rec_only:
+            outs_r: list[torch.Tensor] = []
+            st_r = st
+            for i in range(seq_len):
+                sl_i = slice(i, i + 1)
+                wm_i = None if wmask is None else wmask[:, sl_i]
+                o_i, st_r = _recurrent_hssd_step(
+                    proj["q"][:, sl_i],
+                    proj["k"][:, sl_i],
+                    proj["v"][:, sl_i],
+                    proj["gamma_page_scale"],
+                    proj["gamma_chan_pair"][:, sl_i],
+                    proj["b_gate"][:, sl_i],
+                    proj["w_gate"][:, sl_i],
+                    proj["theta"][:, sl_i],
+                    proj["sb"][:, sl_i],
+                    slp,
+                    thr,
+                    proj["wl"][:, sl_i],
+                    proj["rl"][:, sl_i],
+                    proj["qs"][:, sl_i],
+                    proj["ks"][:, sl_i],
+                    proj["vs"][:, sl_i],
+                    st_r,
+                    boltzmann_gate=adapter.boltzmann_gate,
+                    top_k_pages=tk_pages,
+                    write_mask=wm_i,
+                    scale=scale,
+                    acc_dt=acc_dt,
+                    target_dt=ret_dt,
+                    use_swa=adapter.use_swa,
+                    use_phase=adapter.use_phase,
+                    use_surprise=adapter.use_surprise,
+                    surprise_mode=adapter.surprise_mode,
+                )
+                outs_r.append(o_i)
+            out_r = torch.cat(outs_r, dim=1).to(init_dtype)
+            return out_r, (st_r if out_final else None)
+
+        st_acc = st if st.dtype == acc_dt else st.to(device=query.device, dtype=acc_dt)
+        q_f = proj["q"].to(acc_dt)
+        k_f = proj["k"].to(acc_dt)
+        v_f = proj["v"].to(acc_dt)
+        ps_gamma = proj["gamma_page_scale"].to(device=query.device, dtype=acc_dt).clamp_min(0.0)
+        ch_gamma = proj["gamma_chan_pair"].to(device=query.device, dtype=acc_dt).clamp_min(0.0)
+        bf = proj["b_gate"].to(acc_dt)
+        wf = proj["w_gate"].to(acc_dt)
+        sb = proj["sb"].to(acc_dt)
+        wl = proj["wl"].to(acc_dt)
+        rl = proj["rl"].to(acc_dt)
+        qs = proj["qs"].to(acc_dt)
+        ks = proj["ks"].to(acc_dt)
+        vs = proj["vs"].to(acc_dt)
+
+        th64 = proj["theta"].to(dtype=torch.float64)
+        if wmask is not None:
+            wm = wmask.reshape(bsz, seq_len).to(device=query.device, dtype=acc_dt).clamp(0.0, 1.0)
+            valid_cur = wm > 0.5
+            th64 = th64 * wm.to(dtype=torch.float64).unsqueeze(-1).unsqueeze(-1)
+        else:
+            wm = None
+            valid_cur = torch.ones(bsz, seq_len, device=query.device, dtype=torch.bool)
+        if not adapter.use_phase:
+            th64 = torch.zeros_like(th64)
+
+        theta_cum_all = torch.remainder(
+            st_acc.theta_cum.to(dtype=torch.float64).unsqueeze(1) + torch.cumsum(th64, dim=1),
+            2.0 * math.pi,
+        )
         sc = (dk ** -0.5) if scale is None else float(scale)
-        max_win = st.max_swa_len
-        outs: list[torch.Tensor] = []
+        q_hat = _apply_2d_rotation(q_f, -theta_cum_all) if adapter.use_phase else q_f
+        if sc != 1.0:
+            q_hat = q_hat * sc
+        k_hat = _apply_2d_rotation(k_f, -theta_cum_all) if adapter.use_phase else k_f
 
-        for i in range(seq_len):
-            q_i = proj["q"][:, i : i + 1].to(acc_dt)
-            k_i = proj["k"][:, i : i + 1].to(acc_dt)
-            v_i = proj["v"][:, i : i + 1].to(acc_dt)
-            gcp_i = proj["gamma_chan_pair"][:, i : i + 1].to(acc_dt).repeat_interleave(2, dim=-1)
-            gam_i = (pscale_acc * gcp_i.unsqueeze(2)).clamp_min(0.0)
-            bf_i = proj["b_gate"][:, i : i + 1].to(acc_dt)
-            wf_i = proj["w_gate"][:, i : i + 1].to(acc_dt)
-            sb_i = proj["sb"][:, i : i + 1].to(acc_dt)
-            wl_i = proj["wl"][:, i : i + 1].to(acc_dt)
-            rl_i = proj["rl"][:, i : i + 1].to(acc_dt)
-            qs_i = proj["qs"][:, i : i + 1].to(acc_dt)
-            ks_i = proj["ks"][:, i : i + 1].to(acc_dt)
-            vs_i = proj["vs"][:, i : i + 1].to(acc_dt)
+        step_offset = int(st_acc.step_count[0].item())
+        max_win = st_acc.max_swa_len
+        _, _, swa_base_global = _disjoint_horizon_bounds(step_offset + 1, c_size, w_chunks)
+        if step_offset > swa_base_global:
+            prior_idx = torch.arange(swa_base_global, step_offset, device=query.device) % max_win
+            all_ks = torch.cat([st_acc.swa_k_ring.index_select(1, prior_idx), ks], dim=1)
+            all_vs = torch.cat([st_acc.swa_v_ring.index_select(1, prior_idx), vs], dim=1)
+            all_valid = torch.cat([st_acc.swa_valid_ring.index_select(1, prior_idx), valid_cur], dim=1)
+        else:
+            all_ks = ks
+            all_vs = vs
+            all_valid = valid_cur
 
-            if wmask is not None:
-                wm = wmask[:, i : i + 1].reshape(bsz, 1).to(device=query.device, dtype=acc_dt).clamp(0.0, 1.0)
-                valid_tok = wm.squeeze(1) > 0.5
+        gate_log_kappa = _upcast(adapter.boltzmann_gate.log_kappa).to(acc_dt)
+        gate_tau = _upcast(adapter.boltzmann_gate.tau).to(acc_dt)
+
+        all_chunks = _chunk_slices_for_span(step_offset, seq_len, c_size)
+        seg_step = max(1, int(adapter.segment_chunks))
+        need_grad = any(
+            isinstance(t, torch.Tensor) and t.requires_grad
+            for t in (
+                q_hat,
+                k_hat,
+                v_f,
+                ps_gamma,
+                ch_gamma,
+                bf,
+                wf,
+                sb,
+                slp,
+                thr,
+                wl,
+                rl,
+                qs,
+                all_ks,
+                all_vs,
+                gate_log_kappa,
+                gate_tau,
+                st_acc.page_states,
+            )
+        )
+        use_ckpt = bool(
+            adapter.checkpoint_segments and torch.is_grad_enabled() and need_grad and len(all_chunks) > seg_step
+        )
+
+        p_cur = st_acc.page_states
+        ring_cur = st_acc.boundary_ring
+        seg_outs: list[torch.Tensor] = []
+
+        for c_idx in range(0, len(all_chunks), seg_step):
+            c_group = all_chunks[c_idx : c_idx + seg_step]
+            l_start, l_end = c_group[0][0], c_group[-1][1]
+            g_first = step_offset + l_start
+            g_last = step_offset + l_end
+            _, _, grp_far_cut = _disjoint_horizon_bounds(g_first + 1, c_size, w_chunks)
+            s_lo = grp_far_cut - swa_base_global
+            s_hi = g_last - swa_base_global
+            rel_bounds = [(a - l_start, b - l_start) for a, b in c_group]
+
+            q_seg = q_hat[:, l_start:l_end]
+            k_seg = k_hat[:, l_start:l_end]
+            v_seg = v_f[:, l_start:l_end]
+            ch_seg = ch_gamma[:, l_start:l_end]
+            bf_seg = bf[:, l_start:l_end]
+            wf_seg = wf[:, l_start:l_end]
+            sb_seg = sb[:, l_start:l_end]
+            wl_seg = wl[:, l_start:l_end]
+            rl_seg = rl[:, l_start:l_end]
+            qs_seg = qs[:, l_start:l_end]
+            ks_seg = all_ks[:, s_lo:s_hi]
+            vs_seg = all_vs[:, s_lo:s_hi]
+            val_seg = all_valid[:, s_lo:s_hi]
+            wm_seg = None if wm is None else wm[:, l_start:l_end]
+
+            if use_ckpt:
+
+                def _ckpt_fn(
+                    qc: torch.Tensor,
+                    kc: torch.Tensor,
+                    vc: torch.Tensor,
+                    psc: torch.Tensor,
+                    chc: torch.Tensor,
+                    bfc: torch.Tensor,
+                    wfc: torch.Tensor,
+                    sbc: torch.Tensor,
+                    slpc: torch.Tensor,
+                    thrc: torch.Tensor,
+                    wlc: torch.Tensor,
+                    rlc: torch.Tensor,
+                    qsc: torch.Tensor,
+                    ksc: torch.Tensor,
+                    vsc: torch.Tensor,
+                    glk: torch.Tensor,
+                    gtau: torch.Tensor,
+                    pst: torch.Tensor,
+                    *ring_tensors: torch.Tensor,
+                    _rb: list[tuple[int, int]] = rel_bounds,
+                    _goff: int = g_first,
+                    _sbase: int = grp_far_cut,
+                    _val: torch.Tensor = val_seg,
+                    _wm: torch.Tensor | None = wm_seg,
+                ):
+                    o_g, p_n, r_n = _run_chunk_group(
+                        _rb,
+                        step_offset=_goff,
+                        swa_base_global=_sbase,
+                        chunk_size=c_size,
+                        window_chunks=w_chunks,
+                        num_pages=m_pages,
+                        top_k_pages=tk_pages,
+                        use_swa=adapter.use_swa,
+                        use_surprise=adapter.use_surprise,
+                        surprise_mode=adapter.surprise_mode,
+                        q_hat=qc,
+                        k_hat=kc,
+                        v=vc,
+                        gamma_page_scale=psc,
+                        gamma_chan_seg=chc,
+                        bf=bfc,
+                        wf=wfc,
+                        sb=sbc,
+                        slp=slpc,
+                        thr=thrc,
+                        wl=wlc,
+                        rl=rlc,
+                        qs=qsc,
+                        all_ks=ksc,
+                        all_vs=vsc,
+                        all_valid_swa=_val,
+                        wm=_wm,
+                        gate_log_kappa=glk,
+                        gate_tau=gtau,
+                        page_states=pst,
+                        boundary_ring=ring_tensors,
+                    )
+                    return (o_g, p_n, *r_n)
+
+                ckpt_out = checkpoint(
+                    _ckpt_fn,
+                    q_seg,
+                    k_seg,
+                    v_seg,
+                    ps_gamma,
+                    ch_seg,
+                    bf_seg,
+                    wf_seg,
+                    sb_seg,
+                    slp,
+                    thr,
+                    wl_seg,
+                    rl_seg,
+                    qs_seg,
+                    ks_seg,
+                    vs_seg,
+                    gate_log_kappa,
+                    gate_tau,
+                    p_cur,
+                    *ring_cur,
+                    use_reentrant=False,
+                )
+                o_grp, p_cur = ckpt_out[0], ckpt_out[1]
+                ring_cur = tuple(ckpt_out[2:])
             else:
-                wm = None
-                valid_tok = torch.ones(bsz, device=query.device, dtype=torch.bool)
+                o_grp, p_cur, ring_cur = _run_chunk_group(
+                    rel_bounds,
+                    step_offset=g_first,
+                    swa_base_global=grp_far_cut,
+                    chunk_size=c_size,
+                    window_chunks=w_chunks,
+                    num_pages=m_pages,
+                    top_k_pages=tk_pages,
+                    use_swa=adapter.use_swa,
+                    use_surprise=adapter.use_surprise,
+                    surprise_mode=adapter.surprise_mode,
+                    q_hat=q_seg,
+                    k_hat=k_seg,
+                    v=v_seg,
+                    gamma_page_scale=ps_gamma,
+                    gamma_chan_seg=ch_seg,
+                    bf=bf_seg,
+                    wf=wf_seg,
+                    sb=sb_seg,
+                    slp=slp,
+                    thr=thr,
+                    wl=wl_seg,
+                    rl=rl_seg,
+                    qs=qs_seg,
+                    all_ks=ks_seg,
+                    all_vs=vs_seg,
+                    all_valid_swa=val_seg,
+                    wm=wm_seg,
+                    gate_log_kappa=gate_log_kappa,
+                    gate_tau=gate_tau,
+                    page_states=p_cur,
+                    boundary_ring=ring_cur,
+                )
+            seg_outs.append(o_grp)
 
-            idx0 = int(st.step_count[0].item())
-            s_cstart_bank = st.page_states if (idx0 % c_size == 0) else st.boundary_ring[-1]
-            if adapter.use_phase:
-                th_i = proj["theta"][:, i : i + 1].to(torch.float64)
-                if wm is not None:
-                    th_i = th_i * wm.to(torch.float64).unsqueeze(-1).unsqueeze(-1)
-                theta_cum = torch.remainder(st.theta_cum + th_i.squeeze(1), 2.0 * math.pi)
-                q_hat = _apply_2d_rotation(q_i, -theta_cum.unsqueeze(1))
-                k_hat = _apply_2d_rotation(k_i, -theta_cum.unsqueeze(1))
-            else:
-                theta_cum = st.theta_cum
-                q_hat = q_i
-                k_hat = k_i
-            if sc != 1.0:
-                q_hat = q_hat * sc
-
-            # 1. Far-horizon top-k page readout from S_boundary[max(0, n - W)] == st.boundary_ring[0]
-            pi_r = F.softmax(rl_i, dim=-1)
-            tv_r, ti_r = torch.topk(pi_r, k=tk_pages, dim=-1)
-            tw_r = tv_r / tv_r.sum(dim=-1, keepdim=True).clamp_min(1e-30)
-            all_far = (q_hat.permute(0, 2, 1, 3).unsqueeze(1) @ st.boundary_ring[0]).permute(0, 3, 1, 2, 4)
-            gidx_r = ti_r.unsqueeze(-1).unsqueeze(-1).expand(bsz, 1, tk_pages, hv, dv)
-            o_far = (torch.gather(all_far, dim=2, index=gidx_r) * tw_r.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
-
-            # 2. Disjoint circular SWA ring update + optional PeakBoltzmannGate blend
-            slot_idx = torch.tensor([idx0 % max_win], device=query.device, dtype=torch.long)
-            swa_kr = st.swa_k_ring.index_copy(1, slot_idx, ks_i)
-            swa_vr = st.swa_v_ring.index_copy(1, slot_idx, vs_i)
-            swa_vl = st.swa_valid_ring.index_copy(1, slot_idx, valid_tok.unsqueeze(1))
-
-            if adapter.use_swa:
-                far_cut = max(0, (idx0 // c_size) - w_chunks) * c_size
-                win_idx = torch.arange(far_cut, idx0 + 1, device=query.device) % max_win
-                k_win = swa_kr.index_select(1, win_idx).transpose(1, 2)
-                v_win = swa_vr.index_select(1, win_idx).transpose(1, 2)
-                val_win = swa_vl.index_select(1, win_idx)[:, None, None, :]
-
-                scores = (qs_i.transpose(1, 2) @ k_win.transpose(-1, -2)) * (dk ** -0.5)
-                has_v = val_win.any(dim=-1)
-                safe_v = torch.where(has_v.unsqueeze(-1), val_win, torch.ones_like(val_win))
-                probs = torch.softmax(scores.masked_fill(~safe_v, float("-inf")), dim=-1)
-                probs = torch.where(has_v.unsqueeze(-1), probs, torch.zeros_like(probs))
-                o_loc = (probs @ v_win).transpose(1, 2)
-                p_hit = adapter.boltzmann_gate(scores, valid_mask=val_win).transpose(1, 2).unsqueeze(-1)
-                outs.append(p_hit * o_loc + (1.0 - p_hit) * o_far)
-            else:
-                outs.append(o_far)
-
-            # 3. Top-k write routing + multi-page chunk-start surprise s = g^2 + linear-beta DPLR update
-            pi_w = F.softmax(wl_i, dim=-1)
-            tv_w, ti_w = torch.topk(pi_w, k=tk_pages, dim=-1)
-            tw_w = tv_w / tv_w.sum(dim=-1, keepdim=True).clamp_min(1e-30)
-            tr_w = torch.sqrt(tw_w.clamp_min(1e-30))
-
-            if not adapter.use_surprise:
-                g_root = torch.ones(bsz, 1, hv, device=query.device, dtype=acc_dt)
-            else:
-                if adapter.surprise_mode == "routed":
-                    all_pred = (k_hat.permute(0, 2, 1, 3).unsqueeze(1) @ s_cstart_bank).permute(0, 3, 1, 2, 4)
-                    gidx_w = ti_w.unsqueeze(-1).unsqueeze(-1).expand(bsz, 1, tk_pages, hv, dv)
-                    pred_v = (torch.gather(all_pred, dim=2, index=gidx_w) * tw_w.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
-                else:
-                    pred_v = (k_hat.transpose(1, 2) @ s_cstart_bank[:, 0]).transpose(1, 2)
-                eps_err = _safe_norm(v_i - pred_v, dim=-1) / (_safe_norm(v_i, dim=-1) + 1e-6)
-                g_root = torch.sigmoid(slp * (eps_err - thr) + sb_i)
-            if wm is not None:
-                g_root = g_root * wm.unsqueeze(-1)
-
-            w_root = torch.zeros_like(pi_w).scatter(-1, ti_w, tr_w)
-            g_page = w_root.unsqueeze(-1) * g_root.unsqueeze(2)
-
-            ke = (g_page.unsqueeze(-1) * (_safe_sqrt(bf_i) * k_hat).unsqueeze(2)).squeeze(1)
-            ve = (g_page.unsqueeze(-1) * (_safe_sqrt(wf_i) * v_i).unsqueeze(2)).squeeze(1)
-            dec = (-(g_page * g_page).unsqueeze(-1) * gam_i).squeeze(1).exp().unsqueeze(-1) * st.page_states
-            mem = (ke.unsqueeze(-2) @ dec).squeeze(-2)
-            new_pages = dec + ke.unsqueeze(-1) * (ve - mem).unsqueeze(-2)
-
-            new_step = idx0 + 1
-            new_bring = (*st.boundary_ring[1:], new_pages) if new_step % c_size == 0 else st.boundary_ring
-
-            st = _HSSDCacheState(
-                step_count=new_step,
+        out = (seg_outs[0] if len(seg_outs) == 1 else torch.cat(seg_outs, dim=1)).to(init_dtype)
+        final_st: _HSSDCacheState | None = None
+        if out_final:
+            end_step = step_offset + seq_len
+            keep_from = max(swa_base_global, end_step - max_win)
+            rel_from = keep_from - swa_base_global
+            ring_slots = torch.arange(keep_from, end_step, device=query.device) % max_win
+            new_kr = _compact(st_acc.swa_k_ring.index_copy(1, ring_slots, all_ks[:, rel_from:]))
+            new_vr = _compact(st_acc.swa_v_ring.index_copy(1, ring_slots, all_vs[:, rel_from:]))
+            new_vl = _compact(st_acc.swa_valid_ring.index_copy(1, ring_slots, all_valid[:, rel_from:]))
+            term_theta = theta_cum_all[:, -1].clone().contiguous()
+            raw_final = _HSSDCacheState(
+                step_count=st_acc.step_count + seq_len,
                 chunk_size=c_size,
                 window_chunks=w_chunks,
-                page_states=new_pages,
-                theta_cum=theta_cum,
-                boundary_ring=new_bring,
-                swa_k_ring=swa_kr,
-                swa_v_ring=swa_vr,
-                swa_valid_ring=swa_vl,
+                page_states=_compact(p_cur),
+                theta_cum=term_theta,
+                boundary_ring=ring_cur,
+                swa_k_ring=new_kr,
+                swa_v_ring=new_vr,
+                swa_valid_ring=new_vl,
             )
-
-        out = torch.cat(outs, dim=1).to(init_dtype)
-        final_st = st.to(ret_dt).compact() if out_final else None
+            if raw_final.dtype == ret_dt and raw_final.has_compact_storage():
+                final_st = raw_final
+            else:
+                final_st = raw_final.to(ret_dt).compact()
         return out, final_st
 
     def _recurrent_hssd(
@@ -2250,6 +3100,7 @@ else:
         *args: Any,
         **kwargs: Any,
     ):
+        rec_only = bool(kwargs.pop("_rec_only", False))
         g = args[0] if len(args) >= 1 else kwargs.get("g")
         beta = args[1] if len(args) >= 2 else kwargs.get("beta")
         if not (isinstance(g, torch.Tensor) and isinstance(beta, torch.Tensor)):
@@ -2302,8 +3153,9 @@ else:
             for d in range(n_segs):
                 s0, s1 = int(cu_t[d].item()), int(cu_t[d + 1].item())
                 need_st = out_final and (d == n_segs - 1)
+                seg_dt = ret_dt if ((s1 - s0) <= 1 or rec_only) else acc_dt
                 z_st = _HSSDCacheState.zeros(
-                    1, m_pages, hv, dk, dv, chunk_size=c_size, window_chunks=w_chunks, device=query.device, dtype=acc_dt
+                    1, m_pages, hv, dk, dv, chunk_size=c_size, window_chunks=w_chunks, device=query.device, dtype=seg_dt
                 )
                 wm_d = None if wmask is None else wmask[:, s0:s1]
                 pm_d = None if pad_mask is None else pad_mask[:, s0:s1]
@@ -2322,6 +3174,7 @@ else:
                     scale=scale,
                     head_first=False,
                     pad_mask=pm_d,
+                    _rec_only=rec_only,
                 )
                 seg_outs.append(seg_o)
                 if need_st:
@@ -2349,6 +3202,7 @@ else:
                     end = pos + 1
                     while end < seq_len and int(srow[end].item()) == int(srow[pos].item()):
                         end += 1
+                    seg_dt_b = ret_dt if ((end - pos) <= 1 or rec_only) else acc_dt
                     z_b = _HSSDCacheState.zeros(
                         1,
                         m_pages,
@@ -2358,11 +3212,11 @@ else:
                         chunk_size=c_size,
                         window_chunks=w_chunks,
                         device=query.device,
-                        dtype=acc_dt,
+                        dtype=seg_dt_b,
                     )
                     if int(srow[pos].item()) < 0:
                         b_outs.append(query.new_zeros(1, end - pos, hv, dv, dtype=init_dtype))
-                        b_last = z_b.to(ret_dt).compact()
+                        b_last = z_b if z_b.dtype == ret_dt else z_b.to(ret_dt).compact()
                     else:
                         wm_s = None if wmask is None else wmask[b : b + 1, pos:end]
                         pm_s = None if pad_mask is None else pad_mask[b : b + 1, pos:end]
@@ -2381,6 +3235,7 @@ else:
                             scale=scale,
                             head_first=False,
                             pad_mask=pm_s,
+                            _rec_only=rec_only,
                         )
                         b_outs.append(o_seg)
                         b_last = st_seg
@@ -2407,6 +3262,7 @@ else:
                 out_s = out_s.transpose(1, 2)
             return out_s, (torch.cat(row_sts_s, dim=0) if out_final else None)
 
+        work_dt = ret_dt if (seq_len <= 1 or rec_only) else acc_dt
         st = _coerce_hssd_state(
             init_st,
             bsz=bsz,
@@ -2417,7 +3273,7 @@ else:
             c_size=c_size,
             w_chunks=w_chunks,
             device=query.device,
-            dtype=acc_dt,
+            dtype=work_dt,
         )
 
         pm_norm: torch.Tensor | None = None
@@ -2443,7 +3299,10 @@ else:
                 if valid_idx.numel() == 0:
                     row_outs.append(query.new_zeros(1, seq_len, hv, dv, dtype=init_dtype))
                     if out_final:
-                        row_states.append(st_b.to(ret_dt).compact())
+                        if st_b.dtype == ret_dt and st_b.has_compact_storage():
+                            row_states.append(st_b)
+                        else:
+                            row_states.append(st_b.to(ret_dt).compact())
                 else:
                     wm_b = None if wmask is None else wmask[b : b + 1].index_select(1, valid_idx)
                     o_val, st_b_out = _run_hssd_homog(
@@ -2462,6 +3321,7 @@ else:
                         init_dtype=init_dtype,
                         acc_dt=acc_dt,
                         ret_dt=ret_dt,
+                        rec_only=rec_only,
                     )
                     if valid_idx.numel() == seq_len:
                         row_outs.append(o_val)
@@ -2492,6 +3352,7 @@ else:
             init_dtype=init_dtype,
             acc_dt=acc_dt,
             ret_dt=ret_dt,
+            rec_only=rec_only,
         )
         if head_first:
             out = out.transpose(1, 2)
@@ -4110,6 +4971,7 @@ else:
                                 sb_r: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]] = st_box,
                                 ib: list[int] = in_h_box,
                                 ofn: Callable[..., Any] = orig_h_fn,
+                                ro_f: bool = rec_only,
                             ):
                                 def _hrule(q, k, v, *a, **kw):
                                     if ib[0] > 0:
@@ -4117,7 +4979,16 @@ else:
                                     ib[0] += 1
                                     try:
                                         return _recurrent_hssd(
-                                            ad_r, sb_r[-1][0], sb_r[-1][1], q, k, v, *a, pad_mask=sb_r[-1][2], **kw
+                                            ad_r,
+                                            sb_r[-1][0],
+                                            sb_r[-1][1],
+                                            q,
+                                            k,
+                                            v,
+                                            *a,
+                                            pad_mask=sb_r[-1][2],
+                                            _rec_only=ro_f,
+                                            **kw,
                                         )
                                     finally:
                                         ib[0] -= 1
@@ -4228,7 +5099,16 @@ else:
                                         cir[0] += 1
                                         try:
                                             return _recurrent_hssd(
-                                                cad, csb[-1][0], csb[-1][1], q, k, v, *a, pad_mask=csb[-1][2], **kw
+                                                cad,
+                                                csb[-1][0],
+                                                csb[-1][1],
+                                                q,
+                                                k,
+                                                v,
+                                                *a,
+                                                pad_mask=csb[-1][2],
+                                                _rec_only=_rec,
+                                                **kw,
                                             )
                                         finally:
                                             cir[0] -= 1

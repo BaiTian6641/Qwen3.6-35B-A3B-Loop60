@@ -1775,6 +1775,81 @@ def profile_hssd_layer(
     x_pre, q_pre, k_pre, v_pre = x_all[:, :seq_len], q_all[:, :seq_len], k_all[:, :seq_len], v_all[:, :seq_len]
     g_pre, beta_pre = g_all[:, :seq_len], beta_all[:, :seq_len]
 
+    if dev.type == "cuda":
+        adapter.eval()
+        w_len = min(int(seq_len), 128)
+        with torch.no_grad():
+            pw = adapter.project_inputs(
+                x_pre[:, :w_len],
+                q_pre[:, :w_len],
+                k_pre[:, :w_len],
+                v_pre[:, :w_len],
+                g_pre[:, :w_len],
+                beta_pre[:, :w_len],
+                use_qk_l2norm=True,
+            )
+            _, st_w = chunk_hssd(
+                pw["query"],
+                pw["key"],
+                pw["value"],
+                (pw["gamma_page_scale"], pw["gamma_chan_pair"]),
+                pw["b_gate"],
+                pw["w_gate"],
+                pw["theta"],
+                pw["surprise_bias"],
+                adapter.log_surprise_slope.exp(),
+                adapter.surprise_thresh,
+                pw["write_logits"],
+                pw["read_logits"],
+                pw["q_swa"],
+                pw["k_swa"],
+                pw["v_swa"],
+                boltzmann_gate=adapter.boltzmann_gate,
+                chunk_size=cfg.chunk_size,
+                window_chunks=cfg.window_chunks,
+                num_pages=cfg.num_pages,
+                top_k_pages=cfg.k_pages,
+                segment_chunks=cfg.segment_chunks,
+                checkpoint_segments=False,
+                initial_state=None,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=False,
+                state_dtype=cfg.state_dtype,
+                use_swa=cfg.use_swa,
+                use_phase=cfg.use_phase,
+                use_surprise=cfg.use_surprise,
+                surprise_mode=cfg.surprise_mode,
+            )
+            assert st_w is not None
+            recurrent_hssd_step(
+                pw["query"][:, :1],
+                pw["key"][:, :1],
+                pw["value"][:, :1],
+                (pw["gamma_page_scale"], pw["gamma_chan_pair"][:, :1]),
+                pw["b_gate"][:, :1],
+                pw["w_gate"][:, :1],
+                pw["theta"][:, :1],
+                pw["surprise_bias"][:, :1],
+                adapter.log_surprise_slope.exp(),
+                adapter.surprise_thresh,
+                pw["write_logits"][:, :1],
+                pw["read_logits"][:, :1],
+                pw["q_swa"][:, :1],
+                pw["k_swa"][:, :1],
+                pw["v_swa"][:, :1],
+                st_w,
+                boltzmann_gate=adapter.boltzmann_gate,
+                top_k_pages=cfg.k_pages,
+                use_qk_l2norm_in_kernel=False,
+                state_dtype=cfg.state_dtype,
+                use_swa=cfg.use_swa,
+                use_phase=cfg.use_phase,
+                use_surprise=cfg.use_surprise,
+                surprise_mode=cfg.surprise_mode,
+            )
+            del pw, st_w
+        _sync_if_cuda(dev)
+
     # 1. Full prefill
     adapter.eval()
     with torch.no_grad():

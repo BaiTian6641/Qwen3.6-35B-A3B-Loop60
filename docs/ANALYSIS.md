@@ -1,6 +1,13 @@
-# Qwen3.6-35B-A3B → 64 层 Looped Transformer：方案分析与工程落地
+# Qwen3.6-35B-A3B → Looped Hybrid Architecture：基线工程分析与 Loop-HSSD v3 演进导航
 
-本文档对应仓库 `Qwen3.6-35B-A3B-Loop60` 的实现。内容分三部分：原笔记与补充反馈的技术审查（哪些成立、哪些需要修正）、实际落地的架构（64 层循环 + mHC + MoR + D-LSA + ESFT/APOLLO/CCE），以及按风险排序的执行路线。
+> [!TIP]
+> **最新 `Loop-HSSD v3`（`Qwen3.6-35B-A6B-LoopHSSD`）正式技术规范与研究文档体系已发布于 `docs/`：**
+> - 📘 **[docs/ARCHITECTURE_SPEC.md](ARCHITECTURE_SPEC.md)**：最终主干改造规范（闭环 `v1` 全部 23 项与 `v2 Final-Pass Review` 全部 17 项审查意见 `A1–A6, B1–B6, C1–C2, E1–E3`；统一 `R=2` `64L` `~4.5B` 与 `R=3` `88L` **`~6.0B` (`35B-A6B`)** 动态跨趟专家扩展、`GDN-2 / HSSD v3` 双轨线性记忆升级，以及 `1M` GPU-FP8 主目标 + `10M` Host-DDR5 Block-64 Hadamard `INT4` 延展目标）。
+> - 🛠️ **[docs/IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)**：面向单卡 Colab Blackwell G4（`96 GB` VRAM / `230 GB` SSD）的分阶段实施路线图、模块级代码改造清单（`M1–M6`）与序列证伪门禁（`Gate -1` 至 `Gate 4`）。
+> - 📜 **[docs/RESEARCH_ESSAY.md](RESEARCH_ESSAY.md)**：正式学术研究论文（含复相位旋转 $\equiv$ 实数 `chunk_kda` 同构定理、Householder 累积写入质量衰减定律 $\exp(-\mathcal{B}/d_k)$、`1-bit QJL` 方差放大下界 $\approx 1.567\times$ 及 Block-64 Hadamard 与局部 mRoPE 交换律严格证明）。
+> - 🧪 **[tests/test_loop_hssd_v3_math.py](../tests/test_loop_hssd_v3_math.py)**：`Gate -1` 双精度（`float64`）零权重数学与反例证伪测试套件（`7/7` 通过）。
+
+本文档保留仓库 `Qwen3.6-35B-A3B-Loop60` 当前已落地基线代码（64 层循环 + mHC + MoR + GDN-2 + D-LSA + ESFT/APOLLO/CCE + HubSync）的工程审查记录。
 
 > [!IMPORTANT]
 > 结论先行：循环深度改造 **可行且已实现**，并且在玩具模型上逐项验证了不变量：初始化 bit 级等价、增量解码与整段前向一致、activation checkpoint 梯度一致。真正的不确定性有三个，分别是 **算力预算**（ETD 的收益来自 mid-training 量级的数据）、**NVFP4 冻结底座能否反向**，以及 **循环模型的高吞吐推理**（vLLM 不认识这个新结构）。这三点都在 S0 阶段用廉价探针先验证，确认后再投入大规模算力。

@@ -10,12 +10,17 @@ Retrofits **`Qwen/Qwen3.6-35B-A3B`** (`40` physical layers = `10 × [3 Gated Del
 - **1M Context YaRN + Distilled Latent Sparse Attention (`D-LSA`)**: Non-rotary (`192-d`) key head indexing with batched GPU Ward clustering, distilled at `128K` and evaluated sparse up to `1M` tokens.
 - **Zero-Drive HF Commit Sync & 230 GB Colab Disk Guard (`qloop.hub`)**: Adapted from [`Spark-X2.6-Recursion`](https://github.com/BaiTian6641/Spark-X2.6-Recursion), every stage commits compact trainable bundles (`~1–3 GB`), `manifest.json`, and an auto-rendered `README.md` Model Card to `TassP0lar/Qwen3.6-35B-A3B-Loop64` via `HF_TOKEN`, prunes superseded local checkpoints & HF upload staging caches, and auto-resumes across Colab 24h session resets.
 
-📄 **Detailed architecture & engineering review (Chinese): [docs/ANALYSIS.md](docs/ANALYSIS.md)**
+📄 **Formal Architecture, Implementation Plan & Research Documentation (`docs/`):**
+- 📘 **[Backbone Architecture Specification (`Loop-HSSD v3` / `35B-A6B`)](docs/ARCHITECTURE_SPEC.md)** — Definitive backbone modification blueprint closing all `v1` and `v2 Final-Pass Review` findings (`A1–A6, B1–B6, C1–C2, E1–E3`), scaling `Qwen3.6-35B-A3B` to `64L (~A4.5B)` and `88L (~A6.0B)` while reusing `>98.5%` frozen base weights.
+- 🛠️ **[Comprehensive Implementation & Kill-Gate Plan](docs/IMPLEMENTATION_PLAN.md)** — Module-by-module engineering roadmap (`M1–M6`), `Gate -1 -> Gate 4` falsification criteria, and calibrated Colab G4 (`96 GB` VRAM / `230 GB` SSD) budgets.
+- 📜 **[Formal Research Essay](docs/RESEARCH_ESSAY.md)** — Academic monograph with full proofs of Complex-to-Real `chunk_kda` Isomorphism, Cumulative Write-Mass Retention ($\exp(-\mathcal{B}/d_k)$), and `1-bit QJL` Variance Amplification vs. Block-64 Hadamard `INT4`.
+- 🧭 **[Baseline Engineering Review (Chinese)](docs/ANALYSIS.md)** — Detailed engineering audit of the currently shipped foundation stack.
 
 ## Guarantees Enforced by Unit Tests (`make check`)
 
 | Invariant | Test Suite |
 |---|---|
+| `Loop-HSSD v3` (`Gate -1`): Complex-to-Real KDA isomorphism, disjoint `[513, 576]` horizon (`0` overlap), smooth `s = g^2` chunk-start WY equivalence, write-budget law, `ReEntryBridge` + router unlock, QJL variance & Block-64 Hadamard-ReRoPE commutativity, and `34.661B` ledger + 2-pass multi-layer schedule (`fp64`) | `tests/test_loop_hssd_v3_math.py` |
 | Loop-wrapped + GDN-2 model is **bit-identical** to stock Qwen3.6 at step 0 (including `PassRouterAdapters`) | `tests/test_loop.py`, `tests/test_gdn2.py` |
 | NVIDIA GDN-2 chunkwise WY (`chunk_gdn2`) == sequential `recurrent_gdn2` in `fp64` (`1e-10` fwd / `1e-9` bwd) + MoR write-masked decode | `tests/test_gdn2.py` |
 | Multi-pass dynamic expert routing recruits distinct experts per pass & composes exactly with `HotExpertDeltas` + HF≥5 `TopKRouter` tuples | `tests/test_loop.py` |

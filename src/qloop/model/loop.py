@@ -39,6 +39,16 @@ from torch.utils.checkpoint import checkpoint
 from ._dtype import upcast
 from .introspect import FULL, LINEAR, attention_module, find_children, inspect_model, modules_with_layer_idx, router_of
 from .mhc import LoopBridge
+from .quant_autograd import (
+    _LINEAR_FP8_SCALE_ATTRS,
+    FP8_DTYPES,
+    _dequant_linear_weight,
+    _extract_block_size,
+    _first_tensor_attr,
+    _linear_in_out_features,
+    dequantize_fp8_tensor,
+    is_quantized_module,
+)
 
 log = logging.getLogger("qloop")
 
@@ -206,6 +216,12 @@ class SharedKVView:
     def __getitem__(self, idx: Any) -> Any:
         return object.__getattribute__(self, "_cache")[idx]
 
+    def __len__(self) -> int:
+        return len(object.__getattribute__(self, "_cache"))
+
+    def __bool__(self) -> bool:
+        return True
+
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         cache = object.__getattribute__(self, "_cache")
         if hasattr(cache, "dequantize") or type(cache).__name__ in ("QuantizedHybridCache", "_QuantizedKV"):
@@ -283,14 +299,7 @@ class PassRouterAdapters(nn.Module):
 
 
 def _linear_dims(mod: nn.Module) -> tuple[int, int]:
-    in_f = getattr(mod, "in_features", None)
-    out_f = getattr(mod, "out_features", None)
-    if isinstance(in_f, int) and isinstance(out_f, int):
-        return in_f, out_f
-    w = getattr(mod, "weight", None)
-    if isinstance(w, torch.Tensor) and w.ndim == 2:
-        return int(w.shape[1]), int(w.shape[0])
-    raise RuntimeError(f"cannot determine (in_features, out_features) on {type(mod).__name__}")
+    return _linear_in_out_features(mod)
 
 
 class _PassLoRAProj(nn.Module):
@@ -457,15 +466,16 @@ class VirtualLayer(nn.Module):
             else:
                 ctx.start[s.r] = x
                 x = ctl.adapters.bridge(x, ctx.anchor, s.r - 2)
-        pkv_key = (
-            "past_key_values"
-            if "past_key_values" in kwargs
-            else ("past_key_value" if "past_key_value" in kwargs else None)
-        )
+        pkv_key = next((k for k in ("past_key_values", "past_key_value", "cache") if k in kwargs), None)
         pkv = kwargs.get(pkv_key) if pkv_key is not None else None
         if s.vidx == 0 and pkv is not None:
             ctl._sync_cache_last_linear(pkv)
         if pkv is not None and s.cache_idx != s.vidx and pkv_key is not None:
+            pkv_layers = getattr(pkv, "layers", None)
+            if isinstance(pkv_layers, (list, tuple, nn.ModuleList)) and 0 <= s.vidx < len(pkv_layers):
+                v_lyr = pkv_layers[s.vidx]
+                if hasattr(v_lyr, "supports_early_init") and getattr(v_lyr, "keys", None) is None:
+                    v_lyr.supports_early_init = False
             kwargs = dict(kwargs)
             kwargs[pkv_key] = SharedKVView(pkv)
         r, idx_mods, cache_idx, inner = s.r, self._idx_mods, s.cache_idx, self.inner
@@ -578,6 +588,11 @@ class LoopController:
     def _sync_cache_last_linear(self, pkv: Any) -> None:
         if pkv is None or not isinstance(getattr(pkv, "last_linear_layer", None), int):
             return
+        n_virt = len(self.schedule)
+        for attr in ("conv_states", "recurrent_states", "key_cache", "value_cache"):
+            slots = getattr(pkv, attr, None)
+            if isinstance(slots, list) and len(slots) < n_virt:
+                slots.extend([None] * (n_virt - len(slots)))
         last_lin = self._last_active_linear_vidx()
         if last_lin is not None and pkv.last_linear_layer != last_lin:
             pkv.last_linear_layer = last_lin
@@ -589,6 +604,8 @@ class LoopController:
             pkv = kw.get("past_key_values")
             if pkv is None:
                 pkv = kw.get("past_key_value")
+            if pkv is None:
+                pkv = kw.get("cache")
             if pkv is not None:
                 self._sync_cache_last_linear(pkv)
 
@@ -756,14 +773,43 @@ class LoopController:
 
             # Tuple/list router (e.g. HF>=5 Qwen3_5MoeTopKRouter returning (probs, scores, indices))
             w_mod = getattr(mod, "weight", None)
-            if isinstance(w_mod, torch.Tensor) and w_mod.shape == (e, flat_x.shape[-1]):
-                b_mod = getattr(mod, "bias", None)
-                bias_up = upcast(b_mod) if isinstance(b_mod, torch.Tensor) else None
+            b_mod = getattr(mod, "bias", None)
+            bias_up = upcast(b_mod) if isinstance(b_mod, torch.Tensor) else None
+            acc_dt = torch.float64 if flat_x.dtype == torch.float64 else torch.float32
+            base_logits: torch.Tensor | None = None
+            is_fp8_w = isinstance(w_mod, torch.Tensor) and (
+                w_mod.dtype in FP8_DTYPES or "float8" in str(w_mod.dtype)
+            )
+            _, s_attr = _first_tensor_attr(mod, _LINEAR_FP8_SCALE_ATTRS)
+            if is_quantized_module(mod) or is_fp8_w or (
+                isinstance(w_mod, torch.Tensor) and w_mod.ndim == 2 and s_attr is not None
+            ):
+                w_deq: torch.Tensor | None = None
+                try:
+                    if is_quantized_module(mod):
+                        w_deq = _dequant_linear_weight(mod, dtype=acc_dt)
+                    elif isinstance(w_mod, torch.Tensor) and s_attr is not None:
+                        w_deq = dequantize_fp8_tensor(
+                            w_mod, s_attr, dtype=acc_dt, block_size=_extract_block_size(mod)
+                        )
+                except (RuntimeError, TypeError, ValueError):
+                    w_deq = None
+                if isinstance(w_deq, torch.Tensor) and w_deq.shape == (e, flat_x.shape[-1]):
+                    x_acc = upcast(flat_x).to(dtype=acc_dt)
+                    b_acc = bias_up.to(dtype=acc_dt) if bias_up is not None else None
+                    base_logits = F.linear(x_acc, w_deq, b_acc)
+            elif (
+                isinstance(w_mod, torch.Tensor)
+                and w_mod.is_floating_point()
+                and w_mod.shape == (e, flat_x.shape[-1])
+            ):
                 base_logits = F.linear(upcast(flat_x), upcast(w_mod), bias_up)
-            elif is_probs:
-                base_logits = upcast(full.reshape(-1, e)).clamp_min(1e-30).log()
-            else:
-                base_logits = upcast(full.reshape(-1, e))
+
+            if base_logits is None:
+                if is_probs:
+                    base_logits = upcast(full.reshape(-1, e)).clamp_min(1e-30).log()
+                else:
+                    base_logits = upcast(full.reshape(-1, e))
             new_logits = base_logits + delta.to(base_logits.dtype)
             probs_r = F.softmax(new_logits, dim=-1)
             top_w, top_idx = probs_r.topk(k, dim=-1)

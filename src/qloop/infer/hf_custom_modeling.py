@@ -1043,6 +1043,39 @@ else:
             return c.clone()
         return c
 
+    def _is_hssd_state_duck(obj: Any) -> bool:
+        return (
+            not isinstance(obj, torch.Tensor)
+            and hasattr(obj, "page_states")
+            and hasattr(obj, "boundary_ring")
+            and callable(getattr(obj, "_iter_tensors", None))
+        )
+
+    def _ensure_dynamo_mark_static_address_compat() -> None:
+        dynamo = getattr(torch, "_dynamo", None)
+        orig_fn = getattr(dynamo, "mark_static_address", None) if dynamo is not None else None
+        if not callable(orig_fn) or getattr(orig_fn, "_qloop_hssd_aware", False):
+            return
+
+        @functools.wraps(orig_fn)
+        def _hssd_mark_static_address(t: Any, *args: Any, **kwargs: Any) -> Any:
+            if _is_hssd_state_duck(t):
+                seen: set[int] = set()
+                for sub_t in t._iter_tensors():
+                    if isinstance(sub_t, torch.Tensor) and id(sub_t) not in seen:
+                        seen.add(id(sub_t))
+                        orig_fn(sub_t, *args, **kwargs)
+                return None
+            return orig_fn(t, *args, **kwargs)
+
+        forbid = getattr(dynamo, "forbid_in_graph", None)
+        wrapped = forbid(_hssd_mark_static_address) if callable(forbid) else _hssd_mark_static_address
+        wrapped._qloop_hssd_aware = True  # type: ignore[attr-defined]
+        wrapped._qloop_orig_mark_static_address = orig_fn  # type: ignore[attr-defined]
+        dynamo.mark_static_address = wrapped  # type: ignore[attr-defined]
+
+    _ensure_dynamo_mark_static_address_compat()
+
     def _resolve_state_dt(spec: Any, acc_dt: torch.dtype) -> torch.dtype:
         s = str(spec or "auto").strip().lower()
         if s in ("auto", ""):
@@ -1176,6 +1209,8 @@ else:
             if isinstance(step_count, torch.Tensor):
                 if step_count.ndim == 0:
                     sc_t = torch.full((bsz,), int(step_count.item()), dtype=torch.long, device=dev)
+                elif step_count.device == dev and step_count.dtype == torch.long and step_count.shape == (bsz,):
+                    sc_t = step_count
                 else:
                     sc_t = _compact(step_count.to(device=dev, dtype=torch.long).reshape(bsz))
             else:
@@ -1184,15 +1219,34 @@ else:
             self.chunk_size = int(chunk_size)
             self.window_chunks = int(window_chunks)
             self.page_states = page_states
-            self.theta_cum = _compact(theta_cum.to(device=dev, dtype=torch.float64))
+            self.theta_cum = (
+                theta_cum
+                if (theta_cum.device == dev and theta_cum.dtype == torch.float64)
+                else _compact(theta_cum.to(device=dev, dtype=torch.float64))
+            )
             self.boundary_ring = tuple(boundary_ring)
             self.swa_k_ring = swa_k_ring
             self.swa_v_ring = swa_v_ring
-            self.swa_valid_ring = swa_valid_ring.to(device=dev, dtype=torch.bool)
+            self.swa_valid_ring = (
+                swa_valid_ring
+                if (swa_valid_ring.device == dev and swa_valid_ring.dtype == torch.bool)
+                else swa_valid_ring.to(device=dev, dtype=torch.bool)
+            )
+
+        def __repr__(self) -> str:
+            return (
+                f"_HSSDCacheState(shape={tuple(self.shape)}, dtype={self.dtype}, "
+                f"theta_dtype={self.theta_cum.dtype}, step_count={self.step_count.tolist()}, "
+                f"chunk_size={self.chunk_size}, window_chunks={self.window_chunks})"
+            )
 
         @property
         def s_chunk_start(self) -> torch.Tensor:
             return self.boundary_ring[-1][:, 0]
+
+        @property
+        def s_chunk_start_bank(self) -> torch.Tensor:
+            return self.boundary_ring[-1]
 
         @property
         def step_count_int(self) -> int:
@@ -1209,6 +1263,12 @@ else:
         @property
         def ndim(self) -> int:
             return self.page_states.ndim
+
+        def dim(self) -> int:
+            return self.page_states.dim()
+
+        def __len__(self) -> int:
+            return int(self.page_states.shape[0])
 
         @property
         def dtype(self) -> torch.dtype:
@@ -1250,25 +1310,84 @@ else:
 
         def has_compact_storage(self) -> bool:
             for t in self._iter_tensors():
+                if not t.is_contiguous():
+                    return False
                 if t.numel() == 0:
+                    if int(t.untyped_storage().nbytes()) != 0 or int(t.storage_offset()) != 0:
+                        return False
                     continue
                 need = int(t.numel() * t.element_size())
                 if int(t.untyped_storage().nbytes()) != need or int(t.storage_offset()) != 0:
                     return False
             return True
 
-        def compact(self) -> _HSSDCacheState:
+        def is_contiguous(self) -> bool:
+            return all(t.is_contiguous() for t in self._iter_tensors())
+
+        def contiguous(self) -> _HSSDCacheState:
+            if self.has_compact_storage():
+                return self
+            memo: dict[tuple[int, int, tuple[int, ...], tuple[int, ...]], torch.Tensor] = {}
+
+            def _cp(t: torch.Tensor) -> torch.Tensor:
+                if t.numel() > 0:
+                    key = (
+                        int(t.untyped_storage().data_ptr()),
+                        int(t.storage_offset()),
+                        tuple(t.shape),
+                        tuple(t.stride()),
+                    )
+                    if key in memo:
+                        return memo[key]
+                    out_t = _compact(t)
+                    memo[key] = out_t
+                    return out_t
+                return _compact(t)
+
             return _HSSDCacheState(
                 step_count=_compact(self.step_count),
                 chunk_size=self.chunk_size,
                 window_chunks=self.window_chunks,
-                page_states=_compact(self.page_states),
+                page_states=_cp(self.page_states),
                 theta_cum=_compact(self.theta_cum),
-                boundary_ring=tuple(_compact(t) for t in self.boundary_ring),
+                boundary_ring=tuple(_cp(t) for t in self.boundary_ring),
                 swa_k_ring=_compact(self.swa_k_ring),
                 swa_v_ring=_compact(self.swa_v_ring),
                 swa_valid_ring=_compact(self.swa_valid_ring),
             )
+
+        def compact(self) -> _HSSDCacheState:
+            return self.contiguous()
+
+        def zero_(self) -> _HSSDCacheState:
+            seen_ptrs: set[int] = (
+                {int(self.page_states.untyped_storage().data_ptr())} if self.page_states.numel() > 0 else set()
+            )
+            fixed_ring: list[torch.Tensor] = []
+            unaliased = False
+            for ring_t in self.boundary_ring:
+                cur_t = ring_t
+                if cur_t.numel() > 0:
+                    ptr = int(cur_t.untyped_storage().data_ptr())
+                    if ptr in seen_ptrs:
+                        cur_t = torch.zeros_like(cur_t).contiguous()
+                        ptr = int(cur_t.untyped_storage().data_ptr())
+                        unaliased = True
+                    else:
+                        cur_t.zero_()
+                    seen_ptrs.add(ptr)
+                else:
+                    cur_t.zero_()
+                fixed_ring.append(cur_t)
+            if unaliased:
+                self.boundary_ring = tuple(fixed_ring)
+            self.step_count.zero_()
+            self.page_states.zero_()
+            self.theta_cum.zero_()
+            self.swa_k_ring.zero_()
+            self.swa_v_ring.zero_()
+            self.swa_valid_ring.zero_()
+            return self
 
         @classmethod
         def zeros(
@@ -1279,14 +1398,18 @@ else:
             dk: int,
             dv: int,
             *,
-            chunk_size: int,
-            window_chunks: int,
-            device: torch.device,
-            dtype: torch.dtype,
+            chunk_size: int = 64,
+            window_chunks: int = 8,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype = torch.float32,
+            distinct_ring_buffers: bool = False,
         ) -> _HSSDCacheState:
             ps = torch.zeros(bsz, num_pages, hv, dk, dv, device=device, dtype=dtype)
             th = torch.zeros(bsz, hv, dk // 2, device=device, dtype=torch.float64)
-            br = tuple(torch.zeros_like(ps) for _ in range(window_chunks + 1))
+            if distinct_ring_buffers:
+                br = tuple(torch.zeros_like(ps) for _ in range(window_chunks + 1))
+            else:
+                br = tuple(ps for _ in range(window_chunks + 1))
             mw = (window_chunks + 1) * chunk_size
             kr = torch.zeros(bsz, mw, hv, dk, device=device, dtype=dtype)
             vr = torch.zeros(bsz, mw, hv, dv, device=device, dtype=dtype)
@@ -1294,45 +1417,134 @@ else:
             sc = torch.zeros(bsz, device=device, dtype=torch.long)
             return cls(sc, int(chunk_size), int(window_chunks), ps, th, br, kr, vr, vlr)
 
+        @classmethod
+        def empty_like_state(
+            cls,
+            other: Any,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+        ) -> _HSSDCacheState:
+            dev = other.device if device is None else torch.device(device)
+            dt = other.dtype if dtype is None else dtype
+            bsz, mp, hv, dk, dv = other.page_states.shape
+            ps = torch.empty(bsz, mp, hv, dk, dv, device=dev, dtype=dt)
+            th = torch.empty(bsz, hv, dk // 2, device=dev, dtype=torch.float64)
+            br = tuple(torch.empty_like(ps) for _ in range(int(other.window_chunks) + 1))
+            mw = (int(other.window_chunks) + 1) * int(other.chunk_size)
+            kr = torch.empty(bsz, mw, hv, dk, device=dev, dtype=dt)
+            vr = torch.empty(bsz, mw, hv, dv, device=dev, dtype=dt)
+            vlr = torch.empty(bsz, mw, device=dev, dtype=torch.bool)
+            sc = torch.empty(bsz, device=dev, dtype=torch.long)
+            return cls(sc, int(other.chunk_size), int(other.window_chunks), ps, th, br, kr, vr, vlr)
+
+        @classmethod
+        def from_tensor(
+            cls,
+            state_tensor: torch.Tensor,
+            *,
+            num_pages: int = 8,
+            chunk_size: int = 64,
+            window_chunks: int = 8,
+        ) -> _HSSDCacheState:
+            st = _upcast(state_tensor)
+            if st.ndim == 4:
+                bsz, hv, dk, dv = st.shape
+                ps = st.unsqueeze(1).expand(bsz, num_pages, hv, dk, dv).clone().contiguous()
+            elif st.ndim == 5:
+                bsz, mp, hv, dk, dv = st.shape
+                if mp != num_pages:
+                    raise ValueError(f"expected {num_pages} state pages, got {mp}")
+                ps = st.clone().contiguous()
+            else:
+                raise ValueError(f"initial_state tensor must be 4D or 5D, got shape {tuple(st.shape)}")
+            base = cls.zeros(
+                bsz,
+                num_pages,
+                hv,
+                dk,
+                dv,
+                chunk_size=chunk_size,
+                window_chunks=window_chunks,
+                device=ps.device,
+                dtype=ps.dtype,
+            )
+            base.page_states = ps
+            base.boundary_ring = tuple(ps for _ in range(window_chunks + 1))
+            return base
+
         def to(self, *args: Any, **kwargs: Any) -> _HSSDCacheState:
-            probe = torch.empty(0, device=self.device, dtype=self.dtype).to(*args, **kwargs)
-            dev, dt = probe.device, probe.dtype
+            memo: dict[int, torch.Tensor] = {}
+            non_blocking = bool(kwargs.get("non_blocking", False))
+            ps = _compact(self.page_states.to(*args, **kwargs))
+            if self.page_states.numel() > 0:
+                memo[int(self.page_states.untyped_storage().data_ptr())] = ps
+            dev, dt = ps.device, ps.dtype
+
+            def _cv(t: torch.Tensor) -> torch.Tensor:
+                if t.numel() > 0:
+                    ptr = int(t.untyped_storage().data_ptr())
+                    if ptr in memo:
+                        return memo[ptr]
+                    out_t = _compact(t.to(device=dev, dtype=dt, non_blocking=non_blocking))
+                    memo[ptr] = out_t
+                    return out_t
+                return _compact(t.to(device=dev, dtype=dt, non_blocking=non_blocking))
+
             return _HSSDCacheState(
-                step_count=_compact(self.step_count.to(device=dev, dtype=torch.long)),
+                step_count=_compact(self.step_count.to(device=dev, dtype=torch.long, non_blocking=non_blocking)),
                 chunk_size=self.chunk_size,
                 window_chunks=self.window_chunks,
-                page_states=_compact(self.page_states.to(device=dev, dtype=dt)),
-                theta_cum=_compact(self.theta_cum.to(device=dev, dtype=torch.float64)),
-                boundary_ring=tuple(_compact(t.to(device=dev, dtype=dt)) for t in self.boundary_ring),
-                swa_k_ring=_compact(self.swa_k_ring.to(device=dev, dtype=dt)),
-                swa_v_ring=_compact(self.swa_v_ring.to(device=dev, dtype=dt)),
-                swa_valid_ring=_compact(self.swa_valid_ring.to(device=dev, dtype=torch.bool)),
+                page_states=ps,
+                theta_cum=_compact(self.theta_cum.to(device=dev, dtype=torch.float64, non_blocking=non_blocking)),
+                boundary_ring=tuple(_cv(t) for t in self.boundary_ring),
+                swa_k_ring=_compact(self.swa_k_ring.to(device=dev, dtype=dt, non_blocking=non_blocking)),
+                swa_v_ring=_compact(self.swa_v_ring.to(device=dev, dtype=dt, non_blocking=non_blocking)),
+                swa_valid_ring=_compact(
+                    self.swa_valid_ring.to(device=dev, dtype=torch.bool, non_blocking=non_blocking)
+                ),
             )
 
         def clone(self) -> _HSSDCacheState:
+            memo: dict[int, torch.Tensor] = {}
+
+            def _cl(t: torch.Tensor) -> torch.Tensor:
+                ptr = int(t.untyped_storage().data_ptr()) if t.numel() > 0 else id(t)
+                if ptr not in memo:
+                    memo[ptr] = t.clone().contiguous()
+                return memo[ptr]
+
             return _HSSDCacheState(
-                step_count=self.step_count.clone(),
+                step_count=self.step_count.clone().contiguous(),
                 chunk_size=self.chunk_size,
                 window_chunks=self.window_chunks,
-                page_states=self.page_states.clone(),
-                theta_cum=self.theta_cum.clone(),
-                boundary_ring=tuple(t.clone() for t in self.boundary_ring),
-                swa_k_ring=self.swa_k_ring.clone(),
-                swa_v_ring=self.swa_v_ring.clone(),
-                swa_valid_ring=self.swa_valid_ring.clone(),
+                page_states=_cl(self.page_states),
+                theta_cum=self.theta_cum.clone().contiguous(),
+                boundary_ring=tuple(_cl(t) for t in self.boundary_ring),
+                swa_k_ring=self.swa_k_ring.clone().contiguous(),
+                swa_v_ring=self.swa_v_ring.clone().contiguous(),
+                swa_valid_ring=self.swa_valid_ring.clone().contiguous(),
             )
 
         def detach(self) -> _HSSDCacheState:
+            memo: dict[int, torch.Tensor] = {}
+
+            def _dt(t: torch.Tensor) -> torch.Tensor:
+                ptr = int(t.untyped_storage().data_ptr()) if t.numel() > 0 else id(t)
+                if ptr not in memo:
+                    memo[ptr] = _compact(t.detach())
+                return memo[ptr]
+
             return _HSSDCacheState(
-                step_count=self.step_count.detach(),
+                step_count=_compact(self.step_count.detach()),
                 chunk_size=self.chunk_size,
                 window_chunks=self.window_chunks,
-                page_states=self.page_states.detach(),
-                theta_cum=self.theta_cum.detach(),
-                boundary_ring=tuple(t.detach() for t in self.boundary_ring),
-                swa_k_ring=self.swa_k_ring.detach(),
-                swa_v_ring=self.swa_v_ring.detach(),
-                swa_valid_ring=self.swa_valid_ring.detach(),
+                page_states=_dt(self.page_states),
+                theta_cum=_compact(self.theta_cum.detach()),
+                boundary_ring=tuple(_dt(t) for t in self.boundary_ring),
+                swa_k_ring=_compact(self.swa_k_ring.detach()),
+                swa_v_ring=_compact(self.swa_v_ring.detach()),
+                swa_valid_ring=_compact(self.swa_valid_ring.detach()),
             )
 
         def copy_(self, other: Any) -> _HSSDCacheState:
@@ -1340,14 +1552,23 @@ else:
                 raise TypeError(f"cannot copy_ from {type(other).__name__} into _HSSDCacheState")
             if len(self.boundary_ring) != len(other.boundary_ring):
                 raise ValueError("boundary_ring length mismatch in _HSSDCacheState.copy_")
-            seen_ptrs = {int(self.page_states.untyped_storage().data_ptr())}
+            seen_ptrs = (
+                {int(self.page_states.untyped_storage().data_ptr())} if self.page_states.numel() > 0 else set()
+            )
             unaliased_ring: list[torch.Tensor] = []
+            unaliased = False
             for t in self.boundary_ring:
-                ptr = int(t.untyped_storage().data_ptr())
-                t_ring = t.clone() if ptr in seen_ptrs else t
-                seen_ptrs.add(int(t_ring.untyped_storage().data_ptr()))
-                unaliased_ring.append(t_ring)
-            self.boundary_ring = tuple(unaliased_ring)
+                cur_t = t
+                if cur_t.numel() > 0:
+                    ptr = int(cur_t.untyped_storage().data_ptr())
+                    if ptr in seen_ptrs:
+                        cur_t = cur_t.clone().contiguous()
+                        ptr = int(cur_t.untyped_storage().data_ptr())
+                        unaliased = True
+                    seen_ptrs.add(ptr)
+                unaliased_ring.append(cur_t)
+            if unaliased:
+                self.boundary_ring = tuple(unaliased_ring)
             self.chunk_size = int(other.chunk_size)
             self.window_chunks = int(other.window_chunks)
             if isinstance(other.step_count, torch.Tensor):
@@ -1364,51 +1585,100 @@ else:
             self.swa_valid_ring.copy_(other.swa_valid_ring)
             return self
 
-        def __getitem__(self, idx: Any) -> _HSSDCacheState:
-            sel = slice(idx, idx + 1) if isinstance(idx, int) else idx
-            ps = _compact(self.page_states[sel])
-            if ps.ndim != 5:
-                raise IndexError(
-                    f"_HSSDCacheState batch indexing must preserve 5D page_states, got {tuple(ps.shape)}"
-                )
-            return _HSSDCacheState(
-                step_count=_compact(self.step_count[sel]),
-                chunk_size=self.chunk_size,
-                window_chunks=self.window_chunks,
-                page_states=ps,
-                theta_cum=_compact(self.theta_cum[sel]),
-                boundary_ring=tuple(_compact(t[sel]) for t in self.boundary_ring),
-                swa_k_ring=_compact(self.swa_k_ring[sel]),
-                swa_v_ring=_compact(self.swa_v_ring[sel]),
-                swa_valid_ring=_compact(self.swa_valid_ring[sel]),
-            )
-
         def index_select(self, dim: int, index: torch.Tensor) -> _HSSDCacheState:
-            if dim not in (0, -self.ndim):
+            d = dim if dim >= 0 else dim + self.ndim
+            if d != 0:
                 raise ValueError(f"_HSSDCacheState.index_select only supports batch dim 0, got dim={dim}")
             idx = index.to(device=self.device, dtype=torch.long)
+            memo: dict[int, torch.Tensor] = {}
+
+            def _sel(t: torch.Tensor) -> torch.Tensor:
+                if t.numel() > 0:
+                    ptr = int(t.untyped_storage().data_ptr())
+                    if ptr in memo:
+                        return memo[ptr]
+                    out_t = _compact(torch.index_select(t, 0, idx))
+                    memo[ptr] = out_t
+                    return out_t
+                return _compact(torch.index_select(t, 0, idx))
+
             return _HSSDCacheState(
                 step_count=_compact(torch.index_select(self.step_count, 0, idx)),
                 chunk_size=self.chunk_size,
                 window_chunks=self.window_chunks,
-                page_states=_compact(torch.index_select(self.page_states, 0, idx)),
+                page_states=_sel(self.page_states),
                 theta_cum=_compact(torch.index_select(self.theta_cum, 0, idx)),
-                boundary_ring=tuple(_compact(torch.index_select(t, 0, idx)) for t in self.boundary_ring),
+                boundary_ring=tuple(_sel(t) for t in self.boundary_ring),
                 swa_k_ring=_compact(torch.index_select(self.swa_k_ring, 0, idx)),
                 swa_v_ring=_compact(torch.index_select(self.swa_v_ring, 0, idx)),
                 swa_valid_ring=_compact(torch.index_select(self.swa_valid_ring, 0, idx)),
             )
 
+        def __getitem__(self, idx: Any) -> _HSSDCacheState:
+            if isinstance(idx, tuple):
+                rest = idx[1:]
+                if any(x is not Ellipsis and x != slice(None) for x in rest):
+                    raise IndexError("_HSSDCacheState indexing only supports batch dimension 0")
+                idx = idx[0]
+            if isinstance(idx, int):
+                bsz = len(self)
+                norm_i = idx if idx >= 0 else bsz + idx
+                if not 0 <= norm_i < bsz:
+                    raise IndexError(f"batch index {idx} out of range for batch size {bsz}")
+                return self.index_select(0, torch.tensor([norm_i], device=self.device, dtype=torch.long))
+            if isinstance(idx, slice):
+                indices = torch.arange(len(self), device=self.device, dtype=torch.long)[idx]
+                return self.index_select(0, indices)
+            if isinstance(idx, (list, tuple)):
+                return self.index_select(0, torch.tensor(idx, device=self.device, dtype=torch.long))
+            if isinstance(idx, torch.Tensor):
+                if idx.dtype == torch.bool:
+                    if idx.ndim != 1 or idx.shape[0] != len(self):
+                        raise IndexError("boolean batch mask must have shape [B]")
+                    indices = idx.to(device=self.device).nonzero(as_tuple=False).squeeze(-1)
+                    return self.index_select(0, indices)
+                return self.index_select(0, idx)
+            raise TypeError(f"Unsupported _HSSDCacheState index type: {type(idx).__name__}")
+
         def reorder_cache(self, beam_idx: torch.Tensor) -> _HSSDCacheState:
-            reordered = self.index_select(0, beam_idx)
-            self.step_count = reordered.step_count
-            self.page_states = reordered.page_states
-            self.theta_cum = reordered.theta_cum
-            self.boundary_ring = reordered.boundary_ring
-            self.swa_k_ring = reordered.swa_k_ring
-            self.swa_v_ring = reordered.swa_v_ring
-            self.swa_valid_ring = reordered.swa_valid_ring
-            return self
+            return self.index_select(0, beam_idx)
+
+        def repeat_interleave(
+            self,
+            repeats: int | torch.Tensor,
+            dim: int | None = 0,
+            *,
+            output_size: int | None = None,
+        ) -> _HSSDCacheState:
+            if dim is None:
+                raise ValueError("_HSSDCacheState.repeat_interleave requires explicit batch dim=0, got dim=None")
+            d = dim if dim >= 0 else dim + self.ndim
+            if d != 0:
+                raise ValueError(f"_HSSDCacheState.repeat_interleave only supports batch dim=0, got dim={dim}")
+            rep = repeats.to(device=self.device) if isinstance(repeats, torch.Tensor) else repeats
+            memo: dict[int, torch.Tensor] = {}
+
+            def _ri(t: torch.Tensor) -> torch.Tensor:
+                if t.numel() > 0:
+                    ptr = int(t.untyped_storage().data_ptr())
+                    if ptr in memo:
+                        return memo[ptr]
+                    out_t = _compact(t.repeat_interleave(rep, dim=0, output_size=output_size))
+                    memo[ptr] = out_t
+                    return out_t
+                return _compact(t.repeat_interleave(rep, dim=0, output_size=output_size))
+
+            return _HSSDCacheState(
+                step_count=_compact(self.step_count.repeat_interleave(rep, dim=0, output_size=output_size)),
+                chunk_size=self.chunk_size,
+                window_chunks=self.window_chunks,
+                page_states=_ri(self.page_states),
+                theta_cum=_compact(self.theta_cum.repeat_interleave(rep, dim=0, output_size=output_size)),
+                boundary_ring=tuple(_ri(t) for t in self.boundary_ring),
+                swa_k_ring=_compact(self.swa_k_ring.repeat_interleave(rep, dim=0, output_size=output_size)),
+                swa_v_ring=_compact(self.swa_v_ring.repeat_interleave(rep, dim=0, output_size=output_size)),
+                swa_valid_ring=_compact(self.swa_valid_ring.repeat_interleave(rep, dim=0, output_size=output_size)),
+            )
 
         def state_equal(self, other: Any, *, atol: float = 1e-5, rtol: float = 1e-4) -> bool:
             if not (hasattr(other, "page_states") and hasattr(other, "boundary_ring")):
@@ -1476,19 +1746,26 @@ else:
         ) -> Any:
             del types
             kw = {} if kwargs is None else dict(kwargs)
-            if func in (torch.zeros_like, torch.empty_like):
+            if func is torch.zeros_like:
                 src: _HSSDCacheState = args[0]
-                dt = kw.get("dtype") or src.dtype
-                dev = kw.get("device") or src.device
-                maker = torch.zeros if func is torch.zeros_like else torch.empty
-                ps = maker(src.page_states.shape, dtype=dt, device=dev)
-                th = torch.zeros(src.theta_cum.shape, dtype=torch.float64, device=dev)
-                br = tuple(maker(t.shape, dtype=dt, device=dev) for t in src.boundary_ring)
-                kr = maker(src.swa_k_ring.shape, dtype=dt, device=dev)
-                vr = maker(src.swa_v_ring.shape, dtype=dt, device=dev)
-                vlr = torch.zeros(src.swa_valid_ring.shape, dtype=torch.bool, device=dev)
-                sc = torch.zeros(src.step_count.shape, dtype=torch.long, device=dev)
-                return cls(sc, src.chunk_size, src.window_chunks, ps, th, br, kr, vr, vlr)
+                dt = src.dtype if kw.get("dtype") is None else kw["dtype"]
+                dev = src.device if kw.get("device") is None else torch.device(kw["device"])
+                bsz, mp, hv, dk, dv = src.page_states.shape
+                return cls.zeros(
+                    bsz,
+                    mp,
+                    hv,
+                    dk,
+                    dv,
+                    chunk_size=src.chunk_size,
+                    window_chunks=src.window_chunks,
+                    device=dev,
+                    dtype=dt,
+                    distinct_ring_buffers=True,
+                )
+            if func is torch.empty_like:
+                src = args[0]
+                return cls.empty_like_state(src, device=kw.get("device"), dtype=kw.get("dtype"))
             if func is torch.clone:
                 return args[0].clone()
             if func is torch.detach:
@@ -1498,6 +1775,11 @@ else:
                 dim = int(args[1]) if len(args) >= 2 else int(kw["dim"])
                 index = args[2] if len(args) >= 3 else kw["index"]
                 return src.index_select(dim, index)
+            if func is torch.repeat_interleave:
+                src = args[0]
+                repeats = kw["repeats"] if "repeats" in kw else args[1]
+                dim = kw.get("dim", args[2] if len(args) >= 3 else None)
+                return src.repeat_interleave(repeats, dim=dim, output_size=kw.get("output_size"))
             if func is torch.cat:
                 states = list(args[0])
                 dim = int(args[1]) if len(args) >= 2 else int(kw.get("dim", 0))
@@ -2510,6 +2792,12 @@ else:
         def __getitem__(self, idx: Any) -> Any:
             return object.__getattribute__(self, "_cache")[idx]
 
+        def __len__(self) -> int:
+            return len(object.__getattribute__(self, "_cache"))
+
+        def __bool__(self) -> bool:
+            return True
+
         def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int, *a: Any, **kw: Any) -> Any:
             cache = object.__getattribute__(self, "_cache")
             if hasattr(cache, "dequantize") or type(cache).__name__ in ("QuantizedHybridCache", "_QuantizedKV"):
@@ -2743,13 +3031,35 @@ else:
             if s.ndim == 0 or s.numel() == 1:
                 res = w * s.reshape(())
             elif s.ndim == 1:
-                res = w * (s[:, None] if s.shape[0] == m else s[None, :])
+                sn = int(s.shape[0])
+                if sn == m:
+                    res = w * s[:, None]
+                elif sn == k:
+                    res = w * s[None, :]
+                elif m == 1:
+                    bk = _st_infer_bdim(k, sn, h1)
+                    if k == sn * bk:
+                        res = (w.reshape(1, sn, bk) * s.reshape(1, sn, 1)).reshape(1, k)
+                    else:
+                        res = w * s.repeat_interleave(bk, dim=0)[:k].unsqueeze(0)
+                elif k == 1:
+                    bm = _st_infer_bdim(m, sn, h0)
+                    if m == sn * bm:
+                        res = (w.reshape(sn, bm, 1) * s.reshape(sn, 1, 1)).reshape(m, 1)
+                    else:
+                        res = w * s.repeat_interleave(bm, dim=0)[:m].unsqueeze(1)
+                else:
+                    raise ValueError(f"1D FP8 scale {tuple(s.shape)} incompatible with 2D weight {tuple(w.shape)}")
             else:
                 s0, s1 = int(s.shape[0]), int(s.shape[1])
                 if s0 in (1, m) and s1 in (1, k):
                     res = w * s
                 else:
                     b0, b1 = _st_infer_bdim(m, s0, h0), _st_infer_bdim(k, s1, h1)
+                    if math.ceil(m / b0) != s0 or math.ceil(k / b1) != s1:
+                        raise ValueError(
+                            f"2D FP8 scale {tuple(s.shape)} incompatible with weight {tuple(w.shape)}"
+                        )
                     if m == s0 * b0 and k == s1 * b1:
                         res = (w.reshape(s0, b0, s1, b1) * s.reshape(s0, 1, s1, 1)).reshape(m, k)
                     else:
@@ -3118,15 +3428,16 @@ else:
                     ctx["start"][r] = x
                     assert ow._loop_adapters is not None
                     x = ow._loop_adapters.bridge(x, ctx["anchor"], r - 2)
-            pkv_k = (
-                "past_key_values"
-                if "past_key_values" in kwargs
-                else ("past_key_value" if "past_key_value" in kwargs else None)
-            )
+            pkv_k = next((k for k in ("past_key_values", "past_key_value", "cache") if k in kwargs), None)
             pkv = kwargs.get(pkv_k) if pkv_k is not None else None
             if vidx == 0 and pkv is not None:
                 ow._sync_cache_last_linear(pkv)
             if pkv is not None and cidx != vidx and pkv_k is not None:
+                pkv_layers = getattr(pkv, "layers", None)
+                if isinstance(pkv_layers, (list, tuple, nn.ModuleList)) and 0 <= vidx < len(pkv_layers):
+                    v_lyr = pkv_layers[vidx]
+                    if hasattr(v_lyr, "supports_early_init") and getattr(v_lyr, "keys", None) is None:
+                        v_lyr.supports_early_init = False
                 kwargs = dict(kwargs)
                 kwargs[pkv_k] = _SharedKVProxy(pkv)
             prev = ow._cur_pass
@@ -3214,6 +3525,12 @@ else:
         def _sync_cache_last_linear(self, pkv: Any) -> None:
             if pkv is None or not isinstance(getattr(pkv, "last_linear_layer", None), int):
                 return
+            n_virt = len(self._slot_meta)
+            if n_virt > 0:
+                for attr in ("conv_states", "recurrent_states", "key_cache", "value_cache"):
+                    slots = getattr(pkv, attr, None)
+                    if isinstance(slots, list) and len(slots) < n_virt:
+                        slots.extend([None] * (n_virt - len(slots)))
             for vidx, r_slot, lt in reversed(self._slot_meta):
                 if lt == "linear_attention" and r_slot <= self.active_passes:
                     if pkv.last_linear_layer != vidx:
@@ -3299,6 +3616,9 @@ else:
                     attn.gdn2_adapter = ad
                     x_box: list[torch.Tensor] = []
                     in_g_box: list[int] = [0]
+                    if "_kernel_repo" in attn.__dict__ and "forward" in attn.__dict__:
+                        attn.__dict__.pop("forward", None)
+                        attn.__dict__.pop("_kernel_repo", None)
                     g_wc = False
                     g_wr = False
                     for attr, rec_only in rule_specs:
@@ -3402,6 +3722,7 @@ else:
 
             hcfg = dict(arch.get("hssd") or {})
             if hcfg.get("enabled"):
+                _ensure_dynamo_mark_static_address_compat()
                 for host_m in (self.backbone, tm):
                     pushed_box: list[bool] = []
 
@@ -3448,6 +3769,9 @@ else:
                     attn.hssd_adapter = had
                     st_box: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]] = []
                     in_h_box: list[int] = [0]
+                    if "_kernel_repo" in attn.__dict__ and "forward" in attn.__dict__:
+                        attn.__dict__.pop("forward", None)
+                        attn.__dict__.pop("_kernel_repo", None)
                     h_wc = False
                     h_wr = False
                     for attr, rec_only in rule_specs:
@@ -3768,6 +4092,8 @@ else:
                 pkv = kw.get("past_key_values")
                 if pkv is None:
                     pkv = kw.get("past_key_value")
+                if pkv is None:
+                    pkv = kw.get("cache")
                 if pkv is not None:
                     self._sync_cache_last_linear(pkv)
 
@@ -3868,14 +4194,47 @@ else:
                     return new_out
 
                 w_mod = getattr(mod, "weight", None)
-                if isinstance(w_mod, torch.Tensor) and w_mod.shape == (e, flat_x.shape[-1]):
-                    b_mod = getattr(mod, "bias", None)
-                    b_up = _upcast(b_mod) if isinstance(b_mod, torch.Tensor) else None
+                b_mod = getattr(mod, "bias", None)
+                b_up = _upcast(b_mod) if isinstance(b_mod, torch.Tensor) else None
+                acc_dt = torch.float64 if flat_x.dtype == torch.float64 else torch.float32
+                base_l: torch.Tensor | None = None
+                q_kind = _st_quant_kind(mod)
+                is_fp8_w = isinstance(w_mod, torch.Tensor) and (
+                    w_mod.dtype in _FP8_DTYPES or "float8" in str(w_mod.dtype)
+                )
+                _, s_attr = _st_first_tensor(mod, _ST_LIN_S_ATTRS)
+                if q_kind in ("linear_fp8", "linear_nvfp4") or is_fp8_w or (
+                    isinstance(w_mod, torch.Tensor) and w_mod.ndim == 2 and s_attr is not None
+                ):
+                    w_deq: torch.Tensor | None = None
+                    try:
+                        if q_kind in ("linear_fp8", "linear_nvfp4"):
+                            w_deq = _st_deq_lin(mod, acc_dt)
+                        elif isinstance(w_mod, torch.Tensor):
+                            s_res = (
+                                s_attr
+                                if s_attr is not None
+                                else _st_resolve_fp8_scale(mod, w_mod, _ST_LIN_S_ATTRS, "lin")
+                            )
+                            w_deq = _st_deq_fp8(w_mod, s_res, acc_dt, _st_bsize_of(mod))
+                    except (RuntimeError, TypeError, ValueError):
+                        w_deq = None
+                    if isinstance(w_deq, torch.Tensor) and w_deq.shape == (e, flat_x.shape[-1]):
+                        x_acc = _upcast(flat_x).to(dtype=acc_dt)
+                        b_acc = b_up.to(dtype=acc_dt) if b_up is not None else None
+                        base_l = F.linear(x_acc, w_deq, b_acc)
+                elif (
+                    isinstance(w_mod, torch.Tensor)
+                    and w_mod.is_floating_point()
+                    and w_mod.shape == (e, flat_x.shape[-1])
+                ):
                     base_l = F.linear(_upcast(flat_x), _upcast(w_mod), b_up)
-                elif is_probs:
-                    base_l = _upcast(full.reshape(-1, e)).clamp_min(1e-30).log()
-                else:
-                    base_l = _upcast(full.reshape(-1, e))
+
+                if base_l is None:
+                    if is_probs:
+                        base_l = _upcast(full.reshape(-1, e)).clamp_min(1e-30).log()
+                    else:
+                        base_l = _upcast(full.reshape(-1, e))
                 new_l = base_l + delta.to(base_l.dtype)
                 pr = F.softmax(new_l, dim=-1)
                 top_w, top_idx = pr.topk(top_k, dim=-1)

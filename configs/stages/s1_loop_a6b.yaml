@@ -1,0 +1,85 @@
+# Gate 0b (S1 v3) - Subspace-Aligned Sandwich Loop Healing & Dynamic A6B Expansion (R=2 64L -> R=3 88L).
+# Architecture: Prelude [0,8) x1 + Core [8,32) xR + Coda [32,40) x1 (64L @ R=2 ~4.46B active; 88L @ R=3 ~5.97B active).
+# Step-0 bit-identity is guaranteed by zero-init PassExitGate (`gate_init: 0.0`) while ReEntryBridge (`bridge_rank: 256`,
+# `bridge_mode: subspace`, `bridge_init: [0.05, 0.85, 0.10]` -> w_anchor=0.85) provides live step-1 gradients (Fixes A1-A3).
+# Track-A GDN-2 upgrades all 30 linear layers bit-identically; all 32.338B routed/shared MoE experts stay 100% frozen.
+_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+stage: s1_loop_a6b
+stage_type: lm
+run: {name: s1_loop_a6b}
+
+loop:
+  enabled: true
+  prelude_end: 8
+  core_end: 32
+  num_passes: 3
+  target_virtual_layers: 88
+  kv_share: true                        # Fix A5: Pass 2/3 reuse Pass-1 K/V (1.0x KV RAM) + untied Q/O LoRA
+  bridge_init: [0.05, 0.85, 0.10]       # STREAMS = (h_prev, anchor, h_prev_rms_matched) => w_anchor = 0.85
+  bridge_rank: 256                      # Fix A3: rank-256 ReEntryBridge subspace alignment adapter
+  bridge_mode: subspace                 # v3 RMSNorm -> orthogonal down -> SiLU -> scaled normal up
+  bridge_up_std: 0.01                   # Fix A2: non-vanishing step-1 exit-gate gradient
+  attn_adapter_rank: 64                 # Fix A5: per-(pass>=2, core full-attn) rank-64 LoRA on q_proj & o_proj
+  step_embedding: true
+  gate_init: 0.0                        # exact IEEE-754 bit-identity at step 0 (`x + 0 * delta == x`)
+  per_pass_router: true                 # Fix A1 / Decision 3: task-driven PassRouterAdapters
+  router_adapter_rank: 32
+  router_repel_init: 0.0
+  router_diversity_weight: 0.0          # purely task-driven expert specialization (no artificial overlap penalty)
+  mor: false
+  write_mask: true
+  checkpoint: true
+  train_pass_probs: [0.15, 0.50, 0.35]  # single checkpoint serves R=1 (40L), R=2 (64L), and R=3 (88L A6B)
+
+gdn2:
+  enabled: true
+  rank: 64
+  chunk_size: 64
+  segment_chunks: 16
+  checkpoint_segments: true
+  gate_logit_cap: 8.0
+  decay_log_cap: 1.0
+
+hssd:
+  enabled: false                        # Track-B HSSD v3 activates in Gate 1 (`s1b_hssd_distill.yaml`)
+
+lsa:
+  enabled: false
+
+experts:
+  enabled: false                        # 100% frozen MoE experts (SHA-256 checksum verified before/after stage)
+
+train:
+  steps: 1000                           # 1000 x 16 x 8192 ≈ 131M tokens (~14-17h on single Colab G4 Blackwell)
+  micro_batch: 1
+  grad_accum: 16
+  sha256_frozen_experts: true
+  train_loop_adapters: true
+  train_gdn2: true
+  trainable:
+    - "self_attn\\.(q_norm|k_norm)"
+    - "input_layernorm|post_attention_layernorm"
+  allowed_groups: [loop_adapters, gdn2_adapters, attention, norms]
+  aux_weights: {loop_aux: 1.0}
+  optim:
+    lr: 3.0e-5
+    warmup_steps: 50
+    lr_mult:
+      loop_adapters: 20.0
+      gdn2_adapter: 5.0
+
+data:
+  seq_len: 8192
+  respect_doc_boundaries: true
+  sources:
+    - {name: openthoughts3, weight: 0.25}
+    - {name: nemotron_post, weight: 0.20}
+    - {name: finepdfs_mix, weight: 0.25}
+    - {name: fineweb_edu, weight: 0.15}
+    - {name: fable51, weight: 0.10}
+    - {name: opus46_3000x, weight: 0.05}
+  decontaminate: {enabled: true, ngram: 13, groups: [aime_2026, gpqa, hle, arc_agi_2, kernelbench], on_missing: warn}
+
+eval_quick:
+  n_batches: 16
+  depths: [1, 2, 3]

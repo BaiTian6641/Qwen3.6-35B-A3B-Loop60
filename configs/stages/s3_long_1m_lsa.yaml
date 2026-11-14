@@ -1,0 +1,128 @@
+# Gate 2a (S3 v3) - 1M GPU-Resident FP8 SharedKV + Per-Pass D-LSA + Long-Prefix / Short-Suffix Calibration.
+# Resolves Fix C1 & Decision 1/2:
+#   * 1M primary context (`1,048,576` tokens = `10.00 GiB` GPU FP8 KV + `320 MiB` GPU Ward centroids at 1.0x SharedKV)
+#   * Untied per-pass query indexers `W_q_idx^(r)` (`num_query_passes: 3`) with shared `W_k_idx` & Ward buckets
+#   * Smooth DCA / ReRoPE distance clamping (`pos_rerope`) keeping [0:64] rotary angles inside pretrained [0, 262K] arc
+#   * `prefix_suffix_calibration_step`: streams 512K-992K prefix tokens under `torch.no_grad()` to populate true 1M-scale
+#     FP8 KV + centroids, then backpropagates gradients on the final 32K query/answer suffix (`< 64 GiB` HBM on G4!).
+#   * Includes optional Tier-2 10M Host-DDR5 Block-64 Walsh-Hadamard INT4 offload config (`offload.enabled: false`).
+_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+stage: s3_long_1m_lsa
+stage_type: lm
+run: {name: s3_long_1m_lsa}
+
+model:
+  yarn_target_len: 1048576
+
+loop:
+  enabled: true
+  prelude_end: 8
+  core_end: 32
+  num_passes: 3
+  target_virtual_layers: 88
+  kv_share: true                        # 1.0x KV memory across all passes R in {1, 2, 3}
+  bridge_init: [0.05, 0.85, 0.10]
+  bridge_rank: 256
+  bridge_mode: subspace
+  bridge_up_std: 0.01
+  attn_adapter_rank: 64
+  step_embedding: true
+  gate_init: 0.0
+  per_pass_router: true
+  router_adapter_rank: 32
+  router_repel_init: 0.0
+  router_diversity_weight: 0.0
+  checkpoint: true
+  train_pass_probs: [0.15, 0.50, 0.35]
+
+gdn2:
+  enabled: false
+
+hssd:
+  enabled: true
+  chunk_size: 64
+  window_chunks: 8
+  num_pages: 8
+  k_pages: 2
+  budget_weight: 1.0
+  segment_chunks: 16
+  checkpoint_segments: true
+
+lsa:
+  enabled: true
+  mode: distill
+  num_query_passes: 3                   # untied W_q_idx^(r) for Passes 1..3; shared W_k_idx & Ward centroids
+  index_dim: 64
+  index_on: nope                        # indexes strictly the 192 position-free NoPE dims [64:256]
+  pool: 4
+  block_size: 512
+  avg_bucket_keys: 8
+  max_bucket_keys: 32
+  num_select: 64
+  window: 512
+  sinks: 64
+  search: flat
+  temperature: 0.1
+  distill_weight: 1.0
+  distill_query_frac: 0.0625
+  query_chunk: 256
+
+rerope:
+  enabled: true                         # calibrated via Gate 0p-3 shootout (`yarn` vs `rerope`)
+  linear_ceil: 131072
+  log_scale: 32768
+  max_pos: 240000
+  rotary_dim: 64
+
+long_calib:
+  enabled: true                         # Fix C1: Long-Prefix (`no_grad`) + Short-Suffix (`grad`) calibration
+  prefix_len: 524288                    # 512K-992K streamed prefix under `torch.no_grad()` (`use_cache=True`)
+  max_prefix_len: 1015808               # 992K prefix + 32K suffix = 1,048,576 (1M) tokens
+  suffix_len: 32768                     # 32K differentiable suffix training QK-Norm, attn gates, Q/O LoRA & D-LSA
+  chunk_size: 4096
+  fp8_kv_cache: true                    # Tier-1 10.00 GiB GPU FP8 E4M3 KV cache
+
+offload:
+  enabled: false                        # Gate 2b Stretch: toggle `-s offload.enabled=true` for 10M Host-DDR5 INT4
+  block_size: 64                        # Fix C2: Block-Diagonal H_64 keeps [0:64] mRoPE orthogonal to [64:256] NoPE
+  micro_page_tokens: 4                  # Theorem 3: exact 2,304 B 4-token Group-64 INT4 micro-page (53.64 GiB @ 10M)
+  prefetch_layers_ahead: 3              # async PCIe 5.0 prefetch hidden behind 3 preceding HSSD+MoE layers
+  pin_memory: true
+
+experts:
+  enabled: false
+
+train:
+  init_from: runs/s1b_hssd_distill      # override `-s train.init_from=runs/s1_loop_a6b` if keeping Track-A GDN-2
+  steps: 800                            # 40M tokens @ 64K-128K + prefix/suffix calibration (~8-12h on Colab G4)
+  micro_batch: 1
+  grad_accum: 2
+  sha256_frozen_experts: true
+  train_hssd: false                     # carry forward healed HSSD/GDN-2 weights; train read-side & D-LSA only
+  train_gdn2: false
+  train_loop_adapters: true
+  train_lsa: true
+  trainable:
+    - "self_attn\\.(q_norm|k_norm)"
+  allowed_groups: [loop_adapters, lsa_indexers, attention, norms]
+  aux_weights: {loop_aux: 1.0, lsa_kl: 1.0}
+  optim:
+    lr: 1.0e-4
+    warmup_steps: 40
+    lr_mult:
+      lsa_indexer: 10.0
+      loop_adapters: 5.0
+
+data:
+  seq_len: 65536
+  respect_doc_boundaries: false
+  sources:
+    - {name: finepdfs_mix, weight: 0.45}
+    - {name: fineweb_edu, weight: 0.25}
+    - {name: openthoughts3, weight: 0.15}
+    - {name: fable51, weight: 0.15}
+  decontaminate: {enabled: false}
+
+eval_quick:
+  n_batches: 4
+  depths: [1, 2, 3]

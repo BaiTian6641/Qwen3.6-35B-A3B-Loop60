@@ -208,10 +208,12 @@ class _FP8Slot:
         return int(self.q_data.shape[-2])
 
     def nbytes(self) -> int:
-        return int(
-            self.q_data.numel() * self.q_data.element_size()
-            + self.scale.numel() * self.scale.element_size()
-        )
+        return _tensor_tree_bytes((self.q_data, self.scale), set())
+
+    def reorder_cache(self, beam_idx: torch.Tensor) -> None:
+        idx = beam_idx.to(device=self.q_data.device, dtype=torch.long)
+        self.q_data = self.q_data.index_select(0, idx).contiguous()
+        self.scale = self.scale.index_select(0, idx).contiguous()
 
 
 @dataclass
@@ -260,10 +262,12 @@ class _HadamardINT4Slot:
         return int(self.packed.shape[2])
 
     def nbytes(self) -> int:
-        return int(
-            self.packed.numel() * self.packed.element_size()
-            + self.scale.numel() * self.scale.element_size()
-        )
+        return _tensor_tree_bytes((self.packed, self.scale), set())
+
+    def reorder_cache(self, beam_idx: torch.Tensor) -> None:
+        idx = beam_idx.to(device=self.packed.device, dtype=torch.long)
+        self.packed = self.packed.index_select(0, idx).contiguous()
+        self.scale = self.scale.index_select(0, idx).contiguous()
 
 
 class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
@@ -287,12 +291,12 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
             if "full_attention" in self.layer_types
             else 0
         )
-        self._k_slots: list[ Any ] = [None] * self.num_layers
-        self._v_slots: list[ Any ] = [None] * self.num_layers
+        self._k_slots: list[Any] = [None] * self.num_layers
+        self._v_slots: list[Any] = [None] * self.num_layers
         self.key_cache: list[torch.Tensor | None] = [None] * self.num_layers
         self.value_cache: list[torch.Tensor | None] = [None] * self.num_layers
         self.conv_states: list[torch.Tensor | None] = [None] * self.num_layers
-        self.recurrent_states: list[torch.Tensor | None] = [None] * self.num_layers
+        self.recurrent_states: list[Any] = [None] * self.num_layers
 
     def _encode_slot(self, x: torch.Tensor) -> Any:
         if self.mode == "fp8":
@@ -357,22 +361,51 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
         kc = self.key_cache[idx]
         return 0 if kc is None else int(kc.shape[-2])
 
-    def kv_bytes(self) -> int:
-        if self.mode in ("fp8", "hadamard_int4"):
-            tot = 0
-            for ks, vs in zip(self._k_slots, self._v_slots):
-                if ks is not None:
-                    tot += ks.nbytes()
-                if vs is not None:
-                    tot += vs.nbytes()
-            return tot
-        tot = 0
-        for kt, vt in zip(self.key_cache, self.value_cache):
+    def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+        """Reorder hybrid quantized KV slots, conv states, and recurrent (`HSSDCacheState`/Tensor) states."""
+        for i in range(self.num_layers):
+            ks = self._k_slots[i]
+            if ks is not None:
+                ks.reorder_cache(beam_idx)
+            vs = self._v_slots[i]
+            if vs is not None:
+                vs.reorder_cache(beam_idx)
+            kt = self.key_cache[i]
             if isinstance(kt, torch.Tensor):
-                tot += int(kt.numel() * kt.element_size())
+                self.key_cache[i] = kt.index_select(0, beam_idx.to(device=kt.device, dtype=torch.long)).contiguous()
+            vt = self.value_cache[i]
             if isinstance(vt, torch.Tensor):
-                tot += int(vt.numel() * vt.element_size())
-        return tot
+                self.value_cache[i] = vt.index_select(0, beam_idx.to(device=vt.device, dtype=torch.long)).contiguous()
+            cs = self.conv_states[i]
+            if isinstance(cs, torch.Tensor):
+                self.conv_states[i] = cs.index_select(0, beam_idx.to(device=cs.device, dtype=torch.long)).contiguous()
+            rs = self.recurrent_states[i]
+            if rs is not None:
+                if hasattr(rs, "reorder_cache") and callable(rs.reorder_cache):
+                    new_rs = rs.reorder_cache(beam_idx)
+                    if new_rs is not None:
+                        self.recurrent_states[i] = new_rs
+                elif isinstance(rs, torch.Tensor):
+                    self.recurrent_states[i] = rs.index_select(
+                        0, beam_idx.to(device=rs.device, dtype=torch.long)
+                    ).contiguous()
+                else:
+                    self.recurrent_states[i] = torch.index_select(rs, 0, beam_idx)
+
+    def reset(self) -> None:
+        """Clear all cached KV slots, conv states, and recurrent states across all layers."""
+        self._k_slots = [None] * self.num_layers
+        self._v_slots = [None] * self.num_layers
+        self.key_cache = [None] * self.num_layers
+        self.value_cache = [None] * self.num_layers
+        self.conv_states = [None] * self.num_layers
+        self.recurrent_states = [None] * self.num_layers
+
+    def kv_bytes(self) -> int:
+        seen: set[int] = set()
+        if self.mode in ("fp8", "hadamard_int4"):
+            return _tensor_tree_bytes((*self._k_slots, *self._v_slots), seen)
+        return _tensor_tree_bytes((*self.key_cache, *self.value_cache), seen)
 
     def recurrent_bytes(self) -> int:
         seen: set[int] = set()
@@ -380,23 +413,32 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
 
 
 def _tensor_tree_bytes(obj: Any, seen_ptrs: set[int]) -> int:
-    """Accumulate unique storage bytes across nested tensors, tuples/lists, dicts, and `HSSDCacheState`."""
+    """Accumulate unique backing-storage bytes across nested tensors, sequences, dicts, and `HSSDCacheState`."""
     if obj is None:
         return 0
     if isinstance(obj, torch.Tensor):
         if obj.numel() == 0:
             return 0
-        ptr = int(obj.untyped_storage().data_ptr())
+        st = obj.untyped_storage()
+        ptr = int(st.data_ptr())
         if ptr in seen_ptrs:
             return 0
         seen_ptrs.add(ptr)
-        return int(obj.numel() * obj.element_size())
+        return int(st.nbytes())
     if isinstance(obj, (list, tuple)):
         return sum(_tensor_tree_bytes(x, seen_ptrs) for x in obj)
     if isinstance(obj, dict):
         return sum(_tensor_tree_bytes(v, seen_ptrs) for v in obj.values())
-    if hasattr(obj, "__dict__") and not isinstance(obj, nn.Module):
+    if isinstance(obj, nn.Module):
+        return 0
+    if hasattr(obj, "_iter_tensors") and callable(obj._iter_tensors):
+        return sum(_tensor_tree_bytes(t, seen_ptrs) for t in obj._iter_tensors())
+    if hasattr(obj, "__dataclass_fields__"):
+        return sum(_tensor_tree_bytes(getattr(obj, f), seen_ptrs) for f in obj.__dataclass_fields__)
+    if hasattr(obj, "__dict__"):
         return sum(_tensor_tree_bytes(v, seen_ptrs) for v in vars(obj).values())
+    if hasattr(obj, "__slots__"):
+        return sum(_tensor_tree_bytes(getattr(obj, s), seen_ptrs) for s in obj.__slots__ if hasattr(obj, s))
     return 0
 
 

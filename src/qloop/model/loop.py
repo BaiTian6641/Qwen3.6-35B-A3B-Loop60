@@ -405,6 +405,9 @@ class LoopController:
                     self._hooks.append(mod.register_forward_hook(self._write_hook(None)))
                 for mod in neg.values():
                     self._hooks.append(mod.register_forward_hook(self._write_hook(spec.write_neg_value)))
+                gdn2_ad = getattr(attn, "gdn2_adapter", None)
+                if isinstance(gdn2_ad, nn.Module) and isinstance(getattr(gdn2_ad, "down", None), nn.Module):
+                    self._hooks.append(gdn2_ad.down.register_forward_hook(self._write_hook(None)))
         if self.adapters.pass_router is not None:
             for phys in range(spec.prelude_end, spec.core_end):
                 router = router_of(self._orig["layers"][phys])

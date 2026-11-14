@@ -20,7 +20,7 @@ train:
     - "shared_expert\\."
     - "self_attn\\.(o_proj|q_norm|k_norm)"
     - "input_layernorm|post_attention_layernorm"
-  allowed_groups: [loop_adapters, router, shared_expert, attention, norms, expert_deltas]
+  allowed_groups: [loop_adapters, gdn2_adapters, router, shared_expert, attention, norms, expert_deltas]
   optim: {lr: 3.0e-5}
 data:
   seq_len: 8192

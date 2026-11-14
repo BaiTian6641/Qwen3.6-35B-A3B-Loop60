@@ -17,6 +17,7 @@ train:
   init_from: runs/s2_sft
   steps: 600
   grad_accum: 2
+  train_gdn2: false                     # keep S2's healed GDN-2 gates active & carried forward; distill D-LSA only
   trainable:
     - "self_attn\\.(q_norm|k_norm)"       # tiny: lets attention re-normalise under YaRN
   allowed_groups: [loop_adapters, lsa_indexers, attention]

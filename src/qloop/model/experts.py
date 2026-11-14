@@ -766,6 +766,7 @@ def fold_expert_deltas_state_into_base_(
 
 PARAM_GROUP_RULES: list[tuple[str, str]] = [
     ("expert_deltas", r"expert_deltas\."),
+    ("gdn2_adapters", r"gdn2_adapter\."),
     ("loop_adapters", r"loop_adapters\."),
     ("lsa_indexers", r"(^|\.)(lsa|indexer)[^.]*\.|lsa_indexer"),
     ("router", r"mlp\.gate\.(weight|bias)$"),

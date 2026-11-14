@@ -24,6 +24,7 @@ from ..model.experts import (
     fold_expert_deltas_state_into_base_,
     freeze_all_but,
 )
+from ..model.gdn2 import GDN2Manager, install_gdn2
 from ..model.introspect import ModelParts, inspect_model
 from ..model.loading import load_model
 from ..model.loop import LoopController, apply_loop
@@ -39,12 +40,14 @@ class Stack:
     tokenizer: Any
     parts: ModelParts
     loop: LoopController | None = None
+    gdn2: GDN2Manager | None = None
     lsa: LSAManager | None = None
     deltas: HotExpertDeltas | None = None
     named_trainable: dict[str, nn.Parameter] = field(default_factory=dict)
     named_all: dict[str, nn.Parameter] = field(default_factory=dict)
     carried_params: dict[str, nn.Parameter] = field(default_factory=dict)
     passthrough_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    carried_gdn2_cfg: dict[str, Any] | None = None
     carried_lsa_cfg: dict[str, Any] | None = None
     _folded_experts: set[tuple[int, int]] = field(default_factory=set)
     load_info: dict[str, Any] = field(default_factory=dict)
@@ -81,6 +84,8 @@ class Stack:
         s: dict[str, float] = {}
         if self.loop is not None:
             s.update(self.loop.stats())
+        if self.gdn2 is not None:
+            s.update(self.gdn2.stats())
         if self.lsa is not None:
             s.update(self.lsa.stats())
         return s
@@ -103,6 +108,8 @@ class Stack:
     ) -> dict[str, int]:
         """Restore `saved` across both active trainables and frozen prior-stage adaptations."""
         if prior_stack_meta:
+            if self.gdn2 is None and isinstance(prior_stack_meta.get("gdn2"), dict):
+                self.carried_gdn2_cfg = dict(prior_stack_meta["gdn2"])
             if self.lsa is None and isinstance(prior_stack_meta.get("lsa"), dict):
                 self.carried_lsa_cfg = dict(prior_stack_meta["lsa"])
             if self.deltas is None and prior_stack_meta.get("expert_delta_scale") is not None:
@@ -151,6 +158,7 @@ class Stack:
     def describe(self) -> dict[str, Any]:
         return {
             "loop": None if self.loop is None else self.loop.spec.__dict__,
+            "gdn2": (self.gdn2.cfg.__dict__ if self.gdn2 is not None else self.carried_gdn2_cfg),
             "lsa": (self.lsa.cfg.__dict__ if self.lsa is not None else self.carried_lsa_cfg),
             "hot_experts": None if self.hot_map is None else {str(k): v for k, v in self.hot_map.items()},
             "expert_delta_scale": None if self.deltas is None else self.deltas.scale,
@@ -189,6 +197,11 @@ def build_stack(cfg: dict[str, Any]) -> Stack:
         model, tok, info = load_model(mcfg)
     st = Stack(model, tok, inspect_model(model), load_info=info)
 
+    gcfg = dict(cfg.get("gdn2") or {})
+    if gcfg.pop("enabled", False):
+        with stage("model:gdn2"):
+            st.gdn2 = install_gdn2(model, gcfg)
+
     lcfg = dict(cfg.get("lsa") or {})
     if lcfg.pop("enabled", False):
         with stage("model:lsa"):
@@ -208,13 +221,18 @@ def build_stack(cfg: dict[str, Any]) -> Stack:
     names = stable_names(model)
     tcfg = dict(cfg.get("train") or {})
     patterns = list(tcfg.get("trainable") or [])
+    allowed_groups = list(tcfg["allowed_groups"]) if tcfg.get("allowed_groups") is not None else None
+    if st.gdn2 is not None and st.gdn2.adapters and tcfg.get("train_gdn2", True):
+        patterns.append(r"gdn2_adapter\.")
+        if allowed_groups is not None and "gdn2_adapters" not in allowed_groups:
+            allowed_groups.append("gdn2_adapters")
     if st.lsa is not None and tcfg.get("train_lsa", True):
         patterns.append(r"lsa_indexer\.")
     if st.deltas is not None and tcfg.get("train_expert_deltas", True):
         patterns.append(r"expert_deltas\.")
     with stage("model:freeze"):
         if patterns:
-            report = freeze_all_but(model, patterns, allowed_groups=tcfg.get("allowed_groups"),
+            report = freeze_all_but(model, patterns, allowed_groups=allowed_groups,
                                     strict_patterns=bool(tcfg.get("strict_patterns", True)))
             log.info("freeze policy:\n%s", report)
         else:

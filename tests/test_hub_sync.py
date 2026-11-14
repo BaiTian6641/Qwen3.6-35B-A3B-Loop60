@@ -217,10 +217,11 @@ def test_cumulative_cross_stage_handoff_and_one_call_hub_loader(tmp_path, monkey
     stats.to_json(str(s0_stats))
     hub.push_artifacts("s0_probe", {"artifacts/s0_probe/esft_stats.json": str(s0_stats)}, completed=True)
 
-    # Stage 1: train hot-expert deltas (rank=4) + shared_expert + loop_adapters
+    # Stage 1: train GDN-2 adapters + hot-expert deltas (rank=4) + shared_expert + loop_adapters
     cfg1 = Cfg({
         **_toy_base_cfg(),
         "stage": "s1_loop_heal",
+        "gdn2": {"enabled": True, "rank": 6, "chunk_size": 16, "segment_chunks": 2},
         "experts": {"enabled": True, "stats_path": "runs/s0_probe/esft_stats.json", "per_layer_k": 2, "rank": 4},
         "train": {
             "steps": 2,
@@ -233,11 +234,12 @@ def test_cumulative_cross_stage_handoff_and_one_call_hub_loader(tmp_path, monkey
     })
     LMTrainer(cfg1, str(run_root / "s1_loop_heal"), hub_api=api).train()
 
-    # Wipe local runs completely -> Stage 2 (`s3_long_lsa` analogue): LSA on, experts off, shared_expert frozen!
+    # Wipe local runs completely -> Stage 2 (`s3_long_lsa` analogue): GDN-2 frozen (`train_gdn2: False`), LSA on!
     shutil.rmtree(run_root)
     cfg2 = Cfg({
         **_toy_base_cfg(),
         "stage": "s3_long_lsa",
+        "gdn2": {"enabled": True, "rank": 6, "chunk_size": 16, "segment_chunks": 2},
         "lsa": {"enabled": True, "mode": "distill", "index_dim": 16, "block_size": 16, "pool": 2,
                 "avg_bucket_keys": 4, "max_bucket_keys": 8, "num_select": 4, "window": 16, "sinks": 4},
         "experts": {"enabled": False},
@@ -247,6 +249,7 @@ def test_cumulative_cross_stage_handoff_and_one_call_hub_loader(tmp_path, monkey
             "micro_batch": 1,
             "grad_accum": 1,
             "keep_last": 1,
+            "train_gdn2": False,
             "trainable": ["self_attn\\.(q_norm|k_norm)"],
             "optim": {"lr": 5e-3, "warmup_steps": 1},
         },
@@ -254,11 +257,12 @@ def test_cumulative_cross_stage_handoff_and_one_call_hub_loader(tmp_path, monkey
     tr2 = LMTrainer(cfg2, str(run_root / "s3_long_lsa"), hub_api=api)
     tr2.train()
 
-    # Wipe local runs again -> Stage 3: neither LSA nor experts attached, only router + loop_adapters trained!
+    # Wipe local runs again -> Stage 3: GDN-2 active, neither LSA nor experts attached, router + loop + GDN-2 trained!
     shutil.rmtree(run_root)
     cfg3 = Cfg({
         **_toy_base_cfg(),
         "stage": "s4_final",
+        "gdn2": {"enabled": True, "rank": 6, "chunk_size": 16, "segment_chunks": 2},
         "lsa": {"enabled": False},
         "experts": {"enabled": False},
         "train": {
@@ -274,13 +278,14 @@ def test_cumulative_cross_stage_handoff_and_one_call_hub_loader(tmp_path, monkey
     tr3 = LMTrainer(cfg3, str(run_root / "s4_final"), hub_api=api)
     tr3.train()
 
-    # Load from Hub in 1 call: LSA indexers (from Stage 2), folded expert deltas & shared_expert (from Stage 1),
-    # and router/loop_adapters (from Stage 3) must ALL be present!
+    # Load from Hub in 1 call: GDN-2 adapters, LSA indexers (from Stage 2), folded expert deltas & shared_expert
+    # (from Stage 1), and router/loop_adapters (from Stage 3) must ALL be present!
     loaded = load_qloop_from_hub(
         DEFAULT_HF_REPO,
         overrides=["lsa.mode=distill"],  # dense forward so outputs match tr3 bit-close while keeping trained indexers
         api=api,
     )
+    assert loaded.gdn2 is not None and loaded.gdn2.cfg.rank == 6
     assert loaded.lsa is not None
     assert loaded.loop is not None
     tr3.stack.model.eval()

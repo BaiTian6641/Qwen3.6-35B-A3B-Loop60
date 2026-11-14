@@ -161,3 +161,17 @@ flowchart LR
 1. **零 Google Drive 依赖，全提交历史驱动**：通过 Colab Secret `HF_TOKEN` 将每个阶段的增量可训练权重包（`~1–3 GB`，绝不重复上传 70 GB BF16 底座）、`manifest.json` 阶段状态机以及自动渲染的 `README.md` 模型卡原子提交到公开仓库 `TassP0lar/Qwen3.6-35B-A3B-Loop64`；若远端触发存储配额限制，自动调用 `super_squash_history` 压缩历史快照后重试。
 2. **跨阶段累积增量传递（Cumulative Delta Handoff）**：`Stack.checkpoint_params()` 与 `Stack.restore_checkpoint()` 自动保留跨阶段冻结切片（`carried_params`）、未挂载组件（如穿过 S4 保留到评测阶段的 `lsa_indexer`）并将前序阶段未挂载的 `HotExpertDeltas` 原地折叠进浮点专家底座，确保 `S1 -> S2 -> S3 -> S4 -> Eval -> load_qloop_from_hub` 全链路零信息丢失。
 3. **230 GB 磁盘水位守卫**：底座缓存（`~70 GB`）固定保留在 `/content/hf_cache/hub`；`keep_last: 1` 仅保留最新本地步，阶段完成后自动剥离本地 `optim.pt`/`rng.pt`、清理前序阶段 `checkpoints/` 与 `$HF_HOME/{xet,upload}` 临时分片缓存，全程将空闲磁盘稳定维持在 `85–110 GiB` 以上。
+
+---
+
+## 7. NVIDIA Gated DeltaNet-2 (`GDN-2`) 无损升级 (`src/qloop/model/gdn2.py`)
+
+原版 `Qwen3.6-35B-A3B` 的 30 层线性注意力采用标准 Gated DeltaNet，将每个头的擦除（Key 侧）与写入（Value 侧）强行绑定在同一个标量门 $\beta_t \in (0, 1)$ 与标量衰减 $g_t \le 0$ 上。这在循环深度重入（同一物理层跨趟处理不同粒度的潜状态）与超长上下文精细记忆编辑中会造成通道级覆盖冲突。
+
+我们基于 NVIDIA Research 的 **Gated DeltaNet-2**（Hatamizadeh, Choi, Kautz, *arXiv:2605.22791*, `NVlabs/GatedDeltaNet-2`），将全部 30 层线性注意力原地升级为通道级解耦状态演化：
+$$S_t = \left(I - \mathbf{k}_t (\mathbf{b}_t \odot \mathbf{k}_t)^\top\right) \operatorname{Diag}(\exp(\mathbf{g}_t)) S_{t-1} + \mathbf{k}_t (\mathbf{w}_t \odot \mathbf{v}_t)^\top, \qquad \mathbf{o}_t = S_t^\top \mathbf{q}_t$$
+
+1. **严格泛化与第 0 步 100% Bit 级无损兼容**：当 $\mathbf{b}_t = \beta_t \mathbf{1}_{d_k}$、$\mathbf{w}_t = \beta_t \mathbf{1}_{d_v}$、$\mathbf{g}_t = g_t^{\text{base}} \mathbf{1}_{d_k}$ 时，GDN-2 严格退化为原版 GDN。`GDN2Adapter` 采用零初始化低秩残差（30 层 `rank=64` 合计仅约 `27.5M` 参数），并通过无奇点的对数几率平移恒等式
+   $$\sigma(\operatorname{logit}(\beta) + \delta) \equiv \beta + \frac{2\beta(1-\beta)\tanh(\delta/2)}{1 + (2\beta-1)\tanh(\delta/2)}$$
+   与非正衰减缩放 $\mathbf{g}_t = g_t^{\text{base}} \odot \exp(\tanh(\Delta \mathbf{g}_t)) \le 0$ 合成通道门控：无需调用 `logit()`，在 $\delta=0$ 时浮点 bit 级精确返回原版 $\beta$，且在 $\beta \in \{0, 1\}$（含 MoR 早退写屏蔽）处完全消除 `log(0)` / `NaN` 风险。
+2. **分块 WY 并行核 (`chunk_gdn2`) 与 $O(1)$ 解码核 (`recurrent_gdn2`)**：训练与预填充采用中点中心化的 Tensor-Core 分块 WY 表示（通过 `solve_triangular(..., unitriangular=True)` 批量求解非对称通道衰减下的下三角系统，并带宏段激活重计算），自回归单步解码走 $O(1)$ 状态的 `recurrent_gdn2`，在 `float64` 下前向/反向与逐步递推误差 `< 1e-10` / `< 1e-9`。

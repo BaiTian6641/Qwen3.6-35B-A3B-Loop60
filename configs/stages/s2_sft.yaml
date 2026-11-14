@@ -21,7 +21,7 @@ train:
     - "self_attn\\."
     - "linear_attn\\.(in_proj|out_proj)"
     - "input_layernorm|post_attention_layernorm"
-  allowed_groups: [loop_adapters, router, shared_expert, attention, deltanet, norms, expert_deltas]
+  allowed_groups: [loop_adapters, gdn2_adapters, router, shared_expert, attention, deltanet, norms, expert_deltas]
   optim: {lr: 2.0e-5}
 data:
   seq_len: 32768

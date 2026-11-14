@@ -46,6 +46,7 @@ DEFAULT_METRIC_KEYS = (
     "loop/reroute_rate",
     "loop/unique_experts_core",
     "loop/effective_expert_mult",
+    "gdn2/erase_write_l1",
     "lsa/distill_kl",
     "reward/mean",
     "gate/score",

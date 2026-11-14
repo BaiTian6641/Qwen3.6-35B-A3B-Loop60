@@ -168,11 +168,48 @@ class ToyGatedAttention(nn.Module):
         return self.o_proj(o.reshape(b, t, self.h * self.d))
 
 
+def _toy_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    scale: float | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    init_dtype = query.dtype
+    q, k, v = upcast(query), upcast(key), upcast(value)
+    if use_qk_l2norm_in_kernel:
+        q, k = F.normalize(q, dim=-1), F.normalize(k, dim=-1)
+    sc = (q.shape[-1] ** -0.5) if scale is None else float(scale)
+    if sc != 1.0:
+        q = q * sc
+    b, t, nh, dk = k.shape
+    dv = v.shape[-1]
+    state = q.new_zeros(b, nh, dk, dv) if initial_state is None else upcast(initial_state).clone()
+    gf, bf = upcast(g), upcast(beta)
+    outs = []
+    for i in range(t):
+        state = state * gf[:, i].exp()[..., None, None]
+        kt, vt = k[:, i], v[:, i]
+        mem = (state * kt[..., :, None]).sum(-2)
+        delta = (vt - mem) * bf[:, i][..., None]
+        state = state + kt[..., :, None] * delta[..., None, :]
+        outs.append((state * q[:, i][..., :, None]).sum(-2))
+    out = torch.stack(outs, dim=1).to(init_dtype)
+    return out, (state if output_final_state else None)
+
+
 class ToyGatedDeltaNet(nn.Module):
     def __init__(self, config: ToyConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.nh, self.d = config.linear_num_heads, config.linear_head_dim
+        self.num_k_heads = self.num_v_heads = self.nh
+        self.head_k_dim = self.head_v_dim = self.d
         self.ck = config.linear_conv_kernel_dim
         hs, c = config.hidden_size, 3 * config.linear_num_heads * config.linear_head_dim
         self.in_proj_qkv = nn.Linear(hs, c, bias=False)
@@ -182,6 +219,8 @@ class ToyGatedDeltaNet(nn.Module):
         self.dt_bias = nn.Parameter(torch.zeros(self.nh))
         self.norm = RMSNorm(self.d, config.rms_norm_eps)
         self.out_proj = nn.Linear(self.nh * self.d, hs, bias=False)
+        self.chunk_gated_delta_rule = _toy_gated_delta_rule
+        self.fused_recurrent_gated_delta_rule = _toy_gated_delta_rule
 
     def forward(self, x, cache_params=None, attention_mask=None):
         b, t, _ = x.shape
@@ -199,20 +238,22 @@ class ToyGatedDeltaNet(nn.Module):
         bb, aa = upcast(self.in_proj_ba(x)).chunk(2, dim=-1)
         beta = torch.sigmoid(bb)
         g = -upcast(self.A_log).exp() * F.softplus(aa + upcast(self.dt_bias))  # log-decay <= 0
-        state = cache_params.recurrent_states[self.layer_idx] if cache_params is not None else None
-        if state is None:
-            state = x.new_zeros(b, self.nh, self.d, self.d, dtype=q.dtype)
-        outs = []
-        for i in range(t):
-            state = state * g[:, i].exp()[..., None, None]
-            kt, vt = k[:, i], v[:, i]
-            mem = (state * kt[..., :, None]).sum(-2)
-            delta = (vt - mem) * beta[:, i][..., None]
-            state = state + kt[..., :, None] * delta[..., None, :]
-            outs.append((state * q[:, i][..., :, None]).sum(-2))
+        init_state = cache_params.recurrent_states[self.layer_idx] if cache_params is not None else None
+        rule_fn = self.fused_recurrent_gated_delta_rule if t == 1 else self.chunk_gated_delta_rule
+        core_out, final_state = rule_fn(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            initial_state=init_state,
+            output_final_state=cache_params is not None,
+            use_qk_l2norm_in_kernel=False,
+            scale=1.0,
+        )
         if cache_params is not None:
-            cache_params.recurrent_states[self.layer_idx] = state
-        o = self.norm(torch.stack(outs, dim=1).to(x.dtype))
+            cache_params.recurrent_states[self.layer_idx] = final_state
+        o = self.norm(core_out.to(x.dtype))
         return self.out_proj(o.reshape(b, t, self.nh * self.d))
 
 

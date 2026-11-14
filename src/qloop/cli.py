@@ -145,8 +145,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
             with stage("probe:surgery"):
                 loop = {k: v for k, v in dict(cfg.get("loop") or {}).items() if k != "enabled"}
                 lsa = {k: v for k, v in dict(cfg.get("lsa") or {}).items() if k != "enabled"}
+                gdn2_raw = dict(cfg.get("gdn2") or {})
+                gdn2 = {k: v for k, v in gdn2_raw.items() if k != "enabled"} if gdn2_raw.get("enabled") else None
                 ids = _probe_ids(st, cfg, 1, seq)[0]
-                out["surgery"] = surgery_check(model, ids, loop or None, lsa or None)
+                out["surgery"] = surgery_check(model, ids, loop or None, lsa or None, gdn2_cfg=gdn2)
         probe_path = os.path.join(run_dir, "probe.json")
         with open(probe_path, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=2, default=str)

@@ -282,6 +282,7 @@ class HubManifest:
         "prelude_end": 8,
         "core_end": 32,
         "num_passes": 2,
+        "linear_attention": "gdn2",
         "per_pass_router": True,
         "kv_share": True,
         "routed_experts_per_layer": 256,
@@ -369,6 +370,7 @@ def render_model_card(manifest: HubManifest) -> str:
         "  - qwen3.6",
         "  - moe",
         "  - looped-transformer",
+        "  - gated-deltanet-2",
         "  - dynamic-expert-routing",
         "  - mhc",
         "  - latent-sparse-attention",
@@ -390,8 +392,12 @@ def render_model_card(manifest: HubManifest) -> str:
         "~4.5B-5.9B per token without adding base weight memory).",
         "- **Manifold-Constrained Hyper-Connection (`mHC`) Bridge**: Doubly-stochastic Birkhoff-Sinkhorn mixing with "
         "prelude anchor injection and zero-gated step-0 bit-exact identity.",
+        "- **NVIDIA Gated DeltaNet-2 (`GDN-2`, arXiv:2605.22791) Upgrade**: All 30 Gated DeltaNet linear-attention "
+        "layers are upgraded with decoupled channel-wise erase gates (`b_t`), channel-wise write gates (`w_t`), and "
+        "channel-wise decay (`g_t <= 0`) via chunkwise WY Tensor-Core parallelization while starting bit-identical at "
+        "step 0.",
         "- **Hybrid State Isolation + MoR Recursive KV Sharing**: Independent `(layer, pass)` recurrent/conv slots "
-        "for the 18 core Gated DeltaNet layers, paired with pass-1 KV + D-LSA bucket sharing on the 6 core Gated Full "
+        "for the 18 core GDN-2 layers, paired with pass-1 KV + D-LSA bucket sharing on the 6 core Gated Full "
         "Attention layers (zero KV memory multiplication at 1M context).",
         "- **1M Context YaRN + Distilled Latent Sparse Attention (`D-LSA`)**: Non-rotary key head indexing with "
         "batched Ward clustering for sub-quadratic 1M-token retrieval.",
@@ -683,6 +689,10 @@ class HubSyncManager:
                 "per_pass_router": bool(loop_desc.get("per_pass_router", True)),
                 "kv_share": bool(loop_desc.get("kv_share", True)),
             })
+        gdn2_desc = stack_desc.get("gdn2") if isinstance(stack_desc.get("gdn2"), dict) else None
+        if gdn2_desc is not None:
+            manifest.architecture["linear_attention"] = "gdn2"
+            manifest.architecture["gdn2_rank"] = int(gdn2_desc.get("rank", 64))
 
         now = _utc_now()
         entry = {
@@ -960,6 +970,15 @@ def load_qloop_from_hub(
     # At inference we fold any `expert_deltas` directly into float base weights via `restore_checkpoint`
     # (zero hook overhead during generation).
     raw_cfg["experts"] = {"enabled": False}
+    if any("gdn2_adapter." in k for k in saved):
+        prior_gdn2 = dict((meta.get("stack") or {}).get("gdn2") or {})
+        gcfg = {**dict(raw_cfg.get("gdn2") or {}), **prior_gdn2}
+        for k, t in saved.items():
+            if k.endswith("gdn2_adapter.down.weight") and t.ndim == 2:
+                gcfg["rank"] = int(t.shape[0])
+                break
+        gcfg["enabled"] = True
+        raw_cfg["gdn2"] = gcfg
     if enable_lsa_if_present and any("lsa_indexer." in k for k in saved):
         prior_lsa = dict((meta.get("stack") or {}).get("lsa") or {})
         lcfg = {**dict(raw_cfg.get("lsa") or {}), **prior_lsa}

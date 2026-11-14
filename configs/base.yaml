@@ -31,6 +31,19 @@ loop:
   checkpoint: true            # activation checkpointing per virtual layer (non-reentrant)
   train_pass_probs: [0.25, 0.75]   # sample depth 1 sometimes: keeps the stock-graph path (vLLM-servable) healthy
 
+# ---------------------------------------------------------------- NVIDIA Gated DeltaNet-2 (GDN-2)
+# Upgrades all 30 Qwen3.6 Gated DeltaNet layers with decoupled channel-wise erase gates (b_t),
+# channel-wise write gates (w_t), and channel-wise decay (g_t <= 0) via chunkwise WY parallelization
+# (arXiv:2605.22791). Zero-init residual projections guarantee 100% step-0 bit-exactness.
+gdn2:
+  enabled: true
+  rank: 64
+  chunk_size: 64
+  segment_chunks: 16
+  checkpoint_segments: true
+  gate_logit_cap: 8.0
+  decay_log_cap: 1.0
+
 # ---------------------------------------------------------------- D-LSA (off unless a stage enables it)
 lsa:
   enabled: false
@@ -80,7 +93,7 @@ train:
     impl: auto                # apollo_torch if installed, else the built-in faithful APOLLO
     max_grad_norm_per_param: 1.0
     apollo: {enabled: true, rank: 1, scale_type: tensor, scale: 128.0, update_proj_gap: 200, min_dim: 128}
-    lr_mult: {"loop_adapters": 20.0, "lsa_indexer": 10.0, "mlp\\.gate\\.weight$": 0.5}
+    lr_mult: {"loop_adapters": 20.0, "lsa_indexer": 10.0, "gdn2_adapter": 5.0, "mlp\\.gate\\.weight$": 0.5}
 
 eval_quick:
   n_batches: 8

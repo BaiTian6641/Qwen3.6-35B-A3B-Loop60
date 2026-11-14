@@ -162,14 +162,23 @@ def _greedy(model: nn.Module, ids: torch.Tensor, steps: int) -> tuple[torch.Tens
 
 
 @torch.no_grad()
-def surgery_check(model: nn.Module, ids: torch.Tensor, loop_spec: dict[str, Any] | None,
-                  lsa_cfg: dict[str, Any] | None, decode_steps: int = 8, atol: float = 2e-2) -> dict[str, Any]:
+def surgery_check(
+    model: nn.Module,
+    ids: torch.Tensor,
+    loop_spec: dict[str, Any] | None,
+    lsa_cfg: dict[str, Any] | None,
+    decode_steps: int = 8,
+    atol: float = 2e-2,
+    gdn2_cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Run on the real model in eval mode. Raises with a precise message on any violation."""
+    from .gdn2 import install_gdn2
     from .lsa import install_lsa
 
     model.eval()
     ref = model(input_ids=ids).logits
     rep: dict[str, Any] = {}
+    gdn2 = install_gdn2(model, gdn2_cfg) if gdn2_cfg else None
     mgr = install_lsa(model, dict(lsa_cfg, mode="distill")) if lsa_cfg else None
     ctl = apply_loop(model, loop_spec) if loop_spec else None
     try:
@@ -180,6 +189,12 @@ def surgery_check(model: nn.Module, ids: torch.Tensor, loop_spec: dict[str, Any]
         if ctl is not None:
             with torch.no_grad():
                 ctl.adapters.gates.fill_(0.05)
+        if gdn2 is not None:
+            gen = torch.Generator(device="cpu").manual_seed(17)
+            for ad in gdn2.adapters.values():
+                for w in (ad.erase_up.weight, ad.write_up.weight, ad.decay_up.weight):
+                    noise = torch.randn(w.shape, generator=gen, dtype=torch.float32) * 0.02
+                    w.copy_(noise.to(device=w.device, dtype=w.dtype))
         seq, inc_logits = _greedy(model, ids, decode_steps)
         full = model(input_ids=seq).logits[:, ids.shape[1] - 1:]
         diff = float((full.float() - inc_logits.float()).abs().max())
@@ -195,6 +210,8 @@ def surgery_check(model: nn.Module, ids: torch.Tensor, loop_spec: dict[str, Any]
             ctl.unwrap()
         if mgr is not None:
             mgr.uninstall()
+        if gdn2 is not None:
+            gdn2.uninstall()
     back = model(input_ids=ids).logits
     require(torch.equal(back, ref), "model not restored after unwrap/uninstall")
     log.info("surgery check passed: %s", rep)

@@ -18,7 +18,7 @@ train:
     - "mlp\\.gate\\.weight$"
     - "shared_expert\\."
     - "self_attn\\.o_proj"
-  allowed_groups: [loop_adapters, router, shared_expert, attention, expert_deltas]
+  allowed_groups: [loop_adapters, gdn2_adapters, router, shared_expert, attention, expert_deltas]
   optim: {lr: 1.0e-6, warmup_steps: 10, max_grad_norm_per_param: 0.5}
 rl:
   tasks:

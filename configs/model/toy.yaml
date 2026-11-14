@@ -8,6 +8,10 @@ loop:
   prelude_end: 4
   core_end: 12
   target_virtual_layers: 24
+gdn2:
+  rank: 8
+  chunk_size: 16
+  segment_chunks: 2
 lsa:
   index_dim: 4
   block_size: 16

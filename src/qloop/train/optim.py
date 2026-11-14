@@ -274,9 +274,16 @@ DEFAULT_OPTIM_CFG: dict[str, Any] = {
         "eps": 1e-6,
     },
     # regexes (re.search on the parameter name) always routed to AdamW
-    "adamw_patterns": [r"mlp\.gate\.weight$", r"shared_expert_gate", r"embed_tokens", r"lm_head", r"loop_adapters"],
+    "adamw_patterns": [
+        r"mlp\.gate\.weight$",
+        r"shared_expert_gate",
+        r"embed_tokens",
+        r"lm_head",
+        r"loop_adapters",
+        r"gdn2_adapter\.",
+    ],
     # regex -> lr multiplier; first match wins
-    "lr_mult": {r"loop_adapters": 10.0, r"mlp\.gate\.weight$": 0.5},
+    "lr_mult": {r"loop_adapters": 10.0, r"gdn2_adapter": 5.0, r"mlp\.gate\.weight$": 0.5},
 }
 
 

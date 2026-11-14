@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, fields
 from typing import Any, Callable
@@ -75,6 +76,7 @@ class LSAConfig:
     checkpoint_chunks: bool = True
     strict_mask: bool = False
     cache_entries: int = 4
+    num_query_passes: int = 1       # 1 = shared query indexer; >1 (e.g. 3) = per-pass q_proj_extra for passes 2..R
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> LSAConfig:
@@ -93,6 +95,8 @@ class LSAConfig:
             raise ValueError(f"lsa.mode must be dense|distill|sparse, got {self.mode!r}")
         if self.search not in ("flat", "tree"):
             raise ValueError(f"lsa.search must be flat|tree, got {self.search!r}")
+        if self.num_query_passes < 1:
+            raise ValueError(f"lsa.num_query_passes must be >= 1, got {self.num_query_passes}")
         if self.block_size % self.pool:
             raise ValueError("lsa.block_size must be a multiple of lsa.pool")
         if self.avg_bucket_keys % self.pool or self.max_bucket_keys % self.pool:
@@ -205,6 +209,17 @@ def _fingerprint(block: torch.Tensor) -> tuple[float, float]:
     return float(f.sum()), float(f.abs().sum())
 
 
+class _PassQueryProj(nn.Module):
+    """Per-pass query latent projection (`[num_heads, din, index_dim]`) for passes 2..R."""
+
+    def __init__(self, init_weight: torch.Tensor):
+        super().__init__()
+        self.weight = nn.Parameter(init_weight.clone())
+
+    def forward(self, q_slice: torch.Tensor) -> torch.Tensor:
+        return torch.einsum("bhtd,hde->bhte", q_slice.to(self.weight.dtype), self.weight)
+
+
 class LSAIndexer(nn.Module):
     """Trainable index projections + bucket construction for one full-attention layer."""
 
@@ -223,14 +238,67 @@ class LSAIndexer(nn.Module):
         # same JL projection for keys and their query heads => q_idx.k_idx ~ cos(q, k) at init
         self.wk = nn.Parameter(base.clone())
         self.wq = nn.Parameter(base.repeat_interleave(self.hg, dim=0).clone())
+        # For passes 2..R: copy pass-1 `wq` weights so step-0 bucket selection is bit-identical
+        self.q_proj_extra = nn.ModuleList(
+            [_PassQueryProj(self.wq.detach()) for _ in range(max(0, cfg.num_query_passes - 1))]
+        )
+        self._current_pass: int = 1
         self._cache: OrderedDict[tuple, _CacheEntry] = OrderedDict()
         self.pending: list[torch.Tensor] = []
         self.last_stats: dict[str, float] = {}
+        self.last_selected_buckets: dict[int, torch.Tensor] = {}
+
+    @property
+    def current_pass(self) -> int:
+        return self._current_pass
+
+    def set_current_pass(self, r: int) -> None:
+        """Explicitly set the active query pass index `r >= 1` (used when not inside a VirtualLayer)."""
+        if r < 1:
+            raise ValueError(f"pass index r must be >= 1, got {r}")
+        if self.cfg.num_query_passes > 1 and r > self.cfg.num_query_passes:
+            raise ValueError(
+                f"pass index r={r} exceeds lsa.num_query_passes={self.cfg.num_query_passes}"
+            )
+        self._current_pass = int(r)
+
+    def _resolve_pass(self, module: nn.Module | None = None, pass_idx: int | None = None) -> int:
+        cap = max(1, self.cfg.num_query_passes)
+        if pass_idx is not None:
+            return 1 if int(pass_idx) <= 1 else min(int(pass_idx), cap)
+        tm_ref = getattr(self, "_tm_ref", None)
+        tm = tm_ref() if callable(tm_ref) else None
+        if tm is not None:
+            layers = getattr(tm, "layers", None)
+            if layers is not None and len(layers) > 0:
+                ctl = getattr(layers[0], "_ctl", None)
+                cur = getattr(ctl, "_cur", None) if ctl is not None else None
+                if cur is not None:
+                    r = int(cur[1])
+                    return 1 if r <= 1 else min(r, cap)
+        mod_r = getattr(module, "_current_pass", None) if module is not None else None
+        if mod_r is not None:
+            return 1 if int(mod_r) <= 1 else min(int(mod_r), cap)
+        return 1 if self._current_pass <= 1 else min(self._current_pass, cap)
+
+    def active_wq(self, pass_idx: int | None = None, module: nn.Module | None = None) -> nn.Parameter:
+        r = self._resolve_pass(module=module, pass_idx=pass_idx)
+        if r <= 1 or self.cfg.num_query_passes <= 1:
+            return self.wq
+        proj: _PassQueryProj = self.q_proj_extra[r - 2]  # type: ignore[assignment]
+        return proj.weight
 
     # --------------------------------------------------------------- latents
-    def query_latent(self, q: torch.Tensor) -> torch.Tensor:
+    def query_latent(
+        self, q: torch.Tensor, pass_idx: int | None = None, module: nn.Module | None = None
+    ) -> torch.Tensor:
         """q [B,H,T,D] -> group query latent [B,G,T,d] (sum of normalised head latents)."""
-        z = torch.einsum("bhtd,hde->bhte", q[..., self.lo:].to(self.wq.dtype), self.wq)
+        r = self._resolve_pass(module=module, pass_idx=pass_idx)
+        q_sl = q[..., self.lo:]
+        if r <= 1 or self.cfg.num_query_passes <= 1:
+            z = torch.einsum("bhtd,hde->bhte", q_sl.to(self.wq.dtype), self.wq)
+        else:
+            z = self.q_proj_extra[r - 2](q_sl)
         z = F.normalize(upcast(z), dim=-1)
         b, _, t, d = z.shape
         return z.view(b, self.g, self.hg, t, d).sum(2)
@@ -238,6 +306,32 @@ class LSAIndexer(nn.Module):
     def key_latent(self, k: torch.Tensor) -> torch.Tensor:
         z = torch.einsum("bgtd,gde->bgte", k[..., self.lo:].to(self.wk.dtype), self.wk)
         return F.normalize(upcast(z), dim=-1)
+
+    def q_proj(self, q: torch.Tensor, pass_idx: int | None = None) -> torch.Tensor:
+        """Alias for `query_latent` supporting explicit `pass_idx`."""
+        return self.query_latent(q, pass_idx=pass_idx)
+
+    def k_proj(self, k: torch.Tensor) -> torch.Tensor:
+        """Differentiable key latent projection through `self.wk` (`W_k_idx`)."""
+        return self.key_latent(k)
+
+    def select_buckets(
+        self,
+        q: torch.Tensor,
+        index: BucketIndex,
+        qpos: torch.Tensor | None = None,
+        pass_idx: int | None = None,
+    ) -> torch.Tensor:
+        """Return `[B, G, Tq, kk]` selected bucket slot indices (`-1` where ineligible)."""
+        tq = q.shape[2]
+        if qpos is None:
+            tk = index.n_blocks * self.cfg.block_size + self.cfg.resolved_window()
+            qpos = torch.arange(tk - tq, tk, device=q.device)
+        qz = self.query_latent(q, pass_idx=pass_idx)
+        scores = self.slot_scores(qz, index, qpos)
+        kk = min(self.cfg.num_select, scores.shape[-1])
+        top = scores.topk(kk, dim=-1)
+        return torch.where(torch.isfinite(top.values), top.indices, torch.full_like(top.indices, -1))
 
     # --------------------------------------------------------------- bucket index
     def _cluster_blocks(self, zblocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -386,7 +480,7 @@ def _in_backward() -> bool:
 
 
 def _sparse_chunk(q: torch.Tensor, qz: torch.Tensor, qpos: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                  index: BucketIndex | None, idx: LSAIndexer, scaling: float) -> torch.Tensor:
+                  index: BucketIndex | None, idx: LSAIndexer, scaling: float, cur_pass: int = 1) -> torch.Tensor:
     """q [B,G,Hg,C,D], qz [B,G,C,d], qpos [C] -> out [B,G,Hg,C,D]."""
     cfg = idx.cfg
     w = cfg.resolved_window()
@@ -410,6 +504,13 @@ def _sparse_chunk(q: torch.Tensor, qz: torch.Tensor, qpos: torch.Tensor, k: torc
         scores = idx.slot_scores(qz, index, qpos)                                     # [B,G,C,S]
         kk = min(cfg.num_select, scores.shape[-1])
         top = scores.topk(kk, dim=-1)
+        sel_slots = torch.where(
+            torch.isfinite(top.values.detach()),
+            top.indices,
+            torch.full_like(top.indices, -1),
+        )
+        if not _in_backward():
+            idx.last_selected_buckets[cur_pass] = sel_slots
         mem = index.members.unsqueeze(2).expand(-1, -1, qz.shape[2], -1, -1)          # [B,G,C,S,mk]
         mem = mem.gather(3, top.indices.unsqueeze(-1).expand(-1, -1, -1, -1, mem.shape[-1]))
         mem = torch.where(torch.isfinite(top.values).unsqueeze(-1), mem, torch.full_like(mem, -1))
@@ -435,7 +536,9 @@ def _sparse_chunk(q: torch.Tensor, qz: torch.Tensor, qpos: torch.Tensor, k: torc
         out = out + torch.einsum("bghck,bgckd->bghcd", parts[pi], vb)
     c = len(qpos)
     per_q_bucket = n_sel / max(1, q.shape[0] * q.shape[1] * c)
-    idx.last_stats["keys_per_query"] = float(m_win.sum() + m_sink.sum()) / c + per_q_bucket
+    kpq = float(m_win.sum() + m_sink.sum()) / c + per_q_bucket
+    idx.last_stats["keys_per_query"] = kpq
+    idx.last_stats[f"keys_per_query_p{cur_pass}"] = kpq
     return out
 
 
@@ -484,6 +587,8 @@ def lsa_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor, val
     scaling = dh ** -0.5 if scaling is None else scaling
     qpos_all = torch.arange(tk - tq, tk, device=query.device)
     qin = query.detach() if cfg.detach_inputs else query
+    cur_pass = idx._resolve_pass(module=module)
+    active_wq = idx.active_wq(pass_idx=cur_pass)
     # for Tk <= window every key is inside the local window => sparse == dense exactly
     sparse = cfg.mode == "sparse" and tk > cfg.resolved_window()
     if sparse and attention_mask is not None and cfg.strict_mask:
@@ -491,7 +596,8 @@ def lsa_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor, val
                            "use sequence packing without padding")
     # NOTE: computed identically during checkpoint recomputation (same RNG state is restored), so
     # the saved-tensor structure matches; only the *registration* of the loss is skipped then.
-    want_kl = (cfg.distill_weight > 0 and torch.is_grad_enabled() and idx.wq.requires_grad
+    want_kl = (cfg.distill_weight > 0 and torch.is_grad_enabled()
+               and (active_wq.requires_grad or idx.wk.requires_grad)
                and tk >= cfg.block_size + 1)
     index = idx.bucket_index(key) if (sparse or want_kl) else None
     if want_kl and index is not None:
@@ -503,7 +609,7 @@ def lsa_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor, val
             kls = []
             for s0 in range(0, pick.numel(), cfg.distill_chunk):
                 sel = pick[s0:s0 + cfg.distill_chunk]
-                qz = idx.query_latent(qin[:, :, sel])
+                qz = idx.query_latent(qin[:, :, sel], pass_idx=cur_pass)
                 kl = _distill_kl(qg[:, :, :, sel], qz, qpos_all[sel], key.detach(), index, idx, scaling)
                 if kl is not None:
                     kls.append(kl)
@@ -514,14 +620,14 @@ def lsa_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor, val
     if not sparse:
         return dense(module, query, key, value, attention_mask, scaling=scaling, dropout=dropout, **kwargs)
     qg = query.view(b, g, h // g, tq, dh)
-    qz_all = idx.query_latent(qin)
+    qz_all = idx.query_latent(qin, pass_idx=cur_pass)
     outs = []
     for c0 in range(0, tq, cfg.query_chunk):
         sl = slice(c0, min(tq, c0 + cfg.query_chunk))
 
         def run(qc: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, qzc: torch.Tensor,
-                sl: slice = sl) -> torch.Tensor:
-            return _sparse_chunk(qc, qzc, qpos_all[sl], kc, vc, index, idx, scaling)
+                sl: slice = sl, p: int = cur_pass) -> torch.Tensor:
+            return _sparse_chunk(qc, qzc, qpos_all[sl], kc, vc, index, idx, scaling, cur_pass=p)
 
         args = (qg[:, :, :, sl], key, value, qz_all[:, :, sl])
         if cfg.checkpoint_chunks and torch.is_grad_enabled() and (query.requires_grad or key.requires_grad):
@@ -573,9 +679,14 @@ class LSAManager:
     def trainable_parameters(self) -> list[nn.Parameter]:
         return [p for ix in self.indexers.values() for p in ix.parameters()]
 
+    def set_current_pass(self, r: int) -> None:
+        for ix in self.indexers.values():
+            ix.set_current_pass(r)
+
     def clear_cache(self) -> None:
         for ix in self.indexers.values():
             ix._cache.clear()
+            ix.last_selected_buckets.clear()
 
     def stats(self) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -675,6 +786,7 @@ def install_lsa(model: nn.Module, cfg: LSAConfig | dict[str, Any]) -> LSAManager
         ix = ix.to(device=ref.device, dtype=torch.float64 if ref.dtype == torch.float64 else torch.float32)
         attn.lsa_indexer = ix
         object.__setattr__(ix, "_owners", [attn])
+        object.__setattr__(ix, "_tm_ref", weakref.ref(parts.text_model))
         indexers[i] = ix
     set_impl(LSA_IMPL_NAME)
     log.info("D-LSA installed on layers %s (mode=%s, index_dim=%d on %s dims, block=%d, pool=%d, buckets~%d keys, "

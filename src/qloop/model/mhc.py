@@ -68,35 +68,115 @@ def _rms(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return upcast(x).pow(2).mean(-1, keepdim=True).add(eps).sqrt()
 
 
+V3_BRIDGE_WEIGHTS: tuple[float, float, float] = (0.05, 0.85, 0.10)
+
+
 class LoopBridge(nn.Module):
-    """Convex (simplex / one-row-mHC) mix of [h, anchor, norm-matched h] + step embedding."""
+    """Convex (simplex / one-row-mHC) mix of [h, anchor, norm-matched h] + step embedding + adapter.
+
+    Supports two low-rank adapter modes when `rank > 0`:
+      * `"concat"` (legacy): shared `2*hidden -> rank -> hidden` over `[h_prev, anchor]` with zero `up`.
+      * `"subspace"` (v3 `ReEntryBridge`, Fixes A1/A2/A3): per-pass `nn.RMSNorm(hidden)` on `h_prev` ->
+        orthogonal-init `down(hidden -> rank)` -> `SiLU` -> normal-init `up(rank -> hidden)` (`std=up_init_std`),
+        scaled by `_rms(anchor) / sqrt(hidden)`. Step-0 bit-identity is guaranteed by the zero-initialised
+        pass-exit gate in `loop.py`, while non-zero `up` ensures immediate step-1 gradients into `down`/`norms`.
+    """
 
     STREAMS = ("h_prev", "anchor", "h_prev_rms_matched")
 
-    def __init__(self, hidden: int, n_extra_passes: int, init_weights=(0.6, 0.2, 0.2),
-                 rank: int = 0, step_embedding: bool = True):
+    def __init__(
+        self,
+        hidden: int,
+        n_extra_passes: int,
+        init_weights: tuple[float, ...] = (0.6, 0.2, 0.2),
+        rank: int = 0,
+        step_embedding: bool = True,
+        adapter_mode: str = "concat",
+        up_init_std: float = 0.01,
+    ):
         super().__init__()
         if len(init_weights) != 3 or min(init_weights) <= 0:
             raise ValueError(f"bridge init_weights must be 3 positive numbers, got {init_weights}")
+        if adapter_mode not in ("concat", "subspace"):
+            raise ValueError(f"bridge adapter_mode must be 'concat' or 'subspace', got {adapter_mode!r}")
+        if rank < 0:
+            raise ValueError(f"bridge rank must be >= 0, got {rank}")
+        if up_init_std < 0:
+            raise ValueError(f"bridge up_init_std must be >= 0, got {up_init_std}")
+        if n_extra_passes < 1:
+            raise ValueError(f"n_extra_passes must be >= 1, got {n_extra_passes}")
+        self.hidden = int(hidden)
+        self.n_extra_passes = int(n_extra_passes)
+        self.rank = int(rank)
+        self.adapter_mode = adapter_mode
+        self.up_init_std = float(up_init_std)
         s = sum(init_weights)
         logits = torch.tensor([math.log(w / s) for w in init_weights])
-        self.mix_logits = nn.Parameter(logits.repeat(n_extra_passes, 1))
-        self.step_emb = nn.Parameter(torch.zeros(n_extra_passes, hidden)) if step_embedding else None
-        self.rank = rank
-        if rank > 0:
-            self.down = nn.Linear(2 * hidden, rank, bias=False)
-            self.up = nn.Linear(rank, hidden, bias=False)
-            nn.init.zeros_(self.up.weight)
+        self.mix_logits = nn.Parameter(logits.repeat(self.n_extra_passes, 1))
+        self.step_emb = nn.Parameter(torch.zeros(self.n_extra_passes, self.hidden)) if step_embedding else None
+        if self.rank > 0:
+            if adapter_mode == "concat":
+                self.down = nn.Linear(2 * self.hidden, self.rank, bias=False)
+                self.up = nn.Linear(self.rank, self.hidden, bias=False)
+                nn.init.zeros_(self.up.weight)
+            else:
+                self.norms = nn.ModuleList([nn.RMSNorm(self.hidden, eps=1e-6) for _ in range(self.n_extra_passes)])
+                self.downs = nn.ModuleList(
+                    [nn.Linear(self.hidden, self.rank, bias=False) for _ in range(self.n_extra_passes)]
+                )
+                self.ups = nn.ModuleList(
+                    [nn.Linear(self.rank, self.hidden, bias=False) for _ in range(self.n_extra_passes)]
+                )
+                for i in range(self.n_extra_passes):
+                    nn.init.orthogonal_(self.downs[i].weight)
+                    if self.up_init_std == 0.0:
+                        nn.init.zeros_(self.ups[i].weight)
+                    else:
+                        nn.init.normal_(self.ups[i].weight, mean=0.0, std=self.up_init_std)
 
     def weights(self, extra_pass: int) -> torch.Tensor:
         return F.softmax(upcast(self.mix_logits[extra_pass]), dim=-1)
 
     def forward(self, h: torch.Tensor, anchor: torch.Tensor, extra_pass: int) -> torch.Tensor:
         w = self.weights(extra_pass)
-        matched = upcast(h) * (_rms(anchor) / _rms(h))
+        rms_anc = _rms(anchor)
+        matched = upcast(h) * (rms_anc / _rms(h))
         x = w[0] * upcast(h) + w[1] * upcast(anchor) + w[2] * matched
         if self.step_emb is not None:
             x = x + upcast(self.step_emb[extra_pass])
         if self.rank > 0:
-            x = x + self.up(F.silu(self.down(torch.cat([h, anchor], dim=-1))).to(self.up.weight.dtype)).to(x.dtype)
+            if self.adapter_mode == "concat":
+                cat_in = torch.cat([upcast(h), upcast(anchor)], dim=-1).to(self.down.weight.dtype)
+                delta = self.up(F.silu(self.down(cat_in)).to(self.up.weight.dtype))
+                x = x + upcast(delta)
+            else:
+                norm_mod = self.norms[extra_pass]
+                down_mod = self.downs[extra_pass]
+                up_mod = self.ups[extra_pass]
+                u_hat = norm_mod(upcast(h).to(norm_mod.weight.dtype))
+                delta = up_mod(F.silu(down_mod(u_hat.to(down_mod.weight.dtype))).to(up_mod.weight.dtype))
+                x = x + (rms_anc / math.sqrt(self.hidden)) * upcast(delta)
         return x.to(h.dtype)
+
+
+class ReEntryBridge(LoopBridge):
+    """v3 Subspace-Aligned `ReEntryBridge` preset (`init_weights=(0.05, 0.85, 0.10)`, `adapter_mode='subspace'`)."""
+
+    def __init__(
+        self,
+        hidden: int,
+        n_extra_passes: int,
+        init_weights: tuple[float, ...] = V3_BRIDGE_WEIGHTS,
+        rank: int = 256,
+        step_embedding: bool = True,
+        up_init_std: float = 0.01,
+    ):
+        super().__init__(
+            hidden=hidden,
+            n_extra_passes=n_extra_passes,
+            init_weights=init_weights,
+            rank=rank,
+            step_embedding=step_embedding,
+            adapter_mode="subspace",
+            up_init_std=up_init_std,
+        )

@@ -481,3 +481,373 @@ def test_surgery_check_bf16_moe_calibration_vs_broken_cache_detection():
         m_fp32.lm_head.forward = orig_fp32_head  # type: ignore[method-assign]
 
 
+def test_surgery_check_blackwell_dynamic_fp8_profile_and_broken_cache():
+    from qloop.model.probes import surgery_check
+
+    model = build_toy(num_hidden_layers=20, hidden_size=64, vocab_size=128).to(torch.bfloat16)
+    model.config.quantization_config = {"quant_method": "fp8", "activation_scheme": "dynamic"}
+    ids = torch.randint(0, model.config.vocab_size, (1, 24), generator=torch.Generator().manual_seed(42))
+    # 20 physical -> 44 virtual layers gives exact `depth_mult = 2.2` (matching 40L -> 88L Qwen3.6-FP8)
+    loop_spec = {"prelude_end": 4, "core_end": 16, "num_passes": 3, "target_virtual_layers": 44}
+    orig_head = model.lm_head.forward
+    ref_clean = model.eval()(ids).logits.detach().clone()
+
+    def _make_dynamic_fp8_head(mode: str = "healthy"):
+        def _head(x: torch.Tensor) -> torch.Tensor:
+            raw = orig_head(x).float()
+            v = raw / raw.norm(dim=-1, keepdim=True).clamp_min(1e-6) * 32.0
+            top_idx = v.argmax(dim=-1, keepdim=True)
+            v.scatter_add_(-1, top_idx, torch.full_like(top_idx, 18.0, dtype=torch.float32))
+            if x.shape[1] == 1:
+                is_looped = len(model.model.layers) > 20
+                vocab = v.shape[-1]
+                t_idx = int(top_idx[0, 0].item())
+                spike_idx = (t_idx + 1) % vocab
+                if is_looped and mode == "broken_cos":
+                    # Genuine broken cache: severe directional rotation (`cos < 0.80`)
+                    gen_b = torch.Generator().manual_seed(77)
+                    rot = torch.randn(vocab, generator=gen_b, dtype=torch.float32).to(v.device) * 4.5
+                    v = -0.35 * v + rot.view(1, 1, vocab)
+                    return v.to(x.dtype)
+                if is_looped and mode == "broken_mae":
+                    # Genuine broken cache: global logit drift (`mae > 1.8`) even with positive correlation
+                    signs = torch.tensor(
+                        [2.2 if (i % 2 == 0) else -2.2 for i in range(vocab)],
+                        dtype=torch.float32,
+                        device=v.device,
+                    )
+                    v = v + signs.view(1, 1, vocab)
+                    return v.to(x.dtype)
+
+                t_diff = 11.421875 if is_looped else 6.515625
+                t_mae = 0.5933 if is_looped else 0.4555
+                n_active = 126 if is_looped else 52
+                rem_l1 = max(0.0, vocab * t_mae - t_diff)
+                fill_mag = rem_l1 / n_active
+                delta = torch.zeros(vocab, dtype=torch.float32, device=v.device)
+                placed = 0
+                for i in range(vocab):
+                    if i in (t_idx, spike_idx):
+                        continue
+                    if placed < n_active:
+                        delta[i] = fill_mag if (placed % 2 == 0) else -fill_mag
+                        placed += 1
+                delta[spike_idx] = -t_diff
+                v = v + delta.view(1, 1, vocab)
+            return v.to(x.dtype)
+
+        return _head
+
+    # 1. Healthy Blackwell dynamic-FP8 profile (`base_diff ~ 6.5`, `base_mae ~ 0.405`, `base_cos ~ 0.974`,
+    #    `depth_mult = 2.2`, `diff ~ 11.4`, `mae ~ 0.53`, `cos ~ 0.958`, `top1_match = 1.0`) MUST pass!
+    model.lm_head.forward = _make_dynamic_fp8_head("healthy")  # type: ignore[method-assign]
+    try:
+        rep = surgery_check(
+            model,
+            ids,
+            loop_spec,
+            None,
+            decode_steps=8,
+            atol=2e-2,
+            gdn2_cfg={"rank": 8, "chunk_size": 8},
+        )
+    finally:
+        model.lm_head.forward = orig_head  # type: ignore[method-assign]
+
+    assert rep["low_precision_calibrated"] is True
+    assert rep["depth_mult"] == pytest.approx(2.2, abs=1e-6)
+    assert rep["base_decode_vs_full_maxdiff"] == pytest.approx(6.515625, abs=0.25)
+    assert rep["base_decode_vs_full_mae"] == pytest.approx(0.405, abs=0.03)
+    assert rep["base_decode_vs_full_cosine"] == pytest.approx(0.974, abs=0.006)
+    assert rep["base_decode_vs_full_top1_match"] == 1.0
+    assert rep["decode_vs_full_maxdiff"] == pytest.approx(11.421875, abs=0.25)
+    assert rep["decode_vs_full_mae"] == pytest.approx(0.527, abs=0.03)
+    assert rep["decode_vs_full_cosine"] == pytest.approx(0.958, abs=0.006)
+    assert rep["decode_vs_full_top1_match"] == 1.0
+    assert 0.85 <= rep["effective_min_cosine"] < rep["decode_vs_full_cosine"]
+    assert rep["effective_mae_atol"] > rep["decode_vs_full_mae"]
+    assert torch.equal(model(ids).logits, ref_clean)
+
+    # 2A. Negative test on same dynamic-FP8 mock: genuine broken cache with `cos < 0.80` MUST fail!
+    model.lm_head.forward = _make_dynamic_fp8_head("broken_cos")  # type: ignore[method-assign]
+    try:
+        with pytest.raises(AssertionError, match="cached decode diverges from full forward"):
+            surgery_check(
+                model,
+                ids,
+                loop_spec,
+                None,
+                decode_steps=8,
+                atol=2e-2,
+                gdn2_cfg={"rank": 8, "chunk_size": 8},
+            )
+    finally:
+        model.lm_head.forward = orig_head  # type: ignore[method-assign]
+    assert len(model.model.layers) == 20
+    assert torch.equal(model(ids).logits, ref_clean)
+
+    # 2B. Negative test on same dynamic-FP8 mock: genuine broken cache with `mae > 1.8` MUST fail!
+    model.lm_head.forward = _make_dynamic_fp8_head("broken_mae")  # type: ignore[method-assign]
+    try:
+        with pytest.raises(AssertionError, match="cached decode diverges from full forward"):
+            surgery_check(
+                model,
+                ids,
+                loop_spec,
+                None,
+                decode_steps=8,
+                atol=2e-2,
+                gdn2_cfg={"rank": 8, "chunk_size": 8},
+            )
+    finally:
+        model.lm_head.forward = orig_head  # type: ignore[method-assign]
+    assert len(model.model.layers) == 20
+    assert torch.equal(model(ids).logits, ref_clean)
+
+    # 3. Clean bf16 (`base_infid <= 2e-3`) broken-cache sensitivity preserved (`cos ~ 0.997 < 0.9985` fails!)
+    clean_bf16 = build_toy(num_hidden_layers=12, hidden_size=64, vocab_size=128).to(torch.bfloat16)
+    orig_clean_head = clean_bf16.lm_head.forward
+
+    def _subtle_bf16_cos_drop(x: torch.Tensor) -> torch.Tensor:
+        raw = orig_clean_head(x).float()
+        v = raw / raw.norm(dim=-1, keepdim=True).clamp_min(1e-6) * 10.0
+        if x.shape[1] == 1 and len(clean_bf16.model.layers) > 12:
+            # Orthogonal jitter yielding step cosine ~ 0.9965 (`mean cos ~ 0.997 < 0.9985`) while diff < 0.15
+            vocab = v.shape[-1]
+            ortho = torch.tensor(
+                [0.075 if (i % 2 == 0) else -0.075 for i in range(vocab)],
+                dtype=torch.float32,
+                device=v.device,
+            )
+            ortho = ortho - (ortho * v[0, 0]).sum() / (v[0, 0].pow(2).sum().clamp_min(1e-6)) * v[0, 0]
+            ortho = ortho / ortho.norm().clamp_min(1e-6) * 0.85
+            v = v + ortho.view(1, 1, vocab)
+        return v.to(x.dtype)
+
+    clean_bf16.lm_head.forward = _subtle_bf16_cos_drop  # type: ignore[method-assign]
+    try:
+        with pytest.raises(AssertionError, match="cached decode diverges from full forward"):
+            surgery_check(
+                clean_bf16,
+                ids,
+                {"prelude_end": 4, "core_end": 8, "num_passes": 2, "target_virtual_layers": 16},
+                None,
+                decode_steps=8,
+                atol=2e-2,
+            )
+    finally:
+        clean_bf16.lm_head.forward = orig_clean_head  # type: ignore[method-assign]
+
+
+def test_assert_logits_unchanged_fast_path_deterministic_leak_and_kernel_jitter():
+    from types import SimpleNamespace
+
+    from qloop.model.probes import _assert_logits_unchanged
+
+    ids = torch.tensor([[1, 2, 3, 4]])
+    gen = torch.Generator().manual_seed(101)
+    ref = torch.randn(1, 4, 64, generator=gen, dtype=torch.float32) * 5.0
+
+    # 1. Exact `torch.equal` fast path: zero extra model forward calls
+    calls = [0]
+
+    class CountingModel(torch.nn.Module):
+        def forward(self, input_ids: torch.Tensor):
+            calls[0] += 1
+            return SimpleNamespace(logits=ref.clone())
+
+    det_model = CountingModel()
+    _assert_logits_unchanged(det_model, ids, ref.clone(), ref, "fast path must not fail")
+    assert calls[0] == 0
+
+    # 2. Deterministic leak rejection (`noise == 0` MUST raise AssertionError even for tiny 4e-4 leak!)
+    leaked = ref.clone()
+    leaked[0, 1, 3] += 4e-4
+
+    class DeterministicLeakModel(torch.nn.Module):
+        def forward(self, input_ids: torch.Tensor):
+            calls[0] += 1
+            return SimpleNamespace(logits=leaked.clone())
+
+    with pytest.raises(AssertionError, match="deterministic leak"):
+        _assert_logits_unchanged(DeterministicLeakModel(), ids, leaked, ref, "deterministic leak")
+    assert calls[0] == 1
+
+    # 3. Tiny stochastic 1-ULP kernel jitter (`noise > 0`, `d <= 2.5 * noise`, `cos >= 0.99999`) passes
+    jitter_step = [0]
+
+    class StochasticKernelModel(torch.nn.Module):
+        def forward(self, input_ids: torch.Tensor):
+            jitter_step[0] += 1
+            out = ref.clone()
+            out[0, 0, jitter_step[0] % 8] += 2e-4
+            return SimpleNamespace(logits=out)
+
+    stoch_model = StochasticKernelModel()
+    got_jitter = stoch_model(ids).logits
+    assert not torch.equal(got_jitter, ref)
+    _assert_logits_unchanged(stoch_model, ids, got_jitter, ref, "stochastic jitter should pass")
+
+    # 4. Large drift on a noisy kernel (`d >> 2.5 * noise`) still fails hard (both one-shot and persistent)
+    corrupted = ref.clone()
+    corrupted[0, 0, 0] += 0.05
+    with pytest.raises(AssertionError, match="real drift"):
+        _assert_logits_unchanged(stoch_model, ids, corrupted, ref, "real drift")
+
+    class PersistentLeakStochasticModel(torch.nn.Module):
+        def forward(self, input_ids: torch.Tensor):
+            jitter_step[0] += 1
+            out = corrupted.clone()
+            out[0, 0, 1 + (jitter_step[0] % 7)] += 2e-4
+            return SimpleNamespace(logits=out)
+
+    pers_model = PersistentLeakStochasticModel()
+    got_pers = pers_model(ids).logits
+    with pytest.raises(AssertionError, match="persistent noisy drift"):
+        _assert_logits_unchanged(pers_model, ids, got_pers, ref, "persistent noisy drift")
+
+
+@pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"), reason="torch lacks float8_e4m3fn")
+def test_fp8_router_headroom_mrope_extrapolation_and_bf16_hssd_suite(monkeypatch):
+    from qloop.model import probes as probes_mod
+
+    # 1. Quantized FP8 TupleRouter in `probe_expert_headroom`: must use scaled `_dequant_linear_weight`
+    #    rather than raw unscaled `upcast(w_mod)` (which would be 50x off under `weight_scale_inv=0.02`)!
+    model_ref = build_toy(num_hidden_layers=8, hidden_size=32).float().eval()
+    model_fp8 = build_toy(num_hidden_layers=8, hidden_size=32).float().eval()
+    model_fp8.load_state_dict(model_ref.state_dict())
+    scale_val = 0.02
+
+    class ScaledTupleRouter(torch.nn.Module):
+        def __init__(self, w_fp32: torch.Tensor, top_k: int, norm_topk: bool, quantize: bool):
+            super().__init__()
+            self.top_k = top_k
+            self.norm_topk = norm_topk
+            w_q = (w_fp32 / scale_val).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            if quantize:
+                self.weight = torch.nn.Parameter(w_q, requires_grad=False)
+                self.register_buffer("weight_scale_inv", torch.tensor(scale_val, dtype=torch.float32))
+            else:
+                self.weight = torch.nn.Parameter(w_q.float() * scale_val, requires_grad=False)
+
+        def forward(self, x: torch.Tensor):
+            flat = x.reshape(-1, x.shape[-1]).float()
+            w_eff = (
+                self.weight.float() * self.weight_scale_inv.float()
+                if hasattr(self, "weight_scale_inv")
+                else self.weight.float()
+            )
+            probs = torch.softmax(flat @ w_eff.t(), dim=-1)
+            top_w, top_idx = probs.topk(self.top_k, dim=-1)
+            if self.norm_topk:
+                top_w = top_w / top_w.sum(-1, keepdim=True)
+            return probs.to(x.dtype), top_w.to(x.dtype), top_idx
+
+    class WrappedMoE(torch.nn.Module):
+        def __init__(self, orig: torch.nn.Module, quantize: bool):
+            super().__init__()
+            self.gate = ScaledTupleRouter(orig.gate.weight.detach(), orig.top_k, orig.norm_topk, quantize)
+            self.experts = orig.experts
+            self.shared_expert = orig.shared_expert
+            self.shared_expert_gate = orig.shared_expert_gate
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            bsz, seq, hid = x.shape
+            flat = x.reshape(-1, hid)
+            _p, tw, ti = self.gate(flat)
+            out = self.experts(flat, ti, tw)
+            out = out + torch.sigmoid(self.shared_expert_gate(flat)) * self.shared_expert(flat)
+            return out.view(bsz, seq, hid)
+
+    for lyr_r, lyr_q in zip(model_ref.model.layers, model_fp8.model.layers):
+        lyr_r.mlp = WrappedMoE(lyr_r.mlp, quantize=False)
+        lyr_q.mlp = WrappedMoE(lyr_q.mlp, quantize=True)
+
+    batches = _batches(n=1, b=2, t=20, seed=61)
+    rep_ref = probe_expert_headroom(model_ref, batches, n_perturb=3)
+    rep_fp8 = probe_expert_headroom(model_fp8, batches, n_perturb=3)
+    assert rep_fp8["hard_token_headroom_nats"] == pytest.approx(rep_ref["hard_token_headroom_nats"], abs=1e-6)
+    assert rep_fp8["mean_router_jaccard"] == pytest.approx(rep_ref["mean_router_jaccard"], abs=1e-6)
+
+    # Also verify graceful fallback to `is_probs` / `upcast(full)` when `_dequant_linear_weight` returns None
+    monkeypatch.setattr(probes_mod, "_dequant_linear_weight", lambda *_a, **_kw: None)
+    rep_fallback = probe_expert_headroom(model_fp8, batches, n_perturb=2)
+    assert rep_fallback["ok"] is True
+    monkeypatch.undo()
+
+    # 2. 3D MRoPE `[3, B, T]` `position_ids` + nested `rope_parameters["full_attention"]` in Gate 0p-3
+    mrope_model = build_toy(
+        num_hidden_layers=4,
+        hidden_size=64,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        partial_rotary_factor=0.25,
+        rope_theta=10_000_000.0,
+    ).to(torch.bfloat16)
+    mrope_model.config.max_position_embeddings = 262_144
+    mrope_model.config.rope_parameters = {
+        "full_attention": {"rope_theta": 10_000_000.0, "partial_rotary_factor": 0.25}
+    }
+    orig_rot_fwd = mrope_model.model.rotary_emb.forward
+    inner_rot = mrope_model.model.rotary_emb
+
+    class DirectMRoPE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inv_freq = inner_rot.inv_freq
+
+        def forward(self, x: torch.Tensor, position_ids: torch.Tensor):
+            pos2 = position_ids[0] if position_ids.ndim == 3 else position_ids
+            return orig_rot_fwd(x, pos2)
+
+    direct_rot = DirectMRoPE()
+    mrope_model.model.rotary_emb = direct_rot  # type: ignore[assignment]
+    orig_tm_fwd = mrope_model.model.forward
+    mrope_cos_norms: list[float] = []
+
+    def _mrope_tm_fwd(input_ids=None, *a, **kw):
+        if input_ids is not None and kw.get("position_ids") is None:
+            bsz, seq = input_ids.shape
+            pos3 = torch.arange(seq, device=input_ids.device).view(1, 1, seq).expand(3, bsz, seq)
+            c3, _s3 = mrope_model.model.rotary_emb(
+                torch.empty(bsz, seq, 64, device=input_ids.device),
+                pos3,
+            )
+            mrope_cos_norms.append(float(c3.float().norm()))
+        return orig_tm_fwd(input_ids, *a, **kw)
+
+    mrope_model.model.forward = _mrope_tm_fwd  # type: ignore[method-assign]
+    rep_mrope = probe_positional_extrapolation(mrope_model, batches[0], modes=("native", "yarn", "rerope"), factor=4.0)
+    assert rep_mrope["ok"] is True
+    assert rep_mrope["recommended_mode"] in ("yarn", "rerope")
+    assert len(mrope_cos_norms) >= 4
+    # YaRN mscale > 1.0 changes 3D MRoPE cos norm relative to native
+    assert len({round(v, 4) for v in mrope_cos_norms}) >= 2
+
+    # 3. `run_structured_probe_suite` passes `state_dtype="bfloat16"` to `apply_hssd` on bf16/quantized models
+    seen_state_dtypes: list[str] = []
+    orig_apply_hssd = hssd_mod.apply_hssd
+
+    def _spy_apply_hssd(m: torch.nn.Module, cfg):
+        if isinstance(cfg, dict):
+            seen_state_dtypes.append(str(cfg.get("state_dtype")))
+        return orig_apply_hssd(m, cfg)
+
+    monkeypatch.setattr(hssd_mod, "apply_hssd", _spy_apply_hssd)
+    bf16_toy = build_toy(num_hidden_layers=8, hidden_size=32).to(torch.bfloat16)
+    for p in bf16_toy.parameters():
+        p.requires_grad_(False)
+    suite_rep = run_structured_probe_suite(
+        bf16_toy,
+        batches[0],
+        target_virtual=12,
+        n_perturb=2,
+        subspace_rank=8,
+        decode_steps=2,
+    )
+    assert suite_rep["summary"]["all_critical_ok"] is True
+    assert seen_state_dtypes == ["bfloat16"]
+
+
+

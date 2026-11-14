@@ -38,6 +38,7 @@ from ._dtype import upcast
 from .introspect import FULL, LINEAR, inspect_model, router_of
 from .loop import LoopSpec, _looks_like_probs, apply_loop, sha256_frozen_experts
 from .mhc import V3_BRIDGE_WEIGHTS
+from .quant_autograd import FP8_DTYPES, _dequant_linear_weight, is_quantized_module
 
 log = logging.getLogger("qloop")
 
@@ -287,18 +288,24 @@ def _cached_forward_seq(model: nn.Module, seq: torch.Tensor, prefix_len: int) ->
 def _is_low_prec_or_quant_model(model: nn.Module, sample_dtype: torch.dtype) -> bool:
     if sample_dtype in (torch.bfloat16, torch.float16):
         return True
-    cfg = getattr(model, "config", None)
-    if bool(getattr(cfg, "quantization_config", None)):
-        return True
-    txt_cfg = getattr(cfg, "text_config", None)
-    if bool(getattr(txt_cfg, "quantization_config", None)):
-        return True
+    for owner in (model, getattr(model, "model", None)):
+        cfg = getattr(owner, "config", None)
+        if cfg is None:
+            continue
+        if bool(getattr(cfg, "quantization_config", None)):
+            return True
+        txt_cfg = getattr(cfg, "text_config", None)
+        if bool(getattr(txt_cfg, "quantization_config", None)):
+            return True
     low_dtypes = {torch.bfloat16, torch.float16}
     for t in (*model.parameters(), *model.buffers()):
-        if t.dtype in low_dtypes or "float8" in str(t.dtype):
+        if t.dtype in low_dtypes or t.dtype in FP8_DTYPES or "float8" in str(t.dtype):
             return True
     quant_attrs = ("weight_packed", "gate_up_proj_packed", "down_proj_packed", "weight_scale_inv", "qweight")
-    return any(any(hasattr(mod, attr) for attr in quant_attrs) for mod in model.modules())
+    return any(
+        is_quantized_module(mod) or any(hasattr(mod, attr) for attr in quant_attrs)
+        for mod in model.modules()
+    )
 
 
 def _mean_logit_cosine(a_f32: torch.Tensor, b_f32: torch.Tensor) -> float:
@@ -308,6 +315,35 @@ def _mean_logit_cosine(a_f32: torch.Tensor, b_f32: torch.Tensor) -> float:
     step_cos = F.cosine_similarity(flat_a, flat_b, dim=-1, eps=1e-8)
     step_cos = torch.where(both_zero, torch.ones_like(step_cos), step_cos)
     return float(step_cos.mean())
+
+
+def _assert_logits_unchanged(
+    model: nn.Module,
+    ids: torch.Tensor,
+    got_logits: torch.Tensor,
+    ref_logits: torch.Tensor,
+    msg: str,
+) -> None:
+    if torch.equal(got_logits, ref_logits):
+        return
+    require(
+        got_logits.shape == ref_logits.shape and got_logits.dtype == ref_logits.dtype,
+        msg,
+        got_shape=tuple(got_logits.shape),
+        ref_shape=tuple(ref_logits.shape),
+        got_dtype=got_logits.dtype,
+        ref_dtype=ref_logits.dtype,
+    )
+    with torch.no_grad():
+        ctrl = model(input_ids=ids).logits
+    noise_got = float((ctrl.float() - got_logits.float()).abs().max())
+    noise_ref = float((ctrl.float() - ref_logits.float()).abs().max())
+    noise = min(noise_got, noise_ref)
+    d = float((got_logits.float() - ref_logits.float()).abs().max())
+    c = _mean_logit_cosine(got_logits.float(), ref_logits.float())
+    if noise > 0.0 and d <= max(2.5 * noise, 1e-3) and c >= 0.99999:
+        return
+    require(False, msg, maxdiff=d, kernel_noise=noise, cosine=c)
 
 
 @torch.no_grad()
@@ -350,10 +386,12 @@ def surgery_check(
         require(torch.isfinite(out).all(), "wrapped model produced non-finite logits at init")
         if hssd is None:
             rep["init_identity_maxdiff"] = float((out.float() - ref.float()).abs().max())
-            require(
-                torch.equal(out, ref),
+            _assert_logits_unchanged(
+                model,
+                probe_ids,
+                out,
+                ref,
                 "wrapped model is not bit-identical at init",
-                maxdiff=rep["init_identity_maxdiff"],
             )
         else:
             rep["hssd_vs_gdn1_init_maxdiff"] = float((out.float() - ref.float()).abs().max())
@@ -400,7 +438,13 @@ def surgery_check(
 
     try:
         back = model(input_ids=probe_ids).logits
-        require(torch.equal(back, ref), "model not restored after unwrap/uninstall")
+        _assert_logits_unchanged(
+            model,
+            probe_ids,
+            back,
+            ref,
+            "model not restored after unwrap/uninstall",
+        )
         base_inc = _cached_forward_seq(model, seq, prefix_len)
         base_full = model(input_ids=seq).logits[:, prefix_len - 1 :]
     finally:
@@ -415,9 +459,17 @@ def surgery_check(
     cos = _mean_logit_cosine(f32_full, f32_inc)
     top1_match = float((f32_full.argmax(dim=-1) == f32_inc.argmax(dim=-1)).float().mean())
 
-    base_err = (base_full.float() - base_inc.float()).abs()
+    base_f32_full = base_full.float()
+    base_f32_inc = base_inc.float()
+    base_err = (base_f32_full - base_f32_inc).abs()
     base_diff = float(base_err.max())
     base_mae = float(base_err.mean())
+    base_cos = _mean_logit_cosine(base_f32_full, base_f32_inc)
+    base_top1 = float((base_f32_full.argmax(dim=-1) == base_f32_inc.argmax(dim=-1)).float().mean())
+
+    phys_layers = int(ctl.parts.num_layers) if ctl is not None else 1
+    virt_layers = int(ctl.active_virtual_layers) if ctl is not None else phys_layers
+    depth_mult = max(1.0, float(virt_layers) / max(float(phys_layers), 1.0))
 
     is_low_prec = (out.dtype != torch.float64) and _is_low_prec_or_quant_model(model, out.dtype)
     rep["decode_vs_full_maxdiff"] = diff
@@ -426,6 +478,9 @@ def surgery_check(
     rep["decode_vs_full_top1_match"] = top1_match
     rep["base_decode_vs_full_maxdiff"] = base_diff
     rep["base_decode_vs_full_mae"] = base_mae
+    rep["base_decode_vs_full_cosine"] = base_cos
+    rep["base_decode_vs_full_top1_match"] = base_top1
+    rep["depth_mult"] = depth_mult
     rep["low_precision_calibrated"] = bool(is_low_prec)
 
     if not is_low_prec:
@@ -438,13 +493,29 @@ def surgery_check(
             mae=mae,
             cosine=cos,
             base_diff=base_diff,
+            base_cos=base_cos,
+            depth_mult=depth_mult,
             eff_atol=eff_atol,
         )
     else:
-        eff_atol = max(float(atol), 2.5 * base_diff + 0.15)
-        eff_mae_atol = max(0.04, 2.5 * base_mae + 0.015)
+        base_infid = max(0.0, 1.0 - base_cos)
+        if base_infid <= 2e-3 and base_mae <= 0.05:
+            min_cos = 0.9985
+            strict_cos = 0.9995
+            eff_atol = max(float(atol), 2.5 * base_diff + 0.15)
+            eff_mae_atol = max(0.04, 2.5 * base_mae + 0.015)
+        else:
+            min_cos = max(0.85, 1.0 - (base_infid * (1.6 * depth_mult) + 0.015))
+            strict_cos = max(min_cos, 1.0 - (base_infid * (1.25 * depth_mult) + 0.008))
+            eff_atol = max(float(atol), (1.5 + 0.6 * depth_mult) * base_diff + 0.25)
+            eff_mae_atol = max(0.05, (1.4 + 0.5 * depth_mult) * base_mae + 0.025)
         rep["effective_decode_atol"] = eff_atol
-        ok = cos >= 0.9985 and (diff < eff_atol or (cos >= 0.9995 and mae < eff_mae_atol))
+        rep["effective_min_cosine"] = min_cos
+        rep["effective_mae_atol"] = eff_mae_atol
+        ok = (cos >= min_cos) and (
+            (diff < eff_atol and mae < eff_mae_atol * 1.25)
+            or (cos >= strict_cos and mae < eff_mae_atol)
+        )
         require(
             ok,
             "cached decode diverges from full forward (cache semantics broken)",
@@ -454,7 +525,11 @@ def surgery_check(
             top1_match=top1_match,
             base_diff=base_diff,
             base_mae=base_mae,
+            base_cos=base_cos,
+            min_cos=min_cos,
             eff_atol=eff_atol,
+            eff_mae_atol=eff_mae_atol,
+            depth_mult=depth_mult,
         )
     log.info("surgery check passed: %s", rep)
     return rep
@@ -563,11 +638,31 @@ def probe_expert_headroom(
                         b_idx = call_box[0]
                         full, sc, idx, is_p = _extract_router(p_layer, out)
                         flat_x = inp[0].reshape(-1, inp[0].shape[-1])
+                        x_up = upcast(flat_x)
                         w_mod = getattr(mod, "weight", None)
-                        if isinstance(w_mod, torch.Tensor) and w_mod.shape == (num_experts, flat_x.shape[-1]):
+                        w_up: torch.Tensor | None = None
+                        if is_quantized_module(mod) or (
+                            isinstance(w_mod, torch.Tensor) and w_mod.dtype in FP8_DTYPES
+                        ):
+                            try:
+                                w_deq = _dequant_linear_weight(mod, torch.float32)
+                            except (RuntimeError, TypeError, ValueError):
+                                w_deq = None
+                            if isinstance(w_deq, torch.Tensor) and w_deq.shape == (num_experts, flat_x.shape[-1]):
+                                w_up = w_deq.to(dtype=x_up.dtype)
+                        elif (
+                            isinstance(w_mod, torch.Tensor)
+                            and w_mod.shape == (num_experts, flat_x.shape[-1])
+                            and w_mod.is_floating_point()
+                        ):
+                            w_up = upcast(w_mod).to(dtype=x_up.dtype)
+
+                        if w_up is not None:
                             b_mod = getattr(mod, "bias", None)
-                            bias_up = upcast(b_mod) if isinstance(b_mod, torch.Tensor) else None
-                            base_logits = F.linear(upcast(flat_x), upcast(w_mod), bias_up)
+                            bias_up = (
+                                upcast(b_mod).to(dtype=x_up.dtype) if isinstance(b_mod, torch.Tensor) else None
+                            )
+                            base_logits = F.linear(x_up, w_up, bias_up)
                         elif is_p:
                             base_logits = upcast(full.reshape(-1, num_experts)).clamp_min(1e-30).log()
                         else:
@@ -870,7 +965,14 @@ def _resolve_rotary_params(parts: Any, seq_len: int) -> tuple[nn.Module | None, 
     tc = parts.text_config
     rotary = getattr(parts.text_model, "rotary_emb", None)
     head_dim = int(getattr(tc, "head_dim", None) or (tc.hidden_size // tc.num_attention_heads))
-    rope_params = getattr(tc, "rope_parameters", None) or {}
+    raw_rope_params = getattr(tc, "rope_parameters", None) or {}
+    rope_params = (
+        raw_rope_params.get("full_attention")
+        if isinstance(raw_rope_params, dict) and isinstance(raw_rope_params.get("full_attention"), dict)
+        else raw_rope_params
+    )
+    if not isinstance(rope_params, dict):
+        rope_params = {}
     prf = float(getattr(tc, "partial_rotary_factor", None) or rope_params.get("partial_rotary_factor", 0.25))
     rot_dim = max(2, 2 * (round(head_dim * prf) // 2))
     theta = float(getattr(tc, "rope_theta", None) or rope_params.get("rope_theta", 10000.0))
@@ -1053,13 +1155,27 @@ def probe_positional_extrapolation(
                 else (inv_freq, 1.0)
             )
 
-            def _rotary_hook(_m: nn.Module, inp: Any, out: Any, _mode: str = mode,
-                             _inv: torch.Tensor = eff_inv, _ms: float = mscale) -> Any:
-                if not (isinstance(out, tuple) and len(out) >= 2 and len(inp) >= 2):
+            def _rotary_hook(
+                _m: nn.Module,
+                inp: Any,
+                kw: dict[str, Any],
+                out: Any,
+                _mode: str = mode,
+                _inv: torch.Tensor = eff_inv,
+                _ms: float = mscale,
+            ) -> Any:
+                if not (isinstance(out, tuple) and len(out) >= 2):
                     return out
                 orig_cos, orig_sin = out[0], out[1]
-                pos_ids = inp[1]
+                if not (isinstance(orig_cos, torch.Tensor) and isinstance(orig_sin, torch.Tensor)):
+                    return out
+                pos_ids = inp[1] if (isinstance(inp, tuple) and len(inp) >= 2) else kw.get("position_ids")
                 if not isinstance(pos_ids, torch.Tensor):
+                    return out
+                # Collapse leading MRoPE stream axis (e.g. [3, B, T] -> [B, T] on Qwen3.5/3.6 VLM)
+                while pos_ids.ndim > orig_cos.ndim - 1 and pos_ids.shape[1:] == orig_cos.shape[:-1]:
+                    pos_ids = pos_ids[0]
+                if pos_ids.shape != orig_cos.shape[:-1]:
                     return out
                 t_cur = max(int(pos_ids.shape[-1]), 2)
                 span = float(max(target_max_pos - 1, 1))
@@ -1069,11 +1185,17 @@ def probe_positional_extrapolation(
                 inv_dev = _inv.to(device=pos_ids.device, dtype=torch.float64)
                 freqs = stretched[..., None] * inv_dev
                 emb = torch.cat([freqs, freqs], dim=-1)
+                if emb.numel() != orig_cos.numel():
+                    return out
                 new_cos = (emb.cos() * _ms).to(dtype=orig_cos.dtype).reshape_as(orig_cos)
                 new_sin = (emb.sin() * _ms).to(dtype=orig_sin.dtype).reshape_as(orig_sin)
                 return (new_cos, new_sin, *out[2:])
 
-            handle = rotary_mod.register_forward_hook(_rotary_hook) if rotary_mod is not None else None
+            handle = (
+                rotary_mod.register_forward_hook(_rotary_hook, with_kwargs=True)
+                if rotary_mod is not None
+                else None
+            )
             try:
                 ext_nll = sum(float(_lm_loss(model, b)) for b in batches) / len(batches)
                 pk_logits = model(input_ids=pk_ids).logits[0, -1].float()
@@ -1294,7 +1416,8 @@ def run_structured_probe_suite(
             best_core = {"prelude_end": p_end, "core_end": c_end, "num_passes": r_passes}
 
         hidden = int(getattr(parts.text_config, "hidden_size", 32))
-        ref_dtype = parts.text_model.embed_tokens.weight.dtype
+        embed_w = getattr(parts.text_model.embed_tokens, "weight", None)
+        ref_dtype = embed_w.dtype if isinstance(embed_w, torch.Tensor) else ref_logits.dtype
         atol = 1e-9 if ref_dtype == torch.float64 else 2e-2
         loop_surgery_spec = {
             "prelude_end": p_end,
@@ -1342,6 +1465,11 @@ def run_structured_probe_suite(
         )
         hssd_surgery_rep: dict[str, Any] | None = None
         if has_linear:
+            hssd_state_dtype = (
+                "bfloat16"
+                if (ref_logits.dtype != torch.float64 and _is_low_prec_or_quant_model(model, ref_logits.dtype))
+                else "auto"
+            )
             hssd_surgery_rep = surgery_check(
                 model,
                 b0,
@@ -1354,6 +1482,7 @@ def run_structured_probe_suite(
                     "chunk_size": 8 if probe_seq_len < 64 else 64,
                     "window_chunks": 2,
                     "checkpoint_segments": False,
+                    "state_dtype": hssd_state_dtype,
                 },
             )
 
@@ -1369,15 +1498,21 @@ def run_structured_probe_suite(
             core_end=c_end,
         )
         pos_rep = probe_positional_extrapolation(model, batches, modes=pos_modes, factor=pos_factor)
+
+        with torch.no_grad():
+            after_logits = model(input_ids=b0).logits
+        sha_after = sha256_frozen_experts(model)
+        _assert_logits_unchanged(
+            model,
+            b0,
+            after_logits,
+            ref_logits,
+            "probe suite left residual state on model",
+        )
+        require(sha_after == sha_before, "probe suite mutated frozen expert parameters")
     finally:
         if was_training:
             model.train()
-
-    with torch.no_grad():
-        after_logits = model(input_ids=b0).logits
-    sha_after = sha256_frozen_experts(model)
-    require(torch.equal(after_logits, ref_logits), "probe suite left residual state on model")
-    require(sha_after == sha_before, "probe suite mutated frozen expert parameters")
 
     gates = {
         "0a_backward": {

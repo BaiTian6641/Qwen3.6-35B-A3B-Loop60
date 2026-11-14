@@ -540,3 +540,411 @@ def test_cli_failure_writes_crash_report(tmp_path, monkeypatch):
     assert main(["train", "-c", lm, "-s", "loop.core_end=10", "-s", "run.name=bad"]) == 1
     reports = os.listdir(tmp_path / "bad" / "crash")
     assert reports and "virtual layers" in (tmp_path / "bad" / "crash" / reports[0]).read_text()
+
+
+def test_v3_stages_calibrated_s0_probe_invariants():
+    v3_stages = ("s1_loop_a6b", "s1b_hssd_distill", "s3_long_1m_lsa", "s2_joint_bptt", "s4_rl")
+    cfgs = {st: load_config(os.path.join(ROOT, "configs", "stages", f"{st}.yaml")) for st in v3_stages}
+
+    expected_init_chain = {
+        "s1_loop_a6b": None,
+        "s1b_hssd_distill": "runs/s1_loop_a6b",
+        "s3_long_1m_lsa": "runs/s1b_hssd_distill",
+        "s2_joint_bptt": "runs/s3_long_1m_lsa",
+        "s4_rl": "runs/s2_joint_bptt",
+    }
+
+    for st, cfg in cfgs.items():
+        loop = dict(cfg["loop"])
+        assert loop["enabled"] is True, st
+        assert loop["prelude_end"] == 12, st
+        assert loop["core_end"] == 36, st
+        assert loop["num_passes"] == 3, st
+        assert loop["target_virtual_layers"] == 88, st
+        assert loop["kv_share"] is True, st
+        assert list(loop["bridge_init"]) == [0.05, 0.85, 0.10], st
+        assert loop["bridge_mode"] == "subspace", st
+        assert loop["bridge_rank"] == 256, st
+        assert loop["bridge_up_std"] == 0.01, st
+        assert loop["attn_adapter_rank"] == 64, st
+        assert loop["step_embedding"] is True, st
+        assert loop["gate_init"] == 0.0, st
+        assert loop["per_pass_router"] is True, st
+        assert loop["router_adapter_rank"] == 32, st
+        assert loop["router_repel_init"] == 0.0, st
+        assert loop["router_diversity_weight"] == 0.0, st
+        assert loop["mor"] is False, st
+        assert loop["write_mask"] is True, st
+        assert loop["checkpoint"] is True, st
+        assert cfg["train"].get("init_from") == expected_init_chain[st], st
+        assert list(cfg["eval_quick"]["depths"]) == [1, 2, 3], st
+
+    assert cfgs["s1_loop_a6b"]["gdn2"]["enabled"] is True
+    assert cfgs["s1_loop_a6b"]["hssd"]["enabled"] is False
+
+    expected_hssd = {
+        "enabled": True,
+        "chunk_size": 64,
+        "window_chunks": 8,
+        "num_pages": 8,
+        "k_pages": 2,
+        "theta_low_rank": True,
+        "surprise_mode": "routed",
+        "state_dtype": "bfloat16",
+        "budget_weight": 1.0,
+        "segment_chunks": 4,
+        "checkpoint_segments": True,
+    }
+    for st in ("s1b_hssd_distill", "s3_long_1m_lsa", "s2_joint_bptt", "s4_rl"):
+        cfg = cfgs[st]
+        assert cfg["gdn2"]["enabled"] is False, st
+        for hk, hv in expected_hssd.items():
+            assert cfg["hssd"][hk] == hv, f"{st}: hssd.{hk}={cfg['hssd'].get(hk)!r} != {hv!r}"
+
+    for st in ("s3_long_1m_lsa", "s2_joint_bptt", "s4_rl"):
+        cfg = cfgs[st]
+        assert cfg["model"]["yarn_target_len"] == 1048576, st
+        assert not bool((cfg.get("rerope") or {}).get("enabled", False)), st
+    assert cfgs["s3_long_1m_lsa"]["rerope"]["enabled"] is False
+
+    for st in ("s2_joint_bptt", "s4_rl"):
+        lsa = dict(cfgs[st]["lsa"])
+        assert lsa["enabled"] is True and lsa["mode"] == "sparse", st
+        assert lsa["num_query_passes"] == 3 and lsa["index_dim"] == 64 and lsa["index_on"] == "nope", st
+        assert lsa["pool"] == 4 and lsa["block_size"] == 512, st
+        assert lsa["avg_bucket_keys"] == 8 and lsa["max_bucket_keys"] == 32, st
+        assert lsa["num_select"] == 64 and lsa["window"] == 512 and lsa["sinks"] == 64, st
+        assert lsa["search"] == "flat" and lsa["temperature"] == 0.1 and lsa["query_chunk"] == 256, st
+
+        exp = dict(cfgs[st]["experts"])
+        assert exp["enabled"] is False, st
+        assert exp["stats_path"] == "runs/s1_loop_a6b/esft_stats_looped.json", st
+        assert exp["fraction"] == 0.025 and exp["by"] == "affinity" and exp["per_pass"] == "union" and exp["rank"] == 64
+
+    s4 = cfgs["s4_rl"]
+    assert list(s4["loop"]["train_pass_probs"]) == [0.10, 0.35, 0.55]
+    assert s4["train"]["steps"] == 400 and s4["train"]["ckpt_every"] == 25
+    assert s4["train"]["sha256_frozen_experts"] is True
+    assert s4["train"]["train_loop_adapters"] is True
+    assert s4["train"]["train_hssd"] is True
+    assert s4["train"]["train_lsa"] is True
+    assert s4["train"]["aux_weights"]["loop_aux"] == 1.0
+    assert s4["train"]["aux_weights"]["hssd_budget"] == 0.5
+    assert s4["train"]["optim"]["lr"] == 1.0e-6
+    assert s4["train"]["optim"]["warmup_steps"] == 10
+    assert s4["train"]["optim"]["max_grad_norm_per_param"] == 0.5
+    assert s4["train"]["optim"]["lr_mult"]["loop_adapters"] == 5.0
+    assert s4["train"]["optim"]["lr_mult"]["hssd_adapter"] == 2.0
+    assert s4["train"]["optim"]["lr_mult"]["lsa_indexer"] == 2.0
+    assert s4["rl"]["gate"]["depth"] == 3
+
+
+def test_v3_cli_pipeline_cmds_autoskip_and_notebook_pack_priority(tmp_path, monkeypatch):
+    from qloop.cli import _pipeline_stage_cmds, _run_sync_action
+    from qloop.hub import PIPELINE_ORDER, V3_PIPELINE_ORDER, HubManifest
+
+    def _extract_cfg(cmd: list[str]):
+        c_idx = cmd.index("-c")
+        cpath = cmd[c_idx + 1]
+        ovs = [cmd[i + 1] for i, tok in enumerate(cmd[:-1]) if tok == "-s"]
+        return load_config(cpath, ovs), ovs
+
+    v3_all = (*V3_PIPELINE_ORDER, "eval")
+    s4_v3_cmd = _pipeline_stage_cmds(
+        "s4_rl",
+        config_root=os.path.join(ROOT, "configs"),
+        run_root=str(tmp_path),
+        repo_id="TassP0lar/Qwen3.6-35B-A3B-Loop64",
+        debug_level=1,
+        overrides=[],
+        time_budget_hours=None,
+        scan_batches=4,
+        scan_seq_len=512,
+        all_stages=v3_all,
+    )[0]
+    s4_v3_cfg, _ = _extract_cfg(s4_v3_cmd)
+    assert s4_v3_cfg.loop.prelude_end == 12 and s4_v3_cfg.loop.core_end == 36
+    assert list(s4_v3_cfg.loop.train_pass_probs) == [0.10, 0.35, 0.55]
+    assert s4_v3_cfg.hssd.enabled is True
+    assert s4_v3_cfg.hssd.state_dtype == "bfloat16"
+    assert s4_v3_cfg.hssd.segment_chunks == 4
+    assert s4_v3_cfg.model.yarn_target_len == 1048576
+    assert "norms" in s4_v3_cfg.train.allowed_groups and "deltanet" in s4_v3_cfg.train.allowed_groups
+
+    eval_v3_cmd = _pipeline_stage_cmds(
+        "eval",
+        config_root=os.path.join(ROOT, "configs"),
+        run_root=str(tmp_path),
+        repo_id="TassP0lar/Qwen3.6-35B-A3B-Loop64",
+        debug_level=1,
+        overrides=[],
+        time_budget_hours=None,
+        scan_batches=4,
+        scan_seq_len=512,
+        all_stages=v3_all,
+    )[0]
+    eval_v3_cfg, _ = _extract_cfg(eval_v3_cmd)
+    assert eval_v3_cfg.loop.prelude_end == 12 and eval_v3_cfg.loop.core_end == 36
+    assert eval_v3_cfg.hssd.enabled is True and eval_v3_cfg.hssd.state_dtype == "bfloat16"
+    assert eval_v3_cfg.hssd.segment_chunks == 4
+    assert eval_v3_cfg.model.yarn_target_len == 1048576
+    assert list(eval_v3_cfg["eval"]["defaults"]["depths"]) == [1, 2, 3]
+
+    # Legacy v2 PIPELINE_ORDER compatibility check
+    s4_v2_cmd = _pipeline_stage_cmds(
+        "s4_rl",
+        config_root=os.path.join(ROOT, "configs"),
+        run_root=str(tmp_path),
+        repo_id="TassP0lar/Qwen3.6-35B-A3B-Loop64",
+        debug_level=1,
+        overrides=[],
+        time_budget_hours=None,
+        scan_batches=4,
+        scan_seq_len=512,
+        all_stages=PIPELINE_ORDER,
+    )[0]
+    s4_v2_cfg, _ = _extract_cfg(s4_v2_cmd)
+    assert s4_v2_cfg.loop.prelude_end == 8 and s4_v2_cfg.loop.core_end == 32
+    assert s4_v2_cfg.loop.target_virtual_layers == 64
+    assert s4_v2_cfg.gdn2.enabled is True and s4_v2_cfg.hssd.enabled is False
+    assert s4_v2_cfg.rl.gate.depth == 2
+
+    # Verify s0_probe auto-skips cleanly when remote HF manifest marks s0_probe completed
+    subproc_calls: list[list[str]] = []
+    monkeypatch.setattr("subprocess.call", lambda cmd, *a, **kw: subproc_calls.append(list(cmd)) or 0)
+
+    class _ProbeDoneHub:
+        def fetch_manifest(self) -> HubManifest:
+            return HubManifest(stages={"s0_probe": {"status": "completed", "step": 1}})
+
+    sync_args = SimpleNamespace(
+        action="pipeline",
+        stages="s0_probe,s1_loop_a6b",
+        until="s0_probe",
+        force=False,
+        debug=1,
+        set=[],
+        time_budget_hours=None,
+        scan_batches=2,
+        scan_seq_len=64,
+        reclaim_disk=False,
+    )
+    assert (
+        _run_sync_action(
+            sync_args,
+            hub=_ProbeDoneHub(),
+            repo_id="TassP0lar/Qwen3.6-35B-A3B-Loop64",
+            run_root=str(tmp_path),
+            ckpt_cls=None,
+        )
+        == 0
+    )
+    assert subproc_calls == [], "completed s0_probe in Hub manifest must auto-skip without spawning subprocess"
+
+    # Verify colab_train_e2e.ipynb Cell 5 auto-selects highest completed stage for Whole Model Pack export
+    e2e_nb_path = os.path.join(ROOT, "notebooks", "colab_train_e2e.ipynb")
+    with open(e2e_nb_path, encoding="utf-8") as f:
+        e2e_nb = json.load(f)
+    cell5_src = next(
+        (
+            "".join(c.get("source", []))
+            for c in e2e_nb["cells"]
+            if c.get("cell_type") == "code" and "PACK_STAGE_PRIORITY" in "".join(c.get("source", []))
+        ),
+        "",
+    )
+    assert cell5_src, "missing PACK_STAGE_PRIORITY cell in colab_train_e2e.ipynb"
+    cell5_tree = ast.parse(cell5_src, filename=f"{e2e_nb_path}#pack_cell", feature_version=(3, 9))
+    pack_assigns = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in cell5_tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in ("PACK_SOURCE_STAGE", "PACK_SOURCE_CONFIG", "PACK_STAGE_PRIORITY")
+    }
+    assert pack_assigns["PACK_SOURCE_STAGE"] == "auto"
+    assert pack_assigns["PACK_SOURCE_CONFIG"] == "auto"
+    assert pack_assigns["PACK_STAGE_PRIORITY"] == (
+        "s4_rl",
+        "s2_joint_bptt",
+        "s3_long_1m_lsa",
+        "s1b_hssd_distill",
+        "s1_loop_a6b",
+    )
+
+
+def test_v3_five_stage_toy_chain_init_from_and_strict_restore(tmp_path, monkeypatch):
+    """End-to-end 5-stage Toy chain (`s1_loop_a6b -> s1b_hssd_distill -> s3_long_1m_lsa -> s2_joint_bptt -> s4_rl`).
+
+    Exercises real stage YAMLs mapped onto 16L Toy (`prelude_end=4, core_end=12, num_passes=3, target_virtual=32`),
+    verifying every `train.init_from` transition via `LMTrainer` / `GRPOTrainer`, `carried_params` HSSD preservation
+    through `s3_long_1m_lsa` (`train_hssd: false`), `GRPOTrainer` `aux_weights` + `sha256_frozen_experts`, and exact
+    `restore_checkpoint(..., strict=True)` forward parity across `R in {1, 2, 3}` at every stage.
+    """
+    import torch
+
+    from qloop.train.checkpoint import CheckpointManager
+    from qloop.train.rl import GRPOTrainer
+    from qloop.train.stack import build_stack
+    from qloop.train.trainer import LMTrainer
+
+    monkeypatch.setenv("QLOOP_RUN_ROOT", str(tmp_path))
+
+    common_toy_overrides = [
+        "model.name=toy",
+        "model.dtype=float32",
+        "model.device_map=cpu",
+        "model.toy={seed: 0}",
+        "loop.prelude_end=4",
+        "loop.core_end=12",
+        "loop.num_passes=3",
+        "loop.target_virtual_layers=32",
+        "loop.bridge_rank=16",
+        "loop.attn_adapter_rank=8",
+        "loop.router_adapter_rank=8",
+        "gdn2.rank=8",
+        "gdn2.chunk_size=16",
+        "gdn2.segment_chunks=2",
+        "hssd.chunk_size=16",
+        "hssd.window_chunks=2",
+        "hssd.num_pages=4",
+        "hssd.k_pages=2",
+        "hssd.segment_chunks=2",
+        "lsa.index_dim=4",
+        "lsa.block_size=16",
+        "lsa.pool=2",
+        "lsa.avg_bucket_keys=4",
+        "lsa.max_bucket_keys=8",
+        "lsa.window=16",
+        "lsa.sinks=2",
+        "lsa.num_select=2",
+        "lsa.query_chunk=16",
+        "checkpoint.sync.enabled=false",
+        "checkpoint.sync.hf_repo=null",
+        "train.steps=2",
+        "train.grad_accum=1",
+        "train.log_every=1",
+        "train.ckpt_every=2",
+        "train.eval_every=0",
+        "train.optim.lr=3.0e-3",
+        "train.optim.warmup_steps=1",
+        "train.optim.apollo={min_dim: 16}",
+        "eval_quick.n_batches=1",
+    ]
+    lm_data_overrides = [
+        "data.seq_len=32",
+        "data.sources=[{name: toy_cot, weight: 0.7}, {name: toy_text, weight: 0.3}]",
+        "data.decontaminate.enabled=false",
+    ]
+
+    probe_ids = torch.randint(4, 90, (1, 32))
+
+    def _verify_strict_restore_parity(stage_cfg, stage_dir: str, trained_stack) -> dict[str, torch.Tensor]:
+        trained_stack.model.eval()
+        if trained_stack.lsa is not None:
+            trained_stack.lsa.set_mode("sparse")
+        expected: dict[int, torch.Tensor] = {}
+        with torch.no_grad():
+            for r in (1, 2, 3):
+                trained_stack.loop.set_active_passes(r)
+                expected[r] = trained_stack.model(input_ids=probe_ids).logits.detach().clone()
+
+        mgr = CheckpointManager(stage_dir, keep_last=0)
+        ck = mgr.load(mgr.latest(), map_location="cpu")
+        assert ck is not None, f"missing checkpoint in {stage_dir}"
+        smeta = (ck.get("state") or {}).get("stack") or {}
+
+        fresh = build_stack(stage_cfg)
+        fresh.restore_checkpoint(ck["params"], strict=True, prior_stack_meta=smeta)
+        fresh.model.eval()
+        if fresh.lsa is not None:
+            fresh.lsa.set_mode("sparse")
+        with torch.no_grad():
+            for r in (1, 2, 3):
+                fresh.loop.set_active_passes(r)
+                got = fresh.model(input_ids=probe_ids).logits
+                assert torch.allclose(got, expected[r], atol=1e-5), f"{stage_dir}: strict=True depth-{r} mismatch"
+        return ck["params"]
+
+    # 1. Stage s1_loop_a6b (Track-A GDN-2 + 3-pass Loop)
+    s1_cfg = load_config(
+        os.path.join(ROOT, "configs", "stages", "s1_loop_a6b.yaml"),
+        [*common_toy_overrides, *lm_data_overrides],
+    )
+    s1_dir = str(tmp_path / "s1_loop_a6b")
+    s1_tr = LMTrainer(s1_cfg, s1_dir)
+    assert s1_tr.train()["step"] == 2
+    _verify_strict_restore_parity(s1_cfg, s1_dir, s1_tr.stack)
+
+    # 2. Stage s1b_hssd_distill (init_from: runs/s1_loop_a6b -> swaps GDN-2 for Track-B HSSD v3.1)
+    s1b_cfg = load_config(
+        os.path.join(ROOT, "configs", "stages", "s1b_hssd_distill.yaml"),
+        [*common_toy_overrides, *lm_data_overrides],
+    )
+    assert s1b_cfg.train.init_from == "runs/s1_loop_a6b"
+    s1b_dir = str(tmp_path / "s1b_hssd_distill")
+    s1b_tr = LMTrainer(s1b_cfg, s1b_dir)
+    assert s1b_tr.train()["step"] == 2
+    assert s1b_tr.stack.carried_gdn2_cfg is not None
+    s1b_params = _verify_strict_restore_parity(s1b_cfg, s1b_dir, s1b_tr.stack)
+    s1b_hssd_tensors = {k: v.clone() for k, v in s1b_params.items() if "hssd_adapter." in k}
+    assert s1b_hssd_tensors, "s1b_hssd_distill must save trained hssd_adapter tensors"
+
+    # 3. Stage s3_long_1m_lsa (init_from: runs/s1b_hssd_distill; train_hssd: false carries HSSD; trains D-LSA + YaRN)
+    s3_cfg = load_config(
+        os.path.join(ROOT, "configs", "stages", "s3_long_1m_lsa.yaml"),
+        [*common_toy_overrides, *lm_data_overrides],
+    )
+    assert s3_cfg.train.init_from == "runs/s1b_hssd_distill"
+    assert s3_cfg.train.train_hssd is False
+    assert s3_cfg.model.yarn_target_len == 1048576
+    assert s3_cfg.rerope.enabled is False
+    s3_dir = str(tmp_path / "s3_long_1m_lsa")
+    s3_tr = LMTrainer(s3_cfg, s3_dir)
+    assert s3_tr.train()["step"] == 2
+    assert any("hssd_adapter." in k for k in s3_tr.stack.carried_params), "s3 must carry frozen hssd_adapter params"
+    s3_params = _verify_strict_restore_parity(s3_cfg, s3_dir, s3_tr.stack)
+    for hk, hv in s1b_hssd_tensors.items():
+        assert hk in s3_params and torch.equal(s3_params[hk].cpu(), hv.cpu()), f"s3 dropped or mutated {hk}"
+
+    # 4. Stage s2_joint_bptt (init_from: runs/s3_long_1m_lsa; joint HSSD + sparse D-LSA + Loop)
+    s2_cfg = load_config(
+        os.path.join(ROOT, "configs", "stages", "s2_joint_bptt.yaml"),
+        [*common_toy_overrides, *lm_data_overrides],
+    )
+    assert s2_cfg.train.init_from == "runs/s3_long_1m_lsa"
+    s2_dir = str(tmp_path / "s2_joint_bptt")
+    s2_tr = LMTrainer(s2_cfg, s2_dir)
+    assert s2_tr.train()["step"] == 2
+    _verify_strict_restore_parity(s2_cfg, s2_dir, s2_tr.stack)
+
+    # 5. Stage s4_rl (init_from: runs/s2_joint_bptt; GRPOTrainer with HSSD v3.1 + sparse D-LSA + depth-3 gate)
+    rl_toy_overrides = [
+        *common_toy_overrides,
+        'rl.tasks=[{source: toy_arith, n: 16, verifier: regex, pattern: "[aeiou]"}]',
+        "rl.group_size=4",
+        "rl.prompts_per_step=2",
+        "rl.max_new_tokens=6",
+        "rl.micro_batch_seqs=2",
+        "rl.verifier_workers=1",
+        "rl.gate.every=2",
+        (
+            'rl.gate.benchmarks=[{name: aime_2026, limit: 2, max_new_tokens: 4, '
+            'offline_items: [{id: a, problem: "1+1?", answer: "2"}, {id: b, problem: "2+2?", answer: "4"}]}]'
+        ),
+    ]
+    s4_cfg = load_config(
+        os.path.join(ROOT, "configs", "stages", "s4_rl.yaml"),
+        rl_toy_overrides,
+    )
+    assert s4_cfg.train.init_from == "runs/s2_joint_bptt"
+    assert s4_cfg.rl.gate.depth == 3
+    assert s4_cfg.train.aux_weights.loop_aux == 1.0 and s4_cfg.train.aux_weights.hssd_budget == 0.5
+    s4_dir = str(tmp_path / "s4_rl")
+    s4_tr = GRPOTrainer(s4_cfg, s4_dir)
+    s4_res = s4_tr.train()
+    assert s4_res["step"] == 2
+    assert os.path.exists(os.path.join(s4_dir, "checkpoints", "PROMOTED"))
+    s4_tr.stack.verify_frozen_experts()
+    _verify_strict_restore_parity(s4_cfg, s4_dir, s4_tr.stack)

@@ -413,6 +413,7 @@ class GRPOTrainer:
         mb = int(rl.get("micro_batch_seqs", 4))
         eps_lo, eps_hi = float(rl.get("clip_low", 0.2)), float(rl.get("clip_high", 0.28))
         kl_coef, sft_w = float(rl.get("kl_coef", 0.0)), float((rl.get("teacher") or {}).get("sft_weight", 0.1))
+        aux_w = dict(self.tcfg.get("aux_weights") or {})
         epochs = int(rl.get("ppo_epochs", 1))
         pg = [s for s in seqs if s.kind == "pg"]
         te = [s for s in seqs if s.kind == "teacher"]
@@ -450,7 +451,7 @@ class GRPOTrainer:
                         loss = loss + kl_coef * kl
                         stats["loss/kl"] += float(kl.detach())
                 for a_name, a_loss in self.stack.aux_losses().items():
-                    loss = loss + a_loss
+                    loss = loss + float(aux_w.get(a_name, 1.0)) * a_loss
                     stats[f"loss/{a_name}"] = stats.get(f"loss/{a_name}", 0.0) + float(a_loss.detach())
                 loss.backward()
             stats.update({f"optim/{k}": v for k, v in self.opt.step().items()})
@@ -610,5 +611,7 @@ class GRPOTrainer:
             raise
         finally:
             self.pool.shutdown(wait=False)
+        if self.stack.frozen_experts_sha256 is not None:
+            self.stack.verify_frozen_experts()
         path = self._save_ckpt(completed=(self.step >= steps), metrics=last)
         return {"step": self.step, "checkpoint": path, "last": last}

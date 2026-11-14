@@ -1,8 +1,9 @@
-# Gate 2a (S3 v3) - 1M GPU-Resident FP8 SharedKV + Per-Pass D-LSA + Long-Prefix / Short-Suffix Calibration.
+# Gate 2a (S3 v3.1) - 1M GPU-Resident FP8 SharedKV + Per-Pass D-LSA + Long-Prefix / Short-Suffix Calibration.
+# Architecture: [0,12) x1 + [12,36) xR + [36,40) x1 = 88L (`s0_probe` calibrated ETD core `[12,36)` + Track-B HSSD v3.1).
 # Resolves Fix C1 & Decision 1/2:
 #   * 1M primary context (`1,048,576` tokens = `10.00 GiB` GPU FP8 KV + `320 MiB` GPU Ward centroids at 1.0x SharedKV)
 #   * Untied per-pass query indexers `W_q_idx^(r)` (`num_query_passes: 3`) with shared `W_k_idx` & Ward buckets
-#   * Smooth DCA / ReRoPE distance clamping (`pos_rerope`) keeping [0:64] rotary angles inside pretrained [0, 262K] arc
+#   * Pure YaRN 4.0x (`model.yarn_target_len: 1048576`, `rerope.enabled: false`; Gate 0p-3 winner: NLL=2.6459, +13.7209 passkey margin, 100% needle acc)
 #   * `prefix_suffix_calibration_step`: streams 512K-992K prefix tokens under `torch.no_grad()` to populate true 1M-scale
 #     FP8 KV + centroids, then backpropagates gradients on the final 32K query/answer suffix (`< 64 GiB` HBM on G4!).
 #   * Includes optional Tier-2 10M Host-DDR5 Block-64 Walsh-Hadamard INT4 offload config (`offload.enabled: false`).
@@ -16,8 +17,8 @@ model:
 
 loop:
   enabled: true
-  prelude_end: 8
-  core_end: 32
+  prelude_end: 12
+  core_end: 36
   num_passes: 3
   target_virtual_layers: 88
   kv_share: true                        # 1.0x KV memory across all passes R in {1, 2, 3}
@@ -32,6 +33,8 @@ loop:
   router_adapter_rank: 32
   router_repel_init: 0.0
   router_diversity_weight: 0.0
+  mor: false
+  write_mask: true
   checkpoint: true
   train_pass_probs: [0.15, 0.50, 0.35]
 
@@ -44,8 +47,11 @@ hssd:
   window_chunks: 8
   num_pages: 8
   k_pages: 2
+  theta_low_rank: true
+  surprise_mode: routed
+  state_dtype: bfloat16
   budget_weight: 1.0
-  segment_chunks: 16
+  segment_chunks: 4
   checkpoint_segments: true
 
 lsa:
@@ -68,7 +74,7 @@ lsa:
   query_chunk: 256
 
 rerope:
-  enabled: true                         # calibrated via Gate 0p-3 shootout (`yarn` vs `rerope`)
+  enabled: false                        # Gate 0p-3 calibrated `yarn` 4.0x winner over `rerope` (avoids double-warping rotary angles)
   linear_ceil: 131072
   log_scale: 32768
   max_pos: 240000

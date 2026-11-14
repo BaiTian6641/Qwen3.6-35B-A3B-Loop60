@@ -1,11 +1,12 @@
 # Gate 1 (S1b v3.1) - Track-B HSSD v3.1 Horizon-Split Surprise-Gated Delta Memory KL Distillation (4K -> 32K).
+# Architecture: [0,12) x1 + [12,36) xR + [36,40) x1 = 88L (`s0_probe` calibrated ETD core `[12,36)` + `w_anchor=0.85`).
 # Upgrades all 30 linear-attention layers from Track-A GDN-2 to HSSD v3.1:
 #   * Strictly disjoint horizon partition `k_far = max(0, n - 8)` -> `[513, 576]` exact local SWA (Fix B1)
 #   * Learned `PeakBoltzmannGate` local/far branch-selection heuristic (Fix B5)
 #   * Low-rank 2D phase (`theta_low_rank: true`, ~1.95M/layer) + post-rotation WY `chunk_hssd` & linear-beta `sqrt(w_t)` (Theorem 1)
 #   * Multi-page routed chunk-start root-surprise (`surprise_mode: routed` against `boundary_ring[-1]`, zero `sqrt(s)` singularity)
 #   * Tiered M=8 multi-page router (Top-2 active pages) + STE actual sparse Top-k write-mass budget regularizer
-#   * Compact `state_dtype: bfloat16` retained cache (`81-89 MiB/layer`, `fp32` WY updates + `fp64` `theta_cum`)
+#   * Compact `state_dtype: bfloat16` retained cache (`81-89 MiB/layer`, `fp32` WY updates + `fp64` `theta_cum`) & `segment_chunks: 4` (256-tok WY ckpt)
 # Fallback guarantee: if HSSD < +8% over GDN-2 on 32K-64K RULER/MQAR, Gate 2a seamlessly retains `s1_loop_a6b` Track-A.
 _base_: [../base.yaml, ../model/qwen36_fp8.yaml]
 stage: s1b_hssd_distill
@@ -14,8 +15,8 @@ run: {name: s1b_hssd_distill}
 
 loop:
   enabled: true
-  prelude_end: 8
-  core_end: 32
+  prelude_end: 12
+  core_end: 36
   num_passes: 3
   target_virtual_layers: 88
   kv_share: true
@@ -30,6 +31,8 @@ loop:
   router_adapter_rank: 32
   router_repel_init: 0.0
   router_diversity_weight: 0.0
+  mor: false
+  write_mask: true
   checkpoint: true
   train_pass_probs: [0.15, 0.50, 0.35]
 
@@ -46,7 +49,7 @@ hssd:
   surprise_mode: routed                 # Multi-page chunk-start surprise against Top-k write pages of boundary_ring[-1]
   state_dtype: bfloat16                 # 81-89 MiB/layer decode cache (fp32 WY updates + fp64 theta_cum)
   budget_weight: 1.0                    # Audit 3C: STE actual sparse Top-k write-mass budget regularizer
-  segment_chunks: 16                    # Fix B6: 16 x 64 = 1024-token checkpointed WY macro-segments
+  segment_chunks: 4                     # 4 x 64 = 256-token checkpointed WY macro-segments (~4x lower backward peak VRAM)
   checkpoint_segments: true
 
 distill:

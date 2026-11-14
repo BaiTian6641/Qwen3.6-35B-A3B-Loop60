@@ -786,12 +786,12 @@ def test_standalone_hf_modeling_no_qloop_v3_hssd_subspace_pass_attn_and_dlsa(tmp
         lsa_kw: dict[str, Any] = dict(
             mode="sparse",
             index_dim=16,
-            block_size=4,
+            block_size=8,
             pool=2,
             avg_bucket_keys=4,
-            max_bucket_keys=6,
+            max_bucket_keys=8,
             num_select=2,
-            window=4,
+            window=8,
             sinks=2,
             query_chunk=8,
         )
@@ -842,15 +842,18 @@ def test_standalone_hf_modeling_no_qloop_v3_hssd_subspace_pass_attn_and_dlsa(tmp
                 loop_h.adapters.mor_router.bias.copy_(torch.tensor([0.0, 0.15, 0.05]))
 
         native_model.eval()
-        hssd_stack = Stack(
+        stack_kw: dict[str, Any] = dict(
             model=native_model,
             tokenizer=tok,
             parts=inspect_model(native_model),
             loop=loop_h,
-            hssd=hssd_h,  # type: ignore[call-arg]
             lsa=lsa_h,
             load_info={"name": "toy"},
         )
+        if "hssd" in Stack.__dataclass_fields__:
+            stack_kw["hssd"] = hssd_h
+        hssd_stack = Stack(**stack_kw)
+        hssd_stack.hssd = hssd_h  # type: ignore[attr-defined]
         native_pack_dir = tmp_path / "native_hssd_v3_pack"
         export_whole_model_pack(hssd_stack, native_pack_dir, max_shard_size_bytes=65536)
 

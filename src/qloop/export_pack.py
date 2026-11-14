@@ -48,6 +48,7 @@ from .infer.hf_custom_modeling import (
 from .model.experts import (
     _EXPERT_DELTA_KEY_RE,
     HotExpertDeltas,
+    _experts_are_plain_float,
     fold_expert_deltas_state_into_base_,
     physical_layers,
 )
@@ -58,6 +59,7 @@ from .model.introspect import (
 )
 from .model.loop import LoopController
 from .model.lsa import LSAIndexer, LSAManager
+from .model.quant_autograd import detect_model_quantization, is_quantized_module
 from .train.stack import Stack
 
 log = logging.getLogger("qloop")
@@ -230,6 +232,25 @@ def _unwrap_source(stack_or_model: Any, tokenizer: Any = None) -> _UnwrappedSour
     )
 
 
+def _serialize_quantization_config(qcfg: Any) -> dict[str, Any] | None:
+    if qcfg is None:
+        return None
+    if isinstance(qcfg, dict):
+        raw_d = copy.deepcopy(qcfg)
+    elif hasattr(qcfg, "to_dict"):
+        raw_d = copy.deepcopy(dict(qcfg.to_dict()))
+    elif hasattr(qcfg, "__dict__"):
+        raw_d = {
+            k: copy.deepcopy(v)
+            for k, v in vars(qcfg).items()
+            if not k.startswith("__") and not callable(v)
+        }
+    else:
+        return None
+    cleaned = _json_clean(raw_d)
+    return cleaned if isinstance(cleaned, dict) and bool(cleaned) else None
+
+
 def _extract_physical_base_config(
     backbone: nn.Module,
     loop: LoopController | None,
@@ -244,6 +265,15 @@ def _extract_physical_base_config(
             for k, v in vars(tc).items()
             if not k.startswith("__") and not callable(v)
         }
+
+    raw_qcfg = bcfg.get("quantization_config") or getattr(tc, "quantization_config", None)
+    if not raw_qcfg:
+        bb_cfg = getattr(backbone, "config", None)
+        if bb_cfg is not None:
+            raw_qcfg = getattr(bb_cfg, "quantization_config", None)
+    ser_qcfg = _serialize_quantization_config(raw_qcfg)
+    if ser_qcfg is not None:
+        bcfg["quantization_config"] = ser_qcfg
 
     phys_pairs, _, _ = physical_layers(backbone)
     n_phys = len(phys_pairs)
@@ -268,12 +298,7 @@ def _extract_physical_base_config(
 
     json_safe: dict[str, Any] = {}
     for k, v in bcfg.items():
-        if isinstance(v, torch.dtype):
-            json_safe[k] = _dtype_name(v)
-        elif isinstance(v, tuple):
-            json_safe[k] = list(v)
-        else:
-            json_safe[k] = v
+        json_safe[k] = _json_clean(v)
     return json_safe, kind
 
 
@@ -441,6 +466,97 @@ def _infer_hssd_arch(src: _UnwrappedSource) -> dict[str, Any]:
     return {"enabled": False}
 
 
+_QUANT_BUFFER_EXACT_NAMES = frozenset(
+    {
+        "weight_scale_inv",
+        "scale_inv",
+        "weight_scale",
+        "weight_global_scale",
+        "weight_scale_2",
+        "weight_packed",
+        "weight_zero_point",
+        "weight_shape",
+        "input_scale",
+        "input_global_scale",
+        "gate_up_proj_scale_inv",
+        "down_proj_scale_inv",
+        "gate_up_proj_weight_scale_inv",
+        "down_proj_weight_scale_inv",
+        "gate_up_proj_packed",
+        "down_proj_packed",
+        "gate_up_proj_scale",
+        "down_proj_scale",
+        "gate_up_proj_global_scale",
+        "down_proj_global_scale",
+        "gate_up_proj_scale_2",
+        "down_proj_scale_2",
+    }
+)
+_QUANT_BUFFER_SUFFIXES = (
+    "_scale",
+    "_scale_inv",
+    "_global_scale",
+    "_scale_2",
+    "_packed",
+    "_zero_point",
+    "_qweight",
+    "_scales",
+    "_qzeros",
+)
+_QUANT_WEIGHT_ATTR_NAMES = frozenset(
+    {"weight", "bias", "gate_up_proj", "down_proj", "gate_proj", "up_proj"}
+)
+
+
+def _is_quant_buffer_name(name: str) -> bool:
+    return name in _QUANT_BUFFER_EXACT_NAMES or name.endswith(_QUANT_BUFFER_SUFFIXES)
+
+
+def _experts_disallow_inplace_merge(exp: nn.Module) -> bool:
+    if not _experts_are_plain_float(exp):
+        return True
+    return any(is_quantized_module(sub) for _n, sub in exp.named_modules())
+
+
+def _backbone_has_unmergeable_hot_experts(src: _UnwrappedSource) -> bool:
+    phys_map = dict(physical_layers(src.backbone)[0])
+    target_layers: set[int] = set()
+    if src.deltas is not None:
+        target_layers.update(int(lid) for lid in src.deltas.hot)
+    if src.stack is not None and src.stack.passthrough_tensors:
+        for k in src.stack.passthrough_tensors:
+            m = _EXPERT_DELTA_KEY_RE.search(k)
+            if m is not None and (int(m.group(1)), int(m.group(3))) not in src.stack._folded_experts:
+                target_layers.add(int(m.group(1)))
+    check_layers = sorted(target_layers) if target_layers else sorted(phys_map.keys())
+    for lid in check_layers:
+        layer = phys_map.get(lid)
+        mlp = getattr(layer, "mlp", None) if layer is not None else None
+        exp = getattr(mlp, "experts", None) if mlp is not None else None
+        if isinstance(exp, nn.Module) and _experts_disallow_inplace_merge(exp):
+            return True
+    return False
+
+
+def _resolve_effective_merge_hot_experts(
+    src: _UnwrappedSource,
+    merge_hot_experts: bool,
+    *,
+    log_downgrade: bool = True,
+) -> bool:
+    if not merge_hot_experts:
+        return False
+    has_deltas = src.deltas is not None or bool(_collect_unfolded_passthrough_deltas(src.stack))
+    if has_deltas and _backbone_has_unmergeable_hot_experts(src):
+        if log_downgrade:
+            log.info(
+                "Keeping hot_experts unmerged in Whole Model Pack sidecar/state_dict: "
+                "base MoE experts are quantized (FP8/NVFP4) and cannot absorb BF16 deltas in-place."
+            )
+        return False
+    return True
+
+
 def extract_arch_spec(
     stack_or_model: Any,
     arch_spec: dict[str, Any] | None = None,
@@ -449,6 +565,7 @@ def extract_arch_spec(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Extract `(physical_base_config, qloop_v3_arch)` from a `Stack` or wrapped CausalLM."""
     src = _unwrap_source(stack_or_model)
+    eff_merged_he = _resolve_effective_merge_hot_experts(src, merged_hot_experts, log_downgrade=False)
     bcfg, kind = _extract_physical_base_config(src.backbone, src.loop, src.lsa)
     tm = find_text_model(src.backbone)
     emb_dtype = _dtype_name(tm.embed_tokens.weight.dtype)
@@ -476,18 +593,35 @@ def extract_arch_spec(
         loop_arch = {"enabled": False}
         kv_share = True
 
+    unfolded_pt = _collect_unfolded_passthrough_deltas(src.stack)
     if src.deltas is not None:
         he_arch: dict[str, Any] = {
             "enabled": True,
-            "merged_into_base": bool(merged_hot_experts),
+            "merged_into_base": bool(eff_merged_he),
             "rank": int(src.deltas.rank),
             "alpha": float(src.deltas.scale * src.deltas.rank) if src.deltas.rank > 0 else None,
             "scale": float(src.deltas.scale),
             "hot_map": {str(k): [int(e) for e in v] for k, v in sorted(src.deltas.hot.items())},
         }
+    elif unfolded_pt and not eff_merged_he:
+        hm_pt: dict[int, list[int]] = {}
+        inferred_rank = 0
+        for (lid, eid), parts in sorted(unfolded_pt.items()):
+            hm_pt.setdefault(int(lid), []).append(int(eid))
+            if "gate_up_A" in parts:
+                inferred_rank = int(parts["gate_up_A"].shape[0])
+        he_arch = {
+            "enabled": True,
+            "merged_into_base": False,
+            "rank": inferred_rank,
+            "alpha": float(inferred_rank) if inferred_rank > 0 else None,
+            "scale": 1.0,
+            "hot_map": {str(k): sorted(set(v)) for k, v in sorted(hm_pt.items())},
+        }
     else:
         he_arch = {"enabled": False, "merged_into_base": True}
 
+    quant_info = detect_model_quantization(src.backbone)
     arch: dict[str, Any] = {
         "schema_version": 3,
         "backbone_kind": kind,
@@ -508,6 +642,8 @@ def extract_arch_spec(
             "supported_quant_modes": ["native", "fp8", "hadamard_int4"],
         },
     }
+    if quant_info.get("is_quantized") or bcfg.get("quantization_config"):
+        arch["quantization"] = _json_clean(quant_info)
     if arch_spec:
         for k, v in arch_spec.items():
             if isinstance(v, dict) and isinstance(arch.get(k), dict):
@@ -538,7 +674,7 @@ def _classify_subsystem(key: str) -> str:
         return "hssd"
     if ".lsa_indexer." in key:
         return "lsa"
-    if ".expert_deltas." in key:
+    if ".expert_deltas." in key or key.startswith("expert_deltas."):
         return "hot_expert_deltas"
     if ".mlp.experts." in key or ".mlp.shared_expert" in key or ".mlp.gate." in key:
         return "moe_experts_and_routers"
@@ -548,7 +684,7 @@ def _classify_subsystem(key: str) -> str:
 
 
 def _module_own_state_tensors(mod: nn.Module) -> list[tuple[str, torch.Tensor]]:
-    """Yield `(subkey, tensor)` for all parameters and persistent buffers in `mod` (deduped by key)."""
+    """Yield `(subkey, tensor)` for parameters, persistent buffers, and quantization buffers/tensors."""
     out: list[tuple[str, torch.Tensor]] = []
     seen_keys: set[str] = set()
     for pname, p in mod.named_parameters():
@@ -561,13 +697,26 @@ def _module_own_state_tensors(mod: nn.Module) -> list[tuple[str, torch.Tensor]]:
     }
     for mname, sub in mod.named_modules():
         np_set = non_persist_by_mod.get(id(sub), set())
+        sub_is_quant = is_quantized_module(sub)
         for bname, buf in sub._buffers.items():
-            if buf is None or bname in np_set:
+            if buf is None:
+                continue
+            if bname in np_set and not _is_quant_buffer_name(bname):
                 continue
             full = f"{mname}.{bname}" if mname else bname
             if full not in seen_keys:
                 seen_keys.add(full)
                 out.append((full, buf))
+        for aname, val in sub.__dict__.items():
+            if aname.startswith("_") or aname in sub._parameters or aname in sub._buffers:
+                continue
+            if not isinstance(val, torch.Tensor):
+                continue
+            if _is_quant_buffer_name(aname) or (sub_is_quant and aname in _QUANT_WEIGHT_ATTR_NAMES):
+                full = f"{mname}.{aname}" if mname else aname
+                if full not in seen_keys:
+                    seen_keys.add(full)
+                    out.append((full, val))
     return out
 
 
@@ -595,6 +744,11 @@ def _prepare_canonical_entries(
     merge_in_place: bool = True,
 ) -> tuple[list[_TensorEntry], int]:
     """Return `(canonical_entries, num_merged_experts)` with zero virtual-layer duplication."""
+    merge_hot_experts = _resolve_effective_merge_hot_experts(
+        src,
+        merge_hot_experts,
+        log_downgrade=False,
+    )
     bb = src.backbone
     tm = find_text_model(bb)
     tm_prefix = ""
@@ -779,6 +933,48 @@ def _prepare_canonical_entries(
                     dtype=t.dtype,
                     nbytes=int(t.numel() * t.element_size()),
                     subsystem="loop_adapters",
+                    materialize=lambda _t=t: _t.detach().to("cpu").contiguous(),
+                )
+            )
+
+    # 3b) Sidecar hot-expert deltas when `merge_hot_experts` is False (e.g. quantized FP8/NVFP4 base)
+    if not merge_hot_experts and src.deltas is not None:
+        for subk, t in _module_own_state_tensors(src.deltas):
+            canon_k = _tm_key(f"expert_deltas.{subk}")
+            if canon_k in emitted_keys:
+                continue
+            emitted_keys.add(canon_k)
+            if isinstance(t, nn.Parameter):
+                covered_param_ids.add(id(t))
+            entries.append(
+                _TensorEntry(
+                    key=canon_k,
+                    shape=tuple(int(d) for d in t.shape),
+                    dtype=t.dtype,
+                    nbytes=int(t.numel() * t.element_size()),
+                    subsystem="hot_expert_deltas",
+                    materialize=lambda _t=t: _t.detach().to("cpu").contiguous(),
+                )
+            )
+    if not merge_hot_experts and src.stack is not None and src.stack.passthrough_tensors:
+        for raw_k, t in sorted(src.stack.passthrough_tensors.items()):
+            m = _EXPERT_DELTA_KEY_RE.search(raw_k)
+            if m is None:
+                continue
+            pair = (int(m.group(1)), int(m.group(3)))
+            if pair in src.stack._folded_experts:
+                continue
+            canon_k = _tm_key(f"expert_deltas.deltas.L{pair[0]}.{m.group(2)}.{pair[1]}")
+            if canon_k in emitted_keys:
+                continue
+            emitted_keys.add(canon_k)
+            entries.append(
+                _TensorEntry(
+                    key=canon_k,
+                    shape=tuple(int(d) for d in t.shape),
+                    dtype=t.dtype,
+                    nbytes=int(t.numel() * t.element_size()),
+                    subsystem="hot_expert_deltas",
                     materialize=lambda _t=t: _t.detach().to("cpu").contiguous(),
                 )
             )
@@ -1089,12 +1285,16 @@ def _write_non_shard_pack_files(
         f.write("\n")
     written.append(SAFETENSORS_INDEX_FILE)
 
-    # 2) config.json (with auto_map + qloop_v3_arch)
+    # 2) config.json (with auto_map + qloop_v3_arch + preserved quantization_config)
+    extra_cfg_kw: dict[str, Any] = {}
+    if base_cfg.get("quantization_config"):
+        extra_cfg_kw["quantization_config"] = copy.deepcopy(base_cfg["quantization_config"])
     hf_cfg = Qwen36LoopHSSDConfig(
         base_config=base_cfg,
         qloop_v3_arch=arch,
         auto_map=dict(AUTO_MAP),
         architectures=["Qwen36LoopHSSDForCausalLM"],
+        **extra_cfg_kw,
     )
     hf_cfg.save_pretrained(out_dir)
     written.append("config.json")
@@ -1174,14 +1374,15 @@ def export_whole_model_pack(
     os.makedirs(target_dir, exist_ok=True)
 
     src = _unwrap_source(stack_or_model, tokenizer=tokenizer)
+    eff_merge_he = _resolve_effective_merge_hot_experts(src, merge_hot_experts, log_downgrade=True)
     base_cfg, arch = extract_arch_spec(
         stack_or_model,
         arch_spec=arch_spec,
-        merged_hot_experts=merge_hot_experts,
+        merged_hot_experts=eff_merge_he,
     )
     entries, merged_cnt = _prepare_canonical_entries(
         src,
-        merge_hot_experts=merge_hot_experts,
+        merge_hot_experts=eff_merge_he,
         merge_in_place=merge_in_place,
     )
     planned = _plan_shards(entries, max_shard_size_bytes)
@@ -1363,14 +1564,15 @@ def stream_whole_model_pack(
     _ensure_hub_repo(hub_api, repo_id, private=private)
 
     src = _unwrap_source(stack_or_model, tokenizer=tokenizer)
+    eff_merge_he = _resolve_effective_merge_hot_experts(src, merge_hot_experts, log_downgrade=True)
     base_cfg, arch = extract_arch_spec(
         stack_or_model,
         arch_spec=arch_spec,
-        merged_hot_experts=merge_hot_experts,
+        merged_hot_experts=eff_merge_he,
     )
     entries, merged_cnt = _prepare_canonical_entries(
         src,
-        merge_hot_experts=merge_hot_experts,
+        merge_hot_experts=eff_merge_he,
         merge_in_place=merge_in_place,
     )
     planned = _plan_shards(entries, max_shard_size_bytes)

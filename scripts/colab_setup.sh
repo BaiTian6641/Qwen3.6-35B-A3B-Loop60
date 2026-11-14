@@ -6,6 +6,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 log() { printf '\n\033[1;36m[setup]\033[0m %s\n' "$*"; }
 
+# Eliminate deprecated hf_transfer FutureWarning and enable Hugging Face Xet high-performance transfers
+unset HF_HUB_ENABLE_HF_TRANSFER || true
+export HF_XET_HIGH_PERFORMANCE=1
+
 log "GPU"
 nvidia-smi --query-gpu=name,memory.total,driver_version,compute_cap --format=csv || echo "no nvidia-smi (CPU runtime?)"
 
@@ -17,15 +21,16 @@ if [[ -n "${QLOOP_LOCK:-}" && -f "${QLOOP_LOCK}" ]]; then
   $PY -m pip install -q --no-cache-dir -r "${QLOOP_LOCK}"
 else
   # Keep Colab's preinstalled CUDA 13 torch + pyarrow/rich pins intact (--upgrade-strategy only-if-needed)
-  # while ensuring transformers>=5.0 & huggingface_hub>=0.30 are up to date, with --no-cache-dir for 230 GB SSD.
-  log "installing GPU stack (preserving Colab pyarrow/rich compatibility, --no-cache-dir)"
+  # while ensuring transformers>=5.0 & huggingface_hub>=0.30 (Xet) are up to date, with --no-cache-dir for 230 GB SSD.
+  log "installing GPU stack (preserving Colab pyarrow/rich compatibility, HF_XET_HIGH_PERFORMANCE=1, --no-cache-dir)"
   $PY -m pip install -q --no-cache-dir -U --upgrade-strategy only-if-needed \
       "transformers>=5.0" "huggingface_hub>=0.30" "datasets>=3.0" \
-      accelerate hf_transfer safetensors sentencepiece psutil "pyarrow>=19.0.0,<24" "rich>=12.4.4,<14" || \
+      accelerate safetensors sentencepiece psutil "pyarrow>=19.0.0,<24" "rich>=12.4.4,<14" || \
   $PY -m pip install -q --no-cache-dir -U --upgrade-strategy only-if-needed \
       "transformers>=5.0" "huggingface_hub>=0.30" "datasets>=3.0" \
-      accelerate hf_transfer safetensors sentencepiece psutil
-  log "installing optional kernels (failures are reported by 'qloop doctor', not fatal)"
+      accelerate safetensors sentencepiece psutil
+  log "installing optional kernels & NVFP4 support (failures are reported by 'qloop doctor', not fatal)"
+  $PY -m pip install -q --no-cache-dir compressed-tensors || echo "compressed-tensors unavailable -> needed only for NVFP4 checkpoints"
   $PY -m pip install -q --no-cache-dir apollo-torch || echo "apollo-torch unavailable -> built-in APOLLO fallback"
   $PY -m pip install -q --no-cache-dir "cut-cross-entropy" || echo "cut-cross-entropy unavailable -> chunked CE fallback"
   $PY -m pip install -q --no-cache-dir flash-linear-attention || echo "fla unavailable -> slow DeltaNet torch path"
@@ -37,4 +42,4 @@ fi
 log "installing qloop package"
 $PY -m pip install -q --no-cache-dir --no-deps .
 
-log "done. next: python -m qloop doctor --freeze requirements/colab.lock.txt"
+log "done. next: python -m qloop doctor --freeze requirements/colab.lock.txt --model Qwen/Qwen3.6-35B-A3B-FP8"

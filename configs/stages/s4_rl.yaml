@@ -1,6 +1,6 @@
 # S4 - GRPO recursive self-improvement with verifiable rewards (+ optional teacher guidance).
 # Rollouts use the in-process cache sampler at the trained loop depth (exactly on-policy).
-_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+_base_: [../base.yaml, ../model/qwen36_fp8.yaml]
 stage: s4_rl
 stage_type: rl
 run: {name: s4_rl}

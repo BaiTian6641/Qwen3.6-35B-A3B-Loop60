@@ -1,7 +1,7 @@
 # Held-out evaluation with the loop-depth sweep (depth 1 = stock graph, 2 = trained, 3 = extrapolation
 # only if num_passes was raised). NEVER train on these contamination groups.
 #   python -m qloop eval -c configs/eval/suite.yaml --ckpt runs/s4_rl
-_base_: [../base.yaml, ../model/qwen36_bf16.yaml]
+_base_: [../base.yaml, ../model/qwen36_fp8.yaml]
 run: {name: eval}
 lsa:
   enabled: true

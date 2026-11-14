@@ -163,7 +163,7 @@ class HSSDConfig:
     num_pages: int = 8
     k_pages: int = 2
     top_k_pages: int | None = None
-    segment_chunks: int = 16
+    segment_chunks: int = 4
     checkpoint_segments: bool = True
     gate_logit_cap: float = 8.0
     decay_log_cap: float = 2.0
@@ -1346,6 +1346,16 @@ def _coerce_init_state(
             got=(initial_state.chunk_size, initial_state.window_chunks),
             want=(chunk_size, window_chunks),
         )
+        if (
+            initial_state.device == device
+            and initial_state.dtype == dtype
+            and initial_state.theta_cum.dtype == torch.float64
+            and initial_state.swa_k_ring.dtype == dtype
+            and initial_state.swa_v_ring.dtype == dtype
+            and all(t.dtype == dtype for t in initial_state.boundary_ring)
+            and initial_state.has_compact_storage()
+        ):
+            return initial_state
         return initial_state.to(device=device, dtype=dtype)
     if _is_hssd_state_duck(initial_state):
         require(
@@ -1460,19 +1470,63 @@ def _materialize_chunk_gamma(
     return page_scale.view(1, 1, num_pages, 1, 1) * chan_c.unsqueeze(2)
 
 
+_WY_BLOCK_META_CACHE: dict[
+    tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _get_wy_block_meta(
+    n_blk: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return `(strict_lo_8, bi_idx, bj_idx, all_lin_idx)` on `device` without inference-tensor taint."""
+    if _is_compiling():
+        idx8 = torch.arange(8, device=device)
+        strict_lo_8 = idx8[:, None] > idx8[None, :]
+        diag_lin = torch.arange(n_blk, device=device, dtype=torch.long) * (n_blk + 1)
+        if n_blk >= 2:
+            tril = torch.tril_indices(n_blk, n_blk, offset=-1, device=device)
+            bi_idx = tril[0]
+            bj_idx = tril[1]
+            all_lin_idx = torch.cat([diag_lin, bi_idx * n_blk + bj_idx], dim=0)
+        else:
+            empty_l = torch.empty((0,), dtype=torch.long, device=device)
+            bi_idx, bj_idx, all_lin_idx = empty_l, empty_l, diag_lin
+        return strict_lo_8, bi_idx, bj_idx, all_lin_idx
+
+    key = (device, n_blk)
+    cached = _WY_BLOCK_META_CACHE.get(key)
+    if cached is not None:
+        return cached
+    with torch.inference_mode(False), torch.no_grad():
+        idx8 = torch.arange(8, device=device)
+        strict_lo_8 = idx8[:, None] > idx8[None, :]
+        diag_lin = torch.arange(n_blk, device=device, dtype=torch.long) * (n_blk + 1)
+        if n_blk >= 2:
+            tril = torch.tril_indices(n_blk, n_blk, offset=-1, device=device)
+            bi_idx = tril[0]
+            bj_idx = tril[1]
+            all_lin_idx = torch.cat([diag_lin, bi_idx * n_blk + bj_idx], dim=0)
+        else:
+            empty_l = torch.empty((0,), dtype=torch.long, device=device)
+            bi_idx, bj_idx, all_lin_idx = empty_l, empty_l, diag_lin
+    res = (strict_lo_8, bi_idx, bj_idx, all_lin_idx)
+    _WY_BLOCK_META_CACHE[key] = res
+    return res
+
+
 def _wy_kda_state_update(
     page_states: torch.Tensor,
     k_eff: torch.Tensor,
     v_eff: torch.Tensor,
     log_a: torch.Tensor,
 ) -> torch.Tensor:
-    """Exact overflow-free, zero-host-sync chunk-parallel WY state transition for symmetric DPLR KDA.
+    """Exact overflow-free, zero-host-sync, vectorized Block-8 WY state transition for DPLR KDA.
 
-    Uses block-factored non-positive cumulative log-decays (`b_sz = 8`): because `log_a <= 0`,
-    `cum_log_a` is monotonically non-increasing along time, so every diagonal `i > j` difference
-    AND every off-diagonal block split `(g[i] - g[b_end]) + (g[b_end] - g[j])` (`i > b_end >= j`)
-    is unconditionally `<= 0.0` (never overflowing `exp` even for `span = 10,000`, with zero
-    `bool()` / `.item()` host synchronizations).
+    Uses block-factored non-positive cumulative log-decays (`b_sz = 8`) with zero Python loops and
+    zero `bool()` / `.item()` host synchronizations: because `log_a <= 0`, right-padding `log_a_neg`
+    with `0.0` keeps `cum_log_pad` monotonically non-increasing along time, so every diagonal `i > j`
+    difference AND every off-diagonal block split `(g[i] - g[b_end]) + (g[b_end] - g[j])`
+    (`i > b_end >= j`) is unconditionally `<= 0.0` (never overflowing `exp` even for `span = 10,000`).
 
     Shapes:
         page_states: [B, M, H_v, d_k, d_v]
@@ -1489,43 +1543,53 @@ def _wy_kda_state_update(
         mem = (ke.unsqueeze(-2) @ dec).squeeze(-2)
         return dec + ke.unsqueeze(-1) * (ve - mem).unsqueeze(-2)
 
-    cum_log_a = torch.cumsum(log_a_neg, dim=-2)
     b_sz = 8
     n_blk = (c_len + b_sz - 1) // b_sz
-    row_blocks: list[torch.Tensor] = []
+    c_pad = n_blk * b_sz
+    pad_t = c_pad - c_len
+    dk = k_eff.shape[-1]
+    lead_shape = k_eff.shape[:-2]
 
-    for bi in range(n_blk):
-        i0 = bi * b_sz
-        i1 = min(c_len, (bi + 1) * b_sz)
-        bi_len = i1 - i0
-        k_i = k_eff[..., i0:i1, :]
-        g_i = cum_log_a[..., i0:i1, :]
+    if pad_t > 0:
+        k_pad = F.pad(k_eff, (0, 0, 0, pad_t), value=0.0)
+        log_a_pad = F.pad(log_a_neg, (0, 0, 0, pad_t), value=0.0)
+    else:
+        k_pad = k_eff
+        log_a_pad = log_a_neg
 
-        col_parts: list[torch.Tensor] = []
-        for bj in range(bi):
-            j0 = bj * b_sz
-            j1 = (bj + 1) * b_sz
-            g_piv = cum_log_a[..., j1 - 1 : j1, :]
-            # i >= i0 >= j1 > j1 - 1 => g_i - g_piv <= 0; j <= j1 - 1 => g_piv - g_j <= 0
-            lhs = k_i * (g_i - g_piv).exp()
-            rhs_k = k_eff[..., j0:j1, :] * (g_piv - cum_log_a[..., j0:j1, :]).exp()
-            col_parts.append(lhs @ rhs_k.transpose(-1, -2))
+    cum_log_pad = torch.cumsum(log_a_pad, dim=-2)
+    cum_log_a = cum_log_pad[..., :c_len, :] if pad_t > 0 else cum_log_pad
 
-        idx_d = torch.arange(bi_len, device=k_eff.device)
-        strict_lo = idx_d[:, None] > idx_d[None, :]
-        diff_d = g_i[..., :, None, :] - g_i[..., None, :, :]
-        safe_d = torch.where(strict_lo.unsqueeze(-1), diff_d, torch.zeros_like(diff_d))
-        diag_blk = (k_i[..., :, None, :] * k_i[..., None, :, :] * safe_d.exp()).sum(dim=-1)
-        diag_blk = torch.where(strict_lo, diag_blk, torch.zeros_like(diag_blk))
-        col_parts.append(diag_blk)
+    k_blk = k_pad.reshape((*lead_shape, n_blk, b_sz, dk))
+    g_blk = cum_log_pad.reshape((*lead_shape, n_blk, b_sz, dk))
+    strict_lo_8, bi_idx, bj_idx, all_lin_idx = _get_wy_block_meta(n_blk, k_eff.device)
 
-        if i1 < c_len:
-            z_pad = k_eff.new_zeros(*k_eff.shape[:-2], bi_len, c_len - i1)
-            col_parts.append(z_pad)
+    diff_d = g_blk[..., :, None, :] - g_blk[..., None, :, :]
+    safe_d = torch.where(strict_lo_8.unsqueeze(-1), diff_d, torch.zeros_like(diff_d))
+    diag_blks = (k_blk[..., :, None, :] * k_blk[..., None, :, :] * safe_d.exp()).sum(dim=-1)
+    diag_blks = torch.where(strict_lo_8, diag_blks, torch.zeros_like(diag_blks))
 
-        row_blocks.append(col_parts[0] if len(col_parts) == 1 else torch.cat(col_parts, dim=-1))
+    if n_blk == 1:
+        l_mat = diag_blks.squeeze(-3)[..., :c_len, :c_len]
+    else:
+        rhs_all = k_blk[..., :-1, :, :] * (g_blk[..., :-1, 7:8, :] - g_blk[..., :-1, :, :]).exp()
+        rhs_k = rhs_all.index_select(-3, bj_idx)
+        k_i_pairs = k_blk.index_select(-3, bi_idx)
+        g_i_pairs = g_blk.index_select(-3, bi_idx)
+        g_piv_pairs = g_blk[..., 7:8, :].index_select(-3, bj_idx)
+        lhs = k_i_pairs * (g_i_pairs - g_piv_pairs).exp()
+        off_blks = lhs @ rhs_k.transpose(-1, -2)
 
-    l_mat = row_blocks[0] if len(row_blocks) == 1 else torch.cat(row_blocks, dim=-2)
+        active_blks = torch.cat([diag_blks, off_blks], dim=-3)
+        n_act = active_blks.shape[-3]
+        idx_exp = all_lin_idx.view((*(1,) * len(lead_shape), n_act, 1, 1)).expand(
+            (*lead_shape, n_act, b_sz, b_sz)
+        )
+        grid = k_eff.new_zeros((*lead_shape, n_blk * n_blk, b_sz, b_sz)).scatter(-3, idx_exp, active_blks)
+        l_pad = grid.view((*lead_shape, n_blk, n_blk, b_sz, b_sz)).transpose(-3, -2).reshape(
+            (*lead_shape, c_pad, c_pad)
+        )
+        l_mat = l_pad[..., :c_len, :c_len] if pad_t > 0 else l_pad
 
     gamma_from_0 = cum_log_a.exp()
     rhs = v_eff - (gamma_from_0 * k_eff) @ page_states
@@ -1545,8 +1609,9 @@ def _routed_bank_readout(
 ) -> torch.Tensor:
     """Read `vec_c` (`[B, c_len, H_v, d_k]`) from `top_idx` (`[B, c_len, k]`) of `state_bank`.
 
-    For decode / short spans (`c_len <= 4`) when `k < M`, gathers ONLY the `k` active pages before
-    matmul (`4x` fewer state bytes & FLOPs for `k=2, M=8`).
+    For decode / short spans (`c_len <= 4`) when `k < M`, gathers ONLY the `k` active pages in
+    `state_bank.dtype` and casts just those `k` pages before matmul (`4x` fewer state bytes & FLOPs
+    for `k=2, M=8`, zero full-bank upcast!).
     """
     bsz, c_len, hv, dk = vec_c.shape
     num_pages = state_bank.shape[1]
@@ -1556,6 +1621,8 @@ def _routed_bank_readout(
     if k_sel < num_pages and c_len == 1:
         g_idx = top_idx[:, 0, :, None, None, None].expand(bsz, k_sel, hv, dk, dv)
         s_sel = torch.gather(state_bank, dim=1, index=g_idx)               # [B, k, H_v, d_k, d_v]
+        if s_sel.dtype != vec_c.dtype:
+            s_sel = s_sel.to(dtype=vec_c.dtype)
         v_q = vec_c.permute(0, 2, 1, 3).unsqueeze(1)                       # [B, 1, H_v, 1, d_k]
         picked_1 = (v_q @ s_sel).squeeze(-2)                               # [B, k, H_v, d_v]
         return (picked_1 * top_w[:, 0, :, None, None]).sum(dim=1, keepdim=True)
@@ -1563,12 +1630,15 @@ def _routed_bank_readout(
     if k_sel < num_pages and c_len <= 4:
         flat_idx = top_idx.reshape(bsz, c_len * k_sel, 1, 1, 1).expand(bsz, c_len * k_sel, hv, dk, dv)
         s_sel = torch.gather(state_bank, dim=1, index=flat_idx).view(bsz, c_len, k_sel, hv, dk, dv)
+        if s_sel.dtype != vec_c.dtype:
+            s_sel = s_sel.to(dtype=vec_c.dtype)
         v_q = vec_c.unsqueeze(2).unsqueeze(-2)                             # [B, c_len, 1, H_v, 1, d_k]
         picked_s = (v_q @ s_sel).squeeze(-2)                               # [B, c_len, k, H_v, d_v]
         return (picked_s * top_w.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
 
+    bank_f = state_bank if state_bank.dtype == vec_c.dtype else state_bank.to(dtype=vec_c.dtype)
     v_all = vec_c.permute(0, 2, 1, 3).unsqueeze(1)                         # [B, 1, H_v, c_len, d_k]
-    all_out = (v_all @ state_bank).permute(0, 3, 1, 2, 4)                  # [B, c_len, M, H_v, d_v]
+    all_out = (v_all @ bank_f).permute(0, 3, 1, 2, 4)                      # [B, c_len, M, H_v, d_v]
     gather_idx = top_idx.unsqueeze(-1).unsqueeze(-1).expand(bsz, c_len, k_sel, hv, dv)
     picked = torch.gather(all_out, dim=2, index=gather_idx)
     return (picked * top_w.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
@@ -1631,6 +1701,8 @@ def _compute_root_surprise_and_routing(
             pred_v = _routed_bank_readout(k_hat_c, s_chunk_start_bank, top_idx, top_probs)
         else:
             s0 = s_chunk_start_bank[:, 0] if s_chunk_start_bank.ndim == 5 else s_chunk_start_bank
+            if s0.dtype != k_hat_c.dtype:
+                s0 = s0.to(dtype=k_hat_c.dtype)
             pred_v = (k_hat_c.transpose(1, 2) @ s0).transpose(1, 2)
         eps_err = _safe_norm(v_c - pred_v, dim=-1) / (_safe_norm(v_c, dim=-1) + 1e-6)
         slope = surprise_slope.view(1, 1, hv)
@@ -1803,6 +1875,7 @@ def recurrent_hssd_step(
     dv = value.shape[-1]
     num_pages = state.page_states.shape[1]
     acc_dt = torch.float64 if init_dtype == torch.float64 else torch.float32
+    target_dt = _resolve_state_dtype(state_dtype, acc_dt)
 
     pm_bool: torch.Tensor | None = None
     has_pad_zeros = False
@@ -1820,7 +1893,7 @@ def recurrent_hssd_step(
             st_b = state[b : b + 1]
             if pm_bool is not None and not bool(pm_bool[b, 0]):
                 row_outs.append(query.new_zeros(1, 1, hv, dv, dtype=init_dtype))
-                row_states.append(_cast_state_dtype(st_b, state_dtype, acc_dt))
+                row_states.append(_cast_state_dtype(st_b, target_dt, acc_dt))
                 continue
             sl_b = slice(b, b + 1)
             o_b, nxt_b, u_b, c_b = recurrent_hssd_step(
@@ -1847,7 +1920,7 @@ def recurrent_hssd_step(
                 g_override=None if g_override is None else g_override[sl_b],
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 scale=scale,
-                state_dtype=state_dtype,
+                state_dtype=target_dt,
                 use_swa=use_swa,
                 use_phase=use_phase,
                 use_surprise=use_surprise,
@@ -1866,7 +1939,18 @@ def recurrent_hssd_step(
         return out_ret, st_cat
 
     q, k, v = _prepare_qkv_unscaled(query, key, value, use_qk_l2norm_in_kernel)
-    st = state.to(device=q.device, dtype=acc_dt)
+    st = _coerce_init_state(
+        state,
+        bsz=bsz,
+        num_pages=num_pages,
+        hv=hv,
+        dk=dk,
+        dv=dv,
+        chunk_size=int(state.chunk_size),
+        window_chunks=int(state.window_chunks),
+        device=q.device,
+        dtype=target_dt,
+    )
     ps_gamma, ch_gamma = _normalize_gamma_spec(
         gamma, num_pages=num_pages, dk=dk, acc_dt=acc_dt, device=q.device
     )
@@ -1913,15 +1997,28 @@ def recurrent_hssd_step(
     max_win = st.max_swa_len
     slot = idx0 % max_win
     slot_idx = torch.tensor([slot], device=q.device, dtype=torch.long)
-    swa_k_ring = _compact(st.swa_k_ring.index_copy(1, slot_idx, ks))
-    swa_v_ring = _compact(st.swa_v_ring.index_copy(1, slot_idx, vs))
+    ks_ring = ks if ks.dtype == target_dt else ks.to(dtype=target_dt)
+    vs_ring = vs if vs.dtype == target_dt else vs.to(dtype=target_dt)
+    swa_k_ring = _compact(st.swa_k_ring.index_copy(1, slot_idx, ks_ring))
+    swa_v_ring = _compact(st.swa_v_ring.index_copy(1, slot_idx, vs_ring))
     swa_valid_ring = _compact(st.swa_valid_ring.index_copy(1, slot_idx, valid_tok.unsqueeze(1)))
 
     if use_swa:
         _n_chunk, _k_far, far_cutoff = disjoint_horizon_bounds(idx0 + 1, c_size, w_chunks)
         win_indices = torch.arange(far_cutoff, idx0 + 1, device=q.device) % max_win
-        k_win = swa_k_ring.index_select(1, win_indices).transpose(1, 2)       # [B, H_v, N_t, d_k]
-        v_win = swa_v_ring.index_select(1, win_indices).transpose(1, 2)       # [B, H_v, N_t, d_v]
+        if win_indices.numel() > 1:
+            prior_win = win_indices[:-1]
+            k_prior = st.swa_k_ring.index_select(1, prior_win)
+            v_prior = st.swa_v_ring.index_select(1, prior_win)
+            if k_prior.dtype != acc_dt:
+                k_prior = k_prior.to(dtype=acc_dt)
+            if v_prior.dtype != acc_dt:
+                v_prior = v_prior.to(dtype=acc_dt)
+            k_win = torch.cat([k_prior, ks], dim=1).transpose(1, 2)           # [B, H_v, N_t, d_k]
+            v_win = torch.cat([v_prior, vs], dim=1).transpose(1, 2)           # [B, H_v, N_t, d_v]
+        else:
+            k_win = ks.transpose(1, 2)                                        # [B, H_v, 1, d_k]
+            v_win = vs.transpose(1, 2)                                        # [B, H_v, 1, d_v]
         val_win = swa_valid_ring.index_select(1, win_indices)[:, None, None, :]  # [B, 1, 1, N_t]
 
         q_loc = qs.transpose(1, 2)                                            # [B, H_v, 1, d_k]
@@ -1962,8 +2059,11 @@ def recurrent_hssd_step(
     sqrt_w = _safe_sqrt(wf[:, 0])
     g_sel = g_active[:, 0]                                                    # [B, k, H_v]
     t_idx = top_idx[:, 0]                                                     # [B, k]
+    base_pages = st.page_states
     p_idx = t_idx[:, :, None, None, None].expand(bsz, top_k_pages, hv, dk, dv)
-    s_sel = torch.gather(st.page_states, dim=1, index=p_idx)                  # [B, k, H_v, d_k, d_v]
+    s_sel = torch.gather(base_pages, dim=1, index=p_idx)                      # [B, k, H_v, d_k, d_v]
+    if s_sel.dtype != acc_dt:
+        s_sel = s_sel.to(dtype=acc_dt)
 
     if ps_gamma is not None:
         ch0 = ch_gamma[:, 0]
@@ -1983,26 +2083,23 @@ def recurrent_hssd_step(
     ve_sel = g_sel.unsqueeze(-1) * (sqrt_w * v[:, 0]).unsqueeze(1)
     mem_sel = (ke_sel.unsqueeze(-2) @ dec_sel).squeeze(-2)
     updated_sel = dec_sel + ke_sel.unsqueeze(-1) * (ve_sel - mem_sel).unsqueeze(-2)
-    new_pages = _compact(st.page_states.scatter(1, p_idx, updated_sel))
+    updated_sel_cast = updated_sel if updated_sel.dtype == target_dt else updated_sel.to(dtype=target_dt)
+    new_pages = _compact(base_pages.scatter(1, p_idx, updated_sel_cast))
 
     new_step_int = idx0 + 1
-    new_step_vec = st.step_count + 1
-    new_b_ring = (*st.boundary_ring[1:], new_pages) if new_step_int % c_size == 0 else st.boundary_ring
+    new_step_vec = _compact(st.step_count + 1)
+    new_b_ring = (*st.boundary_ring[1:], new_pages.clone()) if new_step_int % c_size == 0 else st.boundary_ring
 
-    next_state = _cast_state_dtype(
-        HSSDCacheState(
-            step_count=new_step_vec,
-            chunk_size=c_size,
-            window_chunks=w_chunks,
-            page_states=new_pages,
-            theta_cum=theta_cum,
-            boundary_ring=new_b_ring,
-            swa_k_ring=swa_k_ring,
-            swa_v_ring=swa_v_ring,
-            swa_valid_ring=swa_valid_ring,
-        ),
-        state_dtype,
-        acc_dt,
+    next_state = HSSDCacheState(
+        step_count=new_step_vec,
+        chunk_size=c_size,
+        window_chunks=w_chunks,
+        page_states=new_pages,
+        theta_cum=theta_cum,
+        boundary_ring=new_b_ring,
+        swa_k_ring=swa_k_ring,
+        swa_v_ring=swa_v_ring,
+        swa_valid_ring=swa_valid_ring,
     )
     out_cast = out.squeeze(1).to(init_dtype) if squeeze_time else out.to(init_dtype)
     if return_duty_sum:
@@ -2051,6 +2148,7 @@ def _recurrent_hssd_raw(
     dk = key.shape[-1]
     init_dtype = query.dtype
     acc_dt = torch.float64 if init_dtype == torch.float64 else torch.float32
+    target_dt = _resolve_state_dtype(state_dtype, acc_dt)
 
     doc_spans = _validate_packed_boundaries(
         bsz=bsz, seq_len=seq_len, initial_state=initial_state, cu_seqlens=cu_seqlens, seq_idx=seq_idx
@@ -2096,7 +2194,7 @@ def _recurrent_hssd_raw(
                     g_override=None if g_override is None else g_override[sl_b, sl_t],
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                     scale=scale,
-                    state_dtype=state_dtype,
+                    state_dtype=target_dt,
                     use_swa=use_swa,
                     use_phase=use_phase,
                     use_surprise=use_surprise,
@@ -2113,14 +2211,10 @@ def _recurrent_hssd_raw(
             )
             if output_final_state:
                 if last_st is None:
-                    last_st = _cast_state_dtype(
-                        HSSDCacheState.zeros(
-                            1, num_pages, hv, dk, dv,
-                            chunk_size=chunk_size, window_chunks=window_chunks,
-                            device=query.device, dtype=acc_dt,
-                        ),
-                        state_dtype,
-                        acc_dt,
+                    last_st = HSSDCacheState.zeros(
+                        1, num_pages, hv, dk, dv,
+                        chunk_size=chunk_size, window_chunks=window_chunks,
+                        device=query.device, dtype=target_dt,
                     )
                 row_states.append(last_st)
         out_all = row_outs[0] if len(row_outs) == 1 else torch.cat(row_outs, dim=0)
@@ -2141,7 +2235,7 @@ def _recurrent_hssd_raw(
         chunk_size=chunk_size,
         window_chunks=window_chunks,
         device=query.device,
-        dtype=acc_dt,
+        dtype=target_dt,
     )
 
     pm_bool: torch.Tensor | None = None
@@ -2163,7 +2257,7 @@ def _recurrent_hssd_raw(
             if idx_b is not None and idx_b.numel() == 0:
                 row_outs_p.append(query.new_zeros(1, seq_len, hv, dv, dtype=init_dtype))
                 if output_final_state:
-                    row_states_p.append(_cast_state_dtype(st_b, state_dtype, acc_dt))
+                    row_states_p.append(_cast_state_dtype(st_b, target_dt, acc_dt))
                 continue
             tsl: slice | torch.Tensor | None = (
                 idx_b if (idx_b is not None and idx_b.numel() < seq_len) else None
@@ -2219,7 +2313,7 @@ def _recurrent_hssd_raw(
                 g_override=go_b,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 scale=scale,
-                state_dtype=state_dtype,
+                state_dtype=target_dt,
                 use_swa=use_swa,
                 use_phase=use_phase,
                 use_surprise=use_surprise,
@@ -2279,7 +2373,7 @@ def _recurrent_hssd_raw(
             g_override=go_i,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             scale=scale,
-            state_dtype="auto",
+            state_dtype=target_dt,
             use_swa=use_swa,
             use_phase=use_phase,
             use_surprise=use_surprise,
@@ -2291,7 +2385,7 @@ def _recurrent_hssd_raw(
         tok_total = tok_total + cnt_i
 
     out = torch.cat(outs, dim=1) if outs else query.new_zeros(bsz, 0, hv, dv)
-    final_st = _cast_state_dtype(state, state_dtype, acc_dt) if output_final_state else None
+    final_st = _cast_state_dtype(state, target_dt, acc_dt) if output_final_state else None
     return out, final_st, u_total, tok_total
 
 
@@ -2424,6 +2518,7 @@ def _run_chunk_group(
     boundary_ring: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
     """Execute a contiguous group of global-aligned chunks (pure functional for checkpointing)."""
+    bsz = q_hat.shape[0]
     dk = k_hat.shape[-1]
     hv = k_hat.shape[2]
     outs: list[torch.Tensor] = []
@@ -2434,10 +2529,79 @@ def _run_chunk_group(
     kappa_b = kappa[0] if kappa.numel() == 1 else kappa.view(1, hv, 1)
     tau_b = gate_tau[0] if gate_tau.numel() == 1 else gate_tau.view(1, hv, 1)
 
+    n_grp = len(chunk_bounds)
+    base_l0 = chunk_bounds[0][0] if n_grp > 0 else 0
+    g_start = step_offset + base_l0
+    win_prior = window_chunks * chunk_size
+    can_batch_swa = (
+        use_swa
+        and n_grp > 1
+        and g_start % chunk_size == 0
+        and swa_base_global <= max(0, g_start - win_prior)
+        and all(
+            chunk_bounds[c][0] == base_l0 + c * chunk_size
+            and chunk_bounds[c][1] == base_l0 + (c + 1) * chunk_size
+            for c in range(n_grp)
+        )
+    )
+
+    o_loc_batched: torch.Tensor | None = None
+    p_hit_batched: torch.Tensor | None = None
+    if can_batch_swa:
+        win_full = (window_chunks + 1) * chunk_size
+        buf_len = (window_chunks + n_grp) * chunk_size
+        want_start = g_start - win_prior
+        if want_start >= swa_base_global:
+            s_off = want_start - swa_base_global
+            ks_buf = all_ks[:, s_off : s_off + buf_len]
+            vs_buf = all_vs[:, s_off : s_off + buf_len]
+            val_buf = all_valid_swa[:, s_off : s_off + buf_len]
+        else:
+            pad_left = swa_base_global - want_start
+            take_len = buf_len - pad_left
+            ks_buf = F.pad(all_ks[:, :take_len], (0, 0, 0, 0, pad_left, 0), value=0.0)
+            vs_buf = F.pad(all_vs[:, :take_len], (0, 0, 0, 0, pad_left, 0), value=0.0)
+            val_buf = F.pad(all_valid_swa[:, :take_len], (pad_left, 0), value=False)
+
+        k_win_t = ks_buf.unfold(1, win_full, chunk_size)                      # [B, n_grp, H_v, d_k, win_full]
+        v_win_b = vs_buf.unfold(1, win_full, chunk_size).transpose(-1, -2)    # [B, n_grp, H_v, win_full, d_v]
+        val_win_b = val_buf.unfold(1, win_full, chunk_size)                   # [B, n_grp, win_full]
+
+        q_loc_b = (
+            qs[:, base_l0 : base_l0 + n_grp * chunk_size]
+            .reshape(bsz, n_grp, chunk_size, hv, dk)
+            .transpose(2, 3)
+        )                                                                     # [B, n_grp, H_v, C, d_k]
+        scores_b = (q_loc_b @ k_win_t) * (dk ** -0.5)                         # [B, n_grp, H_v, C, win_full]
+
+        r_idx = torch.arange(chunk_size, device=qs.device)[:, None]
+        w_idx = torch.arange(win_full, device=qs.device)[None, :]
+        causal_b = w_idx <= (win_prior + r_idx)
+        valid_mask_b = causal_b[None, None, None, :, :] & val_win_b[:, :, None, None, :]
+
+        has_valid_b = valid_mask_b.any(dim=-1)
+        safe_vm_b = torch.where(has_valid_b.unsqueeze(-1), valid_mask_b, torch.ones_like(valid_mask_b))
+        masked_sc_b = scores_b.masked_fill(~safe_vm_b, float("-inf"))
+
+        probs_b = torch.softmax(masked_sc_b, dim=-1)
+        probs_b = torch.where(has_valid_b.unsqueeze(-1), probs_b, torch.zeros_like(probs_b))
+        o_loc_batched = (probs_b @ v_win_b).transpose(2, 3)                   # [B, n_grp, C, H_v, d_v]
+
+        counts_b = valid_mask_b.expand_as(scores_b).sum(dim=-1)
+        has_v_sc_b = counts_b > 0
+        n_eff_b = counts_b.clamp_min(1).to(scores_b.dtype)
+        lse_b = torch.logsumexp(masked_sc_b, dim=-1)
+        max_sc_b = masked_sc_b.max(dim=-1).values
+        stat_b = 0.5 * (lse_b - torch.log(n_eff_b)) + 0.5 * (
+            max_sc_b - torch.sqrt(2.0 * torch.log(n_eff_b.clamp_min(2.0)))
+        )
+        p_hit_b = torch.sigmoid(kappa_b * (stat_b - tau_b))
+        p_hit_batched = torch.where(has_v_sc_b, p_hit_b, torch.zeros_like(p_hit_b)).transpose(2, 3).unsqueeze(-1)
+
     p_cur = page_states
     ring_cur = boundary_ring
 
-    for l0, l1 in chunk_bounds:
+    for c_i, (l0, l1) in enumerate(chunk_bounds):
         g0 = step_offset + l0
         g1 = step_offset + l1
 
@@ -2454,7 +2618,11 @@ def _run_chunk_group(
         o_far = _far_readout(q_c, ring_cur[0], rl_c, top_k_pages)
 
         # 2. Exact causal local SWA over I_loc(t) = [far_cutoff + 1, t] (0-based [far_cutoff, g1))
-        if use_swa:
+        if o_loc_batched is not None and p_hit_batched is not None:
+            o_loc = o_loc_batched[:, c_i]
+            p_hit = p_hit_batched[:, c_i]
+            outs.append(p_hit * o_loc + (1.0 - p_hit) * o_far)
+        elif use_swa:
             _n_idx, _k_far, far_cutoff = disjoint_horizon_bounds(g0 + 1, chunk_size, window_chunks)
             s0 = far_cutoff - swa_base_global
             s1 = g1 - swa_base_global
@@ -2489,7 +2657,7 @@ def _run_chunk_group(
             outs.append(o_far)
 
         # 3. Parallel routed chunk-start root-surprise (against ring_cur[-1]) + WY multi-page state update
-        g_page, u_sum, cnt_c, _top_idx, _g_act = _compute_root_surprise_and_routing(
+        g_page, u_sum, cnt_c, top_idx, _g_act = _compute_root_surprise_and_routing(
             k_c,
             v_c,
             ring_cur[-1],
@@ -2515,7 +2683,21 @@ def _run_chunk_group(
         k_eff = (g_page.unsqueeze(-1) * (sqrt_b * k_c).unsqueeze(2)).permute(0, 2, 3, 1, 4)
         v_eff = (g_page.unsqueeze(-1) * (sqrt_w * v_c).unsqueeze(2)).permute(0, 2, 3, 1, 4)
         log_a = (-(g_page * g_page).unsqueeze(-1) * gamma_c).permute(0, 2, 3, 1, 4)
-        p_cur = _wy_kda_state_update(p_cur, k_eff, v_eff, log_a)
+        if not torch.is_grad_enabled() and not _is_compiling() and top_k_pages < num_pages:
+            uniq_idx = torch.unique(top_idx)
+            n_uniq = int(uniq_idx.numel())
+            if 0 < n_uniq < num_pages:
+                p_act = _wy_kda_state_update(
+                    p_cur.index_select(1, uniq_idx),
+                    k_eff.index_select(1, uniq_idx),
+                    v_eff.index_select(1, uniq_idx),
+                    log_a.index_select(1, uniq_idx),
+                )
+                p_cur = p_cur.index_copy(1, uniq_idx, p_act)
+            else:
+                p_cur = _wy_kda_state_update(p_cur, k_eff, v_eff, log_a)
+        else:
+            p_cur = _wy_kda_state_update(p_cur, k_eff, v_eff, log_a)
 
         if g1 % chunk_size == 0:
             ring_cur = (*ring_cur[1:], p_cur)
@@ -2649,6 +2831,70 @@ def _chunk_hssd_raw(
         )
         return out_all, st_all, u_tot, cnt_tot
 
+    target_dt = _resolve_state_dtype(state_dtype, acc_dt)
+    if seq_len == 0:
+        st0 = _coerce_init_state(
+            initial_state,
+            bsz=bsz,
+            num_pages=num_pages,
+            hv=hv,
+            dk=dk,
+            dv=dv,
+            chunk_size=chunk_size,
+            window_chunks=window_chunks,
+            device=query.device,
+            dtype=target_dt,
+        )
+        empty_out = query.new_zeros(bsz, 0, hv, dv, dtype=init_dtype)
+        final_0 = _cast_state_dtype(st0, target_dt, acc_dt) if output_final_state else None
+        return empty_out, final_0, query.new_zeros(num_pages, dtype=acc_dt), query.new_zeros((), dtype=acc_dt)
+
+    if seq_len == 1:
+        st1 = _coerce_init_state(
+            initial_state,
+            bsz=bsz,
+            num_pages=num_pages,
+            hv=hv,
+            dk=dk,
+            dv=dv,
+            chunk_size=chunk_size,
+            window_chunks=window_chunks,
+            device=query.device,
+            dtype=target_dt,
+        )
+        o_step, st_next, u_sum, cnt_sum = recurrent_hssd_step(
+            query,
+            key,
+            value,
+            gamma,
+            b_gate,
+            w_gate,
+            theta,
+            surprise_bias,
+            surprise_slope,
+            surprise_thresh,
+            write_logits,
+            read_logits,
+            q_swa,
+            k_swa,
+            v_swa,
+            st1,
+            boltzmann_gate=boltzmann_gate,
+            top_k_pages=top_k_pages,
+            write_mask=write_mask,
+            pad_mask=pad_mask,
+            g_override=g_override,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+            state_dtype=target_dt,
+            use_swa=use_swa,
+            use_phase=use_phase,
+            use_surprise=use_surprise,
+            surprise_mode=surprise_mode,
+            return_duty_sum=True,
+        )
+        return o_step, (st_next if output_final_state else None), u_sum, cnt_sum
+
     st = _coerce_init_state(
         initial_state,
         bsz=bsz,
@@ -2766,45 +3012,6 @@ def _chunk_hssd_raw(
             else None
         )
         return out_p, st_p, u_tot_p, cnt_tot_p
-
-    if seq_len == 0:
-        empty_out = query.new_zeros(bsz, 0, hv, dv, dtype=init_dtype)
-        final_0 = _cast_state_dtype(st, state_dtype, acc_dt) if output_final_state else None
-        return empty_out, final_0, query.new_zeros(num_pages, dtype=acc_dt), query.new_zeros((), dtype=acc_dt)
-
-    if seq_len == 1:
-        o_step, st_next, u_sum, cnt_sum = recurrent_hssd_step(
-            query,
-            key,
-            value,
-            gamma,
-            b_gate,
-            w_gate,
-            theta,
-            surprise_bias,
-            surprise_slope,
-            surprise_thresh,
-            write_logits,
-            read_logits,
-            q_swa,
-            k_swa,
-            v_swa,
-            st,
-            boltzmann_gate=boltzmann_gate,
-            top_k_pages=top_k_pages,
-            write_mask=write_mask,
-            pad_mask=None,
-            g_override=g_override,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            scale=scale,
-            state_dtype=state_dtype,
-            use_swa=use_swa,
-            use_phase=use_phase,
-            use_surprise=use_surprise,
-            surprise_mode=surprise_mode,
-            return_duty_sum=True,
-        )
-        return o_step, (st_next if output_final_state else None), u_sum, cnt_sum
 
     q, k, v = _prepare_qkv_unscaled(query, key, value, use_qk_l2norm_in_kernel)
     ps_gamma, ch_gamma = _normalize_gamma_spec(
@@ -3599,6 +3806,8 @@ def _make_hssd_rule_wrapper(
             c_cfg = adapter.cfg
 
             if seq_len == 1 and cu_seqlens is None and seq_idx is None:
+                acc_dt = torch.float64 if query.dtype == torch.float64 else torch.float32
+                target_dt = _resolve_state_dtype(c_cfg.state_dtype, acc_dt)
                 st0 = _coerce_init_state(
                     init_st,
                     bsz=bsz,
@@ -3609,7 +3818,7 @@ def _make_hssd_rule_wrapper(
                     chunk_size=c_cfg.chunk_size,
                     window_chunks=c_cfg.window_chunks,
                     device=query.device,
-                    dtype=torch.float64 if query.dtype == torch.float64 else torch.float32,
+                    dtype=target_dt,
                 )
                 out, st_next, u_sum, cnt_sum = recurrent_hssd_step(
                     proj["query"],
@@ -3634,7 +3843,7 @@ def _make_hssd_rule_wrapper(
                     pad_mask=pad_mask,
                     use_qk_l2norm_in_kernel=False,
                     scale=scale,
-                    state_dtype=c_cfg.state_dtype,
+                    state_dtype=target_dt,
                     use_swa=c_cfg.use_swa,
                     use_phase=c_cfg.use_phase,
                     use_surprise=c_cfg.use_surprise,

@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import copy
 import gc
+import importlib.util
+import itertools
 import logging
+import sys
 import time
 from collections import Counter
 from collections.abc import Iterable
@@ -27,7 +30,12 @@ from torch import nn
 
 from ..debug import cuda_mem_brief, stage
 from .introspect import inspect_model, summarize
-from .quant_autograd import install_quantized_autograd_bridge, is_quantized_module
+from .quant_autograd import (
+    FP8_DTYPES,
+    install_quantized_autograd_bridge,
+    is_quantized_module,
+    repack_decompressed_nvfp4_moe_experts,
+)
 
 log = logging.getLogger("qloop")
 
@@ -50,18 +58,37 @@ def resolve_device(device_map: Any) -> str:
     return device_map if isinstance(device_map, str) else "cpu"
 
 
+def _param_kind_for_name(name: str) -> str:
+    return (
+        "experts" if ".experts." in name else "router" if name.endswith("mlp.gate.weight") else
+        "shared_expert" if "shared_expert" in name else "linear_attn" if "linear_attn" in name else
+        "self_attn" if "self_attn" in name else "embed" if "embed" in name else
+        "lm_head" if "lm_head" in name else "visual" if "visual" in name else "other"
+    )
+
+
 def param_report(model: nn.Module) -> dict[str, Any]:
     by_dtype: Counter = Counter()
     by_kind: Counter = Counter()
     trainable = 0
+    seen_ids: set[int] = set()
     for name, p in model.named_parameters():
+        seen_ids.add(id(p))
         by_dtype[str(p.dtype).replace("torch.", "")] += p.numel()
-        kind = ("experts" if ".experts." in name else "router" if name.endswith("mlp.gate.weight") else
-                "shared_expert" if "shared_expert" in name else "linear_attn" if "linear_attn" in name else
-                "self_attn" if "self_attn" in name else "embed" if "embed" in name else
-                "lm_head" if "lm_head" in name else "visual" if "visual" in name else "other")
-        by_kind[kind] += p.numel()
+        by_kind[_param_kind_for_name(name)] += p.numel()
         trainable += p.numel() if p.requires_grad else 0
+
+    quant_mod_names = {mname for mname, m in model.named_modules() if is_quantized_module(m)}
+    non_float_quant_dtypes = (*FP8_DTYPES, torch.uint8, torch.int8, torch.int16, torch.int32)
+    for bname, buf in model.named_buffers():
+        if id(buf) in seen_ids:
+            continue
+        parent = bname.rsplit(".", 1)[0] if "." in bname else ""
+        if parent in quant_mod_names and buf.dtype in non_float_quant_dtypes:
+            seen_ids.add(id(buf))
+            by_dtype[str(buf.dtype).replace("torch.", "")] += buf.numel()
+            by_kind[_param_kind_for_name(bname)] += buf.numel()
+
     quant_modules = Counter(
         type(m).__name__
         for m in model.modules()
@@ -209,6 +236,82 @@ def _propagate_quantization_config_to_text_config(config: Any, text_cfg: Any) ->
     return text_cfg_copy
 
 
+def _is_package_installed(pkg_name: str) -> bool:
+    mod = sys.modules.get(pkg_name)
+    if mod is not None and getattr(mod, "__spec__", None) is None:
+        return True
+    if pkg_name in sys.modules and mod is None:
+        return False
+    try:
+        return importlib.util.find_spec(pkg_name) is not None
+    except (ImportError, ValueError):
+        return mod is not None
+
+
+def _is_deferred_ct_decompress_hook(hook: Any) -> bool:
+    cur = hook
+    for _ in range(4):
+        if hasattr(cur, "func"):
+            cur = cur.func
+        elif hasattr(cur, "__wrapped__"):
+            cur = cur.__wrapped__
+        elif hasattr(cur, "__func__"):
+            cur = cur.__func__
+        else:
+            break
+    for obj in (hook, cur, type(hook), type(cur)):
+        name = str(getattr(obj, "__name__", "") or "").lower()
+        qual = str(getattr(obj, "__qualname__", "") or "").lower()
+        mod_name = str(getattr(obj, "__module__", "") or "").lower()
+        if "ct_decompress" in name or "ct_decompress" in qual:
+            return True
+        if "decompress_hook" in name or "decompress_hook" in qual:
+            return True
+        if mod_name.startswith("compressed_tensors") and "compressor" in mod_name:
+            return True
+    return False
+
+
+def _has_deferred_ct_decompress_hook(model: nn.Module) -> bool:
+    for sub in model.modules():
+        pre_hooks = getattr(sub, "_forward_pre_hooks", None)
+        if pre_hooks:
+            for hook in pre_hooks.values():
+                if _is_deferred_ct_decompress_hook(hook):
+                    return True
+    return False
+
+
+def _flush_deferred_quant_hooks(model: nn.Module) -> bool:
+    """Trigger one-shot `compressed-tensors` `ct_decompress_hook` on the pristine un-patched model."""
+    if not _has_deferred_ct_decompress_hook(model):
+        return False
+
+    first_dev = torch.device("cpu")
+    for t in itertools.chain(model.parameters(), model.buffers()):
+        if isinstance(t, torch.Tensor) and t.device.type != "meta":
+            first_dev = t.device
+            break
+
+    dummy_ids = torch.zeros((1, 2), dtype=torch.long, device=first_dev)
+    with torch.no_grad():
+        try:
+            try:
+                model(input_ids=dummy_ids, use_cache=False)
+            except TypeError:
+                model(dummy_ids)
+        except Exception as exc:
+            if _has_deferred_ct_decompress_hook(model):
+                raise
+            log.debug("dummy forward after ct_decompress_hook raised %r (hook already cleared)", exc)
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    log.info("flushed deferred compressed-tensors decompression hook(s) on %s %s", first_dev, cuda_mem_brief("| "))
+    return True
+
+
 def _load_hf(mcfg: dict[str, Any]):
     try:
         import transformers
@@ -289,6 +392,7 @@ def _load_hf(mcfg: dict[str, Any]):
             except Exception as e:
                 errors.append(f"AutoModelForImageTextToText: {e!r}")
                 raise RuntimeError("could not load model:\n  " + "\n  ".join(errors)) from e
+        _flush_deferred_quant_hooks(model)
         log.info("weights loaded in %.0fs %s", time.time() - t0, cuda_mem_brief("| "))
     tok = AutoTokenizer.from_pretrained(mcfg.get("tokenizer") or name, **common)
     return model, tok
@@ -298,14 +402,23 @@ def load_model(mcfg: dict[str, Any]):
     """Returns (model, tokenizer, info). Base parameters are frozen on return."""
     name = mcfg.get("name", "toy")
     model, tok = _load_toy(mcfg) if name == "toy" else _load_hf(mcfg)
+    repack_info: dict[str, Any] | None = None
     if name == "toy":
         model = model.to(resolve_device(mcfg.get("device_map", "cpu")))
+    else:
+        _flush_deferred_quant_hooks(model)
+        if bool(mcfg.get("repack_nvfp4_moe", True)):
+            repack_info = repack_decompressed_nvfp4_moe_experts(model)
     for p in model.parameters():
         p.requires_grad_(False)
     quant_info = install_quantized_autograd_bridge(model)
+    if repack_info is not None and int(repack_info.get("repacked_moe_modules", 0)) > 0:
+        quant_info["repacked_moe_modules"] = int(repack_info["repacked_moe_modules"])
     parts = inspect_model(model)
     info = param_report(model)
     info["quantization"] = quant_info
+    if repack_info is not None and int(repack_info.get("repacked_moe_modules", 0)) > 0:
+        info["nvfp4_moe_repack"] = repack_info
     log.info("%s", summarize(parts))
     for k, v in info.items():
         log.info("  %s: %s", k, v)
@@ -322,27 +435,55 @@ def load_model(mcfg: dict[str, Any]):
             quant_info.get("native_fwd_ok_count", 0),
             quant_info.get("native_grad_ok_count", 0),
         )
-        if int(quant_info.get("native_fwd_ok_count", 0)) == 0:
-            qmethod = str(quant_info.get("quant_method") or "").lower()
-            qfmt = str(quant_info.get("format") or "").lower()
-            has_nvfp4 = (
-                (int(quant_info.get("linear_nvfp4_count", 0)) + int(quant_info.get("moe_nvfp4_count", 0))) > 0
-                or "nvfp4" in qfmt
-                or qmethod == "compressed-tensors"
+        lin_nvfp4_cnt = int(quant_info.get("linear_nvfp4_count", 0))
+        moe_nvfp4_cnt = int(quant_info.get("moe_nvfp4_count", 0))
+        fp8_cnt = int(quant_info.get("linear_fp8_count", 0)) + int(quant_info.get("moe_fp8_count", 0))
+        native_fwd_ok_cnt = int(quant_info.get("native_fwd_ok_count", 0))
+        qmethod = str(quant_info.get("quant_method") or "").lower()
+        qfmt = str(quant_info.get("format") or "").lower()
+        has_nvfp4 = (lin_nvfp4_cnt + moe_nvfp4_cnt) > 0 or "nvfp4" in qfmt or qmethod == "compressed-tensors"
+        ct_installed = _is_package_installed("compressed_tensors")
+        kernels_installed = _is_package_installed("kernels")
+
+        if moe_nvfp4_cnt > 0 or (has_nvfp4 and ct_installed and native_fwd_ok_cnt == 0):
+            log.info(
+                "NVFP4 / compressed-tensors modules (moe_nvfp4=%d, linear_nvfp4=%d) running via "
+                "qloop's vectorized single-sync chunked-3D Tensor-Core engine (bf16 compute, 4-bit HBM storage).",
+                moe_nvfp4_cnt,
+                lin_nvfp4_cnt,
             )
-            install_cmd = (
-                "pip install compressed-tensors"
-                if has_nvfp4
-                else 'pip install "kernels>=0.18.2,<0.19.0"'
-            )
-            log.warning(
-                "native quantized inference kernels unavailable (native_fwd_ok=0/%d for method=%s); "
-                "continuing via transient bf16 fallback. For native Blackwell kernel acceleration, "
-                "run `%s`.",
-                quant_info.get("total_quantized_modules", 0),
-                quant_info.get("quant_method"),
-                install_cmd,
-            )
+
+        if native_fwd_ok_cnt == 0:
+            if has_nvfp4:
+                if not ct_installed and (lin_nvfp4_cnt > 0 or (moe_nvfp4_cnt == 0 and fp8_cnt == 0)):
+                    log.warning(
+                        "native quantized inference kernels unavailable (native_fwd_ok=0/%d for method=%s); "
+                        "continuing via transient bf16 fallback. For native Blackwell kernel acceleration, "
+                        "run `pip install compressed-tensors`.",
+                        quant_info.get("total_quantized_modules", 0),
+                        quant_info.get("quant_method"),
+                    )
+                elif fp8_cnt > 0 and lin_nvfp4_cnt == 0 and not kernels_installed:
+                    log.warning(
+                        "native FP8 inference kernels unavailable (native_fwd_ok=0/%d for method=%s); "
+                        "continuing via transient bf16 fallback. For native Blackwell kernel acceleration, "
+                        'run `pip install "kernels>=0.18.2,<0.19.0"`.',
+                        quant_info.get("total_quantized_modules", 0),
+                        quant_info.get("quant_method"),
+                    )
+            elif not kernels_installed:
+                log.warning(
+                    "native quantized inference kernels unavailable (native_fwd_ok=0/%d for method=%s); "
+                    "continuing via transient bf16 fallback. For native Blackwell kernel acceleration, "
+                    'run `pip install "kernels>=0.18.2,<0.19.0"`.',
+                    quant_info.get("total_quantized_modules", 0),
+                    quant_info.get("quant_method"),
+                )
+            else:
+                log.info(
+                    "FP8 modules (count=%d) running via qloop's transient Tensor-Core engine.",
+                    quant_info.get("total_quantized_modules", 0),
+                )
     elif info["quantized_module_types"]:
         log.warning("quantized modules present %s: run `qloop probe --backward` once to confirm gradients flow "
                     "through frozen quantized experts on this transformers/kernel version",

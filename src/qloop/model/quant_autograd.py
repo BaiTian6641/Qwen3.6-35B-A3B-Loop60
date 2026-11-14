@@ -26,8 +26,10 @@ This module provides:
 from __future__ import annotations
 
 import functools
+import gc
 import logging
 import math
+import types
 from collections import Counter
 from typing import Any
 
@@ -504,20 +506,46 @@ def dequantize_nvfp4_tensor(
 
     if weight_global_scale is not None:
         if isinstance(weight_global_scale, torch.Tensor):
-            gs: torch.Tensor | float = weight_global_scale.to(device=u8.device, dtype=torch.float32)
-            if isinstance(gs, torch.Tensor):
-                if gs.ndim == 1:
-                    if deq.ndim == 3 and gs.shape[0] == deq.shape[0]:
-                        gs = gs.reshape(deq.shape[0], 1, 1)
-                    elif deq.ndim == 2 and gs.shape[0] == deq.shape[0]:
-                        gs = gs.reshape(deq.shape[0], 1)
+            gs_t = weight_global_scale.to(device=u8.device, dtype=torch.float32)
+            if gs_t.ndim == 0 or gs_t.numel() == 1:
+                gs: torch.Tensor | float = gs_t.reshape(())
+            elif deq.ndim == 2:
+                if gs_t.ndim == 1 and gs_t.shape[0] == deq.shape[0]:
+                    gs = gs_t.reshape(deq.shape[0], 1)
                 elif (
-                    deq.ndim == 3
-                    and gs.ndim == 2
-                    and gs.shape[0] == deq.shape[0]
-                    and gs.shape[1] in (1, deq.shape[1])
+                    gs_t.ndim == 2
+                    and gs_t.shape[0] in (1, deq.shape[0])
+                    and gs_t.shape[1] in (1, deq.shape[1])
                 ):
-                    gs = gs.unsqueeze(-1)
+                    gs = gs_t
+                else:
+                    raise ValueError(
+                        f"NVFP4 weight_global_scale shape {tuple(gs_t.shape)} incompatible with 2D unpacked "
+                        f"shape {tuple(deq.shape)}"
+                    )
+            elif deq.ndim == 3:
+                if gs_t.ndim == 1 and gs_t.shape[0] == deq.shape[0]:
+                    gs = gs_t.reshape(deq.shape[0], 1, 1)
+                elif (
+                    gs_t.ndim == 2
+                    and gs_t.shape[0] in (1, deq.shape[0])
+                    and gs_t.shape[1] in (1, deq.shape[1])
+                ):
+                    gs = gs_t.unsqueeze(-1)
+                elif (
+                    gs_t.ndim == 3
+                    and gs_t.shape[0] in (1, deq.shape[0])
+                    and gs_t.shape[1] in (1, deq.shape[1])
+                    and gs_t.shape[2] in (1, deq.shape[2])
+                ):
+                    gs = gs_t
+                else:
+                    raise ValueError(
+                        f"NVFP4 weight_global_scale shape {tuple(gs_t.shape)} incompatible with 3D unpacked "
+                        f"shape {tuple(deq.shape)}"
+                    )
+            else:
+                gs = gs_t
         else:
             gs = float(weight_global_scale)
         deq = deq / gs if global_scale_mode == "divisor" else deq * gs
@@ -1209,8 +1237,12 @@ class _QuantLinearAutogradFn(torch.autograd.Function):
         ctx.mod = mod
         ctx.has_bias = bias is not None
         ctx.bias_dtype = bias.dtype if bias is not None else None
-        w_deq = _dequant_linear_weight(mod, dtype=x.dtype)
         b_cast = bias.to(device=x.device, dtype=x.dtype) if bias is not None else None
+        if _classify_quant_module(mod) is None:
+            w_plain = getattr(mod, "weight", None)
+            if isinstance(w_plain, torch.Tensor) and w_plain.ndim == 2:
+                return F.linear(x, w_plain.to(device=x.device, dtype=x.dtype), b_cast)
+        w_deq = _dequant_linear_weight(mod, dtype=x.dtype).to(device=x.device)
         out = F.linear(x, w_deq, b_cast)
         del w_deq
         return out
@@ -1219,9 +1251,14 @@ class _QuantLinearAutogradFn(torch.autograd.Function):
     def backward(ctx: Any, grad_out: torch.Tensor) -> tuple[torch.Tensor | None, ...]:  # type: ignore[override]
         grad_x: torch.Tensor | None = None
         if ctx.needs_input_grad[0]:
-            w_deq = _dequant_linear_weight(ctx.mod, dtype=grad_out.dtype)
-            grad_x = torch.matmul(grad_out, w_deq)
-            del w_deq
+            if _classify_quant_module(ctx.mod) is None:
+                w_plain = getattr(ctx.mod, "weight", None)
+                if isinstance(w_plain, torch.Tensor) and w_plain.ndim == 2:
+                    grad_x = torch.matmul(grad_out, w_plain.to(device=grad_out.device, dtype=grad_out.dtype))
+            if grad_x is None:
+                w_deq = _dequant_linear_weight(ctx.mod, dtype=grad_out.dtype).to(device=grad_out.device)
+                grad_x = torch.matmul(grad_out, w_deq)
+                del w_deq
 
         grad_bias: torch.Tensor | None = None
         if ctx.has_bias and ctx.needs_input_grad[1]:
@@ -1735,7 +1772,7 @@ def _fallback_linear_nograd(
     if not isinstance(bias, torch.Tensor):
         bias = None
     with torch.no_grad():
-        w_deq = _dequant_linear_weight(mod, dtype=x.dtype)
+        w_deq = _dequant_linear_weight(mod, dtype=x.dtype).to(device=x.device)
         b_cast = bias.to(device=x.device, dtype=x.dtype) if bias is not None else None
         out = F.linear(x, w_deq, b_cast)
         del w_deq
@@ -1758,6 +1795,339 @@ def _fallback_moe_nograd(
         return flat_out.reshape(orig_shape)
 
 
+def _quant_config_targets_nvfp4(model: nn.Module) -> bool:
+    """Return `True` if `model`'s `quantization_config` targets 4-bit float (`NVFP4`)."""
+    qcfg = _extract_raw_quant_config(model)
+    if not qcfg:
+        for sub in model.modules():
+            cfg = getattr(sub, "config", None)
+            sub_qcfg = getattr(cfg, "quantization_config", None) if cfg is not None else None
+            if sub_qcfg is not None:
+                if isinstance(sub_qcfg, dict):
+                    qcfg = dict(sub_qcfg)
+                elif hasattr(sub_qcfg, "to_dict"):
+                    qcfg = dict(sub_qcfg.to_dict())
+                else:
+                    qcfg = {k: v for k, v in vars(sub_qcfg).items() if not k.startswith("_")}
+                break
+    if not qcfg:
+        return False
+
+    for fkey in ("format", "fmt", "quant_algo"):
+        fval = qcfg.get(fkey)
+        if fval is not None and "nvfp4" in str(fval).lower():
+            return True
+
+    cgroups = qcfg.get("config_groups")
+    if isinstance(cgroups, dict):
+        for grp in cgroups.values():
+            gfmt = grp.get("format") if isinstance(grp, dict) else getattr(grp, "format", None)
+            if gfmt is not None and "nvfp4" in str(gfmt).lower():
+                return True
+            weights = grp.get("weights") if isinstance(grp, dict) else getattr(grp, "weights", None)
+            if weights is not None:
+                nbits = weights.get("num_bits") if isinstance(weights, dict) else getattr(weights, "num_bits", None)
+                wtype = weights.get("type") if isinstance(weights, dict) else getattr(weights, "type", None)
+                if nbits == 4 and str(wtype or "").lower() == "float":
+                    return True
+    return False
+
+
+def _quantize_nvfp4_per_expert_3d(
+    weight_3d: torch.Tensor,
+    group_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize `[C, M, K]` float tensor with independent per-expert divisor global scales `[C]`."""
+    if not hasattr(torch, "float8_e4m3fn"):
+        raise RuntimeError("PyTorch build lacks torch.float8_e4m3fn")
+    if weight_3d.ndim != 3:
+        raise ValueError(f"_quantize_nvfp4_per_expert_3d expects 3D tensor, got {tuple(weight_3d.shape)}")
+    if weight_3d.shape[-1] % 2 != 0:
+        raise ValueError(f"NVFP4 inner dimension must be even, got {weight_3d.shape[-1]}")
+    if group_size <= 0:
+        raise ValueError(f"group_size must be > 0, got {group_size}")
+
+    with torch.no_grad():
+        c_total, m_dim, k_dim = int(weight_3d.shape[0]), int(weight_3d.shape[1]), int(weight_3d.shape[2])
+        n_groups = math.ceil(k_dim / group_size)
+        pad_k = n_groups * group_size - k_dim
+        dev = weight_3d.device
+
+        # Cap single-slice fp32 workspace strictly below ~192 MiB regardless of (M, K, C).
+        row_elems = max(1, m_dim * (n_groups * group_size))
+        max_sub_c = max(1, min(c_total, (192 * 1024 * 1024) // (row_elems * 4)))
+
+        packed_out = torch.empty((c_total, m_dim, k_dim // 2), dtype=torch.uint8, device=dev)
+        scale_out = torch.empty((c_total, m_dim, n_groups), dtype=torch.float8_e4m3fn, device=dev)
+        gs_out = torch.empty((c_total,), dtype=torch.float32, device=dev)
+        bnd = _get_e2m1_boundaries(dev)
+
+        for s0 in range(0, c_total, max_sub_c):
+            s1 = min(c_total, s0 + max_sub_c)
+            sub_c = s1 - s0
+            wf = weight_3d[s0:s1].detach().to(dtype=torch.float32).contiguous()
+            amax_per_exp = wf.abs().amax(dim=(1, 2)).clamp_min(1e-12)
+            divisor_gs = (448.0 * 6.0) / amax_per_exp
+            gs_out[s0:s1].copy_(divisor_gs)
+
+            if pad_k:
+                w_pad = F.pad(wf, (0, pad_k))
+                del wf
+            else:
+                w_pad = wf
+            grouped = w_pad.view(sub_c, m_dim, n_groups, group_size)
+
+            gs_3d = divisor_gs.view(sub_c, 1, 1)
+            grp_amax = grouped.abs().amax(dim=-1)
+            w_scale = (grp_amax * gs_3d / 6.0).clamp(0.0, 448.0).to(torch.float8_e4m3fn)
+            scale_out[s0:s1].copy_(w_scale)
+            del grp_amax
+
+            eff_block_scale = (w_scale.to(torch.float32) / gs_3d).unsqueeze(-1)
+            safe_scale = torch.where(eff_block_scale > 0, eff_block_scale, torch.ones_like(eff_block_scale))
+            grouped.div_(safe_scale)
+            grouped.masked_fill_(eff_block_scale <= 0, 0.0)
+            del eff_block_scale, safe_scale, w_scale
+
+            sign = (grouped < 0).to(torch.uint8) << 3
+            mag_code = torch.bucketize(grouped.abs(), bnd).to(torch.uint8)
+            del grouped, w_pad
+            nibbles = (sign | mag_code).view(sub_c, m_dim, n_groups * group_size)[..., :k_dim]
+            del sign, mag_code
+            packed_out[s0:s1].copy_(nibbles[..., 0::2] | (nibbles[..., 1::2] << 4))
+            del nibbles
+
+        return packed_out, scale_out, gs_out
+
+
+def _remove_module_tensor_attr(mod: nn.Module, name: str) -> None:
+    if hasattr(mod, name):
+        try:
+            delattr(mod, name)
+        except Exception:
+            pass
+    if name in mod._parameters:
+        try:
+            del mod._parameters[name]
+        except Exception:
+            mod._parameters.pop(name, None)
+    if name in mod._buffers:
+        try:
+            del mod._buffers[name]
+        except Exception:
+            mod._buffers.pop(name, None)
+    if name in mod.__dict__:
+        mod.__dict__.pop(name, None)
+
+
+def _register_repacked_tensor(mod: nn.Module, name: str, tensor: torch.Tensor) -> None:
+    _remove_module_tensor_attr(mod, name)
+    try:
+        param = nn.Parameter(tensor, requires_grad=False)
+        setattr(mod, name, param)
+        got = getattr(mod, name, None)
+        if not isinstance(got, torch.Tensor) or tuple(got.shape) != tuple(tensor.shape):
+            raise TypeError(f"Parameter registration readback mismatch on {type(mod).__name__}.{name}")
+    except Exception:
+        _remove_module_tensor_attr(mod, name)
+        mod.register_buffer(name, tensor)
+
+
+def repack_decompressed_nvfp4_moe_experts(
+    model: nn.Module,
+    *,
+    group_size: int = 16,
+    expert_batch: int = 64,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Repack HF5 on-the-fly decompressed float 3D MoE experts back into compact `moe_nvfp4`.
+
+    Processes one MoE module at a time in chunks of `expert_batch` experts (`< 250 MiB` transient
+    `fp32` workspace), preserving lossless split-`gate` / `up` per-expert `weight_global_scale`s
+    (`gate_up_proj_global_scale` `[E, 2I]`, `down_proj_global_scale` `[E]`).
+    """
+    if group_size <= 0:
+        raise ValueError(f"group_size must be > 0, got {group_size}")
+    step = max(1, int(expert_batch))
+
+    if not force and not _quant_config_targets_nvfp4(model):
+        return {
+            "repacked_moe_modules": 0,
+            "bytes_before": 0,
+            "bytes_after": 0,
+            "freed_bytes": 0,
+        }
+
+    candidates: list[nn.Module] = []
+    seen: set[int] = set()
+    float_dtypes = (torch.bfloat16, torch.float16, torch.float32, torch.float64)
+    for mod in model.modules():
+        if id(mod) in seen:
+            continue
+        seen.add(id(mod))
+        if _classify_quant_module(mod) is not None:
+            continue
+        gu = getattr(mod, "gate_up_proj", None)
+        dn = getattr(mod, "down_proj", None)
+        if (
+            isinstance(gu, torch.Tensor)
+            and isinstance(dn, torch.Tensor)
+            and gu.ndim == 3
+            and dn.ndim == 3
+            and gu.dtype in float_dtypes
+            and dn.dtype in float_dtypes
+            and gu.device.type != "meta"
+            and dn.device.type != "meta"
+        ):
+            candidates.append(mod)
+
+    if not candidates:
+        return {
+            "repacked_moe_modules": 0,
+            "bytes_before": 0,
+            "bytes_after": 0,
+            "freed_bytes": 0,
+        }
+
+    repacked_count = 0
+    bytes_before = 0
+    bytes_after = 0
+
+    with torch.no_grad():
+        for mod in candidates:
+            gu = getattr(mod, "gate_up_proj", None)
+            dn = getattr(mod, "down_proj", None)
+            if not (isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor)):
+                continue
+            if int(gu.shape[0]) != int(dn.shape[0]) or int(gu.shape[0]) <= 0:
+                continue
+
+            is_tr = _is_expert_pair_transposed(
+                mod,
+                (int(gu.shape[1]), int(gu.shape[2])),
+                (int(dn.shape[1]), int(dn.shape[2])),
+            )
+            n_exp = int(gu.shape[0])
+            if is_tr:
+                h_dim, two_i = int(gu.shape[1]), int(gu.shape[2])
+                inter_dim, dn_h = int(dn.shape[1]), int(dn.shape[2])
+            else:
+                two_i, h_dim = int(gu.shape[1]), int(gu.shape[2])
+                dn_h, inter_dim = int(dn.shape[1]), int(dn.shape[2])
+
+            if two_i != 2 * inter_dim or dn_h != h_dim or (h_dim % 2 != 0) or (inter_dim % 2 != 0):
+                log.warning(
+                    "Skipping NVFP4 MoE repack on %s due to incompatible shapes gate_up=%s down=%s",
+                    type(mod).__name__,
+                    tuple(gu.shape),
+                    tuple(dn.shape),
+                )
+                continue
+
+            mod_before = int(gu.numel() * gu.element_size() + dn.numel() * dn.element_size())
+            gu_dev, dn_dev = gu.device, dn.device
+
+            gu_packed = torch.empty((n_exp, two_i, h_dim // 2), dtype=torch.uint8, device=gu_dev)
+            gu_scale = torch.empty(
+                (n_exp, two_i, math.ceil(h_dim / group_size)),
+                dtype=torch.float8_e4m3fn,
+                device=gu_dev,
+            )
+            gu_global_scale = torch.empty((n_exp, two_i), dtype=torch.float32, device=gu_dev)
+
+            for c0 in range(0, n_exp, step):
+                c1 = min(n_exp, c0 + step)
+                gu_view = gu[c0:c1].transpose(1, 2) if is_tr else gu[c0:c1]
+                gp, gs, ggs = _quantize_nvfp4_per_expert_3d(gu_view[:, :inter_dim, :], group_size=group_size)
+                gu_packed[c0:c1, :inter_dim, :].copy_(gp)
+                gu_scale[c0:c1, :inter_dim, :].copy_(gs)
+                gu_global_scale[c0:c1, :inter_dim].copy_(ggs.unsqueeze(1).expand(-1, inter_dim))
+                del gp, gs, ggs
+
+                up, us, ugs = _quantize_nvfp4_per_expert_3d(gu_view[:, inter_dim:, :], group_size=group_size)
+                gu_packed[c0:c1, inter_dim:, :].copy_(up)
+                gu_scale[c0:c1, inter_dim:, :].copy_(us)
+                gu_global_scale[c0:c1, inter_dim:].copy_(ugs.unsqueeze(1).expand(-1, inter_dim))
+                del up, us, ugs, gu_view
+
+            _remove_module_tensor_attr(mod, "gate_up_proj")
+            del gu
+
+            dn_packed = torch.empty((n_exp, h_dim, inter_dim // 2), dtype=torch.uint8, device=dn_dev)
+            dn_scale = torch.empty(
+                (n_exp, h_dim, math.ceil(inter_dim / group_size)),
+                dtype=torch.float8_e4m3fn,
+                device=dn_dev,
+            )
+            dn_global_scale = torch.empty((n_exp,), dtype=torch.float32, device=dn_dev)
+
+            for c0 in range(0, n_exp, step):
+                c1 = min(n_exp, c0 + step)
+                dn_view = dn[c0:c1].transpose(1, 2) if is_tr else dn[c0:c1]
+                dp, ds, dgs = _quantize_nvfp4_per_expert_3d(dn_view, group_size=group_size)
+                dn_packed[c0:c1].copy_(dp)
+                dn_scale[c0:c1].copy_(ds)
+                dn_global_scale[c0:c1].copy_(dgs)
+                del dp, ds, dgs, dn_view
+
+            _remove_module_tensor_attr(mod, "down_proj")
+            del dn
+
+            mod_after = sum(
+                int(t.numel() * t.element_size())
+                for t in (gu_packed, gu_scale, gu_global_scale, dn_packed, dn_scale, dn_global_scale)
+            )
+            _register_repacked_tensor(mod, "gate_up_proj_packed", gu_packed)
+            _register_repacked_tensor(mod, "gate_up_proj_scale", gu_scale)
+            _register_repacked_tensor(mod, "gate_up_proj_global_scale", gu_global_scale)
+            _register_repacked_tensor(mod, "down_proj_packed", dn_packed)
+            _register_repacked_tensor(mod, "down_proj_scale", dn_scale)
+            _register_repacked_tensor(mod, "down_proj_global_scale", dn_global_scale)
+            mod.group_size = int(group_size)  # type: ignore[attr-defined]
+            mod._qloop_nvfp4_scale_mode = "divisor"  # type: ignore[attr-defined]
+
+            del gu_packed, gu_scale, gu_global_scale, dn_packed, dn_scale, dn_global_scale
+            bytes_before += mod_before
+            bytes_after += mod_after
+            repacked_count += 1
+
+    if repacked_count > 0:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gib_before = bytes_before / (1024.0**3)
+        gib_after = bytes_after / (1024.0**3)
+        gib_freed = max(0.0, gib_before - gib_after)
+        log.info(
+            "repacked %d decompressed 3D MoE expert module(s) back to NVFP4: "
+            "%.2f GiB -> %.2f GiB (freed %.2f GiB)",
+            repacked_count,
+            gib_before,
+            gib_after,
+            gib_freed,
+        )
+
+    return {
+        "repacked_moe_modules": int(repacked_count),
+        "bytes_before": int(bytes_before),
+        "bytes_after": int(bytes_after),
+        "freed_bytes": int(max(0, bytes_before - bytes_after)),
+    }
+
+
+def _bind_method_preserving_meta(fn: Any, orig_forward: Any, mod: nn.Module) -> Any:
+    if isinstance(orig_forward, types.MethodType):
+        fn = functools.wraps(orig_forward.__func__)(fn)
+    else:
+        for attr in ("__name__", "__qualname__", "__doc__", "__module__"):
+            if hasattr(orig_forward, attr):
+                try:
+                    setattr(fn, attr, getattr(orig_forward, attr))
+                except Exception:
+                    pass
+    return types.MethodType(fn, mod)
+
+
 def _wrap_quantized_linear(
     mod: nn.Module,
     *,
@@ -1772,19 +2142,31 @@ def _wrap_quantized_linear(
     if not isinstance(getattr(mod, "out_features", None), int):
         mod.out_features = out_f  # type: ignore[attr-defined]
 
+    had_inst_fwd = "forward" in mod.__dict__
+    orig_inst_fwd = mod.__dict__.get("forward")
     orig_forward = mod.forward
     warn_set = warned_classes if warned_classes is not None else set()
     mod._qloop_native_fwd_ok = bool(native_fwd_ok)  # type: ignore[attr-defined]
 
-    @functools.wraps(orig_forward)
-    def bridged_linear_forward(*args: Any, **kwargs: Any) -> Any:
+    def bridged_linear_forward(_self: nn.Module, *args: Any, **kwargs: Any) -> Any:
+        if _classify_quant_module(_self) is None:
+            w_plain = getattr(_self, "weight", None)
+            if isinstance(w_plain, torch.Tensor) and w_plain.ndim == 2:
+                x_in = args[0] if args else next(v for v in kwargs.values() if isinstance(v, torch.Tensor))
+                b_plain = getattr(_self, "bias", None)
+                b_cast = (
+                    b_plain.to(device=x_in.device, dtype=x_in.dtype)
+                    if isinstance(b_plain, torch.Tensor)
+                    else None
+                )
+                return F.linear(x_in, w_plain.to(device=x_in.device, dtype=x_in.dtype), b_cast)
         if not (torch.is_grad_enabled() and _any_tensor_requires_grad(args, kwargs)):
-            if getattr(mod, "_qloop_native_fwd_ok", False):
+            if getattr(_self, "_qloop_native_fwd_ok", False):
                 try:
                     return orig_forward(*args, **kwargs)
                 except (ImportError, ModuleNotFoundError, NotImplementedError) as exc:
-                    mod._qloop_native_fwd_ok = False  # type: ignore[attr-defined]
-                    cls_name = type(mod).__name__
+                    _self._qloop_native_fwd_ok = False  # type: ignore[attr-defined]
+                    cls_name = type(_self).__name__
                     if cls_name not in warn_set:
                         warn_set.add(cls_name)
                         log.warning(
@@ -1794,16 +2176,18 @@ def _wrap_quantized_linear(
                             type(exc).__name__,
                             exc,
                         )
-            return _fallback_linear_nograd(mod, args, kwargs)
+            return _fallback_linear_nograd(_self, args, kwargs)
         x = args[0] if args else next(v for v in kwargs.values() if isinstance(v, torch.Tensor))
-        bias = getattr(mod, "bias", None)
+        bias = getattr(_self, "bias", None)
         if not isinstance(bias, torch.Tensor):
             bias = None
-        return _QuantLinearAutogradFn.apply(x, bias, mod)
+        return _QuantLinearAutogradFn.apply(x, bias, _self)
 
+    mod._qloop_had_inst_forward = had_inst_fwd  # type: ignore[attr-defined]
+    mod._qloop_orig_inst_forward = orig_inst_fwd  # type: ignore[attr-defined]
     mod._qloop_orig_forward = orig_forward  # type: ignore[attr-defined]
     mod._qloop_quant_bridge_installed = True  # type: ignore[attr-defined]
-    mod.forward = bridged_linear_forward  # type: ignore[method-assign]
+    mod.forward = _bind_method_preserving_meta(bridged_linear_forward, orig_forward, mod)  # type: ignore[method-assign]
 
 
 def _wrap_quantized_moe_experts(
@@ -1814,19 +2198,29 @@ def _wrap_quantized_moe_experts(
 ) -> None:
     if getattr(mod, "_qloop_quant_bridge_installed", False):
         return
+    had_inst_fwd = "forward" in mod.__dict__
+    orig_inst_fwd = mod.__dict__.get("forward")
     orig_forward = mod.forward
     warn_set = warned_classes if warned_classes is not None else set()
     mod._qloop_native_fwd_ok = bool(native_fwd_ok)  # type: ignore[attr-defined]
 
-    @functools.wraps(orig_forward)
-    def bridged_moe_forward(*args: Any, **kwargs: Any) -> Any:
+    def bridged_moe_forward(_self: nn.Module, *args: Any, **kwargs: Any) -> Any:
+        if _classify_quant_module(_self) is None:
+            if not (torch.is_grad_enabled() and _any_tensor_requires_grad(args, kwargs)):
+                return _fallback_moe_nograd(_self, args, kwargs)
+            hidden_d, top_idx_d, top_w_d = _parse_moe_forward_args(args, kwargs)
+            orig_shape_d = hidden_d.shape
+            flat_h_d = hidden_d.reshape(-1, orig_shape_d[-1])
+            idx_2d_d = top_idx_d.reshape(flat_h_d.shape[0], -1).long()
+            w_2d_d = top_w_d.reshape(flat_h_d.shape[0], -1)
+            return _QuantMoERoutedAutogradFn.apply(flat_h_d, idx_2d_d, w_2d_d, _self).reshape(orig_shape_d)
         if not (torch.is_grad_enabled() and _any_tensor_requires_grad(args, kwargs)):
-            if getattr(mod, "_qloop_native_fwd_ok", False):
+            if getattr(_self, "_qloop_native_fwd_ok", False):
                 try:
                     return orig_forward(*args, **kwargs)
                 except (ImportError, ModuleNotFoundError, NotImplementedError) as exc:
-                    mod._qloop_native_fwd_ok = False  # type: ignore[attr-defined]
-                    cls_name = type(mod).__name__
+                    _self._qloop_native_fwd_ok = False  # type: ignore[attr-defined]
+                    cls_name = type(_self).__name__
                     if cls_name not in warn_set:
                         warn_set.add(cls_name)
                         log.warning(
@@ -1836,22 +2230,56 @@ def _wrap_quantized_moe_experts(
                             type(exc).__name__,
                             exc,
                         )
-            return _fallback_moe_nograd(mod, args, kwargs)
+            return _fallback_moe_nograd(_self, args, kwargs)
         hidden, top_idx, top_w = _parse_moe_forward_args(args, kwargs)
         orig_shape = hidden.shape
         flat_h = hidden.reshape(-1, orig_shape[-1])
         idx_2d = top_idx.reshape(flat_h.shape[0], -1).long()
         w_2d = top_w.reshape(flat_h.shape[0], -1)
-        flat_out = _QuantMoERoutedAutogradFn.apply(flat_h, idx_2d, w_2d, mod)
+        flat_out = _QuantMoERoutedAutogradFn.apply(flat_h, idx_2d, w_2d, _self)
         return flat_out.reshape(orig_shape)
 
+    mod._qloop_had_inst_forward = had_inst_fwd  # type: ignore[attr-defined]
+    mod._qloop_orig_inst_forward = orig_inst_fwd  # type: ignore[attr-defined]
     mod._qloop_orig_forward = orig_forward  # type: ignore[attr-defined]
     mod._qloop_quant_bridge_installed = True  # type: ignore[attr-defined]
-    mod.forward = bridged_moe_forward  # type: ignore[method-assign]
+    mod.forward = _bind_method_preserving_meta(bridged_moe_forward, orig_forward, mod)  # type: ignore[method-assign]
+
+
+def unwrap_quantized_autograd_bridge(model: nn.Module) -> int:
+    """Restore pre-bridge `.forward` descriptor/instance bindings on bridged modules."""
+    restored = 0
+    seen: set[int] = set()
+    for mod in model.modules():
+        if id(mod) in seen:
+            continue
+        seen.add(id(mod))
+        if not getattr(mod, "_qloop_quant_bridge_installed", False):
+            continue
+        if getattr(mod, "_qloop_had_inst_forward", False):
+            mod.forward = mod._qloop_orig_inst_forward  # type: ignore[method-assign,attr-defined]
+        else:
+            mod.__dict__.pop("forward", None)
+        for attr in (
+            "_qloop_quant_bridge_installed",
+            "_qloop_orig_forward",
+            "_qloop_orig_inst_forward",
+            "_qloop_had_inst_forward",
+            "_qloop_native_fwd_ok",
+            "_qloop_probed_device",
+        ):
+            mod.__dict__.pop(attr, None)
+        restored += 1
+    return restored
 
 
 def _layout_probe_key(mod: nn.Module, kind: str, dev: torch.device) -> tuple[Any, ...]:
-    inst_fwd = vars(mod).get("_qloop_orig_forward", vars(mod).get("forward"))
+    if getattr(mod, "_qloop_quant_bridge_installed", False):
+        inst_fwd = vars(mod).get("_qloop_orig_inst_forward")
+    else:
+        inst_fwd = vars(mod).get("forward")
+    if isinstance(inst_fwd, types.MethodType):
+        inst_fwd = inst_fwd.__func__
     if kind == "linear_fp8":
         sname, s = _resolve_linear_fp8_scale(mod, mod.weight)
         return (kind, type(mod), inst_fwd, mod.weight.dtype, sname, None if s is None else s.ndim, str(dev))
@@ -1983,4 +2411,6 @@ __all__ = [
     "is_quantized_module",
     "quantize_fp8_blockwise",
     "quantize_nvfp4_tensor",
+    "repack_decompressed_nvfp4_moe_experts",
+    "unwrap_quantized_autograd_bridge",
 ]

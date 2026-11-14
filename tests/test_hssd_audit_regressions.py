@@ -1441,3 +1441,953 @@ def test_hf5_shared_kv_view_zero_reinvocation_qwen35_last_linear_and_buffer_sha2
     packed_buf[0] ^= 1
     assert sha256_frozen_experts(model) != sha_pre
 
+
+# ==============================================================================
+# 11. HF>=5 `HSSDCacheState` & `_HSSDCacheState` (`zero_`, `is_contiguous`,
+#     `contiguous`, `repeat_interleave`, `mark_static_address`), HF 5.2-5.23
+#     DynamicCache + GatedDeltaNet + Loop (`kv_share=True`), & FP8 Router Safety
+# ==============================================================================
+def _load_standalone_ns_no_qloop():
+    import sys
+    import types
+
+    from qloop.infer.hf_custom_modeling import _STANDALONE_CONFIG_SRC, _STANDALONE_MODELING_SRC
+    from qloop.model.toy import ToyConfig, ToyForCausalLM
+
+    mock_tf = types.ModuleType("transformers")
+
+    class _MockPretrainedConfig:
+        model_type = "qwen36_loop_hssd"
+
+        def __init__(self, **kw: object) -> None:
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    class _MockPreTrainedModel(torch.nn.Module):
+        def __init__(self, config: object) -> None:
+            super().__init__()
+            self.config = config
+
+    class _MockAutoConfig:
+        @staticmethod
+        def for_model(_mtype: str, **kw: object) -> ToyConfig:
+            known = {f for f in ToyConfig.__dataclass_fields__ if f in kw}
+            if "layer_types" in kw and isinstance(kw["layer_types"], list):
+                kw = dict(kw, layer_types=tuple(kw["layer_types"]))
+            return ToyConfig(**{k: kw[k] for k in known})  # type: ignore[arg-type]
+
+    class _MockAutoModelForCausalLM:
+        @staticmethod
+        def from_config(cfg: ToyConfig, **_kw: object) -> ToyForCausalLM:
+            m = ToyForCausalLM(cfg)
+            _convert_toy_to_hf5_recurrent_attr(m)
+            return m
+
+    mock_tf.PretrainedConfig = _MockPretrainedConfig  # type: ignore[attr-defined]
+    mock_tf.PreTrainedModel = _MockPreTrainedModel  # type: ignore[attr-defined]
+    mock_tf.AutoConfig = _MockAutoConfig  # type: ignore[attr-defined]
+    mock_tf.AutoModelForCausalLM = _MockAutoModelForCausalLM  # type: ignore[attr-defined]
+
+    saved_tf = sys.modules.get("transformers")
+    saved_cfg_mod = sys.modules.get("configuration_qwen36_loophssd")
+    orig_find_spec = importlib.util.find_spec
+    sys.modules["transformers"] = mock_tf
+    try:
+        importlib.util.find_spec = lambda name, *a, **kw: (  # type: ignore[assignment]
+            None if name == "qloop" else orig_find_spec(name, *a, **kw)
+        )
+        cfg_mod = types.ModuleType("configuration_qwen36_loophssd")
+        exec(compile(_STANDALONE_CONFIG_SRC, "configuration_qwen36_loophssd.py", "exec"), cfg_mod.__dict__)
+        sys.modules["configuration_qwen36_loophssd"] = cfg_mod
+
+        mod_ns = types.ModuleType("modeling_qwen36_loophssd")
+        exec(compile(_STANDALONE_MODELING_SRC, "modeling_qwen36_loophssd.py", "exec"), mod_ns.__dict__)
+        assert mod_ns._HAS_QLOOP is False
+        return cfg_mod, mod_ns
+    finally:
+        importlib.util.find_spec = orig_find_spec  # type: ignore[assignment]
+        if saved_tf is None:
+            sys.modules.pop("transformers", None)
+        else:
+            sys.modules["transformers"] = saved_tf
+        if saved_cfg_mod is None:
+            sys.modules.pop("configuration_qwen36_loophssd", None)
+        else:
+            sys.modules["configuration_qwen36_loophssd"] = saved_cfg_mod
+
+
+def test_hssd_cache_state_zero_contiguous_dynamo_static_address_and_standalone_parity():
+    from qloop.model.hssd import _ensure_dynamo_mark_static_address_compat
+
+    _cfg_mod, mod_ns = _load_standalone_ns_no_qloop()
+    StandaloneState = mod_ns._HSSDCacheState
+
+    gate = PeakBoltzmannGate(num_heads=2).double()
+    inp19 = _make_hssd_inputs(bsz=3, seq_len=19, hv=2, dk=8, dv=8, dtype=torch.float64, seed=1101)
+    _, st19 = chunk_hssd(
+        **inp19,
+        boltzmann_gate=gate,
+        chunk_size=8,
+        window_chunks=2,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    inp16 = _make_hssd_inputs(bsz=3, seq_len=16, hv=2, dk=8, dv=8, dtype=torch.float64, seed=1102)
+    _, st16 = chunk_hssd(
+        **inp16,
+        boltzmann_gate=gate,
+        chunk_size=8,
+        window_chunks=2,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+    )
+    assert st19 is not None and st16 is not None
+
+    # Build matching standalone state from st19
+    st19_sa = StandaloneState.zeros(
+        3, 8, 2, 8, 8, chunk_size=8, window_chunks=2, device=st19.device, dtype=torch.float64
+    )
+    st19_sa.copy_(st19)
+    assert st19.state_equal(st19_sa, atol=0.0, rtol=0.0)
+    assert st19_sa.state_equal(st19, atol=0.0, rtol=0.0)
+
+    for cls_state, sample in ((HSSDCacheState, st19), (StandaloneState, st19_sa)):
+        # 1. Compact & contiguous fast-path (`contiguous()` returns `self` when `has_compact_storage()`)
+        assert sample.is_contiguous() is True
+        assert sample.has_compact_storage() is True
+        assert sample.contiguous() is sample
+        assert sample.compact() is sample
+
+        # 2. Non-contiguous transposed view (`is_contiguous() == False` -> `contiguous()` compacts)
+        non_contig = sample.clone()
+        non_contig.page_states = non_contig.page_states.transpose(-1, -2)
+        assert non_contig.is_contiguous() is False
+        assert non_contig.has_compact_storage() is False
+        compacted_nc = non_contig.contiguous()
+        assert compacted_nc is not non_contig
+        assert compacted_nc.is_contiguous() is True
+        assert compacted_nc.has_compact_storage() is True
+        assert torch.equal(compacted_nc.page_states, non_contig.page_states)
+        assert compacted_nc.contiguous() is compacted_nc
+
+        # 3. Contiguous slice into oversized storage (`is_contiguous() == True`, `has_compact_storage() == False`)
+        sliced_view = sample.clone()
+        max_win = sliced_view.max_swa_len
+        oversized = torch.randn(3 + 5, max_win, 2, 8, dtype=torch.float64)
+        sliced_view.swa_k_ring = oversized[2 : 2 + 3]
+        assert sliced_view.swa_k_ring.is_contiguous() is True
+        assert sliced_view.is_contiguous() is True
+        assert sliced_view.has_compact_storage() is False
+        compacted_sl = sliced_view.contiguous()
+        assert compacted_sl is not sliced_view
+        assert compacted_sl.is_contiguous() is True
+        assert compacted_sl.has_compact_storage() is True
+        assert compacted_sl.state_equal(sliced_view, atol=0.0, rtol=0.0)
+
+        # 4. `.zero_()` on `torch.zeros_like(...)` static buffer preserves ALL 10 distinct `data_ptr()`s!
+        static_buf = torch.zeros_like(sample)
+        static_buf.copy_(sample)
+        assert static_buf.state_equal(sample, atol=0.0, rtol=0.0)
+        ptrs_before = [int(t.data_ptr()) for t in static_buf._iter_tensors()]
+        assert len(set(ptrs_before)) == len(ptrs_before)
+        z_ret = static_buf.zero_()
+        assert z_ret is static_buf
+        ptrs_after = [int(t.data_ptr()) for t in static_buf._iter_tensors()]
+        assert ptrs_after == ptrs_before
+        z_ref = cls_state.zeros(
+            3, 8, 2, 8, 8, chunk_size=8, window_chunks=2, device=sample.device, dtype=torch.float64
+        )
+        assert static_buf.state_equal(z_ref, atol=0.0, rtol=0.0)
+        assert not bool(static_buf.swa_valid_ring.any())
+        assert float(static_buf.swa_k_ring.abs().max()) == 0.0
+        assert float(static_buf.swa_v_ring.abs().max()) == 0.0
+
+        # 5. `.zero_()` on aliased zero-init (`cls.zeros`) and chunk-boundary state unaliases shared ring slots
+        aliased_z = cls_state.zeros(
+            2, 8, 2, 8, 8, chunk_size=8, window_chunks=2, device=sample.device, dtype=torch.float64
+        )
+        assert aliased_z.boundary_ring[0].data_ptr() == aliased_z.page_states.data_ptr()
+        assert aliased_z.zero_() is aliased_z
+        ring_ptrs = [int(t.untyped_storage().data_ptr()) for t in (aliased_z.page_states, *aliased_z.boundary_ring)]
+        assert len(set(ring_ptrs)) == len(ring_ptrs)
+        aliased_z.boundary_ring[0].add_(3.0)
+        assert float(aliased_z.page_states.abs().max()) == 0.0
+        assert float(aliased_z.boundary_ring[1].abs().max()) == 0.0
+
+        # 6. `repeat_interleave`, `(indices, Ellipsis)` batch indexing, and `non_blocking` `.to()`
+        rep_m = sample.repeat_interleave(2, dim=0)
+        rep_f = torch.repeat_interleave(sample, 2, dim=0)
+        assert rep_m.size(0) == 6 and rep_m.has_compact_storage()
+        assert rep_m.state_equal(rep_f, atol=0.0, rtol=0.0)
+        assert rep_m[0:1].state_equal(sample[0:1], atol=0.0, rtol=0.0)
+        assert rep_m[1:2].state_equal(sample[0:1], atol=0.0, rtol=0.0)
+        assert rep_m[4:5].state_equal(sample[2:3], atol=0.0, rtol=0.0)
+
+        idx_ell = sample[torch.tensor([2, 0], dtype=torch.long), ...]
+        assert idx_ell.size(0) == 2 and idx_ell.state_equal(sample[[2, 0]], atol=0.0, rtol=0.0)
+        bf16_nb = sample.to(dtype=torch.bfloat16, non_blocking=True)
+        assert bf16_nb.dtype == torch.bfloat16 and bf16_nb.theta_cum.dtype == torch.float64
+
+    # Chunk-boundary state (`st16`: `boundary_ring[-1]` shares `page_states`) unaliases cleanly on `.zero_()`
+    st16_c = st16.clone()
+    assert st16_c.boundary_ring[-1].data_ptr() == st16_c.page_states.data_ptr()
+    st16_c.zero_()
+    assert st16_c.boundary_ring[-1].data_ptr() != st16_c.page_states.data_ptr()
+    assert int(st16_c.step_count.abs().max().item()) == 0
+
+    # 7. `torch._dynamo.mark_static_address` compatibility for HF>=5.20 `LinearAttentionLayer.lazy_initialization`
+    _ensure_dynamo_mark_static_address_compat()
+    mod_ns._ensure_dynamo_mark_static_address_compat()
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None and callable(getattr(dynamo, "mark_static_address", None)):
+        dynamo.mark_static_address(torch.zeros_like(st19))
+        dynamo.mark_static_address(torch.zeros_like(st19_sa))
+        with pytest.raises(TypeError):
+            dynamo.mark_static_address(12345)
+
+
+def test_hf5_qwen35_dynamic_cache_and_hf523_linear_attention_layer_hssd_loop_decode():
+    import sys
+    import types
+
+    from qloop.model._dtype import upcast
+
+    # --- A. HF 5.2-5.5 style `Qwen3_5DynamicCache` (`recurrent_states`, `conv_states`, `last_linear_layer`, `.zero_()`)
+    class _MockQwen35DynamicCache:
+        def __init__(self, config: object) -> None:
+            n = int(config.num_hidden_layers)  # type: ignore[attr-defined]
+            ltypes = list(config.layer_types)  # type: ignore[attr-defined]
+            self.layer_types = ltypes
+            self.transformer_layers = [i for i, lt in enumerate(ltypes) if lt == "full_attention"]
+            lin_layers = [i for i, lt in enumerate(ltypes) if lt == "linear_attention"]
+            self.last_linear_layer = lin_layers[-1]
+            self.conv_states: list[torch.Tensor | None] = [None] * n
+            self.recurrent_states: list[object] = [None] * n
+            self.key_cache: list[torch.Tensor | None] = [None] * n
+            self.value_cache: list[torch.Tensor | None] = [None] * n
+
+        @property
+        def has_previous_state(self) -> bool:
+            return self.conv_states[self.last_linear_layer] is not None
+
+        def update(
+            self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int, *_a: object, **_kw: object
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            assert key_states.shape[-2] > 0, "SharedKVView must read key_cache/value_cache without empty update"
+            if self.key_cache[layer_idx] is None:
+                self.key_cache[layer_idx] = key_states
+                self.value_cache[layer_idx] = value_states
+            else:
+                self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)  # type: ignore[list-item]
+                self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)  # type: ignore[list-item]
+            return self.key_cache[layer_idx], self.value_cache[layer_idx]  # type: ignore[return-value]
+
+        def get_seq_length(self, layer_idx: int = 0) -> int:
+            if not self.transformer_layers:
+                return 0
+            idx = layer_idx if layer_idx in self.transformer_layers else self.transformer_layers[0]
+            kc = self.key_cache[idx]
+            return int(kc.shape[-2]) if kc is not None else 0
+
+        def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+            for i in range(len(self.key_cache)):
+                if self.key_cache[i] is not None:
+                    dev = self.key_cache[i].device  # type: ignore[union-attr]
+                    self.key_cache[i] = self.key_cache[i].index_select(0, beam_idx.to(dev))  # type: ignore[union-attr]
+                    self.value_cache[i] = self.value_cache[i].index_select(0, beam_idx.to(dev))  # type: ignore[union-attr]
+                if self.conv_states[i] is not None:
+                    dev = self.conv_states[i].device  # type: ignore[union-attr]
+                    self.conv_states[i] = self.conv_states[i].index_select(0, beam_idx.to(dev))  # type: ignore[union-attr]
+                if self.recurrent_states[i] is not None:
+                    rs = self.recurrent_states[i]
+                    self.recurrent_states[i] = rs.index_select(0, beam_idx.to(rs.device))  # type: ignore[attr-defined]
+
+        def reset(self) -> None:
+            for i in range(len(self.key_cache)):
+                self.key_cache[i] = None
+                self.value_cache[i] = None
+                if self.conv_states[i] is not None:
+                    self.conv_states[i].zero_()  # type: ignore[union-attr]
+                    self.conv_states[i] = None
+                if self.recurrent_states[i] is not None:
+                    assert self.recurrent_states[i].is_contiguous()  # type: ignore[attr-defined]
+                    self.recurrent_states[i] = self.recurrent_states[i].contiguous()  # type: ignore[attr-defined]
+                    self.recurrent_states[i].zero_()  # type: ignore[attr-defined]
+
+    # 8 physical layers (2 x [3 linear + 1 full]) looped with prelude=0, core=8, passes=3 -> 24 virtual layers
+    m_q35 = build_toy(num_hidden_layers=8, hidden_size=32).double().eval()
+    _convert_toy_to_hf5_recurrent_attr(m_q35)
+    h_q35 = apply_hssd(
+        m_q35, HSSDConfig(rank=8, chunk_size=6, window_chunks=2, state_dtype="auto", checkpoint_segments=False)
+    )
+    ctl_q35 = apply_loop(
+        m_q35, {"prelude_end": 0, "core_end": 8, "num_passes": 3, "target_virtual_layers": 24, "kv_share": True}
+    )
+    gen = torch.Generator().manual_seed(52301)
+    with torch.no_grad():
+        ctl_q35.adapters.gates.fill_(0.22)
+        for had in h_q35.adapters.values():
+            for p in had.parameters():
+                p.add_(torch.randn(p.shape, generator=gen, dtype=p.dtype) * 0.08)
+
+    ids_a = torch.randint(0, m_q35.config.vocab_size, (2, 15), generator=gen)
+    ids_b = torch.randint(0, m_q35.config.vocab_size, (2, 13), generator=gen)
+    with torch.no_grad():
+        full_a = m_q35(ids_a).logits
+        full_b = m_q35(ids_b).logits
+
+        qcache = _MockQwen35DynamicCache(m_q35.config)
+        pre_a = m_q35(ids_a[:, :10], past_key_values=qcache, use_cache=True)
+        assert qcache.has_previous_state is True
+        dec_a = [pre_a.logits[:, -1:]]
+        for pos in range(10, 15):
+            dec_a.append(m_q35(ids_a[:, pos : pos + 1], past_key_values=qcache, use_cache=True).logits)
+        assert float((torch.cat(dec_a, dim=1) - full_a[:, 9:]).abs().max()) < 1e-11
+        # Shared Pass-2/Pass-3 full-attn KV slots (11, 15, 19, 23) stayed unallocated
+        for shared_slot in (11, 15, 19, 23):
+            assert qcache.key_cache[shared_slot] is None
+
+        # `.reset()` calls `.is_contiguous()`, `.contiguous()`, `.zero_()` on every `HSSDCacheState`; reuse on ids_b!
+        qcache.reset()
+        assert qcache.has_previous_state is False
+        pre_b = m_q35(ids_b[:, :9], past_key_values=qcache, use_cache=True)
+        dec_b = [pre_b.logits[:, -1:]]
+        for pos in range(9, 13):
+            dec_b.append(m_q35(ids_b[:, pos : pos + 1], past_key_values=qcache, use_cache=True).logits)
+        assert float((torch.cat(dec_b, dim=1) - full_b[:, 8:]).abs().max()) < 1e-11
+
+    ctl_q35.unwrap()
+    remove_hssd(m_q35)
+
+    # --- B. HF 5.23.0 `DynamicCache` (`LinearAttentionLayer` + `mark_static_address` + `.copy_()` + `.zero_()`
+    #        + module-level `torch_chunk/recurrent_gated_delta_rule` + `kernels` `_kernel_repo` unwrap)
+    class _HF523DynamicLayer:
+        supports_early_init = True
+
+        def __init__(self) -> None:
+            self.keys: torch.Tensor | None = None
+            self.values: torch.Tensor | None = None
+            self.is_initialized = False
+
+        def update(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            assert k.shape[-2] > 0
+            if not self.is_initialized:
+                self.keys = k
+                self.values = v
+                self.is_initialized = True
+            else:
+                self.keys = torch.cat([self.keys, k], dim=-2)  # type: ignore[list-item]
+                self.values = torch.cat([self.values, v], dim=-2)  # type: ignore[list-item]
+            return self.keys, self.values  # type: ignore[return-value]
+
+        def get_seq_length(self) -> int:
+            return int(self.keys.shape[-2]) if (self.is_initialized and self.keys is not None) else 0
+
+        def reset(self) -> None:
+            self.keys = None
+            self.values = None
+            self.is_initialized = False
+
+        def batch_repeat_interleave(self, repeats: int) -> None:
+            if self.get_seq_length() > 0:
+                self.keys = self.keys.repeat_interleave(repeats, dim=0)  # type: ignore[union-attr]
+                self.values = self.values.repeat_interleave(repeats, dim=0)  # type: ignore[union-attr]
+
+        def batch_select_indices(self, indices: torch.Tensor) -> None:
+            if self.get_seq_length() > 0:
+                self.keys = self.keys[indices.to(self.keys.device), ...]  # type: ignore[index,union-attr]
+                self.values = self.values[indices.to(self.values.device), ...]  # type: ignore[index,union-attr]
+
+    class _HF523LinearAttentionLayer:
+        supports_early_init = False
+
+        def __init__(self) -> None:
+            self.conv_states: list[torch.Tensor | None] = [None]
+            self.recurrent_states: list[object] = [None]
+            self.conv_kernel_size: dict[int, int] = {}
+            self.is_conv_states_initialized = {0: False}
+            self.is_recurrent_states_initialized = {0: False}
+            self.has_previous_state = {0: False}
+            self.record_past = False
+
+        def lazy_initialization(
+            self,
+            conv_states: torch.Tensor | None = None,
+            recurrent_states: object = None,
+            conv_kernel_size: int | None = None,
+            state_idx: int = 0,
+        ) -> None:
+            dynamo = getattr(torch, "_dynamo", None)
+            if conv_states is not None:
+                self.batch_size = conv_states.shape[0]
+                self.conv_kernel_size[state_idx] = (
+                    conv_states.shape[-1] if conv_kernel_size is None else int(conv_kernel_size)
+                )
+                self.conv_states[state_idx] = torch.zeros(
+                    (*conv_states.shape[:-1], self.conv_kernel_size[state_idx]),
+                    dtype=conv_states.dtype,
+                    device=conv_states.device,
+                )
+                if dynamo is not None and callable(getattr(dynamo, "mark_static_address", None)):
+                    dynamo.mark_static_address(self.conv_states[state_idx])
+                self.is_conv_states_initialized[state_idx] = True
+            if recurrent_states is not None:
+                self.batch_size = recurrent_states.shape[0]  # type: ignore[attr-defined]
+                self.recurrent_states[state_idx] = torch.zeros_like(recurrent_states)  # type: ignore[arg-type]
+                if dynamo is not None and callable(getattr(dynamo, "mark_static_address", None)):
+                    dynamo.mark_static_address(self.recurrent_states[state_idx])
+                self.is_recurrent_states_initialized[state_idx] = True
+
+        def update_conv_state(
+            self, conv_states: torch.Tensor, state_idx: int = 0, conv_kernel_size: int | None = None
+        ) -> torch.Tensor:
+            if not self.is_conv_states_initialized[state_idx]:
+                self.lazy_initialization(
+                    conv_states=conv_states, conv_kernel_size=conv_kernel_size, state_idx=state_idx
+                )
+            if not self.has_previous_state[state_idx]:
+                full_cs = conv_states
+                if full_cs.shape[-1] < self.conv_kernel_size[state_idx]:
+                    full_cs = F.pad(full_cs, (self.conv_kernel_size[state_idx] - full_cs.shape[-1], 0), value=0)
+                self.has_previous_state[state_idx] = True
+            else:
+                full_cs = torch.cat([self.conv_states[state_idx], conv_states], dim=-1)  # type: ignore[list-item]
+            self.conv_states[state_idx].copy_(full_cs[..., -self.conv_kernel_size[state_idx] :])  # type: ignore[union-attr]
+            return full_cs
+
+        def update_recurrent_state(self, recurrent_states: object, state_idx: int = 0) -> object:
+            if not self.is_recurrent_states_initialized[state_idx]:
+                self.lazy_initialization(recurrent_states=recurrent_states, state_idx=state_idx)
+            self.recurrent_states[state_idx].copy_(recurrent_states)  # type: ignore[attr-defined]
+            return self.recurrent_states[state_idx]
+
+        def reset(self) -> None:
+            if self.conv_states[0] is not None:
+                self.conv_states[0].zero_()
+                self.has_previous_state[0] = False
+            if self.recurrent_states[0] is not None:
+                self.recurrent_states[0].zero_()  # type: ignore[attr-defined]
+
+        def batch_repeat_interleave(self, repeats: int) -> None:
+            if self.conv_states[0] is not None:
+                self.conv_states[0] = self.conv_states[0].repeat_interleave(repeats, dim=0)
+            if self.recurrent_states[0] is not None:
+                self.recurrent_states[0] = self.recurrent_states[0].repeat_interleave(repeats, dim=0)  # type: ignore[attr-defined]
+            if hasattr(self, "batch_size"):
+                self.batch_size *= repeats
+
+        def batch_select_indices(self, indices: torch.Tensor) -> None:
+            idx = indices.to(torch.long)
+            if self.conv_states[0] is not None:
+                self.conv_states[0] = self.conv_states[0][idx.to(self.conv_states[0].device), ...]
+            if self.recurrent_states[0] is not None:
+                rs = self.recurrent_states[0]
+                self.recurrent_states[0] = rs[idx.to(rs.device), ...]  # type: ignore[attr-defined,index]
+            if hasattr(self, "batch_size"):
+                self.batch_size = int(idx.shape[0])
+
+    class _HF523DynamicCache:
+        def __init__(self, config: object) -> None:
+            self.layers = [
+                _HF523DynamicLayer() if lt == "full_attention" else _HF523LinearAttentionLayer()
+                for lt in config.layer_types  # type: ignore[attr-defined]
+            ]
+
+        @property
+        def is_initialized(self) -> bool:
+            init_layers = [lyr for lyr in self.layers if lyr.supports_early_init]
+            return len(init_layers) > 0 and all(lyr.is_initialized for lyr in init_layers)  # type: ignore[attr-defined]
+
+        def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int, *_a: object, **_kw: object):
+            return self.layers[layer_idx].update(k, v)  # type: ignore[union-attr]
+
+        def has_previous_state(self, layer_idx: int) -> bool:
+            return bool(self.layers[layer_idx].has_previous_state[0])  # type: ignore[union-attr]
+
+        def update_conv_state(self, conv_states: torch.Tensor, layer_idx: int, **kw: object) -> torch.Tensor:
+            return self.layers[layer_idx].update_conv_state(conv_states, **kw)  # type: ignore[union-attr,arg-type]
+
+        def get_recurrent_state(self, layer_idx: int) -> object:
+            lyr = self.layers[layer_idx]
+            return lyr.recurrent_states[0] if lyr.has_previous_state[0] else None  # type: ignore[union-attr]
+
+        def update_recurrent_state(self, recurrent_states: object, layer_idx: int) -> object:
+            return self.layers[layer_idx].update_recurrent_state(recurrent_states)  # type: ignore[union-attr]
+
+        def get_seq_length(self, layer_idx: int = 0) -> int:
+            if isinstance(self.layers[layer_idx], _HF523DynamicLayer):
+                return self.layers[layer_idx].get_seq_length()  # type: ignore[union-attr]
+            first_full = next(lyr for lyr in self.layers if isinstance(lyr, _HF523DynamicLayer))
+            return first_full.get_seq_length()
+
+        def reset(self) -> None:
+            for lyr in self.layers:
+                lyr.reset()
+
+        def batch_repeat_interleave(self, repeats: int) -> None:
+            for lyr in self.layers:
+                lyr.batch_repeat_interleave(repeats)
+
+        def batch_select_indices(self, indices: torch.Tensor) -> None:
+            for lyr in self.layers:
+                lyr.batch_select_indices(indices)
+
+    host_mod_name = "_mock_hf523_qwen35_moe_mod"
+    host_mod = types.ModuleType(host_mod_name)
+    sys.modules[host_mod_name] = host_mod
+    try:
+        m_523 = build_toy(num_hidden_layers=8, hidden_size=32).double().eval()
+        la_proto = m_523.model.layers[0].linear_attn
+        host_mod.torch_chunk_gated_delta_rule = la_proto.chunk_gated_delta_rule  # type: ignore[attr-defined]
+        host_mod.torch_recurrent_gated_delta_rule = la_proto.fused_recurrent_gated_delta_rule  # type: ignore[attr-defined]
+
+        def _cls_hf523_forward(
+            self: torch.nn.Module,
+            x: torch.Tensor,
+            cache_params: object = None,
+            attention_mask: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            del attention_mask
+            b, t, _ = x.shape
+            use_pre = cache_params is not None and cache_params.has_previous_state(self.layer_idx) and t == 1  # type: ignore[attr-defined]
+            qkv = self.in_proj_qkv(x).transpose(1, 2)  # type: ignore[operator]
+            if cache_params is not None:
+                full_cs = cache_params.update_conv_state(qkv, self.layer_idx, conv_kernel_size=self.ck)  # type: ignore[attr-defined]
+                seq = full_cs[..., -self.ck :] if use_pre else torch.cat(  # type: ignore[operator]
+                    [qkv.new_zeros(b, qkv.shape[1], self.ck - 1), qkv], dim=-1  # type: ignore[operator]
+                )
+            else:
+                seq = torch.cat([qkv.new_zeros(b, qkv.shape[1], self.ck - 1), qkv], dim=-1)  # type: ignore[operator]
+            qkv_act = F.silu(self.conv1d(seq))[..., -t:].transpose(1, 2)  # type: ignore[operator]
+            q, k, v = qkv_act.view(b, t, 3, self.nh, self.d).unbind(2)  # type: ignore[attr-defined]
+            q, k = F.normalize(upcast(q), dim=-1), F.normalize(upcast(k), dim=-1)
+            v = upcast(v)
+            bb, aa = upcast(self.in_proj_ba(x)).chunk(2, dim=-1)  # type: ignore[operator]
+            beta = torch.sigmoid(bb)
+            g = -upcast(self.A_log).exp() * F.softplus(aa + upcast(self.dt_bias))  # type: ignore[attr-defined]
+            last_rec = cache_params.get_recurrent_state(self.layer_idx) if use_pre else None  # type: ignore[attr-defined]
+            rule_fn = (
+                host_mod.torch_recurrent_gated_delta_rule  # type: ignore[attr-defined]
+                if t == 1
+                else host_mod.torch_chunk_gated_delta_rule  # type: ignore[attr-defined]
+            )
+            core_out, last_rec = rule_fn(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                initial_state=last_rec,
+                output_final_state=cache_params is not None,
+                use_qk_l2norm_in_kernel=False,
+                scale=1.0,
+            )
+            if cache_params is not None:
+                cache_params.update_recurrent_state(last_rec, self.layer_idx)  # type: ignore[attr-defined]
+            o = self.norm(core_out.to(x.dtype))  # type: ignore[operator]
+            return self.out_proj(o.reshape(b, t, self.nh * self.d))  # type: ignore[operator,attr-defined]
+
+        kernel_sentinel_calls = [0]
+        for lyr in m_523.model.layers:
+            la = getattr(lyr, "linear_attn", None)
+            if la is None:
+                continue
+
+            class _HF523MoeGatedDeltaNet(type(la)):  # type: ignore[misc]
+                forward = _cls_hf523_forward
+
+            _HF523MoeGatedDeltaNet.__module__ = host_mod_name
+            la.__class__ = _HF523MoeGatedDeltaNet
+            delattr(la, "chunk_gated_delta_rule")
+            delattr(la, "fused_recurrent_gated_delta_rule")
+
+            # Simulate `kernels==0.18.2` `kernelize()` having bound an instance `forward` + `_kernel_repo`
+            def _bound_hub_kernel_fwd(*_a: object, **_kw: object) -> torch.Tensor:
+                kernel_sentinel_calls[0] += 1
+                raise AssertionError("bound hub kernel forward should be unwrapped while HSSD is active")
+
+            la.__dict__["forward"] = _bound_hub_kernel_fwd
+            la.__dict__["_kernel_repo"] = "Atlas-Inference/gdn"
+
+        h_523 = apply_hssd(
+            m_523, HSSDConfig(rank=8, chunk_size=6, window_chunks=2, state_dtype="auto", checkpoint_segments=False)
+        )
+        ctl_523 = apply_loop(
+            m_523, {"prelude_end": 0, "core_end": 8, "num_passes": 2, "target_virtual_layers": 16, "kv_share": True}
+        )
+        with torch.no_grad():
+            ctl_523.adapters.gates.fill_(0.2)
+            for had in h_523.adapters.values():
+                for p in had.parameters():
+                    p.add_(torch.randn(p.shape, generator=gen, dtype=p.dtype) * 0.1)
+
+            full_523 = m_523(ids_a).logits
+            c523 = _HF523DynamicCache(m_523.config)
+            pre_523 = m_523(ids_a[:, :10], past_key_values=c523, use_cache=True)
+            assert kernel_sentinel_calls[0] == 0
+            assert c523.is_initialized is True
+
+            lin0_st = c523.layers[0].recurrent_states[0]  # type: ignore[union-attr]
+            assert isinstance(lin0_st, HSSDCacheState)
+            assert lin0_st.dtype == torch.float64 and lin0_st.theta_cum.dtype == torch.float64
+            static_ptrs_0 = [int(t.data_ptr()) for t in lin0_st._iter_tensors()]
+
+            dec_523 = [pre_523.logits[:, -1:]]
+            for pos in range(10, 15):
+                dec_523.append(m_523(ids_a[:, pos : pos + 1], past_key_values=c523, use_cache=True).logits)
+            inc_523 = torch.cat(dec_523, dim=1)
+            assert float((inc_523 - full_523[:, 9:]).abs().max()) < 1e-11
+            assert [int(t.data_ptr()) for t in lin0_st._iter_tensors()] == static_ptrs_0
+
+            # `reset()` zeroes in-place while preserving CUDAGraph static addresses, then cleanly runs `ids_b`!
+            c523.reset()
+            assert [int(t.data_ptr()) for t in lin0_st._iter_tensors()] == static_ptrs_0
+            assert int(lin0_st.step_count.abs().max().item()) == 0
+            full_523_b = m_523(ids_b).logits
+            pre_523_b = m_523(ids_b[:, :9], past_key_values=c523, use_cache=True)
+            dec_523_b = [pre_523_b.logits[:, -1:]]
+            for pos in range(9, 13):
+                dec_523_b.append(m_523(ids_b[:, pos : pos + 1], past_key_values=c523, use_cache=True).logits)
+            inc_523_b = torch.cat(dec_523_b, dim=1)
+            assert float((inc_523_b - full_523_b[:, 8:]).abs().max()) < 1e-11
+
+            # Also verify `state_dtype="bfloat16"` with `LinearAttentionLayer.lazy_initialization` + static address
+            bf16_layer = _HF523LinearAttentionLayer()
+            bf16_sample = lin0_st.to(dtype=torch.bfloat16)
+            bf16_buf = bf16_layer.update_recurrent_state(bf16_sample)
+            assert isinstance(bf16_buf, HSSDCacheState)
+            assert bf16_buf.dtype == torch.bfloat16 and bf16_buf.theta_cum.dtype == torch.float64
+
+            # Batch repeat_interleave & batch_select_indices on HF 5.23 cache
+            c523.batch_repeat_interleave(2)
+            assert c523.layers[0].recurrent_states[0].size(0) == 4  # type: ignore[union-attr]
+            c523.batch_select_indices(torch.tensor([3, 0], dtype=torch.long))
+            assert c523.layers[0].recurrent_states[0].size(0) == 2  # type: ignore[union-attr]
+
+            ctl_523.unwrap()
+            remove_hssd(m_523)
+            # Verify `_kernel_repo` & bound `forward` are cleanly restored after `remove_hssd`
+            assert m_523.model.layers[0].linear_attn.__dict__.get("_kernel_repo") == "Atlas-Inference/gdn"
+            with pytest.raises(AssertionError, match="bound hub kernel forward"):
+                m_523(ids_a[:, :2])
+            assert kernel_sentinel_calls[0] == 1
+    finally:
+        sys.modules.pop(host_mod_name, None)
+
+
+@pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"), reason="torch.float8_e4m3fn required")
+def test_pass_router_adapters_fp8_scaled_router_weight_loop_and_standalone():
+    import sys
+    import types
+
+    from qloop.infer.hf_custom_modeling import _STANDALONE_CONFIG_SRC, _STANDALONE_MODELING_SRC
+    from qloop.model.quant_autograd import dequantize_fp8_tensor
+    from qloop.model.toy import ToyConfig, ToyForCausalLM
+
+    fp8_dt = torch.float8_e4m3fn
+
+    class _TupleFP8TopKRouter(torch.nn.Module):
+        def __init__(
+            self,
+            num_experts: int,
+            hidden_size: int,
+            top_k: int,
+            *,
+            scale_mode: str = "block2d",
+            return_probs: bool = False,
+            seed: int = 9901,
+        ) -> None:
+            super().__init__()
+            self.num_experts = num_experts
+            self.hidden_size = hidden_size
+            self.top_k = top_k
+            self.return_probs = return_probs
+            g = torch.Generator().manual_seed(seed)
+            raw_fp8 = (
+                torch.randn(num_experts, hidden_size, generator=g, dtype=torch.float32).clamp(-6.0, 6.0).to(fp8_dt)
+            )
+            self.weight = torch.nn.Parameter(raw_fp8, requires_grad=False)
+            self.bias: torch.nn.Parameter | None = None
+            if scale_mode == "block2d":
+                self.weight_block_size = (2, 8)
+                # Deliberately asymmetric block scales (0.02 vs 18.0) so unscaled `upcast(weight)` flips expert ranking!
+                s = torch.tensor(
+                    [
+                        [0.02, 18.0, 0.03, 14.0],
+                        [16.0, 0.02, 15.0, 0.04],
+                    ],
+                    dtype=torch.float32,
+                )
+                self.register_buffer("weight_scale_inv", s)
+            elif scale_mode == "row1d":
+                s = torch.tensor([0.02, 19.0, 0.03, 15.0], dtype=torch.float32)
+                self.register_buffer("weight_scale_inv", s)
+            elif scale_mode == "scalar":
+                self.register_buffer("weight_scale_inv", torch.tensor(0.03125, dtype=torch.float32))
+            elif scale_mode == "missing":
+                pass
+            else:
+                raise ValueError(scale_mode)
+
+        def _dequant_ref(self) -> torch.Tensor:
+            s = getattr(self, "weight_scale_inv", None)
+            if s is None:
+                # Simulate stock router computing probs from true scaled weights while scale attr was stripped
+                return self.weight.to(torch.float32) * 0.05
+            bsize = getattr(self, "weight_block_size", None)
+            return dequantize_fp8_tensor(self.weight, s, dtype=torch.float32, block_size=bsize)
+
+        def forward(self, hidden_states: torch.Tensor):
+            flat = hidden_states.reshape(-1, self.hidden_size).float()
+            logits = F.linear(flat, self._dequant_ref())
+            probs = F.softmax(logits, dim=-1)
+            top_w, top_i = probs.topk(self.top_k, dim=-1)
+            top_w = top_w / top_w.sum(-1, keepdim=True)
+            full_out = probs if self.return_probs else logits
+            return full_out.to(hidden_states.dtype), top_w.to(hidden_states.dtype), top_i
+
+    def _install_tuple_fp8_routers(
+        model: ToyForCausalLM, *, scale_mode: str, return_probs: bool, base_seed: int
+    ) -> list[_TupleFP8TopKRouter]:
+        installed: list[_TupleFP8TopKRouter] = []
+        for li, lyr in enumerate(model.model.layers):
+            mlp = lyr.mlp
+            rt = _TupleFP8TopKRouter(4, 32, 2, scale_mode=scale_mode, return_probs=return_probs, seed=base_seed + li)
+            mlp.gate = rt  # type: ignore[assignment]
+
+            def _tuple_moe_fwd(x: torch.Tensor, _mlp: torch.nn.Module = mlp) -> torch.Tensor:
+                b, t, h = x.shape
+                flat = x.reshape(-1, h)
+                _rlogits, top_w, top_idx = _mlp.gate(flat)  # type: ignore[operator]
+                out = _mlp.experts(flat, top_idx, top_w)  # type: ignore[operator]
+                out = out + torch.sigmoid(_mlp.shared_expert_gate(flat)) * _mlp.shared_expert(flat)  # type: ignore[operator]
+                return out.view(b, t, h)
+
+            mlp.forward = _tuple_moe_fwd  # type: ignore[method-assign]
+            installed.append(rt)
+        return installed
+
+    for scale_mode in ("block2d", "row1d", "scalar"):
+        for return_probs in (False, True):
+            m = build_toy(num_hidden_layers=4, hidden_size=32, num_experts=4).float().eval()
+            router0 = _install_tuple_fp8_routers(m, scale_mode=scale_mode, return_probs=return_probs, base_seed=9901)[0]
+
+            captured_r2: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+            ctl = apply_loop(
+                m,
+                {
+                    "prelude_end": 0,
+                    "core_end": 4,
+                    "num_passes": 2,
+                    "target_virtual_layers": 8,
+                    "per_pass_router": True,
+                    "router_adapter_rank": 4,
+                },
+            )
+            # Register capture hook AFTER `apply_loop` so it sees the output rewritten by `_pass_router_hook`!
+            router0.register_forward_hook(
+                lambda _mod, _inp, out, cap=captured_r2: cap.append(
+                    (out[0].detach().clone(), out[1].detach().clone(), out[2].detach().clone())
+                )
+            )
+
+            gen = torch.Generator().manual_seed(7700)
+            with torch.no_grad():
+                pr = ctl.adapters.pass_router
+                assert pr is not None
+                pr.up.copy_(torch.randn(pr.up.shape, generator=gen) * 0.25)
+                pr.bias.copy_(torch.tensor([[[0.15, -0.10, 0.20, -0.05]]] * 4).squeeze(1))
+                pr.repel.fill_(0.35)
+
+                x_tok = torch.randn(1, 5, 32, generator=gen, dtype=torch.float32)
+                # Capture exact input reaching layer 0's router in Pass 1 and Pass 2
+                router_inps: list[torch.Tensor] = []
+                router0.register_forward_pre_hook(
+                    lambda _m, a, inps=router_inps: inps.append(a[0].detach().clone())
+                )
+                _ = m.model(inputs_embeds=x_tok)
+                # Layer 0's router runs once per pass: index 0 is (phys=0, r=1), index 1 is (phys=0, r=2)
+                assert len(captured_r2) == 2
+                x_p1 = router_inps[0].reshape(-1, 32)
+                x_p2 = router_inps[1].reshape(-1, 32)
+                got_full, got_w, got_idx = captured_r2[1]
+
+                # Exact reference with scaled FP8 dequantization
+                w_deq = router0._dequant_ref()
+                p1_top = F.softmax(F.linear(x_p1, w_deq), dim=-1).topk(2, dim=-1).indices
+                prev_mask = torch.zeros(5, 4, dtype=torch.float32).scatter_(1, p1_top, 1.0)
+                delta_ref = ctl.adapters.pass_router.delta_logits(x_p2, 0, 0, prev_mask)  # type: ignore[union-attr]
+                ref_logits = F.linear(x_p2, w_deq) + delta_ref
+                ref_probs = F.softmax(ref_logits, dim=-1)
+                ref_w, ref_idx = ref_probs.topk(2, dim=-1)
+                ref_w = ref_w / ref_w.sum(-1, keepdim=True)
+                ref_full = ref_probs if return_probs else ref_logits
+
+                assert float((got_full - ref_full).abs().max()) < 1e-5
+                assert float((got_w - ref_w).abs().max()) < 1e-6
+                assert torch.equal(got_idx, ref_idx)
+
+                # Prove unscaled `F.linear(x_p2, router0.weight.float()) + delta_ref` would have been wildly wrong!
+                unscaled_logits = F.linear(x_p2, router0.weight.float()) + delta_ref
+                unscaled_probs = F.softmax(unscaled_logits, dim=-1)
+                assert float((ref_probs - unscaled_probs).abs().max()) > 0.25
+
+            ctl.unwrap()
+
+    # Fallback test when `weight_scale_inv` is missing on an FP8 router: must NOT use unscaled `weight.float()`!
+    m_miss = build_toy(num_hidden_layers=4, hidden_size=32, num_experts=4).float().eval()
+    router_missing = _install_tuple_fp8_routers(m_miss, scale_mode="missing", return_probs=True, base_seed=9920)[0]
+    ctl_miss = apply_loop(
+        m_miss, {"prelude_end": 0, "core_end": 4, "num_passes": 2, "target_virtual_layers": 8, "per_pass_router": True}
+    )
+    cap_miss: list[torch.Tensor] = []
+    inp_miss: list[torch.Tensor] = []
+    router_missing.register_forward_pre_hook(lambda _m, a: inp_miss.append(a[0].detach().clone()))
+    router_missing.register_forward_hook(lambda _m, _i, out: cap_miss.append(out[0].detach().clone()))
+    with torch.no_grad():
+        ctl_miss.adapters.pass_router.bias.fill_(0.2)  # type: ignore[union-attr]
+        ctl_miss.adapters.pass_router.up.fill_(0.1)  # type: ignore[union-attr]
+        _ = m_miss(torch.randint(0, 50, (1, 4)))
+        x_m2 = inp_miss[1].reshape(-1, 32)
+        base_probs_m2 = F.softmax(F.linear(x_m2, router_missing._dequant_ref()), dim=-1)
+        delta_m2 = ctl_miss.adapters.pass_router.delta_logits(x_m2, 0, 0, None)  # type: ignore[union-attr]
+        expected_fb_probs = F.softmax(base_probs_m2.clamp_min(1e-30).log() + delta_m2, dim=-1)
+        assert float((cap_miss[1] - expected_fb_probs).abs().max()) < 1e-5
+    ctl_miss.unwrap()
+
+    # Standalone `_STANDALONE_MODELING_SRC` (`_HAS_QLOOP = False`) parity on `float8_e4m3fn` + `weight_scale_inv` router
+    mock_tf = types.ModuleType("transformers")
+
+    class _MockPretrainedConfig:
+        model_type = "qwen36_loop_hssd"
+
+        def __init__(self, **kw: object) -> None:
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    class _MockPreTrainedModel(torch.nn.Module):
+        def __init__(self, config: object) -> None:
+            super().__init__()
+            self.config = config
+
+    class _MockAutoConfig:
+        @staticmethod
+        def for_model(_mtype: str, **kw: object) -> ToyConfig:
+            known = {f for f in ToyConfig.__dataclass_fields__ if f in kw}
+            if "layer_types" in kw and isinstance(kw["layer_types"], list):
+                kw = dict(kw, layer_types=tuple(kw["layer_types"]))
+            return ToyConfig(**{k: kw[k] for k in known})  # type: ignore[arg-type]
+
+    st_routers: list[_TupleFP8TopKRouter] = []
+
+    class _MockAutoModelForCausalLM:
+        @staticmethod
+        def from_config(cfg: ToyConfig, **_kw: object) -> ToyForCausalLM:
+            m_st = ToyForCausalLM(cfg).float()
+            _convert_toy_to_hf5_recurrent_attr(m_st)
+            st_routers.extend(
+                _install_tuple_fp8_routers(m_st, scale_mode="block2d", return_probs=False, base_seed=9955)
+            )
+            return m_st
+
+    mock_tf.PretrainedConfig = _MockPretrainedConfig  # type: ignore[attr-defined]
+    mock_tf.PreTrainedModel = _MockPreTrainedModel  # type: ignore[attr-defined]
+    mock_tf.AutoConfig = _MockAutoConfig  # type: ignore[attr-defined]
+    mock_tf.AutoModelForCausalLM = _MockAutoModelForCausalLM  # type: ignore[attr-defined]
+
+    saved_tf = sys.modules.get("transformers")
+    saved_cfg_mod = sys.modules.get("configuration_qwen36_loophssd")
+    orig_find_spec = importlib.util.find_spec
+    sys.modules["transformers"] = mock_tf
+    try:
+        importlib.util.find_spec = lambda name, *a, **kw: (  # type: ignore[assignment]
+            None if name == "qloop" else orig_find_spec(name, *a, **kw)
+        )
+        cfg_mod = types.ModuleType("configuration_qwen36_loophssd")
+        exec(compile(_STANDALONE_CONFIG_SRC, "configuration_qwen36_loophssd.py", "exec"), cfg_mod.__dict__)
+        sys.modules["configuration_qwen36_loophssd"] = cfg_mod
+
+        mod_ns = types.ModuleType("modeling_qwen36_loophssd")
+        exec(compile(_STANDALONE_MODELING_SRC, "modeling_qwen36_loophssd.py", "exec"), mod_ns.__dict__)
+        assert mod_ns._HAS_QLOOP is False
+
+        base_d = {
+            "vocab_size": 128,
+            "hidden_size": 32,
+            "moe_intermediate_size": 16,
+            "shared_expert_intermediate_size": 16,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "partial_rotary_factor": 0.5,
+            "linear_num_heads": 4,
+            "linear_head_dim": 8,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        }
+        arch_d: dict[str, object] = {
+            "base_model_type": "toy",
+            "base_dtype": "float32",
+            "loop": {
+                "enabled": True,
+                "prelude_end": 0,
+                "core_end": 4,
+                "num_passes": 2,
+                "kv_share": True,
+                "per_pass_router": True,
+                "router_adapter_rank": 4,
+            },
+        }
+        scfg = cfg_mod.Qwen36LoopHSSDConfig(base_config=base_d, qloop_v3_arch=arch_d)
+        smodel = mod_ns.Qwen36LoopHSSDForCausalLM(scfg, _dtype_override=torch.float32).eval()
+        st_router0 = st_routers[0]
+
+        st_cap: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        st_inps: list[torch.Tensor] = []
+        st_router0.register_forward_pre_hook(lambda _m, a: st_inps.append(a[0].detach().clone()))
+        st_router0.register_forward_hook(
+            lambda _m, _i, out: st_cap.append(
+                (out[0].detach().clone(), out[1].detach().clone(), out[2].detach().clone())
+            )
+        )
+        with torch.no_grad():
+            pr_st = smodel._loop_adapters.pass_router
+            pr_st.up.fill_(0.18)
+            pr_st.bias.copy_(torch.tensor([[[0.25, -0.15, 0.10, -0.20]]] * 4).squeeze(1))
+            pr_st.repel.fill_(0.30)
+
+            _ = smodel(input_ids=torch.randint(0, 100, (1, 5), generator=torch.Generator().manual_seed(9966)))
+            assert len(st_cap) == 2
+            sx_p1 = st_inps[0].reshape(-1, 32)
+            sx_p2 = st_inps[1].reshape(-1, 32)
+            sgot_full, sgot_w, sgot_idx = st_cap[1]
+
+            sw_deq = st_router0._dequant_ref()
+            sp1_top = F.softmax(F.linear(sx_p1, sw_deq), dim=-1).topk(2, dim=-1).indices
+            sprev_m = torch.zeros(5, 4, dtype=torch.float32).scatter_(1, sp1_top, 1.0)
+            sdelta_ref = smodel._loop_adapters.pass_router.delta_logits(sx_p2, 0, 0, sprev_m)
+            sref_logits = F.linear(sx_p2, sw_deq) + sdelta_ref
+            sref_probs = F.softmax(sref_logits, dim=-1)
+            sref_w, sref_idx = sref_probs.topk(2, dim=-1)
+            sref_w = sref_w / sref_w.sum(-1, keepdim=True)
+
+            assert float((sgot_full - sref_logits).abs().max()) < 1e-5
+            assert float((sgot_w - sref_w).abs().max()) < 1e-6
+            assert torch.equal(sgot_idx, sref_idx)
+            sunscaled_probs = F.softmax(F.linear(sx_p2, st_router0.weight.float()) + sdelta_ref, dim=-1)
+            assert float((sref_probs - sunscaled_probs).abs().max()) > 0.25
+    finally:
+        importlib.util.find_spec = orig_find_spec  # type: ignore[assignment]
+        if saved_tf is None:
+            sys.modules.pop("transformers", None)
+        else:
+            sys.modules["transformers"] = saved_tf
+        if saved_cfg_mod is None:
+            sys.modules.pop("configuration_qwen36_loophssd", None)
+        else:
+            sys.modules["configuration_qwen36_loophssd"] = saved_cfg_mod
+
+

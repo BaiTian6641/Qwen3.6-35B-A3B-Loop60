@@ -31,6 +31,7 @@ Clean-room Apache-2.0 / MIT PyTorch implementation.
 """
 from __future__ import annotations
 
+import functools
 import importlib.util
 import logging
 import math
@@ -89,16 +90,53 @@ def _is_compiling() -> bool:
 
 
 def _compact(t: torch.Tensor) -> torch.Tensor:
-    """Ensure `t` is contiguous and owns compact backing storage (`nbytes == numel * element_size`)."""
+    """Ensure `t` is contiguous and owns compact backing storage (`nbytes == numel * element_size`, offset 0)."""
     if not t.is_contiguous():
         return t.contiguous()
     if t.numel() == 0:
-        if int(t.untyped_storage().nbytes()) != 0:
+        if int(t.untyped_storage().nbytes()) != 0 or int(t.storage_offset()) != 0:
             return t.clone()
         return t
-    if int(t.untyped_storage().nbytes()) != int(t.numel() * t.element_size()):
+    if int(t.untyped_storage().nbytes()) != int(t.numel() * t.element_size()) or int(t.storage_offset()) != 0:
         return t.clone().contiguous()
     return t
+
+
+def _is_hssd_state_duck(obj: Any) -> bool:
+    return (
+        not isinstance(obj, torch.Tensor)
+        and hasattr(obj, "page_states")
+        and hasattr(obj, "boundary_ring")
+        and callable(getattr(obj, "_iter_tensors", None))
+    )
+
+
+def _ensure_dynamo_mark_static_address_compat() -> None:
+    """Make `torch._dynamo.mark_static_address` accept `HSSDCacheState` / `_HSSDCacheState` (`transformers>=5.20`)."""
+    dynamo = getattr(torch, "_dynamo", None)
+    orig_fn = getattr(dynamo, "mark_static_address", None) if dynamo is not None else None
+    if not callable(orig_fn) or getattr(orig_fn, "_qloop_hssd_aware", False):
+        return
+
+    @functools.wraps(orig_fn)
+    def _hssd_mark_static_address(t: Any, *args: Any, **kwargs: Any) -> Any:
+        if _is_hssd_state_duck(t):
+            seen: set[int] = set()
+            for sub_t in t._iter_tensors():
+                if isinstance(sub_t, torch.Tensor) and id(sub_t) not in seen:
+                    seen.add(id(sub_t))
+                    orig_fn(sub_t, *args, **kwargs)
+            return None
+        return orig_fn(t, *args, **kwargs)
+
+    forbid = getattr(dynamo, "forbid_in_graph", None)
+    wrapped = forbid(_hssd_mark_static_address) if callable(forbid) else _hssd_mark_static_address
+    wrapped._qloop_hssd_aware = True  # type: ignore[attr-defined]
+    wrapped._qloop_orig_mark_static_address = orig_fn  # type: ignore[attr-defined]
+    dynamo.mark_static_address = wrapped  # type: ignore[attr-defined]
+
+
+_ensure_dynamo_mark_static_address_compat()
 
 
 def _resolve_state_dtype(state_dtype: str | torch.dtype | None, acc_dt: torch.dtype) -> torch.dtype:
@@ -469,9 +507,81 @@ class HSSDCacheState:
         for t in self._iter_tensors():
             if not t.is_contiguous():
                 return False
-            if int(t.untyped_storage().nbytes()) != int(t.numel() * t.element_size()):
+            if int(t.untyped_storage().nbytes()) != int(t.numel() * t.element_size()) or int(t.storage_offset()) != 0:
                 return False
         return True
+
+    def is_contiguous(self) -> bool:
+        """Return True iff every tensor in `_iter_tensors()` is contiguous."""
+        return all(t.is_contiguous() for t in self._iter_tensors())
+
+    def contiguous(self) -> HSSDCacheState:
+        """Return `self` if `has_compact_storage()` else a compacted copy."""
+        if self.has_compact_storage():
+            return self
+        memo: dict[tuple[int, int, tuple[int, ...], tuple[int, ...]], torch.Tensor] = {}
+
+        def _cp(t: torch.Tensor) -> torch.Tensor:
+            if t.numel() > 0:
+                key = (
+                    int(t.untyped_storage().data_ptr()),
+                    int(t.storage_offset()),
+                    tuple(t.shape),
+                    tuple(t.stride()),
+                )
+                if key in memo:
+                    return memo[key]
+                out_t = _compact(t)
+                memo[key] = out_t
+                return out_t
+            return _compact(t)
+
+        return HSSDCacheState(
+            step_count=_compact(self.step_count),
+            chunk_size=self.chunk_size,
+            window_chunks=self.window_chunks,
+            page_states=_cp(self.page_states),
+            theta_cum=_compact(self.theta_cum),
+            boundary_ring=tuple(_cp(t) for t in self.boundary_ring),
+            swa_k_ring=_compact(self.swa_k_ring),
+            swa_v_ring=_compact(self.swa_v_ring),
+            swa_valid_ring=_compact(self.swa_valid_ring),
+        )
+
+    def compact(self) -> HSSDCacheState:
+        return self.contiguous()
+
+    def zero_(self) -> HSSDCacheState:
+        """In-place zero all state buffers, unaliasing shared ring slots while preserving distinct static addresses."""
+        seen_ptrs: set[int] = (
+            {int(self.page_states.untyped_storage().data_ptr())} if self.page_states.numel() > 0 else set()
+        )
+        fixed_ring: list[torch.Tensor] = []
+        unaliased = False
+        for ring_t in self.boundary_ring:
+            cur_t = ring_t
+            if cur_t.numel() > 0:
+                ptr = int(cur_t.untyped_storage().data_ptr())
+                if ptr in seen_ptrs:
+                    cur_t = torch.zeros_like(cur_t).contiguous()
+                    ptr = int(cur_t.untyped_storage().data_ptr())
+                    unaliased = True
+                else:
+                    cur_t.zero_()
+                seen_ptrs.add(ptr)
+            else:
+                cur_t.zero_()
+            fixed_ring.append(cur_t)
+        if unaliased:
+            self.boundary_ring = tuple(fixed_ring)
+
+        self.step_count.zero_()
+        self.page_states.zero_()
+        self.theta_cum.zero_()
+        self.swa_k_ring.zero_()
+        self.swa_v_ring.zero_()
+        self.swa_valid_ring.zero_()
+        return self
 
     @classmethod
     def zeros(
@@ -620,6 +730,7 @@ class HSSDCacheState:
 
     def to(self, *args: Any, **kwargs: Any) -> HSSDCacheState:
         memo: dict[int, torch.Tensor] = {}
+        non_blocking = bool(kwargs.get("non_blocking", False))
         p_states = _compact(self.page_states.to(*args, **kwargs))
         if self.page_states.numel() > 0:
             memo[int(self.page_states.untyped_storage().data_ptr())] = p_states
@@ -631,27 +742,30 @@ class HSSDCacheState:
                 ptr = int(t.untyped_storage().data_ptr())
                 if ptr in memo:
                     return memo[ptr]
-                out_t = _compact(t.to(device=dev, dtype=dt))
+                out_t = _compact(t.to(device=dev, dtype=dt, non_blocking=non_blocking))
                 memo[ptr] = out_t
                 return out_t
-            return _compact(t.to(device=dev, dtype=dt))
+            return _compact(t.to(device=dev, dtype=dt, non_blocking=non_blocking))
 
         return HSSDCacheState(
-            step_count=_compact(self.step_count.to(device=dev, dtype=torch.long)),
+            step_count=_compact(self.step_count.to(device=dev, dtype=torch.long, non_blocking=non_blocking)),
             chunk_size=self.chunk_size,
             window_chunks=self.window_chunks,
             page_states=p_states,
-            theta_cum=_compact(self.theta_cum.to(device=dev, dtype=torch.float64)),
+            theta_cum=_compact(self.theta_cum.to(device=dev, dtype=torch.float64, non_blocking=non_blocking)),
             boundary_ring=tuple(_conv(t) for t in self.boundary_ring),
-            swa_k_ring=_compact(self.swa_k_ring.to(device=dev, dtype=dt)),
-            swa_v_ring=_compact(self.swa_v_ring.to(device=dev, dtype=dt)),
-            swa_valid_ring=_compact(self.swa_valid_ring.to(device=dev, dtype=torch.bool)),
+            swa_k_ring=_compact(self.swa_k_ring.to(device=dev, dtype=dt, non_blocking=non_blocking)),
+            swa_v_ring=_compact(self.swa_v_ring.to(device=dev, dtype=dt, non_blocking=non_blocking)),
+            swa_valid_ring=_compact(self.swa_valid_ring.to(device=dev, dtype=torch.bool, non_blocking=non_blocking)),
         )
 
-    def copy_(self, other: HSSDCacheState) -> HSSDCacheState:
-        require(isinstance(other, HSSDCacheState), f"copy_ expects HSSDCacheState, got {type(other).__name__}")
+    def copy_(self, other: Any) -> HSSDCacheState:
         require(
-            self.chunk_size == other.chunk_size and self.window_chunks == other.window_chunks,
+            isinstance(other, HSSDCacheState) or _is_hssd_state_duck(other),
+            f"copy_ expects HSSDCacheState, got {type(other).__name__}",
+        )
+        require(
+            self.chunk_size == int(other.chunk_size) and self.window_chunks == int(other.window_chunks),
             "HSSDCacheState.copy_ chunk_size/window_chunks mismatch",
             dst=(self.chunk_size, self.window_chunks),
             src=(other.chunk_size, other.window_chunks),
@@ -742,6 +856,43 @@ class HSSDCacheState:
     def reorder_cache(self, beam_idx: torch.LongTensor) -> HSSDCacheState:
         return self.index_select(0, beam_idx)
 
+    def repeat_interleave(
+        self,
+        repeats: int | torch.Tensor,
+        dim: int | None = 0,
+        *,
+        output_size: int | None = None,
+    ) -> HSSDCacheState:
+        if dim is None:
+            raise ValueError("HSSDCacheState.repeat_interleave requires explicit batch dim=0, got dim=None")
+        d = dim if dim >= 0 else dim + self.ndim
+        if d != 0:
+            raise ValueError(f"HSSDCacheState.repeat_interleave only supports batch dim=0, got dim={dim}")
+        rep = repeats.to(device=self.device) if isinstance(repeats, torch.Tensor) else repeats
+        memo: dict[int, torch.Tensor] = {}
+
+        def _ri(t: torch.Tensor) -> torch.Tensor:
+            if t.numel() > 0:
+                ptr = int(t.untyped_storage().data_ptr())
+                if ptr in memo:
+                    return memo[ptr]
+                out_t = _compact(t.repeat_interleave(rep, dim=0, output_size=output_size))
+                memo[ptr] = out_t
+                return out_t
+            return _compact(t.repeat_interleave(rep, dim=0, output_size=output_size))
+
+        return HSSDCacheState(
+            step_count=_compact(self.step_count.repeat_interleave(rep, dim=0, output_size=output_size)),
+            chunk_size=self.chunk_size,
+            window_chunks=self.window_chunks,
+            page_states=_ri(self.page_states),
+            theta_cum=_compact(self.theta_cum.repeat_interleave(rep, dim=0, output_size=output_size)),
+            boundary_ring=tuple(_ri(t) for t in self.boundary_ring),
+            swa_k_ring=_compact(self.swa_k_ring.repeat_interleave(rep, dim=0, output_size=output_size)),
+            swa_v_ring=_compact(self.swa_v_ring.repeat_interleave(rep, dim=0, output_size=output_size)),
+            swa_valid_ring=_compact(self.swa_valid_ring.repeat_interleave(rep, dim=0, output_size=output_size)),
+        )
+
     @classmethod
     def __torch_function__(
         cls,
@@ -783,17 +934,22 @@ class HSSDCacheState:
             dim = kw["dim"] if "dim" in kw else args[1]
             index = kw["index"] if "index" in kw else args[2]
             return st.index_select(int(dim), index)
+        if func is torch.repeat_interleave:
+            st = args[0]
+            repeats = kw["repeats"] if "repeats" in kw else args[1]
+            dim = kw.get("dim", args[2] if len(args) >= 3 else None)
+            return st.repeat_interleave(repeats, dim=dim, output_size=kw.get("output_size"))
         if func is torch.cat:
             states: Sequence[HSSDCacheState] = args[0]
             dim = int(args[1] if len(args) >= 2 else kw.get("dim", 0))
             if dim not in (0, -5):
                 raise ValueError(f"torch.cat on HSSDCacheState only supports batch dim=0, got dim={dim}")
-            if not states or not all(isinstance(s, cls) for s in states):
+            if not states or not all(isinstance(s, cls) or _is_hssd_state_duck(s) for s in states):
                 return NotImplemented
             ref = states[0]
             for s in states[1:]:
                 require(
-                    s.chunk_size == ref.chunk_size and s.window_chunks == ref.window_chunks,
+                    int(s.chunk_size) == ref.chunk_size and int(s.window_chunks) == ref.window_chunks,
                     "torch.cat HSSDCacheState chunk_size/window_chunks mismatch",
                 )
             return cls(
@@ -813,39 +969,64 @@ class HSSDCacheState:
         return NotImplemented
 
     def state_equal(self, other: Any, *, atol: float = 1e-5, rtol: float = 1e-4) -> bool:
-        if not isinstance(other, HSSDCacheState):
+        if not (isinstance(other, HSSDCacheState) or _is_hssd_state_duck(other)):
             return False
-        if self.chunk_size != other.chunk_size or self.window_chunks != other.window_chunks:
+        if self.chunk_size != int(other.chunk_size) or self.window_chunks != int(other.window_chunks):
             return False
-        if self.step_count.shape != other.step_count.shape or not bool(torch.equal(self.step_count, other.step_count)):
+        osc = (
+            other.step_count.to(device=self.device, dtype=torch.long).reshape(-1)
+            if isinstance(other.step_count, torch.Tensor)
+            else torch.full(self.step_count.shape, int(other.step_count), device=self.device, dtype=torch.long)
+        )
+        if self.step_count.shape != osc.shape or not bool(torch.equal(self.step_count, osc)):
             return False
+        cmp_dt = (
+            torch.float64
+            if torch.float64 in (self.page_states.dtype, other.page_states.dtype)
+            else torch.float32
+        )
         if self.page_states.shape != other.page_states.shape or not bool(
-            torch.allclose(self.page_states, other.page_states, atol=atol, rtol=rtol)
+            torch.allclose(
+                self.page_states.to(cmp_dt),
+                other.page_states.to(device=self.device, dtype=cmp_dt),
+                atol=atol,
+                rtol=rtol,
+            )
         ):
             return False
-        if self.theta_cum.shape != other.theta_cum.shape or not bool(
-            torch.allclose(self.theta_cum, other.theta_cum, atol=atol, rtol=rtol)
+        oth_th = other.theta_cum.to(device=self.device, dtype=torch.float64)
+        if self.theta_cum.shape != oth_th.shape or not bool(
+            torch.allclose(self.theta_cum, oth_th, atol=atol, rtol=rtol)
         ):
             return False
         if len(self.boundary_ring) != len(other.boundary_ring):
             return False
         for a, b in zip(self.boundary_ring, other.boundary_ring):
-            if a.shape != b.shape or not bool(torch.allclose(a, b, atol=atol, rtol=rtol)):
+            if a.shape != b.shape or not bool(
+                torch.allclose(a.to(cmp_dt), b.to(device=self.device, dtype=cmp_dt), atol=atol, rtol=rtol)
+            ):
                 return False
-        if self.swa_valid_ring.shape != other.swa_valid_ring.shape or not bool(
-            torch.equal(self.swa_valid_ring, other.swa_valid_ring)
-        ):
+        oth_val = other.swa_valid_ring.to(device=self.device, dtype=torch.bool)
+        if self.swa_valid_ring.shape != oth_val.shape or not bool(torch.equal(self.swa_valid_ring, oth_val)):
             return False
         if self.swa_k_ring.shape != other.swa_k_ring.shape or self.swa_v_ring.shape != other.swa_v_ring.shape:
             return False
         if bool(self.swa_valid_ring.any()):
             vm = self.swa_valid_ring.unsqueeze(-1).unsqueeze(-1)
-            k_a = torch.where(vm, self.swa_k_ring, torch.zeros_like(self.swa_k_ring))
-            k_b = torch.where(vm, other.swa_k_ring, torch.zeros_like(other.swa_k_ring))
+            k_a = torch.where(vm, self.swa_k_ring.to(cmp_dt), torch.zeros_like(self.swa_k_ring, dtype=cmp_dt))
+            k_b = torch.where(
+                vm,
+                other.swa_k_ring.to(device=self.device, dtype=cmp_dt),
+                torch.zeros_like(self.swa_k_ring, dtype=cmp_dt),
+            )
             if not bool(torch.allclose(k_a, k_b, atol=atol, rtol=rtol)):
                 return False
-            v_a = torch.where(vm, self.swa_v_ring, torch.zeros_like(self.swa_v_ring))
-            v_b = torch.where(vm, other.swa_v_ring, torch.zeros_like(other.swa_v_ring))
+            v_a = torch.where(vm, self.swa_v_ring.to(cmp_dt), torch.zeros_like(self.swa_v_ring, dtype=cmp_dt))
+            v_b = torch.where(
+                vm,
+                other.swa_v_ring.to(device=self.device, dtype=cmp_dt),
+                torch.zeros_like(self.swa_v_ring, dtype=cmp_dt),
+            )
             if not bool(torch.allclose(v_a, v_b, atol=atol, rtol=rtol)):
                 return False
         return True
@@ -867,6 +1048,28 @@ class _GrowingSlotList(list):  # type: ignore[type-arg]
         if isinstance(idx, int) and idx >= 0:
             self._ensure(idx)
         super().__setitem__(idx, value)
+
+
+class _HybridHasPreviousState:
+    """Dual-mode `has_previous_state`: truthy as a property (`HF 5.2-5.5`) and callable `(layer_idx)` (`HF 5.20+`)."""
+
+    def __init__(self, cache: HSSDHybridCache) -> None:
+        self._cache = cache
+
+    def __bool__(self) -> bool:
+        return self()
+
+    def __call__(self, layer_idx: int | None = None, state_idx: int | None = None) -> bool:
+        del state_idx
+        c = self._cache
+        if layer_idx is not None:
+            cs = c.conv_states[layer_idx] if layer_idx < len(c.conv_states) else None
+            rs = c.recurrent_states[layer_idx] if layer_idx < len(c.recurrent_states) else None
+            return cs is not None or rs is not None
+        last_lin = getattr(c, "last_linear_layer", None)
+        if isinstance(last_lin, int) and 0 <= last_lin < len(c.conv_states):
+            return c.conv_states[last_lin] is not None or c.recurrent_states[last_lin] is not None
+        return any(x is not None for x in c.conv_states) or any(x is not None for x in c.recurrent_states)
 
 
 class HSSDHybridCache(_HFCacheBase):  # type: ignore[misc]
@@ -908,6 +1111,16 @@ class HSSDHybridCache(_HFCacheBase):  # type: ignore[misc]
         self.first_full: int | None = (
             self.layer_types.index("full_attention") if "full_attention" in self.layer_types else None
         )
+        lin_indices = [idx for idx, lt in enumerate(self.layer_types) if lt == "linear_attention"]
+        self.last_linear_layer: int | None = lin_indices[-1] if lin_indices else None
+
+    @property
+    def has_previous_state(self) -> _HybridHasPreviousState:
+        return _HybridHasPreviousState(self)
+
+    def is_recording_past(self, layer_idx: int = 0) -> bool:
+        del layer_idx
+        return False
 
     def __len__(self) -> int:
         return max(len(self.key_cache), len(self.recurrent_states))
@@ -966,7 +1179,7 @@ class HSSDHybridCache(_HFCacheBase):  # type: ignore[misc]
                 if isinstance(item, torch.Tensor):
                     seq[i] = _compact(item.index_select(0, beam_idx.to(device=item.device, dtype=torch.long)))
         for i, st in enumerate(self.recurrent_states):
-            if isinstance(st, HSSDCacheState):
+            if isinstance(st, HSSDCacheState) or _is_hssd_state_duck(st):
                 self.recurrent_states[i] = st.reorder_cache(beam_idx)
             elif isinstance(st, torch.Tensor):
                 self.recurrent_states[i] = _compact(
@@ -986,14 +1199,55 @@ class HSSDHybridCache(_HFCacheBase):  # type: ignore[misc]
         base = max(int(stride) if stride is not None else self._initial_slots, 1)
         return int(layer_idx) + int(pass_idx) * base
 
+    def update_conv_state(
+        self,
+        conv_states: torch.Tensor,
+        layer_idx: int,
+        state_idx: int = 0,
+        *,
+        conv_kernel_size: int | None = None,
+        pass_idx: int = 0,
+        stride: int | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del kwargs
+        require(state_idx == 0, f"HSSDHybridCache only supports state_idx=0, got {state_idx}")
+        idx = self.slot_index(layer_idx, pass_idx=pass_idx, stride=stride)
+        prev = self.conv_states[idx]
+        if prev is None:
+            full_conv = conv_states
+            if conv_kernel_size is not None and full_conv.shape[-1] < int(conv_kernel_size):
+                full_conv = F.pad(full_conv, (int(conv_kernel_size) - full_conv.shape[-1], 0), value=0)
+        else:
+            full_conv = torch.cat([prev, conv_states], dim=-1)
+        keep_w = int(conv_kernel_size) if conv_kernel_size is not None else full_conv.shape[-1]
+        self.conv_states[idx] = _compact(full_conv[..., -keep_w:])
+        return full_conv
+
+    def get_conv_state(
+        self,
+        layer_idx: int,
+        state_idx: int = 0,
+        *,
+        pass_idx: int = 0,
+        stride: int | None = None,
+    ) -> torch.Tensor | None:
+        require(state_idx == 0, f"HSSDHybridCache only supports state_idx=0, got {state_idx}")
+        idx = self.slot_index(layer_idx, pass_idx=pass_idx, stride=stride)
+        return self.conv_states[idx] if idx < len(self.conv_states) else None
+
     def update_recurrent_state(
         self,
         state: HSSDCacheState | torch.Tensor | None,
         layer_idx: int,
+        state_idx: int = 0,
         *,
         pass_idx: int = 0,
         stride: int | None = None,
+        **kwargs: Any,
     ) -> HSSDCacheState | torch.Tensor | None:
+        del kwargs
+        require(state_idx == 0, f"HSSDHybridCache only supports state_idx=0, got {state_idx}")
         idx = self.slot_index(layer_idx, pass_idx=pass_idx, stride=stride)
         self.recurrent_states[idx] = state
         return state
@@ -1001,10 +1255,12 @@ class HSSDHybridCache(_HFCacheBase):  # type: ignore[misc]
     def get_recurrent_state(
         self,
         layer_idx: int,
+        state_idx: int = 0,
         *,
         pass_idx: int = 0,
         stride: int | None = None,
     ) -> HSSDCacheState | torch.Tensor | None:
+        require(state_idx == 0, f"HSSDHybridCache only supports state_idx=0, got {state_idx}")
         idx = self.slot_index(layer_idx, pass_idx=pass_idx, stride=stride)
         return self.recurrent_states[idx] if idx < len(self.recurrent_states) else None
 
@@ -1027,7 +1283,7 @@ class HSSDHybridCache(_HFCacheBase):  # type: ignore[misc]
                 if isinstance(item, torch.Tensor):
                     _acc(item)
         for rs in self.recurrent_states:
-            if isinstance(rs, HSSDCacheState):
+            if isinstance(rs, HSSDCacheState) or _is_hssd_state_duck(rs):
                 for t in rs._iter_tensors():
                     _acc(t)
             elif isinstance(rs, torch.Tensor):
@@ -1090,6 +1346,24 @@ def _coerce_init_state(
             want=(chunk_size, window_chunks),
         )
         return initial_state.to(device=device, dtype=dtype)
+    if _is_hssd_state_duck(initial_state):
+        require(
+            int(initial_state.chunk_size) == chunk_size and int(initial_state.window_chunks) == window_chunks,
+            "HSSDCacheState chunk_size/window_chunks mismatch",
+            got=(initial_state.chunk_size, initial_state.window_chunks),
+            want=(chunk_size, window_chunks),
+        )
+        return HSSDCacheState(
+            step_count=initial_state.step_count,
+            chunk_size=chunk_size,
+            window_chunks=window_chunks,
+            page_states=initial_state.page_states.to(device=device, dtype=dtype),
+            theta_cum=initial_state.theta_cum,
+            boundary_ring=tuple(t.to(device=device, dtype=dtype) for t in initial_state.boundary_ring),
+            swa_k_ring=initial_state.swa_k_ring.to(device=device, dtype=dtype),
+            swa_v_ring=initial_state.swa_v_ring.to(device=device, dtype=dtype),
+            swa_valid_ring=initial_state.swa_valid_ring,
+        )
     if isinstance(initial_state, torch.Tensor):
         return HSSDCacheState.from_tensor(
             initial_state,
@@ -3155,7 +3429,9 @@ def _extract_hssd_gdr_args(
     for extra in args[2:]:
         if isinstance(extra, int):
             chunk_size = extra
-        elif isinstance(extra, (HSSDCacheState, torch.Tensor)) and initial_state is None:
+        elif initial_state is None and (
+            isinstance(extra, (HSSDCacheState, torch.Tensor)) or _is_hssd_state_duck(extra)
+        ):
             initial_state = extra
     output_final = bool(kwargs.get("output_final_state", False))
     use_l2 = bool(kwargs.get("use_qk_l2norm_in_kernel", False))
@@ -3478,6 +3754,7 @@ def apply_hssd(model: nn.Module, cfg: HSSDConfig | dict[str, Any] | None = None)
     """
     if getattr(model, "_hssd_handle", None) is not None:
         raise RuntimeError("HSSD v3 is already installed on this model; call remove_hssd(model) first")
+    _ensure_dynamo_mark_static_address_compat()
     if not isinstance(cfg, HSSDConfig):
         cfg = HSSDConfig.from_dict(cfg)
     cfg.validate()
@@ -3553,6 +3830,20 @@ def apply_hssd(model: nn.Module, cfg: HSSDConfig | dict[str, Any] | None = None)
                 delattr(a, "hssd_adapter")
 
         restorers.append(_del_adapter)
+
+        if "_kernel_repo" in attn.__dict__ and "forward" in attn.__dict__:
+            saved_kfwd = attn.__dict__.pop("forward")
+            saved_krepo = attn.__dict__.pop("_kernel_repo")
+
+            def _restore_kernel_fwd(
+                a: nn.Module = attn,
+                kfwd: Any = saved_kfwd,
+                krepo: Any = saved_krepo,
+            ) -> None:
+                a.__dict__["forward"] = kfwd
+                a.__dict__["_kernel_repo"] = krepo
+
+            restorers.append(_restore_kernel_fwd)
 
         wrapped_chunk = False
         wrapped_rec = False

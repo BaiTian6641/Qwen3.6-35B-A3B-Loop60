@@ -8,6 +8,8 @@ stage_type: lm
 run: {name: s1_loop_heal}
 loop:
   router_diversity_weight: 0.005     # encourage pass-2 dynamic re-routing to complementary experts
+gdn2:
+  enabled: true                      # legacy v2 GDN-2 stage (explicit since base.yaml disables gdn2 globally)
 experts:
   enabled: true
   stats_path: runs/s0_probe/esft_stats.json

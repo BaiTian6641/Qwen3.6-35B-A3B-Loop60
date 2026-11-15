@@ -511,8 +511,31 @@ class LMTrainer:
         self._install_signal_handlers()
         st.model.train()
         t_start = time.time()
-        if self.step == 0 and eval_every:
-            self.metrics.log(0, self.quick_eval())
+        max_step0_loss = float(t.get("max_step0_loss", 10.0))
+        model_name = (self.cfg.get("model") or {}).get("name")
+        check_step0 = max_step0_loss > 0.0 and model_name not in (None, "", "toy")
+        if self.step == 0 and (eval_every or (check_step0 and self.eval_batches)):
+            ev = self.quick_eval()
+            if eval_every or ev:
+                self.metrics.log(0, ev)
+            if check_step0 and ev:
+                loss_d1 = ev.get("eval/loss_d1")
+                if loss_d1 is None:
+                    d_vals = [
+                        float(v)
+                        for k, v in ev.items()
+                        if k.startswith("eval/loss_d") and isinstance(v, (int, float))
+                    ]
+                    if d_vals:
+                        loss_d1 = next((x for x in d_vals if not math.isfinite(x)), min(d_vals))
+                if loss_d1 is not None and (not math.isfinite(float(loss_d1)) or float(loss_d1) > max_step0_loss):
+                    loss_f = float(loss_d1)
+                    raise RuntimeError(
+                        f"Step-0 eval loss ({loss_f:.4f}) exceeds train.max_step0_loss={max_step0_loss:.2f} "
+                        "(uniform random vocab loss is ~12.42); base model weights appear corrupted or "
+                        "mis-dequantized (e.g. incompatible quantized checkpoint layout). "
+                        "Use model.name=Qwen/Qwen3.6-35B-A3B-FP8 or set train.max_step0_loss=0 to disable this check."
+                    )
         # Reset throughput timer AFTER step-0 quick_eval() so initial eval duration never pollutes step-1 tok/s.
         t_log, tok_log = time.time(), 0
         last: dict[str, Any] = {}

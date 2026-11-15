@@ -1,13 +1,12 @@
-# Gate 1 (S1b v3.1) - Track-B HSSD v3.1 Horizon-Split Surprise-Gated Delta Memory KL Distillation (4K -> 32K).
+# Gate 1 (S1b v3.2) - HSSD v3.2 Horizon-Split Surprise-Gated Delta Memory KL Distillation (4K -> 32K).
 # Architecture: [0,12) x1 + [12,36) xR + [36,40) x1 = 88L (`s0_probe` calibrated ETD core `[12,36)` + `w_anchor=0.85`).
-# Upgrades all 30 linear-attention layers from Track-A GDN-2 to HSSD v3.1:
-#   * Strictly disjoint horizon partition `k_far = max(0, n - 8)` -> `[513, 576]` exact local SWA (Fix B1)
-#   * Learned `PeakBoltzmannGate` local/far branch-selection heuristic (Fix B5)
+# Upgrades all 30 linear-attention layers from stock Qwen3.6 GDN (`s1_loop_a6b`) directly to HSSD v3.2:
+#   * Strictly disjoint horizon partition `k_far = max(0, n - 8)` -> `[513, 576]` exact local SWA + `swa_recency_init: 0.05` (Fixes B1, H3)
+#   * Full-strength `write_mode: full` Top-2 routed writes across `M=8` log-spaced pages + active-page compaction (Fixes H1/H6, 5.2 #4)
 #   * Low-rank 2D phase (`theta_low_rank: true`, ~1.95M/layer) + post-rotation WY `chunk_hssd` & linear-beta `sqrt(w_t)` (Theorem 1)
 #   * Multi-page routed chunk-start root-surprise (`surprise_mode: routed` against `boundary_ring[-1]`, zero `sqrt(s)` singularity)
-#   * Tiered M=8 multi-page router (Top-2 active pages) + STE actual sparse Top-k write-mass budget regularizer
-#   * Compact `state_dtype: bfloat16` retained cache (`81-89 MiB/layer`, `fp32` WY updates + `fp64` `theta_cum`) & `segment_chunks: 4` (256-tok WY ckpt)
-# Fallback guarantee: if HSSD < +8% over GDN-2 on 32K-64K RULER/MQAR, Gate 2a seamlessly retains `s1_loop_a6b` Track-A.
+#   * Compact lagged-replay `state_dtype: bfloat16` decode cache (`compact_decode_cache: true`, Fix H5) & `segment_chunks: 4` (256-tok WY ckpt)
+#   * Zero-duplicate-VRAM `SharedBackboneTeacher` (`teacher_track: stock`) using `hssd.teacher_mode()` zero-hook fast path in Phase 2.
 _base_: [../base.yaml, ../model/qwen36_fp8.yaml]
 stage: s1b_hssd_distill
 stage_type: lm
@@ -37,7 +36,7 @@ loop:
   train_pass_probs: [0.15, 0.50, 0.35]
 
 gdn2:
-  enabled: false                        # student swaps Track-A GDN-2 for Track-B HSSD v3
+  enabled: false                        # HSSD v3.2 is the primary linear-attention architecture (GDN-2 retired)
 
 hssd:
   enabled: true
@@ -63,7 +62,7 @@ distill:
   share_backbone: true                  # 5.2 #7: zero-duplicate-VRAM SharedBackboneTeacher (0.00 GiB extra expert HBM)
   layerwise_warmup_steps: 400           # 5.2 #2: Phase-1 online per-layer teacher-forced warm-up before end-to-end KL
   teacher_ckpt: runs/s1_loop_a6b
-  teacher_track: gdn2                   # chunked-vocab KL(p_teacher || p_student) + hidden MSE via HSSDDistiller
+  teacher_track: stock                  # stock linear-attention teacher (`hssd.teacher_mode()` zero-hook fast path in Phase 2)
   temperature: 1.0
   kl_weight: 1.0
   hidden_mse_weight: 0.1

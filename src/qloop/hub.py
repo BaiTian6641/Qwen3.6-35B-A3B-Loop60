@@ -311,7 +311,7 @@ class HubManifest:
         "prelude_end": 8,
         "core_end": 32,
         "num_passes": 2,
-        "linear_attention": "gdn2",
+        "linear_attention": "hssd",
         "per_pass_router": True,
         "kv_share": True,
         "routed_experts_per_layer": 256,
@@ -390,6 +390,48 @@ def render_model_card(manifest: HubManifest) -> str:
     pre = arch.get("prelude_end", 8)
     cend = arch.get("core_end", 32)
     passes = arch.get("num_passes", 2)
+    raw_lin = arch.get("linear_attention")
+    lin_attn = str(raw_lin).strip().lower() if raw_lin else "hssd"
+    if lin_attn == "gdn2":
+        lin_tags = ["  - gated-deltanet-2"]
+        lin_bullets = [
+            "- **NVIDIA Gated DeltaNet-2 (`GDN-2`, arXiv:2605.22791) Upgrade**: All 30 Gated DeltaNet "
+            "linear-attention layers are upgraded with decoupled channel-wise erase gates (`b_t`), channel-wise "
+            "write gates (`w_t`), and channel-wise decay (`g_t <= 0`) via chunkwise WY Tensor-Core "
+            "parallelization while starting bit-identical at step 0.",
+            "- **Hybrid State Isolation + MoR Recursive KV Sharing**: Independent `(layer, pass)` recurrent/conv "
+            "slots for the core GDN-2 layers, paired with pass-1 KV + D-LSA bucket sharing on the core Gated Full "
+            "Attention layers (zero KV memory multiplication at 1M context).",
+            "- **1M Context YaRN + Distilled Latent Sparse Attention (`D-LSA`)**: Non-rotary key head indexing "
+            "with batched Ward clustering for sub-quadratic 1M-token retrieval.",
+        ]
+    elif lin_attn == "stock":
+        lin_tags = ["  - gated-deltanet"]
+        lin_bullets = [
+            "- **Fast Stock Qwen3.6 Gated DeltaNet Linear Attention (`-> HSSD v3.2`)**: Heals the recurrent ETD "
+            "loop directly over native Qwen3.6 linear-attention layers with zero adapter overhead prior to "
+            "`HSSD v3.2` distillation.",
+            "- **Hybrid State Isolation + MoR Recursive KV Sharing**: Independent `(layer, pass)` recurrent/conv "
+            "slots for the core linear-attention layers, paired with 1.0x pass-1 FP8 KV + per-pass `D-LSA` bucket "
+            "sharing on Gated Full Attention layers (zero KV memory multiplication at 1M context).",
+            "- **1M Context YaRN & Distilled Latent Sparse Attention (`D-LSA`)**: Position-free NoPE head "
+            "indexing with active-slot compacted Ward clustering for sub-quadratic 1M-token retrieval.",
+        ]
+    else:
+        lin_tags = ["  - hssd", "  - d-lsa"]
+        lin_bullets = [
+            "- **Horizon-Split Surprise-Gated Delta Memory (`HSSD v3.2`)**: Upgrades all 30 linear-attention "
+            "layers with a strictly disjoint local SWA + multi-timescale `M=8` Top-2 routed page bank "
+            "(`write_mode=\"full\"`, learnable SWA recency slope, low-rank 2D phase rotation, and chunkwise WY "
+            "Tensor-Core parallelization).",
+            "- **Hybrid State Isolation + MoR Recursive KV Sharing**: Independent `(layer, pass)` compact "
+            "lagged-replay HSSD state caches across recurrent core passes, paired with 1.0x pass-1 FP8 KV + "
+            "per-pass `D-LSA` bucket sharing on Gated Full Attention layers (zero KV memory multiplication at 1M "
+            "context).",
+            "- **1M Context YaRN & Distilled Latent Sparse Attention (`D-LSA`)**: Position-free NoPE head "
+            "indexing with active-slot compacted Ward clustering and hybrid sparse+KL calibration for "
+            "sub-quadratic 1M-token retrieval.",
+        ]
     lines = [
         "---",
         "library_name: transformers",
@@ -399,7 +441,7 @@ def render_model_card(manifest: HubManifest) -> str:
         "  - qwen3.6",
         "  - moe",
         "  - looped-transformer",
-        "  - gated-deltanet-2",
+        *lin_tags,
         "  - dynamic-expert-routing",
         "  - mhc",
         "  - latent-sparse-attention",
@@ -421,15 +463,7 @@ def render_model_card(manifest: HubManifest) -> str:
         "~4.5B-5.9B per token without adding base weight memory).",
         "- **Manifold-Constrained Hyper-Connection (`mHC`) Bridge**: Doubly-stochastic Birkhoff-Sinkhorn mixing with "
         "prelude anchor injection and zero-gated step-0 bit-exact identity.",
-        "- **NVIDIA Gated DeltaNet-2 (`GDN-2`, arXiv:2605.22791) Upgrade**: All 30 Gated DeltaNet linear-attention "
-        "layers are upgraded with decoupled channel-wise erase gates (`b_t`), channel-wise write gates (`w_t`), and "
-        "channel-wise decay (`g_t <= 0`) via chunkwise WY Tensor-Core parallelization while starting bit-identical at "
-        "step 0.",
-        "- **Hybrid State Isolation + MoR Recursive KV Sharing**: Independent `(layer, pass)` recurrent/conv slots "
-        "for the 18 core GDN-2 layers, paired with pass-1 KV + D-LSA bucket sharing on the 6 core Gated Full "
-        "Attention layers (zero KV memory multiplication at 1M context).",
-        "- **1M Context YaRN + Distilled Latent Sparse Attention (`D-LSA`)**: Non-rotary key head indexing with "
-        "batched Ward clustering for sub-quadratic 1M-token retrieval.",
+        *lin_bullets,
         "",
         "## Multi-Stage Training Progress (Synced via HF Commit History)",
         "",
@@ -724,6 +758,7 @@ class HubSyncManager:
             })
         hssd_desc = stack_desc.get("hssd") if isinstance(stack_desc.get("hssd"), dict) else None
         gdn2_desc = stack_desc.get("gdn2") if isinstance(stack_desc.get("gdn2"), dict) else None
+        lsa_desc = stack_desc.get("lsa") if isinstance(stack_desc.get("lsa"), dict) else None
         if hssd_desc is not None:
             manifest.architecture["linear_attention"] = "hssd"
             manifest.architecture["hssd_rank"] = int(hssd_desc.get("rank", 64))
@@ -731,6 +766,10 @@ class HubSyncManager:
         elif gdn2_desc is not None:
             manifest.architecture["linear_attention"] = "gdn2"
             manifest.architecture["gdn2_rank"] = int(gdn2_desc.get("rank", 64))
+        elif stack_desc:
+            manifest.architecture["linear_attention"] = "stock"
+        if lsa_desc is not None:
+            manifest.architecture["sparse_attention"] = "d-lsa"
 
         now = _utc_now()
         entry = {

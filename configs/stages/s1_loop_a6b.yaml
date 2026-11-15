@@ -1,9 +1,10 @@
-# Gate 0b (S1 v3.1) - Subspace-Aligned Sandwich Loop Healing & Dynamic A6B Expansion (R=2 64L -> R=3 88L).
+# Gate 0b (S1 v3.2) - Subspace-Aligned Sandwich Loop Healing & Dynamic A6B Expansion (R=2 64L -> R=3 88L).
 # Architecture: Prelude [0,12) x1 + Core [12,36) xR + Coda [36,40) x1 = 88L (64L @ R=2 ~4.46B active; 88L @ R=3 ~5.97B active).
 # Calibrated via Gate 0p (`probe_core_ranges`): `[12,36)` won decisively (+0.4092 nats vs +1.0032 nats on `[8,32)`).
 # Step-0 bit-identity is guaranteed by zero-init PassExitGate (`gate_init: 0.0`) while ReEntryBridge (`bridge_rank: 256`,
 # `bridge_mode: subspace`, `bridge_init: [0.05, 0.85, 0.10]` -> w_anchor=0.85) provides live step-1 gradients (Fixes A1-A3).
-# Track-A GDN-2 upgrades all 30 linear layers bit-identically; all 32.338B routed/shared MoE experts stay 100% frozen.
+# Pipeline: Stock Qwen3.6 GDN -> HSSD v3.2 + D-LSA. Heals the 88L loop directly over fast stock linear attention
+# (no GDN-2 overhead) before `s1b_hssd_distill` upgrades all 30 linear layers to HSSD v3.2; MoE experts stay 100% frozen.
 _base_: [../base.yaml, ../model/qwen36_fp8.yaml]
 stage: s1_loop_a6b
 stage_type: lm
@@ -33,16 +34,10 @@ loop:
   train_pass_probs: [0.15, 0.50, 0.35]  # single checkpoint serves R=1 (40L), R=2 (64L), and R=3 (88L A6B)
 
 gdn2:
-  enabled: true
-  rank: 64
-  chunk_size: 64
-  segment_chunks: 16
-  checkpoint_segments: true
-  gate_logit_cap: 8.0
-  decay_log_cap: 1.0
+  enabled: false                        # Stock Qwen3.6 linear attention here; HSSD v3.2 activates in s1b_hssd_distill
 
 hssd:
-  enabled: false                        # Track-B HSSD v3 activates in Gate 1 (`s1b_hssd_distill.yaml`)
+  enabled: false                        # HSSD v3.2 activates in Gate 1 (`s1b_hssd_distill.yaml`)
 
 lsa:
   enabled: false
@@ -51,24 +46,24 @@ experts:
   enabled: false                        # 100% frozen MoE experts (SHA-256 checksum verified before/after stage)
 
 train:
-  steps: 1000                           # 1000 x 16 x 8192 ≈ 131M tokens (micro_batch=2 x grad_accum=8 utilizes 96 GiB Blackwell HBM)
-  micro_batch: 2
-  grad_accum: 8
+  steps: 1000                           # 1000 x 16 x 8192 ≈ 131M tokens (micro_batch=4 x grad_accum=4 halves MoE dequant passes on 96 GiB Blackwell HBM)
+  micro_batch: 4
+  grad_accum: 4
   log_every: 5
   sha256_frozen_experts: true
   train_loop_adapters: true
-  train_gdn2: true
+  train_gdn2: false
   trainable:
     - "self_attn\\.(q_norm|k_norm)"
     - "input_layernorm|post_attention_layernorm"
-  allowed_groups: [loop_adapters, gdn2_adapters, attention, norms]
+  allowed_groups: [loop_adapters, attention, norms]
   aux_weights: {loop_aux: 1.0}
   optim:
     lr: 3.0e-5
     warmup_steps: 50
     lr_mult:
+      _replace_: true
       loop_adapters: 20.0
-      gdn2_adapter: 5.0
 
 data:
   seq_len: 8192

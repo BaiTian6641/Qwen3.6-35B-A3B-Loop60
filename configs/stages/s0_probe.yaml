@@ -6,6 +6,10 @@ stage: s0_probe
 run: {name: s0_probe}
 loop:
   enabled: false        # probes apply/remove the loop themselves; the scan sees the stock model
+gdn2:
+  enabled: false
+hssd:
+  enabled: false
 lsa:
   enabled: false
 data:

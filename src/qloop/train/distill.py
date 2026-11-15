@@ -78,7 +78,7 @@ class HSSDDistillConfig:
     mask_kl_by_labels: bool = False
     include_loop_aux: bool = True
     teacher_ckpt: str | None = None
-    teacher_track: str = "gdn2"
+    teacher_track: str = "stock"
     share_backbone: bool = True
     layerwise_warmup_steps: int = 400
     layerwise_mse_weight: float = 1.0
@@ -88,6 +88,7 @@ class HSSDDistillConfig:
             self.chunk_size = int(self.vocab_chunk_size)
         else:
             self.vocab_chunk_size = int(self.chunk_size)
+        self.teacher_track = str(self.teacher_track or "stock").strip().lower()
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> HSSDDistillConfig:
@@ -107,6 +108,10 @@ class HSSDDistillConfig:
             raise ValueError(f"distill.temperature must be > 0, got {self.temperature}")
         if self.layerwise_warmup_steps < 0:
             raise ValueError(f"distill.layerwise_warmup_steps must be >= 0, got {self.layerwise_warmup_steps}")
+        if self.teacher_track not in ("stock", "auto", "gdn2"):
+            raise ValueError(
+                f"distill.teacher_track must be one of ('stock', 'auto', 'gdn2'), got {self.teacher_track!r}"
+            )
         if (
             self.kl_weight < 0.0
             or self.hidden_mse_weight < 0.0
@@ -587,7 +592,7 @@ class SharedBackboneTeacher:
         stack_or_model: Any,
         *,
         teacher_ckpt: str | None = None,
-        teacher_track: str = "gdn2",
+        teacher_track: str = "stock",
         run_root: str | None = None,
     ) -> None:
         self.stack_or_model = stack_or_model
@@ -597,7 +602,11 @@ class SharedBackboneTeacher:
             getattr(stack_or_model, "hssd", None) or getattr(self.model, "_hssd_handle", None)
         )
         self.teacher_ckpt = teacher_ckpt
-        self.teacher_track = str(teacher_track or "gdn2")
+        self.teacher_track = str(teacher_track or "stock").strip().lower()
+        if self.teacher_track not in ("stock", "auto", "gdn2"):
+            raise ValueError(
+                f"SharedBackboneTeacher: teacher_track must be one of ('stock', 'auto', 'gdn2'), got {teacher_track!r}"
+            )
 
         ckpt_params, ckpt_state = _load_teacher_ckpt_bundle(teacher_ckpt, run_root=run_root)
         self.loaded_from_ckpt = bool(ckpt_params)
@@ -608,7 +617,8 @@ class SharedBackboneTeacher:
             if "hssd_adapter." in name:
                 continue
             if "gdn2_adapter." in name:
-                gdn2_tensors[name] = tensor
+                if self.teacher_track != "stock":
+                    gdn2_tensors[name] = tensor
                 continue
             target_p = self.named_all.get(name)
             if target_p is not None and tuple(target_p.shape) == tuple(tensor.shape):
@@ -622,7 +632,7 @@ class SharedBackboneTeacher:
             self.teacher_deltas[name] = p.detach().clone()
 
         self.gdn2_adapters: dict[int, nn.Module] = {}
-        if gdn2_tensors and self.teacher_track == "gdn2" and self.hssd is not None:
+        if gdn2_tensors and self.teacher_track in ("auto", "gdn2") and self.hssd is not None:
             self._init_gdn2_teacher_adapters(gdn2_tensors, ckpt_state)
 
         delta_mb = self.extra_vram_bytes() / (1024.0 * 1024.0)
@@ -698,7 +708,9 @@ class SharedBackboneTeacher:
                 yield
             return
 
-        from ..model.gdn2 import _make_rule_wrapper as _make_gdn2_wrapper
+        _make_gdn2_wrapper: Any = None
+        if self.gdn2_adapters:
+            from ..model.gdn2 import _make_rule_wrapper as _make_gdn2_wrapper
 
         _, phys_layers, _ = _resolve_physical_layers(self.model)
         temp_hooks: list[Any] = []

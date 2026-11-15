@@ -13,6 +13,8 @@ lsa:
   mode: distill
 loop:
   train_pass_probs: [0.2, 0.8]
+gdn2:
+  enabled: true                      # legacy v2 GDN-2 stage (explicit since base.yaml disables gdn2 globally)
 train:
   init_from: runs/s2_sft
   steps: 600

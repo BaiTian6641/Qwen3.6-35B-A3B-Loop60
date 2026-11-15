@@ -73,6 +73,7 @@ experts:
   rank: 64                    # rank-64 ESFT deltas (~1.4 GB ckpt, <4 GB VRAM on 96 GB GPU); 0 = full-rank
 
 train:
+  allow_tf32: true            # enable TF32 Tensor Cores globally for fp32 matmul/bmm (~8x faster on Blackwell)
   resume: true
   steps: 1000
   micro_batch: 1
@@ -92,7 +93,7 @@ train:
     fused: true
     impl: auto                # apollo_torch if installed, else the built-in faithful APOLLO
     max_grad_norm_per_param: 1.0
-    apollo: {enabled: true, rank: 1, scale_type: tensor, scale: 128.0, update_proj_gap: 200, min_dim: 128}
+    apollo: {enabled: true, rank: 256, scale_type: channel, scale: 1.0, update_proj_gap: 200, update_Gap: 200, min_dim: 128}
     lr_mult: {"loop_adapters": 20.0, "lsa_indexer": 10.0, "gdn2_adapter": 5.0, "mlp\\.gate\\.weight$": 0.5}
 
 eval_quick:

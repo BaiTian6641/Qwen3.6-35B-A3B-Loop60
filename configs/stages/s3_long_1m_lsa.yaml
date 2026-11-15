@@ -43,6 +43,11 @@ gdn2:
 
 hssd:
   enabled: true
+  write_mode: full
+  swa_recency_init: 0.05
+  horizon_tokens: 1048576               # Fix H7: scale vault-page mu_max inversely at 1M horizon
+  compact_active_pages: true
+  compact_decode_cache: true
   chunk_size: 64
   window_chunks: 8
   num_pages: 8
@@ -56,7 +61,11 @@ hssd:
 
 lsa:
   enabled: true
-  mode: distill
+  mode: hybrid                          # Fix D1: alternates sparse-forward + sampled KL so downstream Q/O & loop adapt to sparse attn
+  compact_active_slots: true            # Fix D5: 2x smaller BucketIndex & slot_scores by dropping empty Ward slots
+  max_selected_keys: 768                # Fix D6: tight valid-member packing in _sparse_chunk
+  recall_threshold: 0.70                # Fix D1: recall gate before hybrid sparse-forward transitions
+  hybrid_sparse_every: 2
   num_query_passes: 3                   # untied W_q_idx^(r) for Passes 1..3; shared W_k_idx & Ward centroids
   index_dim: 64
   index_on: nope                        # indexes strictly the 192 position-free NoPE dims [64:256]
@@ -81,12 +90,15 @@ rerope:
   rotary_dim: 64
 
 long_calib:
-  enabled: true                         # Fix C1: Long-Prefix (`no_grad`) + Short-Suffix (`grad`) calibration
+  enabled: true                         # Fixes C1, D2, D3: sub-quadratic sparse-prefix + chunked-CE 32K suffix calibration
   prefix_len: 524288                    # 512K-992K streamed prefix under `torch.no_grad()` (`use_cache=True`)
   max_prefix_len: 1015808               # 992K prefix + 32K suffix = 1,048,576 (1M) tokens
   suffix_len: 32768                     # 32K differentiable suffix training QK-Norm, attn gates, Q/O LoRA & D-LSA
   chunk_size: 4096
   fp8_kv_cache: true                    # Tier-1 10.00 GiB GPU FP8 E4M3 KV cache
+  prefix_lsa_mode: sparse               # Fix D3: sub-quadratic sparse D-LSA prefix streaming once warmed up (~15-30x faster)
+  calib_every_steps: 10                 # 60 true 512K-1M calibration steps + 540 64K hybrid steps in 600 total steps
+  sparse_prefix_after_step: 80
 
 offload:
   enabled: false                        # Gate 2b Stretch: toggle `-s offload.enabled=true` for 10M Host-DDR5 INT4
@@ -100,7 +112,7 @@ experts:
 
 train:
   init_from: runs/s1b_hssd_distill      # override `-s train.init_from=runs/s1_loop_a6b` if keeping Track-A GDN-2
-  steps: 800                            # 40M tokens @ 64K-128K + prefix/suffix calibration (~8-12h on Colab G4)
+  steps: 600                            # 540 x 64K hybrid steps + 60 x (512K-1M) calibration steps (~8-12h single Blackwell session)
   micro_batch: 1
   grad_accum: 2
   sha256_frozen_experts: true

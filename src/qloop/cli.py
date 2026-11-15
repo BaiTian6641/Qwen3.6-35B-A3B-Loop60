@@ -52,10 +52,23 @@ def _common(p: argparse.ArgumentParser, config: bool = True) -> None:
     p.add_argument("--debug", type=int, default=None, help="debug level 0-3 (overrides debug.level)")
 
 
+def _resolve_allow_tf32(cfg: Cfg | None) -> bool:
+    if cfg is None:
+        return True
+    val = cfg.get_path("train.allow_tf32")
+    if val is None:
+        val = cfg.get_path("model.allow_tf32")
+    return True if val is None else bool(val)
+
+
 def _start(cfg: Cfg | None, name: str, args: argparse.Namespace) -> str:
     run_dir = _run_dir(cfg, name)
     level = args.debug if args.debug is not None else int((cfg.get_path("debug.level") if cfg else None) or 1)
     setup_run(run_dir, level)
+    if name != "external":
+        from .utils.tf32 import configure_tf32
+
+        configure_tf32(_resolve_allow_tf32(cfg))
     if cfg is not None:
         with open(os.path.join(run_dir, f"config_{int(time.time())}.json"), "w", encoding="utf-8") as f:
             json.dump(cfg.to_dict(), f, indent=2)

@@ -41,19 +41,27 @@ gdn2:
 
 hssd:
   enabled: true
+  write_mode: full                      # Fix H1/H6: full-strength 1.0 writes to each selected Top-k page via STE
+  swa_recency_init: 0.05                # Fix H3: learnable per-head SWA recency slope inside local window
+  blend_init: 0.0                       # Fix H2: step-0 forward == stock teacher in Phase 2, ramping -> 1.0
+  blend_warmup_steps: 250
+  compact_active_pages: true            # 5.2 #4: active-page/token compaction (~2.5-4x fewer WY/readout FLOPs)
+  compact_decode_cache: true            # Fix H5: lagged-replay decode cache (~3-4x smaller per pass-layer)
   chunk_size: 64
   window_chunks: 8                      # Fix B1: k_far = max(0, n - 8), |I_loc| in [513, 576], 0 overlap
   num_pages: 8                          # Fix B2: M=8 log-spaced multi-timescale memory pages
   k_pages: 2                            # Fixes B2, B6: Top-2 sparse active write/read pages per chunk
   theta_low_rank: true                  # Pure linear theta_down + theta_up (~1.95M/layer, ~58.5M/30L vs 176.5M)
   surprise_mode: routed                 # Multi-page chunk-start surprise against Top-k write pages of boundary_ring[-1]
-  state_dtype: bfloat16                 # 81-89 MiB/layer decode cache (fp32 WY updates + fp64 theta_cum)
+  state_dtype: bfloat16                 # Compact decode cache (fp32 WY updates + fp64 theta_cum)
   budget_weight: 1.0                    # Audit 3C: STE actual sparse Top-k write-mass budget regularizer
   segment_chunks: 4                     # 4 x 64 = 256-token checkpointed WY macro-segments (~4x lower backward peak VRAM)
   checkpoint_segments: true
 
 distill:
   enabled: true
+  share_backbone: true                  # 5.2 #7: zero-duplicate-VRAM SharedBackboneTeacher (0.00 GiB extra expert HBM)
+  layerwise_warmup_steps: 400           # 5.2 #2: Phase-1 online per-layer teacher-forced warm-up before end-to-end KL
   teacher_ckpt: runs/s1_loop_a6b
   teacher_track: gdn2                   # chunked-vocab KL(p_teacher || p_student) + hidden MSE via HSSDDistiller
   temperature: 1.0
@@ -69,9 +77,9 @@ experts:
 
 train:
   init_from: runs/s1_loop_a6b
-  steps: 1500                           # 1500 x 4 x 16384 ≈ 98.3M tokens (~12-15h on single Colab G4)
-  micro_batch: 1
-  grad_accum: 4
+  steps: 1500                           # 1500 x 4 x 16384 ≈ 98.3M tokens (micro_batch=2 x grad_accum=2 enabled by H4 + shared teacher)
+  micro_batch: 2
+  grad_accum: 2
   sha256_frozen_experts: true
   train_loop_adapters: true
   train_hssd: true

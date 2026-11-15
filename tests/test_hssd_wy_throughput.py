@@ -551,15 +551,215 @@ def test_outer_checkpoint_skips_redundant_nested_segment_recompute_and_matches_r
         assert float((g_nr - g_rc).abs().max()) < 1e-12, f"{key} outer_nr vs rec grad diff"
         assert float((g_in - g_rc).abs().max()) < 1e-12, f"{key} inner vs rec grad diff"
 
-    # 5. Verify checkpoint_segments_min_len gating & validation
+    # 5. Verify checkpoint_segments_min_len & outer_checkpoint_max_tokens validation
     with pytest.raises(ValueError, match="checkpoint_segments_min_len"):
         HSSDConfig(checkpoint_segments_min_len=-1).validate()
+    with pytest.raises(ValueError, match="outer_checkpoint_max_tokens"):
+        HSSDConfig(outer_checkpoint_max_tokens=-1).validate()
 
     call_log.clear()
     inp_minlen = _clone_inputs(inp_outer_nonreentrant)
     out_minlen = _run_chunk(inp_minlen, ckpt_segs=True, min_len=128)  # seq_len=96 < 128 -> uncheckpointed
     (out_minlen * grad_out).sum().backward()
     assert len(call_log) == 3, f"Expected 3 uncheckpointed segment calls when T < min_len, got {len(call_log)}"
+
+
+def test_outer_checkpoint_max_tokens_keeps_segment_checkpointing_on_long_sequences_fp64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify `bsz * seq_len > outer_checkpoint_max_tokens` keeps segment checkpointing active (9 calls for 3 segs)."""
+    torch.manual_seed(919)
+    bsz, seq_len, hv, dk, dv, num_pages, k_pages = 2, 96, 2, 8, 8, 6, 2  # bsz * seq_len = 192
+
+    def _fresh_inputs() -> dict[str, Any]:
+        torch.manual_seed(919)
+        return {
+            "query": torch.randn(bsz, seq_len, hv, dk, dtype=torch.float64, requires_grad=True),
+            "key": torch.randn(bsz, seq_len, hv, dk, dtype=torch.float64, requires_grad=True),
+            "value": torch.randn(bsz, seq_len, hv, dv, dtype=torch.float64, requires_grad=True),
+            "ps_gamma": torch.linspace(0.01, 0.25, num_pages, dtype=torch.float64, requires_grad=True),
+            "ch_gamma": torch.rand(bsz, seq_len, hv, dk // 2, dtype=torch.float64).mul(0.2).requires_grad_(True),
+            "b_gate": torch.rand(bsz, seq_len, hv, dk, dtype=torch.float64).mul(1.4).requires_grad_(True),
+            "w_gate": torch.rand(bsz, seq_len, hv, dv, dtype=torch.float64).requires_grad_(True),
+            "theta": (0.2 * torch.randn(bsz, seq_len, hv, dk // 2, dtype=torch.float64)).requires_grad_(True),
+            "surprise_bias": (0.25 * torch.randn(bsz, seq_len, hv, dtype=torch.float64)).requires_grad_(True),
+            "surprise_slope": torch.full((hv,), 2.5, dtype=torch.float64, requires_grad=True),
+            "surprise_thresh": torch.full((hv,), 0.8, dtype=torch.float64, requires_grad=True),
+            "write_logits": torch.randn(bsz, seq_len, num_pages, dtype=torch.float64, requires_grad=True),
+            "read_logits": torch.randn(bsz, seq_len, num_pages, dtype=torch.float64, requires_grad=True),
+            "q_swa": torch.randn(bsz, seq_len, hv, dk, dtype=torch.float64, requires_grad=True),
+            "k_swa": torch.randn(bsz, seq_len, hv, dk, dtype=torch.float64, requires_grad=True),
+            "v_swa": torch.randn(bsz, seq_len, hv, dv, dtype=torch.float64, requires_grad=True),
+            "boltzmann_gate": PeakBoltzmannGate(hv).double(),
+            "swa_recency_slope": torch.linspace(0.05, 0.2, hv, dtype=torch.float64, requires_grad=True),
+        }
+
+    orig_run_group = hssd_mod._run_chunk_group
+    group_calls = [0]
+
+    def _counting_group(*args: Any, **kwargs: Any) -> Any:
+        group_calls[0] += 1
+        return orig_run_group(*args, **kwargs)
+
+    monkeypatch.setattr(hssd_mod, "_run_chunk_group", _counting_group)
+
+    def _exec_chunk(d: dict[str, Any], *, max_toks: int, cu_seqlens: list[int] | None = None) -> torch.Tensor:
+        out, _ = chunk_hssd(
+            d["query"],
+            d["key"],
+            d["value"],
+            (d["ps_gamma"], d["ch_gamma"]),
+            d["b_gate"],
+            d["w_gate"],
+            d["theta"],
+            d["surprise_bias"],
+            d["surprise_slope"],
+            d["surprise_thresh"],
+            d["write_logits"],
+            d["read_logits"],
+            d["q_swa"],
+            d["k_swa"],
+            d["v_swa"],
+            boltzmann_gate=d["boltzmann_gate"],
+            swa_recency_slope=d["swa_recency_slope"],
+            chunk_size=16,
+            window_chunks=2,
+            num_pages=num_pages,
+            top_k_pages=k_pages,
+            segment_chunks=2,  # 96 / 32 = 3 segments
+            checkpoint_segments=True,
+            outer_checkpoint_max_tokens=max_toks,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=True,
+            output_final_state=False,
+            write_mode="full",
+        )
+        return out
+
+    inp_ref = _fresh_inputs()
+    out_rec, _ = recurrent_hssd(
+        inp_ref["query"],
+        inp_ref["key"],
+        inp_ref["value"],
+        (inp_ref["ps_gamma"], inp_ref["ch_gamma"]),
+        inp_ref["b_gate"],
+        inp_ref["w_gate"],
+        inp_ref["theta"],
+        inp_ref["surprise_bias"],
+        inp_ref["surprise_slope"],
+        inp_ref["surprise_thresh"],
+        inp_ref["write_logits"],
+        inp_ref["read_logits"],
+        inp_ref["q_swa"],
+        inp_ref["k_swa"],
+        inp_ref["v_swa"],
+        boltzmann_gate=inp_ref["boltzmann_gate"],
+        swa_recency_slope=inp_ref["swa_recency_slope"],
+        chunk_size=16,
+        window_chunks=2,
+        num_pages=num_pages,
+        top_k_pages=k_pages,
+        segment_chunks=2,
+        use_qk_l2norm_in_kernel=True,
+        output_final_state=False,
+        write_mode="full",
+    )
+    torch.manual_seed(777)
+    grad_out = torch.randn_like(out_rec)
+    (out_rec * grad_out).sum().backward()
+
+    # 1. use_reentrant=False with bsz * seq_len = 192 > outer_checkpoint_max_tokens = 128:
+    #    Segment checkpointing stays active -> 3*N_seg - 1 = 8 calls (PyTorch early-stop on final segment) vs 6 skipped!
+    for max_toks in (128, 0):
+        inp_nr = _fresh_inputs()
+        group_calls[0] = 0
+
+        def _fn_nr(q_t: torch.Tensor, d_ref: dict[str, Any] = inp_nr, mt: int = max_toks) -> torch.Tensor:
+            d_loc = dict(d_ref)
+            d_loc["query"] = q_t
+            return _exec_chunk(d_loc, max_toks=mt)
+
+        out_nr = checkpoint(_fn_nr, inp_nr["query"], use_reentrant=False)
+        (out_nr * grad_out).sum().backward()
+        assert group_calls[0] == 8, (
+            f"Expected 8 segment calls (active ckpt) for max_toks={max_toks}, got {group_calls[0]}"
+        )
+        assert float((out_nr.detach() - out_rec.detach()).abs().max()) < 1e-12
+        for k_name in ("query", "key", "value", "b_gate", "w_gate", "theta", "write_logits", "read_logits"):
+            assert inp_nr[k_name].grad is not None and inp_ref[k_name].grad is not None
+            assert float((inp_nr[k_name].grad - inp_ref[k_name].grad).abs().max()) < 1e-12
+
+    # 2. use_reentrant=True with bsz * seq_len = 192 > outer_checkpoint_max_tokens = 128 -> 3*N_seg = 9 calls (active!)
+    inp_r = _fresh_inputs()
+    group_calls[0] = 0
+
+    def _fn_r(q_t: torch.Tensor) -> torch.Tensor:
+        d_loc = dict(inp_r)
+        d_loc["query"] = q_t
+        return _exec_chunk(d_loc, max_toks=128)
+
+    out_r = checkpoint(_fn_r, inp_r["query"], use_reentrant=True)
+    (out_r * grad_out).sum().backward()
+    assert group_calls[0] == 9, f"Expected 9 segment calls under use_reentrant=True, got {group_calls[0]}"
+    assert float((out_r.detach() - out_rec.detach()).abs().max()) < 1e-12
+    for k_name in ("query", "key", "value", "b_gate", "w_gate"):
+        assert inp_r[k_name].grad is not None and inp_ref[k_name].grad is not None
+        assert float((inp_r[k_name].grad - inp_ref[k_name].grad).abs().max()) < 1e-12
+
+    # 3. Packed-doc cu_seqlens=[0, 64, 96] (B=1) threads outer_checkpoint_max_tokens into recursive sub-calls
+    inp_pack = {
+        k_n: (v_t[:1].detach().clone().requires_grad_(True) if isinstance(v_t, torch.Tensor) and v_t.ndim >= 2 else v_t)
+        for k_n, v_t in _fresh_inputs().items()
+    }
+    group_calls[0] = 0
+
+    def _fn_pack(q_t: torch.Tensor) -> torch.Tensor:
+        d_loc = dict(inp_pack)
+        d_loc["query"] = q_t
+        # doc0=64 (>32 -> ckpt active: 2*3 = 6 calls), doc1=32 (1 seg -> 2 calls) => 8 calls total (vs 6 if skipped)
+        return _exec_chunk(d_loc, max_toks=32, cu_seqlens=[0, 64, 96])
+
+    out_pack = checkpoint(_fn_pack, inp_pack["query"], use_reentrant=False)
+    out_pack.sum().backward()
+    assert group_calls[0] == 8, f"Expected 8 packed-doc segment calls (6 + 2), got {group_calls[0]}"
+
+
+def test_hssd_handle_stats_multi_device_safe() -> None:
+    """Verify `HSSDHandle.stats()` groups `_pending_stats_tensor` per device (`device_map='auto'` safe)."""
+    torch.manual_seed(404)
+    tok = ToyTokenizer()
+    cfg = ToyConfig(
+        vocab_size=tok.vocab_size,
+        hidden_size=32,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        num_hidden_layers=3,
+        layer_types=("linear_attention", "full_attention", "linear_attention"),
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        linear_num_heads=4,
+        linear_head_dim=8,
+        num_experts=4,
+        num_experts_per_tok=2,
+    )
+    model = ToyForCausalLM(cfg)
+    handle = apply_hssd(model, HSSDConfig(rank=16, chunk_size=16, window_chunks=2))
+    ad0, ad2 = handle.adapters[0], handle.adapters[2]
+    ad0._pending_stats_tensor = torch.tensor([1.0, 0.01, 0.10, 0.02, 0.0], device="cpu")
+    alt_dev = (
+        torch.device("mps")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        else torch.device("cpu")
+    )
+    ad2._pending_stats_tensor = torch.tensor([3.0, 0.03, 0.30, 0.06, 2.0], device=alt_dev)
+    stats = handle.stats()
+    assert abs(stats["hssd/budget_aux_loss"] - 2.0) < 1e-6
+    assert abs(stats["hssd/vault_duty"] - 0.02) < 1e-6
+    assert abs(stats["hssd/scratch_duty"] - 0.20) < 1e-6
+    assert abs(stats["hssd/dense_router_prob"] - 0.04) < 1e-6
+    assert abs(stats["hssd/dead_page_count"] - 1.0) < 1e-6
+    assert ad0._pending_stats_tensor is None and ad2._pending_stats_tensor is None
 
 
 def test_looped_virtual_layer_hssd_zero_scalar_sync_and_lazy_stats(

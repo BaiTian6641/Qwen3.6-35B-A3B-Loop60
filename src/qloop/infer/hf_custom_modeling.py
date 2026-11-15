@@ -2658,6 +2658,7 @@ else:
             self.segment_chunks = int(hcfg.get("segment_chunks", 4))
             self.checkpoint_segments = bool(hcfg.get("checkpoint_segments", True))
             self.checkpoint_segments_min_len = max(0, int(hcfg.get("checkpoint_segments_min_len", 0)))
+            self.outer_checkpoint_max_tokens = max(0, int(hcfg.get("outer_checkpoint_max_tokens", 2048)))
             self.cap_g = float(hcfg.get("gate_logit_cap", 8.0))
             self.cap_d = float(hcfg.get("decay_log_cap", 2.0))
             self.decay_gamma_min = float(hcfg.get("decay_gamma_min", 1e-4))
@@ -4763,14 +4764,18 @@ else:
                 st_acc.page_states,
             )
         )
+        skip_nested_ckpt = (
+            adapter.outer_checkpoint_max_tokens > 0
+            and bsz * seq_len <= adapter.outer_checkpoint_max_tokens
+            and (_in_backward() or _in_outer_checkpoint())
+        )
         use_ckpt = bool(
             adapter.checkpoint_segments
             and seq_len >= adapter.checkpoint_segments_min_len
             and torch.is_grad_enabled()
             and need_grad
             and len(seg_groups) > 1
-            and not _in_backward()
-            and not _in_outer_checkpoint()
+            and not skip_nested_ckpt
         )
 
         p_cur = st_acc.page_states

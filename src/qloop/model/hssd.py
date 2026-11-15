@@ -193,6 +193,7 @@ class HSSDConfig:
     segment_chunks: int = 4
     checkpoint_segments: bool = True
     checkpoint_segments_min_len: int = 0
+    outer_checkpoint_max_tokens: int = 2048
     gate_logit_cap: float = 8.0
     decay_log_cap: float = 2.0
     kappa_init: float = 2.0
@@ -279,6 +280,10 @@ class HSSDConfig:
         if int(self.checkpoint_segments_min_len) < 0:
             raise ValueError(
                 f"hssd.checkpoint_segments_min_len must be >= 0, got {self.checkpoint_segments_min_len}"
+            )
+        if int(self.outer_checkpoint_max_tokens) < 0:
+            raise ValueError(
+                f"hssd.outer_checkpoint_max_tokens must be >= 0, got {self.outer_checkpoint_max_tokens}"
             )
         if self.gate_logit_cap <= 0 or self.decay_log_cap <= 0:
             raise ValueError("hssd.gate_logit_cap and hssd.decay_log_cap must be > 0")
@@ -4546,6 +4551,7 @@ def _chunk_hssd_raw(
     segment_chunks: int,
     checkpoint_segments: bool,
     checkpoint_segments_min_len: int,
+    outer_checkpoint_max_tokens: int,
     initial_state: HSSDCacheState | torch.Tensor | None,
     output_final_state: bool,
     write_mask: torch.Tensor | None,
@@ -4609,6 +4615,7 @@ def _chunk_hssd_raw(
                     segment_chunks=segment_chunks,
                     checkpoint_segments=checkpoint_segments,
                     checkpoint_segments_min_len=checkpoint_segments_min_len,
+                    outer_checkpoint_max_tokens=outer_checkpoint_max_tokens,
                     initial_state=None,
                     output_final_state=output_final_state,
                     write_mask=None if write_mask is None else write_mask[sl_b, sl_t],
@@ -4820,6 +4827,7 @@ def _chunk_hssd_raw(
                 segment_chunks=segment_chunks,
                 checkpoint_segments=checkpoint_segments,
                 checkpoint_segments_min_len=checkpoint_segments_min_len,
+                outer_checkpoint_max_tokens=outer_checkpoint_max_tokens,
                 initial_state=st_b,
                 output_final_state=output_final_state,
                 write_mask=wm_b,
@@ -5052,14 +5060,18 @@ def _chunk_hssd_raw(
             go,
         )
     )
+    skip_nested_ckpt = (
+        int(outer_checkpoint_max_tokens) > 0
+        and bsz * seq_len <= int(outer_checkpoint_max_tokens)
+        and (_in_backward() or _in_outer_checkpoint())
+    )
     use_ckpt = bool(
         checkpoint_segments
         and seq_len >= int(checkpoint_segments_min_len)
         and torch.is_grad_enabled()
         and need_grad
         and len(seg_groups) > 1
-        and not _in_backward()
-        and not _in_outer_checkpoint()
+        and not skip_nested_ckpt
     )
 
     p_cur = st.page_states
@@ -5518,6 +5530,7 @@ def chunk_hssd(
     segment_chunks: int = 4,
     checkpoint_segments: bool = True,
     checkpoint_segments_min_len: int = 0,
+    outer_checkpoint_max_tokens: int = 2048,
     initial_state: HSSDCacheState | torch.Tensor | None = None,
     output_final_state: bool = False,
     write_mask: torch.Tensor | None = None,
@@ -5564,6 +5577,7 @@ def chunk_hssd(
         segment_chunks=segment_chunks,
         checkpoint_segments=checkpoint_segments,
         checkpoint_segments_min_len=checkpoint_segments_min_len,
+        outer_checkpoint_max_tokens=outer_checkpoint_max_tokens,
         initial_state=initial_state,
         output_final_state=output_final_state,
         write_mask=write_mask,
@@ -6062,16 +6076,21 @@ class HSSDHandle:
             return {}
         pending_ads = [ad for ad in self.adapters.values() if ad._pending_stats_tensor is not None]
         if pending_ads:
-            rows = torch.stack([ad._pending_stats_tensor for ad in pending_ads], dim=0).tolist()  # type: ignore[misc]
-            for ad, vals in zip(pending_ads, rows):
-                ad._pending_stats_tensor = None
-                ad._last_stats = {
-                    "budget_aux_loss": float(vals[0]),
-                    "vault_duty": float(vals[1]),
-                    "scratch_duty": float(vals[2]),
-                    "dense_router_prob": float(vals[3]),
-                    "dead_page_count": float(vals[4]),
-                }
+            by_dev: dict[torch.device, list[HSSDAdapter]] = {}
+            for ad in pending_ads:
+                assert ad._pending_stats_tensor is not None
+                by_dev.setdefault(ad._pending_stats_tensor.device, []).append(ad)
+            for dev_ads in by_dev.values():
+                rows = torch.stack([ad._pending_stats_tensor for ad in dev_ads], dim=0).tolist()  # type: ignore[misc]
+                for ad, vals in zip(dev_ads, rows):
+                    ad._pending_stats_tensor = None
+                    ad._last_stats = {
+                        "budget_aux_loss": float(vals[0]),
+                        "vault_duty": float(vals[1]),
+                        "scratch_duty": float(vals[2]),
+                        "dense_router_prob": float(vals[3]),
+                        "dead_page_count": float(vals[4]),
+                    }
         out: dict[str, float] = {}
         stat_keys = (
             "budget_aux_loss",
@@ -6320,6 +6339,7 @@ def _make_hssd_rule_wrapper(
                     segment_chunks=c_cfg.segment_chunks,
                     checkpoint_segments=c_cfg.checkpoint_segments,
                     checkpoint_segments_min_len=c_cfg.checkpoint_segments_min_len,
+                    outer_checkpoint_max_tokens=c_cfg.outer_checkpoint_max_tokens,
                     initial_state=init_st,
                     output_final_state=out_final,
                     write_mask=mor_wmask,

@@ -1578,12 +1578,24 @@ def test_fp8_missing_kernels_nograd_fallback_probe_suite_and_backward(
             if p_b.is_floating_point() and p_b.dtype != torch.float8_e4m3fn:
                 p_b.data = p_b.data.to(torch.bfloat16)
     with torch.no_grad():
+        for (_n, dm), (_qn, qm) in zip(
+            [(n, m) for n, m in deq_ref_bf16.named_modules()],
+            [(n, m) for n, m in model_bf16.named_modules()],
+        ):
+            if isinstance(qm, MockNoKernelsFP8Linear) and isinstance(dm, nn.Linear):
+                dm.weight.copy_(qa._dequant_linear_weight(qm, dtype=torch.bfloat16))
+            elif isinstance(qm, MockNoKernelsFP8Experts) and hasattr(dm, "gate_up_proj"):
+                for ei in range(qm.num_experts):
+                    gue, dne = qa._dequant_single_expert(qm, ei, dtype=torch.bfloat16)
+                    dm.gate_up_proj[ei].copy_(gue)
+                    dm.down_proj[ei].copy_(dne)
         bf16_logits = model_bf16(inp).logits.float()
         bf16_deq_ref = deq_ref_bf16(inp).logits.float()
     assert model_bf16(inp).logits.dtype == torch.bfloat16
     assert (bf16_logits - bf16_deq_ref).abs().max().item() < 1e-2
     cos = F.cosine_similarity(nograd_logits.reshape(-1), float_ref_logits.reshape(-1), dim=0).item()
     assert cos > 0.95
+    assert F.cosine_similarity(bf16_logits.reshape(-1), float_ref_logits.reshape(-1), dim=0).item() > 0.95
 
     # 2) Full `run_structured_probe_suite` (where Colab crashed at `ref_logits = model(input_ids=b0)`)
     if flatten_2d_scale and moe_scale_names == ("gate_up_proj_scale_inv", "down_proj_scale_inv"):
@@ -1788,6 +1800,7 @@ def test_chunked_3d_moe_dispatch_exact_parity_across_40_experts_with_padding_and
         seen_eids.update(expert_ids)
         return orig_chunk_fn(mod, expert_ids, dtype=dtype, nvfp4_mode_override=nvfp4_mode_override)
 
+    monkeypatch.setattr(qa, "_MOE_CHUNK_EXPERTS", 32)
     monkeypatch.setattr(qa, "_dequant_experts_chunk", _spy_chunk_40)
 
     x_base = torch.randn(n_tokens, h_dim, dtype=torch.float32)

@@ -112,7 +112,11 @@ _MOE_DN_FP8_SCALE_ATTRS: tuple[str, ...] = (
     "w2_weight_scale_inv",
     "w2_weight_scale",
 )
-_MOE_CHUNK_EXPERTS: int = 32
+_MOE_CHUNK_EXPERTS: int = 64
+_MOE_PADDED_BMM_MIN_EXPERTS: int = 4
+_MOE_PADDED_BMM_MIN_FILL: float = 0.4
+_MOE_PADDED_BMM_MAX_ROWS: int = 32768
+_GROUPED_MM_CACHE: dict[tuple[Any, ...], bool] = {}
 
 
 def _get_e2m1_lut(device: torch.device) -> torch.Tensor:
@@ -323,6 +327,25 @@ def _resolve_moe_fp8_scale(
 # ============================================================================ dequantization & quantization helpers
 
 
+def _fp8_scale_fits_bf16(scale_inv: torch.Tensor | None) -> bool:
+    """Return `True` if `scale_inv` can multiply directly in `bfloat16` without overflow/underflow."""
+    if scale_inv is None or scale_inv.dtype == torch.bfloat16:
+        return True
+    if scale_inv.dtype not in (torch.float16, torch.float32):
+        return False
+    if scale_inv.device.type != "cpu" or scale_inv.numel() == 0:
+        return True
+    s_abs = scale_inv.detach().abs()
+    s_max = float(s_abs.max().item())
+    if s_max == 0.0:
+        return True
+    if not math.isfinite(s_max) or s_max >= 1e30:
+        return False
+    nz = s_abs > 0
+    s_min = float(s_abs[nz].min().item()) if bool(nz.any().item()) else 1.0
+    return s_min > 1e-30
+
+
 def dequantize_fp8_tensor(
     weight: torch.Tensor,
     scale_inv: torch.Tensor | None,
@@ -335,12 +358,27 @@ def dequantize_fp8_tensor(
     Supports scalar, per-channel, and 2D block-scaled (`[ceil(out/B0), ceil(in/B1)]`, e.g.
     `[128, 128]` in `Qwen/Qwen3.6-35B-A3B-FP8`) `scale_inv` / `weight_scale` multipliers,
     slicing partial edge blocks cleanly when dimensions are not exact multiples of block size.
-    """
-    w = weight.to(torch.float32)
-    if scale_inv is None:
-        return w.to(dtype=dtype)
 
-    s = scale_inv.to(device=weight.device, dtype=torch.float32)
+    When `dtype == torch.bfloat16` and `weight.dtype in FP8_DTYPES` (and `scale_inv` fits normal
+    `bf16` range), promotes directly to `torch.bfloat16` (`float8_e4m3fn` has 3 mantissa bits and
+    exponent `[-6, 8]`, which is 100% lossless in `bf16`), cutting transient memory & HBM traffic
+    in half without allocating a `4x` `float32` intermediate.
+    """
+    if weight.ndim not in (2, 3):
+        raise ValueError(f"dequantize_fp8_tensor expects 2D or 3D weight, got shape {tuple(weight.shape)}")
+
+    if dtype == torch.bfloat16 and weight.dtype in FP8_DTYPES and _fp8_scale_fits_bf16(scale_inv):
+        work_dtype = torch.bfloat16
+    elif dtype == torch.float64:
+        work_dtype = torch.float64
+    else:
+        work_dtype = torch.float32
+
+    w = weight.to(work_dtype)
+    if scale_inv is None:
+        return w if w.dtype == dtype else w.to(dtype=dtype)
+
+    s = scale_inv.to(device=weight.device, dtype=work_dtype)
     hint0 = block_size[0] if block_size is not None else None
     hint1 = block_size[1] if block_size is not None else None
 
@@ -376,66 +414,63 @@ def dequantize_fp8_tensor(
                     res = w * s_exp
         else:
             raise ValueError(f"unsupported scale_inv shape {tuple(s.shape)} for 2D weight {tuple(w.shape)}")
-        return res.to(dtype=dtype)
+        return res if res.dtype == dtype else res.to(dtype=dtype)
 
-    if w.ndim == 3:
-        e_cnt, m, k = w.shape
-        if (
-            s.ndim == 2
-            and e_cnt > 1
-            and s.shape not in ((e_cnt, m), (e_cnt, k))
-            and int(s.shape[0]) % e_cnt == 0
-        ):
-            sub_s0 = int(s.shape[0]) // e_cnt
-            is_flat_3d = (
-                (hint0 is not None and math.ceil(m / hint0) == sub_s0)
-                or (math.ceil(m / 128) == sub_s0 and math.ceil(m / 128) != int(s.shape[0]))
-                or (not _can_infer_block_dim(m, int(s.shape[0]), hint0) and _can_infer_block_dim(m, sub_s0, hint0))
-            )
-            if is_flat_3d:
-                s = s.reshape(e_cnt, sub_s0, int(s.shape[1]))
+    e_cnt, m, k = w.shape
+    if (
+        s.ndim == 2
+        and e_cnt > 1
+        and s.shape not in ((e_cnt, m), (e_cnt, k))
+        and int(s.shape[0]) % e_cnt == 0
+    ):
+        sub_s0 = int(s.shape[0]) // e_cnt
+        is_flat_3d = (
+            (hint0 is not None and math.ceil(m / hint0) == sub_s0)
+            or (math.ceil(m / 128) == sub_s0 and math.ceil(m / 128) != int(s.shape[0]))
+            or (not _can_infer_block_dim(m, int(s.shape[0]), hint0) and _can_infer_block_dim(m, sub_s0, hint0))
+        )
+        if is_flat_3d:
+            s = s.reshape(e_cnt, sub_s0, int(s.shape[1]))
 
-        if s.ndim == 0 or s.numel() == 1:
-            res = w * s.reshape(())
-        elif s.ndim == 1 and s.shape[0] == e_cnt:
-            res = w * s.reshape(e_cnt, 1, 1)
-        elif s.ndim == 2:
-            if s.shape == (e_cnt, m):
-                res = w * s[:, :, None]
-            elif s.shape == (e_cnt, k):
-                res = w * s[:, None, :]
-            else:
-                s0, s1 = int(s.shape[0]), int(s.shape[1])
-                b0 = _infer_block_dim(m, s0, hint0)
-                b1 = _infer_block_dim(k, s1, hint1)
-                s_exp = s if b0 == 1 else s.repeat_interleave(b0, dim=0)[:m, :]
-                s_exp = s_exp if b1 == 1 else s_exp.repeat_interleave(b1, dim=1)[:, :k]
-                res = w * s_exp.unsqueeze(0)
-        elif s.ndim == 3:
-            es, s0, s1 = int(s.shape[0]), int(s.shape[1]), int(s.shape[2])
-            if es not in (1, e_cnt):
-                raise ValueError(f"3D FP8 scale expert dim {es} != weight expert dim {e_cnt}")
-            if s0 in (1, m) and s1 in (1, k):
-                res = w * s
-            else:
-                b0 = _infer_block_dim(m, s0, hint0)
-                b1 = _infer_block_dim(k, s1, hint1)
-                if math.ceil(m / b0) != s0 or math.ceil(k / b1) != s1:
-                    raise ValueError(
-                        f"3D FP8 block scale shape {tuple(s.shape)} incompatible with weight {tuple(w.shape)} "
-                        f"and block_size=({b0}, {b1})"
-                    )
-                if m == s0 * b0 and k == s1 * b1:
-                    res = (w.reshape(e_cnt, s0, b0, s1, b1) * s.reshape(es, s0, 1, s1, 1)).reshape(e_cnt, m, k)
-                else:
-                    s_exp = s if b0 == 1 else s.repeat_interleave(b0, dim=1)[:, :m, :]
-                    s_exp = s_exp if b1 == 1 else s_exp.repeat_interleave(b1, dim=2)[:, :, :k]
-                    res = w * s_exp
+    if s.ndim == 0 or s.numel() == 1:
+        res = w * s.reshape(())
+    elif s.ndim == 1 and s.shape[0] == e_cnt:
+        res = w * s.reshape(e_cnt, 1, 1)
+    elif s.ndim == 2:
+        if s.shape == (e_cnt, m):
+            res = w * s[:, :, None]
+        elif s.shape == (e_cnt, k):
+            res = w * s[:, None, :]
         else:
-            raise ValueError(f"unsupported scale_inv shape {tuple(s.shape)} for 3D weight {tuple(w.shape)}")
-        return res.to(dtype=dtype)
-
-    raise ValueError(f"dequantize_fp8_tensor expects 2D or 3D weight, got shape {tuple(weight.shape)}")
+            s0, s1 = int(s.shape[0]), int(s.shape[1])
+            b0 = _infer_block_dim(m, s0, hint0)
+            b1 = _infer_block_dim(k, s1, hint1)
+            s_exp = s if b0 == 1 else s.repeat_interleave(b0, dim=0)[:m, :]
+            s_exp = s_exp if b1 == 1 else s_exp.repeat_interleave(b1, dim=1)[:, :k]
+            res = w * s_exp.unsqueeze(0)
+    elif s.ndim == 3:
+        es, s0, s1 = int(s.shape[0]), int(s.shape[1]), int(s.shape[2])
+        if es not in (1, e_cnt):
+            raise ValueError(f"3D FP8 scale expert dim {es} != weight expert dim {e_cnt}")
+        if s0 in (1, m) and s1 in (1, k):
+            res = w * s
+        else:
+            b0 = _infer_block_dim(m, s0, hint0)
+            b1 = _infer_block_dim(k, s1, hint1)
+            if math.ceil(m / b0) != s0 or math.ceil(k / b1) != s1:
+                raise ValueError(
+                    f"3D FP8 block scale shape {tuple(s.shape)} incompatible with weight {tuple(w.shape)} "
+                    f"and block_size=({b0}, {b1})"
+                )
+            if m == s0 * b0 and k == s1 * b1:
+                res = (w.reshape(e_cnt, s0, b0, s1, b1) * s.reshape(es, s0, 1, s1, 1)).reshape(e_cnt, m, k)
+            else:
+                s_exp = s if b0 == 1 else s.repeat_interleave(b0, dim=1)[:, :m, :]
+                s_exp = s_exp if b1 == 1 else s_exp.repeat_interleave(b1, dim=2)[:, :, :k]
+                res = w * s_exp
+    else:
+        raise ValueError(f"unsupported scale_inv shape {tuple(s.shape)} for 3D weight {tuple(w.shape)}")
+    return res if res.dtype == dtype else res.to(dtype=dtype)
 
 
 def dequantize_nvfp4_tensor(
@@ -1091,7 +1126,7 @@ def _dequant_experts_chunk(
     *,
     nvfp4_mode_override: str | None = None,
 ) -> tuple[torch.Tensor | list[torch.Tensor], torch.Tensor | list[torch.Tensor]]:
-    """Batch-dequantize a chunk of `<= 32` active experts `[C, 2I, H]` & `[C, H, I]` in one 3D call."""
+    """Batch-dequantize a chunk of `<= 64` active experts `[C, 2I, H]` & `[C, H, I]` in one 3D call."""
     kind = _classify_quant_module(experts_mod)
 
     if kind == "moe_fp8":
@@ -1187,6 +1222,31 @@ def _dequant_experts_chunk(
         except ValueError:
             pass
 
+    elif kind is None:
+        gu_f = getattr(experts_mod, "gate_up_proj", None)
+        dn_f = getattr(experts_mod, "down_proj", None)
+        if (
+            isinstance(gu_f, torch.Tensor)
+            and isinstance(dn_f, torch.Tensor)
+            and gu_f.ndim == 3
+            and dn_f.ndim == 3
+            and gu_f.is_floating_point()
+            and dn_f.is_floating_point()
+            and gu_f.dtype not in FP8_DTYPES
+            and dn_f.dtype not in FP8_DTYPES
+        ):
+            eids_t = torch.tensor(expert_ids, device=gu_f.device, dtype=torch.long)
+            gu_chunk = gu_f.index_select(0, eids_t).to(dtype=dtype)
+            dn_chunk = dn_f.index_select(0, eids_t).to(dtype=dtype)
+            if _is_expert_pair_transposed(
+                experts_mod,
+                (int(gu_chunk.shape[1]), int(gu_chunk.shape[2])),
+                (int(dn_chunk.shape[1]), int(dn_chunk.shape[2])),
+            ):
+                gu_chunk = gu_chunk.transpose(1, 2).contiguous()
+                dn_chunk = dn_chunk.transpose(1, 2).contiguous()
+            return gu_chunk, dn_chunk
+
     gu_list: list[torch.Tensor] = []
     dn_list: list[torch.Tensor] = []
     for eid in expert_ids:
@@ -1266,8 +1326,295 @@ class _QuantLinearAutogradFn(torch.autograd.Function):
         return grad_x, grad_bias, None
 
 
+def _in_backward() -> bool:
+    """Return `True` when currently executing inside an autograd backward pass (e.g. checkpoint recompute)."""
+    fn = getattr(torch._C, "_current_graph_task_id", None)
+    return bool(fn is not None and fn() != -1)
+
+
+def _is_standard_silu(act_fn: Any) -> bool:
+    """Return `True` when `act_fn` is standard SiLU (`None`, `F.silu`, `nn.SiLU`, HF `SiLUActivation`)."""
+    if act_fn is None or act_fn is F.silu:
+        return True
+    if isinstance(act_fn, nn.SiLU):
+        return True
+    cls_name = type(act_fn).__name__
+    if cls_name in ("SiLUActivation", "PyTorchSiLUActivation"):
+        return True
+    fn_name = getattr(act_fn, "__name__", None)
+    return bool(fn_name == "silu" and str(getattr(act_fn, "__module__", "")).startswith("torch"))
+
+
+def _swiglu_backward_from_gate_up(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    grad_mid: torch.Tensor,
+) -> torch.Tensor:
+    """Analytic backward of `mid = silu(gate) * up`, returning `cat((d_gate, d_up), dim=-1)`."""
+    out_dt = grad_mid.dtype
+    if out_dt in (torch.bfloat16, torch.float16) or gate.dtype in (torch.bfloat16, torch.float16):
+        gf = gate.float()
+        sig_f = torch.sigmoid(gf)
+        silu_g = (gf * sig_f).to(out_dt)
+        dsilu_f = sig_f * (1.0 + gf * (1.0 - sig_f))
+        d_up = grad_mid * silu_g
+        d_gate = (grad_mid.float() * up.float() * dsilu_f).to(out_dt)
+    else:
+        g_dt = gate.to(out_dt)
+        u_dt = up.to(out_dt)
+        sig = torch.sigmoid(g_dt)
+        silu_g = g_dt * sig
+        d_up = grad_mid * silu_g
+        d_gate = grad_mid * u_dt * (sig * (1.0 + g_dt * (1.0 - sig)))
+    return torch.cat((d_gate, d_up), dim=-1)
+
+
+def _swiglu_backward_analytic(gu_out: torch.Tensor, grad_mid: torch.Tensor) -> torch.Tensor:
+    """Analytic SwiGLU backward from fused `gu_out` (`[..., 2I]`) and `grad_mid` (`[..., I]`)."""
+    gate, up = gu_out.chunk(2, dim=-1)
+    return _swiglu_backward_from_gate_up(gate, up, grad_mid)
+
+
+def _supports_grouped_mm(device: torch.device, dtype: torch.dtype) -> bool:
+    """Probe once per `(fn, device, dtype)` whether `torch._grouped_mm(a_2d, b_3d, offs)` works."""
+    gmm = getattr(torch, "_grouped_mm", None)
+    if gmm is None or not callable(gmm) or device.type == "meta":
+        return False
+    cache_key = (gmm, str(device), dtype)
+    cached = _GROUPED_MM_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    ok = False
+    try:
+        with torch.inference_mode(False), torch.no_grad():
+            a_p = torch.zeros((4, 16), device=device, dtype=dtype)
+            b_p = torch.zeros((2, 16, 16), device=device, dtype=dtype)
+            offs_p = torch.tensor([2, 4], device=device, dtype=torch.int32)
+            y1 = gmm(a_p, b_p, offs=offs_p)
+            y2 = gmm(a_p, b_p.transpose(1, 2), offs=offs_p)
+            ok = (
+                isinstance(y1, torch.Tensor)
+                and isinstance(y2, torch.Tensor)
+                and tuple(y1.shape) == (4, 16)
+                and tuple(y2.shape) == (4, 16)
+                and y1.dtype == dtype
+                and y2.dtype == dtype
+            )
+    except Exception:
+        ok = False
+    _GROUPED_MM_CACHE[cache_key] = ok
+    return ok
+
+
+def _should_use_padded_bmm(
+    chunk_spans: list[tuple[int, int, int]],
+    m_chunk: int,
+) -> tuple[bool, int]:
+    c_len = len(chunk_spans)
+    if c_len < _MOE_PADDED_BMM_MIN_EXPERTS or m_chunk <= 0:
+        return False, 0
+    max_cnt = max(cnt for _eid, _off, cnt in chunk_spans)
+    if max_cnt <= 0:
+        return False, 0
+    pad_rows = c_len * max_cnt
+    if pad_rows > _MOE_PADDED_BMM_MAX_ROWS:
+        return False, max_cnt
+    return (m_chunk >= _MOE_PADDED_BMM_MIN_FILL * pad_rows), max_cnt
+
+
+def _build_chunk_pad_positions(
+    chunk_spans: list[tuple[int, int, int]],
+    m_chunk: int,
+    max_cnt: int,
+    device: torch.device,
+) -> torch.Tensor:
+    counts: list[int] = []
+    shifts: list[int] = []
+    acc = 0
+    for g_idx, (_eid, _off, cnt) in enumerate(chunk_spans):
+        counts.append(cnt)
+        shifts.append(g_idx * max_cnt - acc)
+        acc += cnt
+    cnts_t = torch.tensor(counts, device=device, dtype=torch.long)
+    shift_t = torch.tensor(shifts, device=device, dtype=torch.long)
+    return torch.arange(m_chunk, device=device, dtype=torch.long) + torch.repeat_interleave(
+        shift_t,
+        cnts_t,
+        output_size=m_chunk,
+    )
+
+
+def _moe_chunk_forward_silu(
+    x_sub: torch.Tensor,
+    gu_chunk: torch.Tensor | list[torch.Tensor],
+    dn_chunk: torch.Tensor | list[torch.Tensor],
+    chunk_spans: list[tuple[int, int, int]],
+    c_start: int,
+    *,
+    need_y: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Compute `(gu_sub [M_c, 2I], y_sub [M_c, H] | None)` via `_grouped_mm`, padded `bmm`, or `linear`."""
+    is_3d = (
+        isinstance(gu_chunk, torch.Tensor)
+        and isinstance(dn_chunk, torch.Tensor)
+        and gu_chunk.ndim == 3
+        and dn_chunk.ndim == 3
+    )
+    if is_3d and _supports_grouped_mm(x_sub.device, x_sub.dtype) and int(x_sub.shape[0]) <= 2_147_483_647:
+        gmm = getattr(torch, "_grouped_mm", None)
+        if gmm is not None:
+            try:
+                assert isinstance(gu_chunk, torch.Tensor) and isinstance(dn_chunk, torch.Tensor)
+                gu_c = gu_chunk.to(device=x_sub.device, dtype=x_sub.dtype)
+                offs = torch.tensor(
+                    [off + cnt - c_start for _eid, off, cnt in chunk_spans],
+                    device=x_sub.device,
+                    dtype=torch.int32,
+                )
+                gu_sub = gmm(x_sub.contiguous(), gu_c.transpose(1, 2), offs=offs)
+                if not need_y:
+                    return gu_sub, None
+                dn_c = dn_chunk.to(device=x_sub.device, dtype=x_sub.dtype)
+                gate, up = gu_sub.chunk(2, dim=-1)
+                mid_sub = (F.silu(gate) * up).contiguous()
+                y_sub = gmm(mid_sub, dn_c.transpose(1, 2), offs=offs)
+                return gu_sub, y_sub
+            except (RuntimeError, NotImplementedError, TypeError, ValueError):
+                pass
+
+    if is_3d:
+        use_bmm, max_cnt = _should_use_padded_bmm(chunk_spans, int(x_sub.shape[0]))
+        if use_bmm:
+            assert isinstance(gu_chunk, torch.Tensor) and isinstance(dn_chunk, torch.Tensor)
+            c_len = len(chunk_spans)
+            m_chunk, h_dim = int(x_sub.shape[0]), int(x_sub.shape[1])
+            gu_c = gu_chunk.to(device=x_sub.device, dtype=x_sub.dtype)
+            two_i = int(gu_c.shape[1])
+            pad_pos = _build_chunk_pad_positions(chunk_spans, m_chunk, max_cnt, x_sub.device)
+            x_pad = x_sub.new_zeros((c_len * max_cnt, h_dim))
+            x_pad.index_copy_(0, pad_pos, x_sub)
+            gu_pad = torch.bmm(x_pad.view(c_len, max_cnt, h_dim), gu_c.transpose(1, 2))
+            gu_sub = gu_pad.reshape(c_len * max_cnt, two_i).index_select(0, pad_pos)
+            del x_pad, gu_pad
+            if not need_y:
+                return gu_sub, None
+            dn_c = dn_chunk.to(device=x_sub.device, dtype=x_sub.dtype)
+            gate, up = gu_sub.chunk(2, dim=-1)
+            mid_sub = F.silu(gate) * up
+            i_dim = int(mid_sub.shape[1])
+            mid_pad = mid_sub.new_zeros((c_len * max_cnt, i_dim))
+            mid_pad.index_copy_(0, pad_pos, mid_sub)
+            y_pad = torch.bmm(mid_pad.view(c_len, max_cnt, i_dim), dn_c.transpose(1, 2))
+            y_sub = y_pad.reshape(c_len * max_cnt, h_dim).index_select(0, pad_pos)
+            del mid_sub, mid_pad, y_pad
+            return gu_sub, y_sub
+
+    gu_parts: list[torch.Tensor] = []
+    for local_i, (_eid, off, cnt) in enumerate(chunk_spans):
+        rel = off - c_start
+        gu_e = gu_chunk[local_i].to(device=x_sub.device, dtype=x_sub.dtype)
+        gu_parts.append(F.linear(x_sub[rel : rel + cnt], gu_e))
+    gu_sub = gu_parts[0] if len(gu_parts) == 1 else torch.cat(gu_parts, dim=0)
+    del gu_parts
+    if not need_y:
+        return gu_sub, None
+    gate, up = gu_sub.chunk(2, dim=-1)
+    mid_sub = F.silu(gate) * up
+    y_parts: list[torch.Tensor] = []
+    for local_i, (_eid, off, cnt) in enumerate(chunk_spans):
+        rel = off - c_start
+        dn_e = dn_chunk[local_i].to(device=x_sub.device, dtype=x_sub.dtype)
+        y_parts.append(F.linear(mid_sub[rel : rel + cnt], dn_e))
+    y_sub = y_parts[0] if len(y_parts) == 1 else torch.cat(y_parts, dim=0)
+    del mid_sub, y_parts
+    return gu_sub, y_sub
+
+
+def _moe_chunk_backward_dx(
+    gu_sub: torch.Tensor,
+    grad_y_sub: torch.Tensor,
+    gu_chunk: torch.Tensor | list[torch.Tensor],
+    dn_chunk: torch.Tensor | list[torch.Tensor],
+    chunk_spans: list[tuple[int, int, int]],
+    c_start: int,
+) -> torch.Tensor:
+    """Analytic chunk backward `dL/dx_sub` via `_grouped_mm`, padded `bmm`, or per-expert `matmul`."""
+    is_3d = (
+        isinstance(gu_chunk, torch.Tensor)
+        and isinstance(dn_chunk, torch.Tensor)
+        and gu_chunk.ndim == 3
+        and dn_chunk.ndim == 3
+    )
+    if (
+        is_3d
+        and _supports_grouped_mm(grad_y_sub.device, grad_y_sub.dtype)
+        and int(grad_y_sub.shape[0]) <= 2_147_483_647
+    ):
+        gmm = getattr(torch, "_grouped_mm", None)
+        if gmm is not None:
+            try:
+                assert isinstance(gu_chunk, torch.Tensor) and isinstance(dn_chunk, torch.Tensor)
+                gu_c = gu_chunk.to(device=grad_y_sub.device, dtype=grad_y_sub.dtype)
+                dn_c = dn_chunk.to(device=grad_y_sub.device, dtype=grad_y_sub.dtype)
+                offs = torch.tensor(
+                    [off + cnt - c_start for _eid, off, cnt in chunk_spans],
+                    device=grad_y_sub.device,
+                    dtype=torch.int32,
+                )
+                grad_mid_sub = gmm(grad_y_sub.contiguous(), dn_c, offs=offs)
+                grad_gu_sub = _swiglu_backward_analytic(gu_sub, grad_mid_sub)
+                grad_x_sub = gmm(grad_gu_sub.contiguous(), gu_c, offs=offs)
+                return grad_x_sub
+            except (RuntimeError, NotImplementedError, TypeError, ValueError):
+                pass
+
+    if is_3d:
+        use_bmm, max_cnt = _should_use_padded_bmm(chunk_spans, int(grad_y_sub.shape[0]))
+        if use_bmm:
+            assert isinstance(gu_chunk, torch.Tensor) and isinstance(dn_chunk, torch.Tensor)
+            c_len = len(chunk_spans)
+            m_chunk, h_dim = int(grad_y_sub.shape[0]), int(grad_y_sub.shape[1])
+            gu_c = gu_chunk.to(device=grad_y_sub.device, dtype=grad_y_sub.dtype)
+            dn_c = dn_chunk.to(device=grad_y_sub.device, dtype=grad_y_sub.dtype)
+            i_dim = int(dn_c.shape[2])
+            pad_pos = _build_chunk_pad_positions(chunk_spans, m_chunk, max_cnt, grad_y_sub.device)
+            gy_pad = grad_y_sub.new_zeros((c_len * max_cnt, h_dim))
+            gy_pad.index_copy_(0, pad_pos, grad_y_sub)
+            gm_pad = torch.bmm(gy_pad.view(c_len, max_cnt, h_dim), dn_c)
+            grad_mid_sub = gm_pad.reshape(c_len * max_cnt, i_dim).index_select(0, pad_pos)
+            del gy_pad, gm_pad
+            grad_gu_sub = _swiglu_backward_analytic(gu_sub, grad_mid_sub)
+            del grad_mid_sub
+            two_i = int(grad_gu_sub.shape[1])
+            ggu_pad = grad_gu_sub.new_zeros((c_len * max_cnt, two_i))
+            ggu_pad.index_copy_(0, pad_pos, grad_gu_sub)
+            del grad_gu_sub
+            gx_pad = torch.bmm(ggu_pad.view(c_len, max_cnt, two_i), gu_c)
+            grad_x_sub = gx_pad.reshape(c_len * max_cnt, h_dim).index_select(0, pad_pos)
+            del ggu_pad, gx_pad
+            return grad_x_sub
+
+    gm_parts: list[torch.Tensor] = []
+    for local_i, (_eid, off, cnt) in enumerate(chunk_spans):
+        rel = off - c_start
+        dn_e = dn_chunk[local_i].to(device=grad_y_sub.device, dtype=grad_y_sub.dtype)
+        gm_parts.append(torch.matmul(grad_y_sub[rel : rel + cnt], dn_e))
+    grad_mid_sub = gm_parts[0] if len(gm_parts) == 1 else torch.cat(gm_parts, dim=0)
+    del gm_parts
+    grad_gu_sub = _swiglu_backward_analytic(gu_sub, grad_mid_sub)
+    del grad_mid_sub
+    gx_parts: list[torch.Tensor] = []
+    for local_i, (_eid, off, cnt) in enumerate(chunk_spans):
+        rel = off - c_start
+        gu_e = gu_chunk[local_i].to(device=grad_y_sub.device, dtype=grad_y_sub.dtype)
+        gx_parts.append(torch.matmul(grad_gu_sub[rel : rel + cnt], gu_e))
+    grad_x_sub = gx_parts[0] if len(gx_parts) == 1 else torch.cat(gx_parts, dim=0)
+    del grad_gu_sub, gx_parts
+    return grad_x_sub
+
+
 class _QuantSwiGLUExpertFn(torch.autograd.Function):
-    """Single-expert transient SwiGLU autograd (saves neither dequantized W nor `[M_e, 2I]` mid-activations)."""
+    """Single-expert transient SwiGLU autograd (analytic backward; saves neither W nor `[M_e, 2I]` mid)."""
 
     @staticmethod
     def forward(  # type: ignore[override]
@@ -1281,11 +1628,14 @@ class _QuantSwiGLUExpertFn(torch.autograd.Function):
         ctx.experts_mod = experts_mod
         ctx.expert_idx = int(expert_idx)
         gu_e, dn_e = _dequant_single_expert(experts_mod, int(expert_idx), dtype=x_e.dtype)
+        gu_e = gu_e.to(device=x_e.device, dtype=x_e.dtype)
+        dn_e = dn_e.to(device=x_e.device, dtype=x_e.dtype)
         gate, up = F.linear(x_e, gu_e).chunk(2, dim=-1)
         act_fn = getattr(experts_mod, "act_fn", None) or F.silu
-        y_e = F.linear(act_fn(gate) * up, dn_e)
-        out_e = y_e * w_e.unsqueeze(-1).to(y_e.dtype)
-        del gu_e, dn_e, gate, up, y_e
+        mid = (F.silu(gate) * up) if _is_standard_silu(act_fn) else (act_fn(gate) * up)
+        y_e = F.linear(mid, dn_e)
+        out_e = y_e * w_e.unsqueeze(-1).to(device=y_e.device, dtype=y_e.dtype)
+        del gu_e, dn_e, gate, up, mid, y_e
         return out_e
 
     @staticmethod
@@ -1297,25 +1647,54 @@ class _QuantSwiGLUExpertFn(torch.autograd.Function):
             return None, None, None, None
 
         gu_e, dn_e = _dequant_single_expert(ctx.experts_mod, ctx.expert_idx, dtype=x_e_saved.dtype)
+        gu_e = gu_e.to(device=x_e_saved.device, dtype=x_e_saved.dtype)
+        dn_e = dn_e.to(device=x_e_saved.device, dtype=x_e_saved.dtype)
         act_fn = getattr(ctx.experts_mod, "act_fn", None) or F.silu
-        grad_xe: torch.Tensor | None = None
+        acc_dt = (
+            torch.float64
+            if torch.float64 in (x_e_saved.dtype, w_e_saved.dtype)
+            else torch.float32
+        )
+
+        if _is_standard_silu(act_fn):
+            gate, up = F.linear(x_e_saved, gu_e).chunk(2, dim=-1)
+            grad_we: torch.Tensor | None = None
+            if need_w:
+                y_det = F.linear(F.silu(gate) * up, dn_e)
+                grad_we = (grad_out_e.to(acc_dt) * y_det.to(acc_dt)).sum(dim=-1).to(w_e_saved.dtype)
+                del y_det
+            grad_xe: torch.Tensor | None = None
+            if need_x:
+                grad_y = grad_out_e.to(device=x_e_saved.device, dtype=x_e_saved.dtype) * w_e_saved.unsqueeze(-1).to(
+                    device=x_e_saved.device,
+                    dtype=x_e_saved.dtype,
+                )
+                grad_mid = torch.matmul(grad_y, dn_e)
+                grad_gu = _swiglu_backward_from_gate_up(gate, up, grad_mid)
+                grad_xe = torch.matmul(grad_gu, gu_e).to(x_e_saved.dtype)
+                del grad_y, grad_mid, grad_gu
+            del gu_e, dn_e, gate, up
+            return grad_xe, grad_we, None, None
+
+        # Clean fallback solely for exotic non-SiLU custom activation callables
+        grad_xe_fb: torch.Tensor | None = None
         if need_x:
             with torch.enable_grad():
                 xe = x_e_saved.detach().requires_grad_(True)
                 gate, up = F.linear(xe, gu_e).chunk(2, dim=-1)
                 y_e = F.linear(act_fn(gate) * up, dn_e)
                 grad_y = grad_out_e.to(y_e.dtype) * w_e_saved.unsqueeze(-1).to(y_e.dtype)
-                grad_xe = torch.autograd.grad(y_e, xe, grad_y, retain_graph=False)[0].to(x_e_saved.dtype)
+                grad_xe_fb = torch.autograd.grad(y_e, xe, grad_y, retain_graph=False)[0].to(x_e_saved.dtype)
                 y_det = y_e.detach()
         else:
             gate, up = F.linear(x_e_saved, gu_e).chunk(2, dim=-1)
             y_det = F.linear(act_fn(gate) * up, dn_e)
 
-        grad_we: torch.Tensor | None = None
+        grad_we_fb: torch.Tensor | None = None
         if need_w:
-            grad_we = (grad_out_e.float() * y_det.float()).sum(dim=-1).to(w_e_saved.dtype)
+            grad_we_fb = (grad_out_e.to(acc_dt) * y_det.to(acc_dt)).sum(dim=-1).to(w_e_saved.dtype)
         del gu_e, dn_e, gate, up, y_det
-        return grad_xe, grad_we, None, None
+        return grad_xe_fb, grad_we_fb, None, None
 
 
 def _build_moe_dispatch_plan(
@@ -1349,31 +1728,59 @@ def _build_moe_dispatch_plan(
     return perm_valid, tok_valid, slot_valid, active_spans
 
 
-def _moe_routed_forward_chunked(
+def _moe_routed_forward_impl(
     flat_hidden: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
     experts_mod: nn.Module,
     *,
-    chunk_experts: int = _MOE_CHUNK_EXPERTS,
+    chunk_experts: int | None = None,
     nvfp4_mode_override: str | None = None,
-) -> torch.Tensor:
+    capture_recompute_cache: bool = False,
+) -> tuple[torch.Tensor, tuple[Any, ...] | None]:
     out = torch.zeros_like(flat_hidden)
     if flat_hidden.numel() == 0 or top_k_index.numel() == 0:
-        return out
+        return out, None
 
     n_exp = _num_experts_of(experts_mod)
-    _, tok_valid, slot_valid, active_spans = _build_moe_dispatch_plan(top_k_index, n_exp)
-    if not active_spans:
-        return out
-
+    perm_valid, tok_valid, slot_valid, active_spans = _build_moe_dispatch_plan(top_k_index, n_exp)
     act_fn = getattr(experts_mod, "act_fn", None) or F.silu
-    x_sorted = flat_hidden.index_select(0, tok_valid)
-    w_sorted = top_k_weights[tok_valid, slot_valid]
-    c_step = max(1, int(chunk_experts))
+    is_std_silu = _is_standard_silu(act_fn)
+    do_cache = bool(capture_recompute_cache and is_std_silu)
+
+    if not active_spans:
+        if do_cache:
+            empty_x = flat_hidden[:0].detach()
+            empty_w = top_k_weights.reshape(-1)[:0].detach()
+            return out, (
+                empty_x,
+                empty_x,
+                empty_x,
+                perm_valid.detach(),
+                tok_valid.detach(),
+                empty_w,
+                [],
+            )
+        return out, None
+
+    tok_valid_dev = tok_valid.to(device=flat_hidden.device)
+    x_sorted = flat_hidden.index_select(0, tok_valid_dev)
+    w_sorted = top_k_weights[tok_valid, slot_valid].to(device=flat_hidden.device)
+    c_step = max(1, int(_MOE_CHUNK_EXPERTS if chunk_experts is None else chunk_experts))
+
+    total_routed = int(x_sorted.shape[0])
+    h_dim = int(flat_hidden.shape[1])
+    gu_all: torch.Tensor | None = None
+    y_all: torch.Tensor | None = (
+        torch.empty((total_routed, h_dim), dtype=flat_hidden.dtype, device=flat_hidden.device)
+        if do_cache
+        else None
+    )
 
     for c0 in range(0, len(active_spans), c_step):
         chunk_spans = active_spans[c0 : c0 + c_step]
+        c_start = chunk_spans[0][1]
+        c_end = chunk_spans[-1][1] + chunk_spans[-1][2]
         chunk_eids = [eid for eid, _, _ in chunk_spans]
         gu_chunk, dn_chunk = _dequant_experts_chunk(
             experts_mod,
@@ -1381,22 +1788,90 @@ def _moe_routed_forward_chunked(
             dtype=flat_hidden.dtype,
             nvfp4_mode_override=nvfp4_mode_override,
         )
-        for local_i, (_eid, off, cnt) in enumerate(chunk_spans):
-            x_e = x_sorted[off : off + cnt]
-            w_e = w_sorted[off : off + cnt]
-            gu_e = gu_chunk[local_i].to(device=x_e.device, dtype=x_e.dtype)
-            dn_e = dn_chunk[local_i].to(device=x_e.device, dtype=x_e.dtype)
-            gate, up = F.linear(x_e, gu_e).chunk(2, dim=-1)
-            y_e = F.linear(act_fn(gate) * up, dn_e)
-            contrib = y_e * w_e.unsqueeze(-1).to(y_e.dtype)
-            out.index_add_(0, tok_valid[off : off + cnt], contrib)
-            del gate, up, y_e, contrib
+
+        if is_std_silu:
+            x_sub = x_sorted[c_start:c_end]
+            w_sub = w_sorted[c_start:c_end]
+            gu_sub, y_sub = _moe_chunk_forward_silu(
+                x_sub,
+                gu_chunk,
+                dn_chunk,
+                chunk_spans,
+                c_start,
+                need_y=True,
+            )
+            assert y_sub is not None
+            if do_cache:
+                if gu_all is None:
+                    gu_all = torch.empty(
+                        (total_routed, int(gu_sub.shape[1])),
+                        dtype=flat_hidden.dtype,
+                        device=flat_hidden.device,
+                    )
+                gu_all[c_start:c_end] = gu_sub
+                assert y_all is not None
+                y_all[c_start:c_end] = y_sub
+            contrib = (y_sub * w_sub.unsqueeze(-1).to(y_sub.dtype)).contiguous()
+            out.index_add_(0, tok_valid_dev[c_start:c_end], contrib)
+            del gu_sub, y_sub, contrib
+        else:
+            for local_i, (_eid, off, cnt) in enumerate(chunk_spans):
+                x_e = x_sorted[off : off + cnt]
+                w_e = w_sorted[off : off + cnt]
+                gu_e = gu_chunk[local_i].to(device=x_e.device, dtype=x_e.dtype)
+                dn_e = dn_chunk[local_i].to(device=x_e.device, dtype=x_e.dtype)
+                gate, up = F.linear(x_e, gu_e).chunk(2, dim=-1)
+                y_e = F.linear(act_fn(gate) * up, dn_e)
+                contrib = y_e * w_e.unsqueeze(-1).to(y_e.dtype)
+                out.index_add_(0, tok_valid_dev[off : off + cnt], contrib)
+                del gate, up, y_e, contrib
         del gu_chunk, dn_chunk
+
+    if do_cache and gu_all is not None and y_all is not None:
+        cache = (
+            x_sorted.detach(),
+            gu_all.detach(),
+            y_all.detach(),
+            perm_valid.detach(),
+            tok_valid_dev.detach(),
+            w_sorted.detach(),
+            active_spans,
+        )
+        return out, cache
+    return out, None
+
+
+def _moe_routed_forward_chunked(
+    flat_hidden: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    experts_mod: nn.Module,
+    *,
+    chunk_experts: int | None = None,
+    nvfp4_mode_override: str | None = None,
+) -> torch.Tensor:
+    out, _ = _moe_routed_forward_impl(
+        flat_hidden,
+        top_k_index,
+        top_k_weights,
+        experts_mod,
+        chunk_experts=chunk_experts,
+        nvfp4_mode_override=nvfp4_mode_override,
+        capture_recompute_cache=False,
+    )
     return out
 
 
 class _QuantMoERoutedAutogradFn(torch.autograd.Function):
-    """Single-sync sorted + chunked-3D active-expert MoE autograd (`0` `.item()` / `.nonzero()` loops)."""
+    """Single-sync sorted + chunked-3D active-expert MoE autograd (`_grouped_mm` + analytic SwiGLU).
+
+    When invoked during single-layer checkpoint backward recomputation (`_in_backward() == True`),
+    caches `(x_sorted, gu_all, y_all, perm_valid, tok_valid, w_sorted, active_spans)` on a 0-byte
+    saved-tensor carrier + `ctx` so the immediately-following `.backward()` skips BOTH the second
+    `_build_moe_dispatch_plan` host sync AND all forward GEMMs (`gu_all`, `y_all`), freeing the
+    cache as soon as that single layer's backward completes. Outside backward recomputation
+    (`_in_backward() == False`), saves zero extra activation memory across layers.
+    """
 
     @staticmethod
     def forward(  # type: ignore[override]
@@ -1406,16 +1881,38 @@ class _QuantMoERoutedAutogradFn(torch.autograd.Function):
         top_k_weights: torch.Tensor,
         experts_mod: nn.Module,
     ) -> torch.Tensor:
-        ctx.save_for_backward(flat_hidden.detach(), top_k_index.detach(), top_k_weights.detach())
         ctx.experts_mod = experts_mod
-        return _moe_routed_forward_chunked(flat_hidden, top_k_index, top_k_weights, experts_mod)
+        carrier = torch.empty((0,), dtype=torch.uint8)
+        in_bwd = _in_backward()
+        out, cache = _moe_routed_forward_impl(
+            flat_hidden,
+            top_k_index,
+            top_k_weights,
+            experts_mod,
+            capture_recompute_cache=in_bwd,
+        )
+        if cache is not None:
+            carrier._qloop_moe_recomp = cache  # type: ignore[attr-defined]
+            ctx._qloop_moe_recomp = cache
+        else:
+            ctx._qloop_moe_recomp = None
+        ctx.save_for_backward(flat_hidden.detach(), top_k_index.detach(), top_k_weights.detach(), carrier)
+        return out
 
     @staticmethod
     def backward(ctx: Any, grad_out: torch.Tensor) -> tuple[torch.Tensor | None, ...]:  # type: ignore[override]
-        flat_hidden, top_k_index, top_k_weights = ctx.saved_tensors
+        flat_hidden, top_k_index, top_k_weights, carrier = ctx.saved_tensors
+        recomp_cache = getattr(ctx, "_qloop_moe_recomp", None)
+        if recomp_cache is None:
+            recomp_cache = getattr(carrier, "_qloop_moe_recomp", None)
+        ctx._qloop_moe_recomp = None
+        if hasattr(carrier, "__dict__"):
+            carrier.__dict__.pop("_qloop_moe_recomp", None)
+
         need_h = bool(ctx.needs_input_grad[0])
         need_w = bool(ctx.needs_input_grad[2])
         if not (need_h or need_w):
+            del recomp_cache
             return None, None, None, None
 
         grad_h = torch.zeros_like(flat_hidden) if need_h else None
@@ -1425,22 +1922,127 @@ class _QuantMoERoutedAutogradFn(torch.autograd.Function):
             else None
         )
         if flat_hidden.numel() == 0 or top_k_index.numel() == 0:
+            del recomp_cache
             return grad_h, None, grad_w, None
 
         experts_mod = ctx.experts_mod
+        acc_dt = (
+            torch.float64
+            if torch.float64 in (flat_hidden.dtype, top_k_weights.dtype)
+            else torch.float32
+        )
+        c_step = max(1, int(_MOE_CHUNK_EXPERTS))
+
+        # Fast path A: inside single-layer checkpoint recomputation (`recomp_cache` populated in forward)
+        if recomp_cache is not None:
+            _x_sorted, gu_all, y_all, perm_valid, tok_valid_dev, w_sorted, active_spans = recomp_cache
+            del recomp_cache, _x_sorted
+            if not active_spans:
+                del gu_all, y_all
+                return grad_h, None, grad_w, None
+
+            go_sorted = grad_out.index_select(0, tok_valid_dev)
+            if grad_w is not None:
+                grad_w_sorted = (go_sorted.to(acc_dt) * y_all.to(acc_dt)).sum(dim=-1).to(
+                    device=top_k_weights.device,
+                    dtype=top_k_weights.dtype,
+                )
+                grad_w.view(-1).index_copy_(0, perm_valid.to(device=top_k_weights.device), grad_w_sorted)
+                del grad_w_sorted
+            del y_all
+
+            if need_h and grad_h is not None:
+                grad_y_all = go_sorted.to(dtype=flat_hidden.dtype) * w_sorted.unsqueeze(-1).to(dtype=flat_hidden.dtype)
+                for c0 in range(0, len(active_spans), c_step):
+                    chunk_spans = active_spans[c0 : c0 + c_step]
+                    c_start = chunk_spans[0][1]
+                    c_end = chunk_spans[-1][1] + chunk_spans[-1][2]
+                    chunk_eids = [eid for eid, _, _ in chunk_spans]
+                    gu_chunk, dn_chunk = _dequant_experts_chunk(experts_mod, chunk_eids, dtype=flat_hidden.dtype)
+                    grad_x_sub = _moe_chunk_backward_dx(
+                        gu_all[c_start:c_end],
+                        grad_y_all[c_start:c_end],
+                        gu_chunk,
+                        dn_chunk,
+                        chunk_spans,
+                        c_start,
+                    )
+                    grad_h.index_add_(
+                        0,
+                        tok_valid_dev[c_start:c_end],
+                        grad_x_sub.contiguous().to(dtype=flat_hidden.dtype),
+                    )
+                    del gu_chunk, dn_chunk, grad_x_sub
+                del grad_y_all
+            del gu_all, go_sorted
+            return grad_h, None, grad_w, None
+
+        # Fast path B: uncheckpointed backward (0 extra forward activation memory saved across layers)
         n_exp = _num_experts_of(experts_mod)
         perm_valid, tok_valid, slot_valid, active_spans = _build_moe_dispatch_plan(top_k_index, n_exp)
         if not active_spans:
             return grad_h, None, grad_w, None
 
         act_fn = getattr(experts_mod, "act_fn", None) or F.silu
-        x_sorted = flat_hidden.index_select(0, tok_valid)
-        w_sorted = top_k_weights[tok_valid, slot_valid]
-        go_sorted = grad_out.index_select(0, tok_valid)
+        tok_valid_dev = tok_valid.to(device=flat_hidden.device)
+        x_sorted = flat_hidden.index_select(0, tok_valid_dev)
+        w_sorted = top_k_weights[tok_valid, slot_valid].to(device=flat_hidden.device)
+        go_sorted = grad_out.index_select(0, tok_valid_dev)
         flat_grad_w = grad_w.view(-1) if grad_w is not None else None
+        perm_valid_w = perm_valid.to(device=top_k_weights.device) if flat_grad_w is not None else None
 
-        for c0 in range(0, len(active_spans), _MOE_CHUNK_EXPERTS):
-            chunk_spans = active_spans[c0 : c0 + _MOE_CHUNK_EXPERTS]
+        if _is_standard_silu(act_fn):
+            grad_y_all = (
+                go_sorted.to(dtype=flat_hidden.dtype) * w_sorted.unsqueeze(-1).to(dtype=flat_hidden.dtype)
+                if need_h
+                else None
+            )
+            for c0 in range(0, len(active_spans), c_step):
+                chunk_spans = active_spans[c0 : c0 + c_step]
+                c_start = chunk_spans[0][1]
+                c_end = chunk_spans[-1][1] + chunk_spans[-1][2]
+                chunk_eids = [eid for eid, _, _ in chunk_spans]
+                gu_chunk, dn_chunk = _dequant_experts_chunk(experts_mod, chunk_eids, dtype=flat_hidden.dtype)
+                gu_sub, y_sub = _moe_chunk_forward_silu(
+                    x_sorted[c_start:c_end],
+                    gu_chunk,
+                    dn_chunk,
+                    chunk_spans,
+                    c_start,
+                    need_y=(flat_grad_w is not None),
+                )
+                if flat_grad_w is not None and perm_valid_w is not None:
+                    assert y_sub is not None
+                    grad_w_sub = (go_sorted[c_start:c_end].to(acc_dt) * y_sub.to(acc_dt)).sum(dim=-1).to(
+                        device=top_k_weights.device,
+                        dtype=top_k_weights.dtype,
+                    )
+                    flat_grad_w.index_copy_(0, perm_valid_w[c_start:c_end], grad_w_sub)
+                    del grad_w_sub
+                del y_sub
+
+                if need_h and grad_h is not None and grad_y_all is not None:
+                    grad_x_sub = _moe_chunk_backward_dx(
+                        gu_sub,
+                        grad_y_all[c_start:c_end],
+                        gu_chunk,
+                        dn_chunk,
+                        chunk_spans,
+                        c_start,
+                    )
+                    grad_h.index_add_(
+                        0,
+                        tok_valid_dev[c_start:c_end],
+                        grad_x_sub.contiguous().to(dtype=flat_hidden.dtype),
+                    )
+                    del grad_x_sub
+                del gu_chunk, dn_chunk, gu_sub
+            del grad_y_all
+            return grad_h, None, grad_w, None
+
+        # Exotic custom `act_fn` fallback
+        for c0 in range(0, len(active_spans), c_step):
+            chunk_spans = active_spans[c0 : c0 + c_step]
             chunk_eids = [eid for eid, _, _ in chunk_spans]
             gu_chunk, dn_chunk = _dequant_experts_chunk(experts_mod, chunk_eids, dtype=flat_hidden.dtype)
             for local_i, (_eid, off, cnt) in enumerate(chunk_spans):
@@ -1458,14 +2060,17 @@ class _QuantMoERoutedAutogradFn(torch.autograd.Function):
                         grad_y = go_e.to(y_e.dtype) * w_saved.unsqueeze(-1).to(y_e.dtype)
                         grad_xe = torch.autograd.grad(y_e, xe, grad_y, retain_graph=False)[0].to(flat_hidden.dtype)
                         y_det = y_e.detach()
-                    grad_h.index_add_(0, tok_valid[off : off + cnt], grad_xe)
+                    grad_h.index_add_(0, tok_valid_dev[off : off + cnt], grad_xe)
                 else:
                     gate, up = F.linear(x_saved, gu_e).chunk(2, dim=-1)
                     y_det = F.linear(act_fn(gate) * up, dn_e)
 
-                if flat_grad_w is not None:
-                    grad_we = (go_e.float() * y_det.float()).sum(dim=-1).to(top_k_weights.dtype)
-                    flat_grad_w.index_copy_(0, perm_valid[off : off + cnt], grad_we)
+                if flat_grad_w is not None and perm_valid_w is not None:
+                    grad_we = (go_e.to(acc_dt) * y_det.to(acc_dt)).sum(dim=-1).to(
+                        device=top_k_weights.device,
+                        dtype=top_k_weights.dtype,
+                    )
+                    flat_grad_w.index_copy_(0, perm_valid_w[off : off + cnt], grad_we)
                 del gate, up, y_det
             del gu_chunk, dn_chunk
 

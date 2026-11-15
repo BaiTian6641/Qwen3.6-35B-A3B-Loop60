@@ -405,7 +405,7 @@ def _build_physical_backbone(config: Qwen36LoopHSSDConfig, dtype_override: torch
 
         known_toy = {f.name for f in fields(ToyConfig)}
         toy_kw = {k: v for k, v in bcfg.items() if k in known_toy}
-        if toy_kw.get("_attn_implementation") == "qloop_lsa":
+        if toy_kw.get("_attn_implementation") in ("qloop_lsa", "qloop_standalone_lsa"):
             toy_kw["_attn_implementation"] = "eager"
         tcfg = ToyConfig(**toy_kw)
         for extra_k in ("max_position_embeddings", "rope_scaling", "rope_parameters"):
@@ -424,7 +424,7 @@ def _build_physical_backbone(config: Qwen36LoopHSSDConfig, dtype_override: torch
     base_model_type = str(arch.get("base_model_type") or bcfg.get("model_type") or "qwen3_5_moe")
     clean_bcfg = {k: v for k, v in bcfg.items() if k != "model_type"}
     attn_impl = str(clean_bcfg.pop("_attn_implementation", "sdpa") or "sdpa")
-    if attn_impl == "qloop_lsa":
+    if attn_impl in ("qloop_lsa", "qloop_standalone_lsa"):
         attn_impl = "sdpa"
     hf_cfg = AutoConfig.for_model(base_model_type, **clean_bcfg)
     hf_cfg._attn_implementation = attn_impl
@@ -1024,8 +1024,9 @@ import os
 import struct
 import sys
 import types
+import weakref
 from collections import OrderedDict
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
@@ -2874,10 +2875,11 @@ else:
                 return True
             if st._s_chunk_start_bank.numel() > 0 and int(st._s_chunk_start_bank.untyped_storage().data_ptr()) == p_ptr:
                 return True
-        if st._s_seg_start_bank is not None and st._s_seg_start_bank.numel() > 0:
-            if int(st._s_seg_start_bank.untyped_storage().data_ptr()) == p_ptr:
-                return True
-        return False
+        return bool(
+            st._s_seg_start_bank is not None
+            and st._s_seg_start_bank.numel() > 0
+            and int(st._s_seg_start_bank.untyped_storage().data_ptr()) == p_ptr
+        )
 
     def _build_wy_unit_lower(
         k_eff: torch.Tensor,
@@ -3988,10 +3990,7 @@ else:
             wm_c = None if wm is None else wm[:, l0:l1]
 
             pre_sl = pre_chunk_map[c_i]
-            if pre_sl is not None:
-                o_far = o_far_pre[:, pre_sl[0] : pre_sl[1]]
-            else:
-                o_far = o_far_intra.pop(c_i)
+            o_far = o_far_pre[:, pre_sl[0] : pre_sl[1]] if pre_sl is not None else o_far_intra.pop(c_i)
 
             if o_loc_batched is not None and p_hit_batched is not None:
                 o_loc = o_loc_batched[:, c_i]
@@ -5150,52 +5149,199 @@ else:
         return out, final_st
 
     # ---------------------------------------------------------------- D-LSA
+    _LSA_FP8_DTYPES: tuple[torch.dtype, ...] = tuple(
+        getattr(torch, nm)
+        for nm in ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz")
+        if hasattr(torch, nm)
+    )
+
+    def _st_ensure_lsa_kv_dtype(
+        module: nn.Module,
+        t: torch.Tensor,
+        target_dt: torch.dtype,
+        *,
+        is_key: bool,
+    ) -> torch.Tensor:
+        if t.dtype in _LSA_FP8_DTYPES or not t.is_floating_point():
+            s_attr = "k_scale" if is_key else "v_scale"
+            kvc = getattr(module, "kv_cache", None)
+            sc = getattr(kvc, s_attr, None) if kvc is not None else None
+            if not isinstance(sc, torch.Tensor):
+                sc = getattr(module, s_attr, None)
+            if isinstance(sc, torch.Tensor):
+                sf = sc.to(device=t.device, dtype=torch.float32)
+                if sf.numel() == 1:
+                    sf = sf.reshape(())
+                elif sf.ndim == 1 and t.ndim == 4 and sf.shape[0] == t.shape[1]:
+                    sf = sf.view(1, -1, 1, 1)
+                else:
+                    while sf.ndim < t.ndim:
+                        sf = sf.unsqueeze(-1)
+                return (t.to(torch.float32) * sf).to(target_dt)
+            return t.to(target_dt)
+        return t
+
     def _ward_cluster(x: torch.Tensor, n_clusters: int, max_size: int) -> torch.Tensor:
         nrow, n, _ = x.shape
         dev = x.device
-        if n_clusters >= n or max_size < 2:
+        if n_clusters >= n or nrow == 0:
             return torch.arange(n, device=dev).expand(nrow, n).clone()
-        xf = _upcast(x).clone()
+        xf = _upcast(x)
         cent = xf.clone()
         size = torch.ones(nrow, n, device=dev, dtype=xf.dtype)
         active = torch.ones(nrow, n, device=dev, dtype=torch.bool)
         labels = torch.arange(n, device=dev).expand(nrow, n).clone()
+        if max_size < 2:
+            return labels
         inf = torch.finfo(xf.dtype).max
         dist = (0.5 * torch.cdist(xf, xf).pow(2)).masked_fill(torch.eye(n, device=dev, dtype=torch.bool), inf)
         rows = torch.arange(nrow, device=dev)
+        ar_n = torch.arange(n, device=dev)
+        z_sz = torch.zeros(nrow, device=dev, dtype=xf.dtype)
+        z_bool = torch.zeros(nrow, device=dev, dtype=torch.bool)
+        inf_row = torch.full((nrow, n), inf, device=dev, dtype=xf.dtype)
         for _ in range(n - n_clusters):
             best, idx = dist.view(nrow, -1).min(dim=-1)
             ok = best < inf
-            if not bool(ok.any()):
-                break
             i, j = idx // n, idx % n
-            a, b = torch.minimum(i, j)[ok], torch.maximum(i, j)[ok]
-            r = rows[ok]
-            na, nb = size[r, a], size[r, b]
-            cent[r, a] = (na[:, None] * cent[r, a] + nb[:, None] * cent[r, b]) / (na + nb)[:, None]
-            size[r, a], size[r, b], active[r, b] = na + nb, 0, False
-            labels[r] = torch.where(labels[r] == b[:, None], a[:, None], labels[r])
-            sa, sk = size[r, a][:, None], size[r]
-            d_new = (sa * sk / (sa + sk).clamp_min(1e-12)) * (cent[r] - cent[r, a][:, None]).pow(2).sum(-1)
-            bad = (~active[r]) | (sa + sk > max_size)
-            bad[torch.arange(len(r), device=dev), a] = True
+            a, b_idx = torch.minimum(i, j), torch.maximum(i, j)
+            na, nb_sz = size[rows, a], size[rows, b_idx]
+            denom = (na + nb_sz).clamp_min(1e-12)
+            m_cent = (na[:, None] * cent[rows, a] + nb_sz[:, None] * cent[rows, b_idx]) / denom[:, None]
+            cent[rows, a] = torch.where(ok[:, None], m_cent, cent[rows, a])
+            size[rows, a] = torch.where(ok, na + nb_sz, na)
+            size[rows, b_idx] = torch.where(ok, z_sz, size[rows, b_idx])
+            active[rows, b_idx] = torch.where(ok, z_bool, active[rows, b_idx])
+            labels = torch.where(ok[:, None] & (labels == b_idx[:, None]), a[:, None], labels)
+            sa = size[rows, a][:, None]
+            d_new = (sa * size / (sa + size).clamp_min(1e-12)) * (cent - cent[rows, a][:, None]).pow(2).sum(-1)
+            bad = (~active) | (sa + size > max_size) | (ar_n[None, :] == a[:, None])
             d_new = d_new.masked_fill(bad, inf)
-            dist[r, a, :], dist[r, :, a], dist[r, b, :], dist[r, :, b] = d_new, d_new, inf, inf
+            upd_a = torch.where(ok[:, None], d_new, dist[rows, a, :])
+            dist[rows, a, :] = upd_a
+            dist[rows, :, a] = upd_a
+            dist[rows, b_idx, :] = torch.where(ok[:, None], inf_row, dist[rows, b_idx, :])
+            dist[rows, :, b_idx] = torch.where(ok[:, None], inf_row, dist[rows, :, b_idx])
         return labels
 
     def _members_table(labels: torch.Tensor, max_members: int) -> torch.Tensor:
         nrow, n = labels.shape
         dev = labels.device
+        if nrow == 0 or max_members <= 0:
+            return torch.full((nrow, n, max(0, max_members)), -1, device=dev, dtype=torch.long)
         ar = torch.arange(n, device=dev)
         order = torch.argsort(labels * n + ar, dim=-1)
         slab = labels.gather(-1, order)
         cnts = torch.zeros(nrow, n, device=dev, dtype=torch.long).scatter_add_(1, labels, torch.ones_like(labels))
         offs = cnts.cumsum(-1) - cnts
         rank = ar.expand(nrow, n) - offs.gather(1, slab)
-        out = torch.full((nrow, n, max_members), -1, device=dev, dtype=torch.long)
+        out = torch.full((nrow, n, max_members + 1), -1, device=dev, dtype=torch.long)
         rr = torch.arange(nrow, device=dev)[:, None].expand(nrow, n)
-        out[rr, slab, rank] = order
-        return out
+        out[rr, slab, rank.clamp(min=0, max=max_members)] = order
+        return out[..., :max_members].contiguous()
+
+    def _st_pack_valid_members(
+        mem: torch.Tensor,
+        m_b: torch.Tensor,
+        *,
+        tk: int,
+        eff_cap: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        dev = mem.device
+        kb_n = mem.shape[-1]
+        if kb_n == 0 or eff_cap <= 0:
+            return None
+        if _is_compiling():
+            l_pack = min(kb_n, eff_cap)
+        else:
+            max_valid = int(m_b.sum(dim=-1).max().item())
+            if max_valid == 0:
+                return None
+            l_pack = min(max_valid, eff_cap, kb_n)
+        ar_kb = torch.arange(kb_n, device=dev, dtype=torch.long)
+        prio = torch.where(m_b, kb_n - ar_kb, torch.zeros_like(ar_kb))
+        if l_pack < kb_n:
+            top_prio, pack_idx = prio.topk(l_pack, dim=-1, largest=True, sorted=True)
+            mem_p = mem.gather(-1, pack_idx)
+            m_p = top_prio > 0
+        else:
+            mem_p = mem
+            m_p = m_b
+        sentinel = tk + torch.arange(mem_p.shape[-1], device=dev, dtype=torch.long)
+        key_sorted, _ = torch.where(m_p, mem_p, sentinel).sort(dim=-1)
+        is_dup = (
+            F.pad(key_sorted[..., 1:] == key_sorted[..., :-1], (1, 0), value=False)
+            if key_sorted.shape[-1] > 1
+            else torch.zeros_like(key_sorted, dtype=torch.bool)
+        )
+        m_final = (key_sorted < tk) & (~is_dup)
+        mem_final = torch.where(m_final, key_sorted, torch.zeros_like(key_sorted))
+        return mem_final, m_final
+
+    @torch.no_grad()
+    def _st_compute_lsa_recall(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        index: dict[str, Any],
+        sel_slots: torch.Tensor,
+        *,
+        top_k_keys: int,
+        window: int,
+        sinks: int,
+        qpos: torch.Tensor,
+    ) -> float:
+        b, hq, tq, dh = q.shape
+        g = k.shape[1]
+        hg = hq // g
+        dev = q.device
+        sc = dh ** -0.5
+        nb = max(1, int(index["n_blocks"]))
+        k2s_raw: torch.Tensor = index["key2slot"]
+        indexed_keys = int(k2s_raw.shape[-1])
+        bs = max(1, indexed_keys // nb)
+        frontier = ((qpos // bs) * bs).clamp(max=indexed_keys)
+        win_lo = qpos - int(window) + 1
+        hist_hi = torch.minimum(win_lo, frontier)
+        valid_q = hist_hi > int(sinks)
+        if not bool(valid_q.any()):
+            return 1.0
+        sel_h = (
+            sel_slots.unsqueeze(2).expand(b, g, hg, tq, sel_slots.shape[-1]).reshape(b, hq, tq, sel_slots.shape[-1])
+            if (sel_slots.shape[1] == g and g != hq)
+            else sel_slots
+        )
+        valid_q_idx = valid_q.nonzero(as_tuple=True)[0]
+        head_rec_sum = torch.zeros(hq, device=dev, dtype=torch.float64)
+        total_q_eval = 0
+        kf = _upcast(k[:, :, : int(hist_hi.max())])
+        max_hi = kf.shape[2]
+        kpos = torch.arange(max_hi, device=dev)
+        k2s_h = k2s_raw[:, :, :max_hi].unsqueeze(2).expand(b, g, hg, max_hi).reshape(b, hq, max_hi)
+        for c0 in range(0, int(valid_q_idx.numel()), 64):
+            qi = valid_q_idx[c0 : c0 + 64]
+            c_len = int(qi.numel())
+            hi_c = hist_hi[qi]
+            qc = _upcast(q[:, :, qi]).view(b, g, hg, c_len, dh)
+            scores = torch.einsum("bghcd,bgtd->bghct", qc, kf).reshape(b, hq, c_len, max_hi) * sc
+            hmask = (kpos[None, :] >= int(sinks)) & (kpos[None, :] < hi_c[:, None])
+            scores = scores.masked_fill(~hmask[None, None, :, :], float("-inf"))
+            n_hist_c = hmask.sum(dim=-1)
+            k_req = min(int(top_k_keys), int(n_hist_c.max()))
+            top_vals, top_k_idx = scores.topk(k_req, dim=-1)
+            valid_top = torch.isfinite(top_vals) & (
+                torch.arange(k_req, device=dev)[None, :] < n_hist_c[:, None]
+            )[None, None, :, :]
+            true_slots = k2s_h.unsqueeze(2).expand(b, hq, c_len, max_hi).gather(-1, top_k_idx)
+            chosen_c = sel_h[:, :, qi, :]
+            hit = (
+                (true_slots.unsqueeze(-1) == chosen_c.unsqueeze(-2)) & (chosen_c.unsqueeze(-2) >= 0)
+            ).any(dim=-1) & valid_top
+            denom = valid_top.sum(dim=-1).clamp_min(1).to(torch.float64)
+            rec_bc = hit.to(torch.float64).sum(dim=-1) / denom
+            head_rec_sum += rec_bc.sum(dim=(0, 2))
+            total_q_eval += b * c_len
+        per_head = (head_rec_sum / max(1, total_q_eval)).tolist()
+        return float(sum(per_head) / max(1, len(per_head)))
 
     class _StandalonePassQueryProj(nn.Module):
         def __init__(self, nh: int, din: int, idx_dim: int) -> None:
@@ -5206,7 +5352,15 @@ else:
             return torch.einsum("bhtd,hde->bhte", q_sl.to(self.weight.dtype), self.weight)
 
     class _StandaloneLSAIndexer(nn.Module):
-        def __init__(self, nh: int, nkv: int, hd: int, rot: int, lcfg: dict[str, Any]) -> None:
+        def __init__(
+            self,
+            nh: int,
+            nkv: int,
+            hd: int,
+            rot: int,
+            lcfg: dict[str, Any],
+            mgr_state: dict[str, Any] | None = None,
+        ) -> None:
             super().__init__()
             self.h, self.g, self.dh = int(nh), int(nkv), int(hd)
             self.hg = self.h // self.g
@@ -5215,27 +5369,62 @@ else:
             din = self.dh - self.lo
             idx_dim = int(lcfg.get("index_dim", 64))
             self.n_q = max(1, int(lcfg.get("num_query_passes", 1)))
+            self.per_head_select = bool(lcfg.get("per_head_select", False))
             self.mode = str(lcfg.get("mode", "dense"))
-            self.search = str(lcfg.get("search", "tree"))
+            self.search = str(lcfg.get("search", "flat"))
             self.block_size = int(lcfg.get("block_size", 512))
             self.pool = int(lcfg.get("pool", 4))
-            self.avg_bucket_keys = int(lcfg.get("avg_bucket_keys", 32))
-            self.max_bucket_keys = int(lcfg.get("max_bucket_keys", 64))
-            self.num_select = int(lcfg.get("num_select", 32))
-            self.sinks = int(lcfg.get("sinks", 16))
+            self.avg_bucket_keys = int(lcfg.get("avg_bucket_keys", 8))
+            self.max_bucket_keys = int(lcfg.get("max_bucket_keys", 32))
+            self.num_select = int(lcfg.get("num_select", 64))
+            self.sinks = int(lcfg.get("sinks", 64))
             win = lcfg.get("window")
             self.window = self.block_size if win is None else int(win)
-            self.query_chunk = int(lcfg.get("query_chunk", 128))
-            self.temperature = float(lcfg.get("temperature", 0.25))
+            self.query_chunk = int(lcfg.get("query_chunk", 256))
+            self.temperature = float(lcfg.get("temperature", 0.1))
             self.tree_group = int(lcfg.get("tree_group", 16))
-            self.tree_beam = int(lcfg.get("tree_beam", 4))
+            self.tree_beam = int(lcfg.get("tree_beam", 8))
+            self.compact_active_slots = bool(lcfg.get("compact_active_slots", True))
+            self.max_selected_keys = int(lcfg.get("max_selected_keys", 768))
+            self.recall_threshold = float(lcfg.get("recall_threshold", 0.70))
+            self.hybrid_sparse_every = int(lcfg.get("hybrid_sparse_every", 2))
+            self.hybrid_warmup_steps = int(lcfg.get("hybrid_warmup_steps", 0))
+            self.recall_check_every = int(lcfg.get("recall_check_every", 5))
             self.wk = nn.Parameter(torch.zeros(self.g, din, idx_dim))
-            self.wq = nn.Parameter(torch.zeros(self.h, din, idx_dim))
-            self.q_proj_extra = nn.ModuleList(
-                [_StandalonePassQueryProj(self.h, din, idx_dim) for _ in range(max(0, self.n_q - 1))]
-            )
+            if self.per_head_select:
+                self.wq = nn.Parameter(torch.zeros(self.n_q, self.h, din, idx_dim))
+                self.q_proj_extra = nn.ModuleList()
+            else:
+                self.wq = nn.Parameter(torch.zeros(self.h, din, idx_dim))
+                self.q_proj_extra = nn.ModuleList(
+                    [_StandalonePassQueryProj(self.h, din, idx_dim) for _ in range(max(0, self.n_q - 1))]
+                )
             self._current_pass = 1
             self._cache: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+            self._step = 0
+            self._last_recall_step = -1
+            self._recall_checks = 0
+            self.last_recall = 0.0
+            self.recall_ready = bool(self.recall_threshold <= 0.0)
+            object.__setattr__(self, "_mgr_state", mgr_state)
+            if isinstance(mgr_state, dict):
+                mgr_state.setdefault("indexers", []).append(weakref.ref(self))
+
+        def slots_per_block(self) -> int:
+            n = self.block_size // self.pool
+            if not self.compact_active_slots:
+                return n
+            n_clusters = max(1, self.block_size // self.avg_bucket_keys)
+            max_units = max(1, self.max_bucket_keys // self.pool)
+            m_cap = 1 if n <= max_units else 2 + (n - max_units - 1) // ((max_units // 2) + 1)
+            return min(n, max(n_clusters, m_cap))
+
+        def _eff_cap(self, s_slots: int, kk: int, kb_n: int, tk: int) -> int:
+            if self.max_selected_keys <= 0 or kk >= s_slots:
+                return kb_n
+            if self.num_select * self.avg_bucket_keys > self.max_selected_keys:
+                return min(kb_n, max(self.max_selected_keys, min(tk, self.num_select * self.avg_bucket_keys * 2)))
+            return min(kb_n, self.max_selected_keys)
 
         def set_current_pass(self, r: int) -> None:
             self._current_pass = 1 if int(r) <= 1 else min(int(r), self.n_q)
@@ -5243,11 +5432,17 @@ else:
         def query_latent(self, q: torch.Tensor, pass_idx: int | None = None) -> torch.Tensor:
             r = self._current_pass if pass_idx is None else max(1, min(int(pass_idx), self.n_q))
             q_sl = q[..., self.lo :]
-            if r <= 1 or self.n_q <= 1:
+            if self.wq.ndim == 4:
+                p_idx = min(max(r - 1, 0), self.wq.shape[0] - 1)
+                w_r = self.wq[p_idx]
+                z = torch.einsum("bhtd,hde->bhte", q_sl.to(w_r.dtype), w_r)
+            elif r <= 1 or self.n_q <= 1 or len(self.q_proj_extra) == 0:
                 z = torch.einsum("bhtd,hde->bhte", q_sl.to(self.wq.dtype), self.wq)
             else:
                 z = self.q_proj_extra[r - 2](q_sl)
             z = F.normalize(_upcast(z), dim=-1)
+            if self.per_head_select:
+                return z
             b, _, t, d = z.shape
             return z.view(b, self.g, self.hg, t, d).sum(2)
 
@@ -5255,57 +5450,258 @@ else:
             z = torch.einsum("bgtd,gde->bgte", k[..., self.lo :].to(self.wk.dtype), self.wk)
             return F.normalize(_upcast(z), dim=-1)
 
+        def _build_index(self, key: torch.Tensor) -> dict[str, Any] | None:
+            b, g, tk, _ = key.shape
+            bs, pool = self.block_size, self.pool
+            nb = tk // bs
+            if nb == 0:
+                return None
+            use_cache = not torch.is_grad_enabled()
+            ckey = (int(key.data_ptr()), tuple(key.shape), tuple(key.stride()), int(key._version), str(key.device))
+            if use_cache and ckey in self._cache:
+                ent = self._cache[ckey]
+                k_ref = ent.get("k_ref")
+                if callable(k_ref) and k_ref() is key:
+                    self._cache.move_to_end(ckey)
+                    return ent["index"]
+            n = bs // pool
+            spb = self.slots_per_block()
+            dev = key.device
+            with torch.no_grad():
+                zk = self.key_latent(key[:, :, : nb * bs]).view(b, g, nb, bs, -1)
+                d = zk.shape[-1]
+                units = F.normalize(zk.reshape(b, g, nb, n, pool, d).mean(4), dim=-1)
+                n_clusters = max(1, bs // self.avg_bucket_keys)
+                max_units = max(1, self.max_bucket_keys // pool)
+                labels = _ward_cluster(units.reshape(-1, n, d), n_clusters, max_units).view(b, g, nb, n)
+                umem_full = _members_table(labels.view(-1, n), max_units).view(b, g, nb, n, max_units)
+                cnts_full = torch.zeros_like(labels).scatter_add_(3, labels, torch.ones_like(labels))
+                if spb == n:
+                    slot_labels = labels
+                    slot_counts = cnts_full
+                    umem = umem_full
+                else:
+                    slot_counts, rep_u = cnts_full.topk(spb, dim=-1, largest=True, sorted=True)
+                    rep_map = torch.zeros_like(labels)
+                    ar_spb = torch.arange(spb, device=dev, dtype=labels.dtype).view(1, 1, 1, spb).expand_as(rep_u)
+                    rep_map.scatter_(3, rep_u, ar_spb)
+                    slot_labels = rep_map.gather(3, labels)
+                    umem = umem_full.gather(3, rep_u.unsqueeze(-1).expand(b, g, nb, spb, max_units))
+                    umem = torch.where((slot_counts > 0).unsqueeze(-1), umem, torch.full_like(umem, -1))
+                z_u = zk.view(b, g, nb, n, pool, d).sum(4)
+                idx_c = slot_labels.unsqueeze(-1).expand(b, g, nb, n, d)
+                cent_b = torch.zeros(b, g, nb, spb, d, device=dev, dtype=z_u.dtype).scatter_add(3, idx_c, z_u)
+                cent_b = F.normalize(cent_b, dim=-1) * (slot_counts > 0).unsqueeze(-1).to(cent_b.dtype)
+                s_total = nb * spb
+                cent = cent_b.reshape(b, g, s_total, d)
+                active = (slot_counts > 0).reshape(b, g, s_total)
+                upos = torch.arange(nb, device=dev).view(1, 1, nb, 1, 1) * bs + umem * pool
+                ks = upos.unsqueeze(-1) + torch.arange(pool, device=dev)
+                members = torch.where(umem.unsqueeze(-1) >= 0, ks, torch.full_like(ks, -1)).reshape(b, g, s_total, -1)
+                slot_end = ((torch.arange(s_total, device=dev) // spb) + 1) * bs
+                ar_k = torch.arange(nb * bs, device=dev)
+                key2slot = (ar_k // bs) * spb + slot_labels[:, :, ar_k // bs, (ar_k % bs) // pool]
+            index = {
+                "n_blocks": nb,
+                "spb": spb,
+                "centroids": cent,
+                "active": active,
+                "members": members,
+                "slot_end": slot_end,
+                "key2slot": key2slot,
+            }
+            if use_cache:
+                try:
+                    k_wref: Any = weakref.ref(key)
+                except TypeError:
+                    k_wref = None
+                if k_wref is not None:
+                    self._cache[ckey] = {"k_ref": k_wref, "index": index}
+                    while len(self._cache) > 4:
+                        self._cache.popitem(last=False)
+            return index
+
+        def slot_scores(self, qz: torch.Tensor, index: dict[str, Any], qpos: torch.Tensor) -> torch.Tensor:
+            b, q_heads, c, d = qz.shape
+            cent_raw: torch.Tensor = index["centroids"]
+            active: torch.Tensor = index["active"]
+            slot_end: torch.Tensor = index["slot_end"]
+            nb = int(index["n_blocks"])
+            spb = int(index["spb"])
+            s_total = cent_raw.shape[2]
+            frontier = (qpos // self.block_size) * self.block_size
+            elig = active[:, :, None, :] & (slot_end[None, None, None, :] <= frontier[None, None, :, None])
+            cent = cent_raw.to(qz.dtype)
+            per_head = self.per_head_select or (q_heads == self.h and self.h != self.g)
+            tg = self.tree_group
+            ng = -(-nb // tg)
+            use_tree = self.search == "tree" and ng > self.tree_beam
+
+            if use_tree:
+                bsum = (cent_raw.view(b, self.g, nb, spb, -1) * active.view(b, self.g, nb, spb, 1)).sum(3)
+                if ng * tg > nb:
+                    bsum = F.pad(bsum, (0, 0, 0, ng * tg - nb))
+                cs = bsum.view(b, self.g, ng, tg, -1).cumsum(3)
+                full = F.normalize(cs[:, :, :, -1], dim=-1)
+                fb = qpos // self.block_size
+                jq, rem = fb // tg, fb % tg
+                part = F.normalize(cs[:, :, jq.clamp(max=ng - 1), (rem - 1).clamp(min=0)], dim=-1)
+                jn = torch.arange(ng, device=qz.device)
+                is_p = jn[None, :] == jq[:, None]
+                v_sup = (jn[None, :] < jq[:, None]) | (is_p & (rem[:, None] > 0))
+
+            if per_head:
+                hg = q_heads // self.g
+                qz_g = qz.view(b, self.g, hg, c, d)
+                sc = torch.einsum("bghcd,bgsd->bghcs", qz_g, cent) / self.temperature
+                if use_tree:
+                    ss = torch.einsum("bghcd,bgnd->bghcn", qz_g, full.to(qz_g.dtype))
+                    sp = (qz_g * part.to(qz_g.dtype)[:, :, None, :, :]).sum(-1)
+                    ss = torch.where(is_p[None, None, None], sp.unsqueeze(-1), ss)
+                    top_s = ss.masked_fill(~v_sup[None, None, None], float("-inf")).topk(
+                        min(self.tree_beam, ng), dim=-1
+                    )
+                    ksup = torch.zeros(b, self.g, hg, c, ng, dtype=torch.bool, device=qz.device)
+                    ksup.scatter_(-1, top_s.indices, torch.isfinite(top_s.values))
+                    keep_s = ksup.repeat_interleave(tg * spb, dim=-1)[..., :s_total]
+                    sc = sc.masked_fill(~keep_s, float("-inf"))
+                return sc.masked_fill(~elig[:, :, None, :, :], float("-inf")).reshape(b, q_heads, c, s_total)
+
+            sc = torch.einsum("bgcd,bgsd->bgcs", qz, cent) / self.temperature
+            if use_tree:
+                ss = torch.einsum("bgcd,bgnd->bgcn", qz, full.to(qz.dtype))
+                sp = (qz * part.to(qz.dtype)).sum(-1)
+                ss = torch.where(is_p[None, None], sp.unsqueeze(-1), ss)
+                top_s = ss.masked_fill(~v_sup[None, None], float("-inf")).topk(min(self.tree_beam, ng), dim=-1)
+                ksup = torch.zeros(b, self.g, c, ng, dtype=torch.bool, device=qz.device)
+                ksup.scatter_(-1, top_s.indices, torch.isfinite(top_s.values))
+                keep_s = ksup.repeat_interleave(tg * spb, dim=-1)[..., :s_total]
+                sc = sc.masked_fill(~keep_s, float("-inf"))
+            return sc.masked_fill(~elig, float("-inf"))
+
+        def select_buckets(
+            self,
+            q: torch.Tensor,
+            index: dict[str, Any],
+            qpos: torch.Tensor,
+            pass_idx: int | None = None,
+        ) -> torch.Tensor:
+            qz = self.query_latent(q, pass_idx=pass_idx)
+            scores = self.slot_scores(qz, index, qpos)
+            kk = min(self.num_select, scores.shape[-1])
+            top = scores.topk(kk, dim=-1)
+            return torch.where(torch.isfinite(top.values), top.indices, torch.full_like(top.indices, -1))
+
+        def _update_recall_state(self, mean_rec: float) -> None:
+            self.last_recall = float(mean_rec)
+            self._last_recall_step = self._step
+            self._recall_checks += 1
+            if self.last_recall >= self.recall_threshold or self.recall_threshold <= 0.0:
+                self.recall_ready = True
+            mgr_state = getattr(self, "_mgr_state", None)
+            if isinstance(mgr_state, dict):
+                ix_list = [r() for r in mgr_state.get("indexers", ()) if callable(r)]
+                measured = [ix.last_recall for ix in ix_list if ix is not None and ix._recall_checks > 0]
+                if measured:
+                    avg_rec = float(sum(measured) / len(measured))
+                    mgr_state["last_recall"] = avg_rec
+                    if avg_rec >= self.recall_threshold or self.recall_threshold <= 0.0:
+                        mgr_state["recall_ready"] = True
+                        for ix in ix_list:
+                            if ix is not None:
+                                ix.recall_ready = True
+
+        def _resolve_hybrid_sparse(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            index: dict[str, Any] | None,
+        ) -> bool:
+            mgr_state = getattr(self, "_mgr_state", None)
+            step = int(mgr_state["step"]) if isinstance(mgr_state, dict) else int(self._step)
+            ready = bool(mgr_state["recall_ready"]) if isinstance(mgr_state, dict) else bool(self.recall_ready)
+            if self.recall_threshold <= 0.0:
+                ready = True
+                self.recall_ready = True
+                if isinstance(mgr_state, dict):
+                    mgr_state["recall_ready"] = True
+            tk = k.shape[2]
+            tq = q.shape[2]
+            win = self.window
+            if not ready and index is not None and tk > self.sinks + win and not _is_compiling():
+                check_every = max(1, int(self.recall_check_every))
+                due = (self._recall_checks == 0) or (
+                    step != self._last_recall_step and (step % check_every) == 0
+                )
+                if due:
+                    with torch.no_grad():
+                        qpos_all = torch.arange(tk - tq, tk, device=q.device)
+                        cand_r = torch.nonzero(qpos_all >= (self.sinks + win)).flatten()
+                        if cand_r.numel() > 0:
+                            take = min(16, int(cand_r.numel()))
+                            stride = max(1, int(cand_r.numel()) // take)
+                            sel_r = cand_r[::stride][:take]
+                            q_sub = q[:, :, sel_r].detach()
+                            qpos_sub = qpos_all[sel_r]
+                            chosen = self.select_buckets(
+                                q_sub, index, qpos=qpos_sub, pass_idx=self._current_pass
+                            )
+                            mean_rec = _st_compute_lsa_recall(
+                                q_sub,
+                                k.detach(),
+                                index,
+                                chosen,
+                                top_k_keys=64,
+                                window=win,
+                                sinks=self.sinks,
+                                qpos=qpos_sub,
+                            )
+                            self._update_recall_state(mean_rec)
+                            ready = (
+                                bool(mgr_state["recall_ready"])
+                                if isinstance(mgr_state, dict)
+                                else bool(self.recall_ready)
+                            )
+            if not ready and self.hybrid_warmup_steps > 0 and step >= self.hybrid_warmup_steps:
+                ready = True
+            if not ready or self.hybrid_sparse_every <= 0 or tk <= win:
+                return False
+            return (step % self.hybrid_sparse_every) == 0
+
         def sparse_attend(
             self,
             query: torch.Tensor,
             key: torch.Tensor,
             value: torch.Tensor,
             scaling: float,
+            *,
+            index: dict[str, Any] | None = None,
         ) -> torch.Tensor:
             b, h, tq, dh = query.shape
             g, tk = key.shape[1], key.shape[2]
-            bs, pool = self.block_size, self.pool
-            n = bs // pool
-            nb = tk // bs
+            hg = h // g
             dev = query.device
             qpos_all = torch.arange(tk - tq, tk, device=dev)
-            qz_all = self.query_latent(query)
-            qg = query.view(b, g, h // g, tq, dh)
-
-            cent = active = members = slot_end = None
-            if nb > 0:
-                zk = self.key_latent(key[:, :, : nb * bs]).view(b, g, nb, bs, -1)
-                units = F.normalize(zk.reshape(b, g, nb, n, pool, -1).mean(4), dim=-1)
-                labels = _ward_cluster(
-                    units.reshape(-1, n, units.shape[-1]),
-                    max(1, bs // self.avg_bucket_keys),
-                    self.max_bucket_keys // pool,
-                ).view(b, g, nb, n)
-                umem = _members_table(labels.view(-1, n), self.max_bucket_keys // pool).view(
-                    b, g, nb, n, self.max_bucket_keys // pool
-                )
-                z_u = zk.view(b, g, nb, n, pool, -1).sum(4)
-                cent = F.normalize(
-                    torch.zeros_like(z_u).scatter_add(3, labels.unsqueeze(-1).expand_as(z_u), z_u), dim=-1
-                ).reshape(b, g, nb * n, -1)
-                cnts = torch.zeros_like(labels).scatter_add_(3, labels, torch.ones_like(labels))
-                active = (cnts > 0).view(b, g, nb * n)
-                upos = torch.arange(nb, device=dev).view(1, 1, nb, 1, 1) * bs + umem * pool
-                ks = upos.unsqueeze(-1) + torch.arange(pool, device=dev)
-                members = torch.where(umem.unsqueeze(-1) >= 0, ks, torch.full_like(ks, -1)).view(b, g, nb * n, -1)
-                slot_end = ((torch.arange(nb * n, device=dev) // n) + 1) * bs
+            with torch.no_grad():
+                qz_all = self.query_latent(query.detach())
+            if index is None and tk // self.block_size > 0:
+                index = self._build_index(key)
+            qg = query.view(b, g, hg, tq, dh)
+            per_head = self.per_head_select or (qz_all.shape[1] == g * hg and hg > 1)
 
             outs = []
             w, ns = self.window, self.sinks
             for c0 in range(0, tq, self.query_chunk):
                 sl = slice(c0, min(tq, c0 + self.query_chunk))
                 qc, qzc, qpos = qg[:, :, :, sl], qz_all[:, :, sl], qpos_all[sl]
-                lo, hi = max(0, int(qpos[0]) - w + 1), int(qpos[-1]) + 1
+                c = qpos.shape[0]
+                lo = 0 if _is_compiling() else max(0, int(qpos[0]) - w + 1)
+                hi = tk if _is_compiling() else int(qpos[-1]) + 1
                 kw, vw = key[:, :, lo:hi], value[:, :, lo:hi]
                 kpos = torch.arange(lo, hi, device=dev)
                 win_lo = qpos - w + 1
                 m_win = (kpos[None] <= qpos[:, None]) & (kpos[None] >= win_lo[:, None])
-                ns_c = min(ns, int(qpos[-1]) + 1)
+                ns_c = min(ns, hi)
                 spos = torch.arange(ns_c, device=dev)
                 m_sink = (spos[None] < win_lo[:, None]) & (spos[None] <= qpos[:, None])
                 s_parts = [torch.einsum("bghcd,bgld->bghcl", qc, kw) * scaling]
@@ -5314,51 +5710,47 @@ else:
                     s_parts.append(torch.einsum("bghcd,bgld->bghcl", qc, key[:, :, :ns_c]) * scaling)
                     masks.append(m_sink[None, None, None])
                 kb = vb = None
-                if cent is not None and active is not None and members is not None and slot_end is not None:
-                    frontier = (qpos // bs) * bs
-                    elig = active[:, :, None, :] & (slot_end[None, None, None, :] <= frontier[None, None, :, None])
-                    sc = torch.einsum("bgcd,bgsd->bgcs", qzc, cent.to(qzc.dtype)) / self.temperature
-                    if self.search == "tree":
-                        tg = self.tree_group
-                        ng = -(-nb // tg)
-                        if ng > self.tree_beam:
-                            bsum = (cent.view(b, g, nb, n, -1) * active.view(b, g, nb, n, 1)).sum(3)
-                            if ng * tg > nb:
-                                bsum = F.pad(bsum, (0, 0, 0, ng * tg - nb))
-                            cs = bsum.view(b, g, ng, tg, -1).cumsum(3)
-                            full = F.normalize(cs[:, :, :, -1], dim=-1)
-                            fb = qpos // bs
-                            jq, rem = fb // tg, fb % tg
-                            ss = torch.einsum("bgcd,bgnd->bgcn", qzc, full.to(qzc.dtype))
-                            part = F.normalize(cs[:, :, jq.clamp(max=ng - 1), (rem - 1).clamp(min=0)], dim=-1)
-                            sp = (qzc * part.to(qzc.dtype)).sum(-1)
-                            jn = torch.arange(ng, device=dev)
-                            is_p = jn[None, :] == jq[:, None]
-                            ss = torch.where(is_p[None, None], sp.unsqueeze(-1), ss)
-                            v_sup = (jn[None, :] < jq[:, None]) | (is_p & (rem[:, None] > 0))
-                            top_s = ss.masked_fill(~v_sup[None, None], float("-inf")).topk(
-                                min(self.tree_beam, ng), dim=-1
-                            )
-                            ksup = torch.zeros(b, g, qzc.shape[2], ng, dtype=torch.bool, device=dev)
-                            ksup.scatter_(-1, top_s.indices, torch.isfinite(top_s.values))
-                            keep_s = ksup.repeat_interleave(tg * n, dim=-1)[..., : cent.shape[2]]
-                            sc = sc.masked_fill(~keep_s, float("-inf"))
-                    sc = sc.masked_fill(~elig, float("-inf"))
-                    top = sc.topk(min(self.num_select, sc.shape[-1]), dim=-1)
-                    mem = members.unsqueeze(2).expand(-1, -1, qzc.shape[2], -1, -1)
-                    mem = mem.gather(3, top.indices.unsqueeze(-1).expand(-1, -1, -1, -1, mem.shape[-1]))
-                    mem = torch.where(
-                        torch.isfinite(top.values).unsqueeze(-1), mem, torch.full_like(mem, -1)
-                    ).flatten(-2)
-                    m_b = (mem >= ns_c) & (mem < win_lo[None, None, :, None])
-                    kb_n = mem.shape[-1]
-                    gidx = mem.clamp_min(0).view(b, g, qzc.shape[2] * kb_n, 1).expand(-1, -1, -1, key.shape[-1])
-                    kb = key.gather(2, gidx).view(b, g, qzc.shape[2], kb_n, -1)
-                    vb = value.gather(2, gidx).view(b, g, qzc.shape[2], kb_n, -1)
-                    s_parts.append(torch.einsum("bghcd,bgckd->bghck", qc, kb) * scaling)
-                    masks.append(m_b[:, :, None])
+                if index is not None:
+                    with torch.no_grad():
+                        scores = self.slot_scores(qzc, index, qpos)
+                        s_slots = scores.shape[-1]
+                        kk = min(self.num_select, s_slots)
+                        top = scores.topk(kk, dim=-1)
+                        fin_top = torch.isfinite(top.values)
+                        members_tbl: torch.Tensor = index["members"]
+                        mk = members_tbl.shape[-1]
+                        kb_n = kk * mk
+                        eff_cap = self._eff_cap(s_slots, kk, kb_n, tk)
+                        if per_head:
+                            top_idx_g = top.indices.view(b, g, hg, c, kk)
+                            fin_g = fin_top.view(b, g, hg, c, kk)
+                            flat_sel = top_idx_g.reshape(b, g, hg * c * kk, 1).expand(b, g, hg * c * kk, mk)
+                            mem = members_tbl.gather(2, flat_sel).view(b, g, hg, c, kk, mk)
+                            mem = torch.where(fin_g.unsqueeze(-1), mem, torch.full_like(mem, -1)).flatten(-2)
+                            m_b = (mem >= ns_c) & (mem < win_lo[None, None, None, :, None])
+                        else:
+                            flat_sel = top.indices.reshape(b, g, c * kk, 1).expand(b, g, c * kk, mk)
+                            mem = members_tbl.gather(2, flat_sel).view(b, g, c, kk, mk)
+                            mem = torch.where(fin_top.unsqueeze(-1), mem, torch.full_like(mem, -1)).flatten(-2)
+                            m_b = (mem >= ns_c) & (mem < win_lo[None, None, :, None])
+                        packed = _st_pack_valid_members(mem, m_b, tk=tk, eff_cap=eff_cap)
+                    if packed is not None:
+                        mem_final, m_final = packed
+                        l_pack = mem_final.shape[-1]
+                        if per_head:
+                            gidx = mem_final.reshape(b, g, hg * c * l_pack, 1).expand(b, g, hg * c * l_pack, dh)
+                            kb = key.gather(2, gidx).view(b, g, hg, c, l_pack, dh)
+                            vb = value.gather(2, gidx).view(b, g, hg, c, l_pack, dh)
+                            s_parts.append(torch.einsum("bghcd,bghckd->bghck", qc, kb) * scaling)
+                            masks.append(m_final)
+                        else:
+                            gidx = mem_final.reshape(b, g, c * l_pack, 1).expand(b, g, c * l_pack, dh)
+                            kb = key.gather(2, gidx).view(b, g, c, l_pack, dh)
+                            vb = value.gather(2, gidx).view(b, g, c, l_pack, dh)
+                            s_parts.append(torch.einsum("bghcd,bgckd->bghck", qc, kb) * scaling)
+                            masks.append(m_final[:, :, None])
                 s_all = torch.cat([_upcast(sp).masked_fill(~mk, float("-inf")) for sp, mk in zip(s_parts, masks)], -1)
-                attn = torch.softmax(s_all, dim=-1).to(value.dtype)
+                attn = torch.nan_to_num(torch.softmax(s_all, dim=-1), nan=0.0).to(value.dtype)
                 parts = torch.split(attn, [sp.shape[-1] for sp in s_parts], dim=-1)
                 o_c = torch.einsum("bghcl,bgld->bghcd", parts[0], vw)
                 pi = 1
@@ -5366,7 +5758,10 @@ else:
                     o_c = o_c + torch.einsum("bghcl,bgld->bghcd", parts[1], value[:, :, :ns_c])
                     pi = 2
                 if kb is not None and vb is not None:
-                    o_c = o_c + torch.einsum("bghck,bgckd->bghcd", parts[pi], vb)
+                    if per_head:
+                        o_c = o_c + torch.einsum("bghck,bghckd->bghcd", parts[pi], vb)
+                    else:
+                        o_c = o_c + torch.einsum("bghck,bgckd->bghcd", parts[pi], vb)
                 outs.append(o_c)
             return torch.cat(outs, dim=3).reshape(b, h, tq, dh).transpose(1, 2).contiguous()
 
@@ -6447,7 +6842,7 @@ else:
             mtype = str(arch.get("base_model_type") or bcfg.pop("model_type", "qwen3_5_moe"))
             bcfg.pop("model_type", None)
             attn_impl = str(bcfg.pop("_attn_implementation", "sdpa") or "sdpa")
-            if attn_impl == "qloop_lsa":
+            if attn_impl in ("qloop_lsa", "qloop_standalone_lsa"):
                 attn_impl = "sdpa"
             hf_cfg = AutoConfig.for_model(mtype, **bcfg)
             hf_cfg._attn_implementation = attn_impl
@@ -6914,27 +7309,39 @@ else:
                 rope_p = getattr(hf_cfg, "rope_parameters", None) or {}
                 prf = getattr(hf_cfg, "partial_rotary_factor", None) or rope_p.get("partial_rotary_factor", 1.0)
                 rot = int(lcfg.get("rotary_dim") if lcfg.get("rotary_dim") is not None else int(hd * prf))
+                lsa_mgr_state: dict[str, Any] = {
+                    "step": 0,
+                    "last_recall": 0.0,
+                    "recall_ready": bool(float(lcfg.get("recall_threshold", 0.70)) <= 0.0),
+                    "indexers": [],
+                }
                 for i, layer in enumerate(tm.layers):
                     attn = getattr(layer, "self_attn", None)
                     if attn is None or (lcfg.get("layers") is not None and i not in lcfg["layers"]):
                         continue
                     attn.lsa_indexer = _StandaloneLSAIndexer(
-                        hf_cfg.num_attention_heads, hf_cfg.num_key_value_heads, hd, rot, lcfg
+                        hf_cfg.num_attention_heads,
+                        hf_cfg.num_key_value_heads,
+                        hd,
+                        rot,
+                        lcfg,
+                        mgr_state=lsa_mgr_state,
                     ).to(dtype=ref_dt)
 
-                if str(lcfg.get("mode", "dense")) == "sparse":
+                if str(lcfg.get("mode", "dense")) in ("sparse", "hybrid"):
                     self._install_standalone_lsa_dispatch(tm)
 
         def _install_standalone_lsa_dispatch(self, tm: nn.Module) -> None:
             tc = tm.config
             prev_impl = getattr(tc, "_attn_implementation", None) or "sdpa"
-            lsa_name = "qloop_lsa"
+            lsa_name = "qloop_standalone_lsa"
+            dense_skip = ("qloop_lsa", "qloop_standalone_lsa")
             layer0_attn = next((getattr(ly, "self_attn", None) for ly in tm.layers if hasattr(ly, "self_attn")), None)
             host_mod = sys.modules.get(type(layer0_attn).__module__) if layer0_attn is not None else None
             toy_table = getattr(host_mod, "TOY_ATTENTION_FUNCTIONS", None) if host_mod is not None else None
             if isinstance(toy_table, dict):
                 prior_toy = toy_table.get(lsa_name)
-                dense_key = prev_impl if (prev_impl != lsa_name and prev_impl in toy_table) else "eager"
+                dense_key = prev_impl if (prev_impl not in dense_skip and prev_impl in toy_table) else "eager"
                 dense_fn = toy_table.get(dense_key) or next(iter(toy_table.values()), None)
                 if callable(dense_fn):
 
@@ -6950,10 +7357,19 @@ else:
                         ix = getattr(module, "lsa_indexer", None)
                         if ix is not None and not isinstance(ix, _StandaloneLSAIndexer) and callable(prior_toy):
                             return prior_toy(module, q, k, v, attention_mask, scaling=scaling, **kw)
+                        k = _st_ensure_lsa_kv_dtype(module, k, q.dtype, is_key=True)
+                        v = _st_ensure_lsa_kv_dtype(module, v, q.dtype, is_key=False)
                         sc = (q.shape[-1] ** -0.5) if scaling is None else float(scaling)
-                        if not isinstance(ix, _StandaloneLSAIndexer) or ix.mode != "sparse" or k.shape[2] <= ix.window:
+                        if (
+                            not isinstance(ix, _StandaloneLSAIndexer)
+                            or ix.mode not in ("sparse", "hybrid")
+                            or k.shape[2] <= ix.window
+                        ):
                             return dense_fn(module, q, k, v, attention_mask, scaling=sc, **kw)
-                        return ix.sparse_attend(q, k, v, sc), None
+                        index = ix._build_index(k)
+                        if ix.mode == "hybrid" and not ix._resolve_hybrid_sparse(q, k, index):
+                            return dense_fn(module, q, k, v, attention_mask, scaling=sc, **kw)
+                        return ix.sparse_attend(q, k, v, sc, index=index), None
 
                     toy_table[lsa_name] = _lsa_fn
                     tc._attn_implementation = lsa_name
@@ -6964,7 +7380,7 @@ else:
                 prior_hf = ALL_ATTENTION_FUNCTIONS.get(lsa_name, None)
                 fb_key = (
                     prev_impl
-                    if (prev_impl != lsa_name and prev_impl in ALL_ATTENTION_FUNCTIONS)
+                    if (prev_impl not in dense_skip and prev_impl in ALL_ATTENTION_FUNCTIONS)
                     else ("sdpa" if "sdpa" in ALL_ATTENTION_FUNCTIONS else "eager")
                 )
                 if fb_key in ALL_ATTENTION_FUNCTIONS:
@@ -6982,12 +7398,29 @@ else:
                         ix = getattr(module, "lsa_indexer", None)
                         if ix is not None and not isinstance(ix, _StandaloneLSAIndexer) and callable(prior_hf):
                             return prior_hf(module, q, k, v, attention_mask, scaling=scaling, **kw)
+                        k = _st_ensure_lsa_kv_dtype(module, k, q.dtype, is_key=True)
+                        v = _st_ensure_lsa_kv_dtype(module, v, q.dtype, is_key=False)
                         sc = (q.shape[-1] ** -0.5) if scaling is None else float(scaling)
-                        if not isinstance(ix, _StandaloneLSAIndexer) or ix.mode != "sparse" or k.shape[2] <= ix.window:
+                        if (
+                            not isinstance(ix, _StandaloneLSAIndexer)
+                            or ix.mode not in ("sparse", "hybrid")
+                            or k.shape[2] <= ix.window
+                        ):
                             return dense_hf(module, q, k, v, attention_mask, scaling=sc, **kw)
-                        return ix.sparse_attend(q, k, v, sc), None
+                        index = ix._build_index(k)
+                        if ix.mode == "hybrid" and not ix._resolve_hybrid_sparse(q, k, index):
+                            return dense_hf(module, q, k, v, attention_mask, scaling=sc, **kw)
+                        return ix.sparse_attend(q, k, v, sc, index=index), None
 
                     ALL_ATTENTION_FUNCTIONS[lsa_name] = _hf_lsa
+                    try:
+                        from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
+
+                        m_key = prev_impl if prev_impl in ALL_MASK_ATTENTION_FUNCTIONS else fb_key
+                        if m_key in ALL_MASK_ATTENTION_FUNCTIONS:
+                            ALL_MASK_ATTENTION_FUNCTIONS[lsa_name] = ALL_MASK_ATTENTION_FUNCTIONS[m_key]
+                    except Exception:
+                        pass
                     tc._attn_implementation = lsa_name
                     for ly in tm.layers:
                         sa = getattr(getattr(ly, "inner", ly), "self_attn", None)

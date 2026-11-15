@@ -5,6 +5,7 @@ import ast
 import importlib.util
 import json
 import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -20,7 +21,11 @@ from qloop.export_pack import (
     load_whole_model_pack,
 )
 from qloop.infer import CONFIG_FILENAME, MODELING_FILENAME
-from qloop.infer.hf_custom_modeling import load_safetensors_file, save_safetensors_file
+from qloop.infer.hf_custom_modeling import (
+    load_safetensors_file,
+    save_safetensors_file,
+    write_standalone_hf_modeling_files,
+)
 from qloop.model.experts import attach_hot_expert_deltas
 from qloop.model.hssd import HSSDConfig, apply_hssd
 from qloop.model.introspect import inspect_model
@@ -397,3 +402,235 @@ def test_v32_export_pack_mid_warmup_blend_preserved_in_live_and_standalone(
         sa_out = loaded_sa(prompt, use_cache=False).logits
         assert (live_out - logits_b035).abs().max().item() < 1e-5
         assert (sa_out - logits_b035).abs().max().item() < 1e-5
+
+
+def test_write_standalone_hf_modeling_files_passes_ruff_and_py39_ast(tmp_path: Path) -> None:
+    emitted = write_standalone_hf_modeling_files(tmp_path)
+    assert set(emitted.keys()) == {CONFIG_FILENAME, MODELING_FILENAME}
+    for fname, fpath in emitted.items():
+        src = Path(fpath).read_text(encoding="utf-8")
+        ast.parse(src, filename=fname, feature_version=(3, 9))
+
+    ruff_bin = str(Path(sys.executable).with_name("ruff"))
+    if not Path(ruff_bin).is_file():
+        found_ruff = shutil.which("ruff")
+        assert found_ruff is not None, "ruff binary not found in venv or PATH"
+        ruff_bin = found_ruff
+
+    proc = subprocess.run([ruff_bin, "check", str(tmp_path)], capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, f"ruff check failed on emitted standalone files:\n{proc.stdout}\n{proc.stderr}"
+
+
+def _clone_pack_with_lsa_overrides(
+    src_pack: Path,
+    dst_pack: Path,
+    lsa_updates: dict[str, Any],
+    *,
+    convert_wq_4d: bool = False,
+    seed: int = 901,
+) -> None:
+    shutil.copytree(src_pack, dst_pack)
+    cfg_path = dst_pack / "config.json"
+    cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    lsa_cfg = cfg_data["qloop_v3_arch"]["lsa"]
+    lsa_cfg.update(lsa_updates)
+    cfg_path.write_text(json.dumps(cfg_data, indent=2), encoding="utf-8")
+
+    if not convert_wq_4d:
+        return
+
+    gen = torch.Generator().manual_seed(seed)
+    n_q = max(1, int(lsa_cfg.get("num_query_passes", 2)))
+    idx_path = dst_pack / SAFETENSORS_INDEX_FILE
+    idx_data = json.loads(idx_path.read_text(encoding="utf-8"))
+    wmap: dict[str, str] = idx_data["weight_map"]
+    shard_tensors: dict[str, dict[str, torch.Tensor]] = {}
+    for sfile in sorted(set(wmap.values())):
+        shard_tensors[sfile] = load_safetensors_file(str(dst_pack / sfile))
+
+    extra_keys = [k for k in list(wmap.keys()) if ".lsa_indexer.q_proj_extra." in k]
+    for ek in extra_keys:
+        sf = wmap.pop(ek)
+        shard_tensors[sf].pop(ek, None)
+
+    for wk_name, sf in list(wmap.items()):
+        if wk_name.endswith(".lsa_indexer.wq"):
+            old_wq = shard_tensors[sf][wk_name]
+            if old_wq.ndim == 3:
+                nh, din, idx_dim = old_wq.shape
+                wq_4d = torch.randn((n_q, nh, din, idx_dim), generator=gen, dtype=old_wq.dtype) * 0.25
+                shard_tensors[sf][wk_name] = wq_4d
+
+    total_bytes = 0
+    for sfile, tdict in list(shard_tensors.items()):
+        spath = dst_pack / sfile
+        if not tdict:
+            spath.unlink(missing_ok=True)
+            del shard_tensors[sfile]
+        else:
+            save_safetensors_file(tdict, str(spath))
+            total_bytes += sum(int(t.numel() * t.element_size()) for t in tdict.values())
+
+    idx_data["metadata"]["total_size"] = total_bytes
+    idx_path.write_text(json.dumps(idx_data, indent=2), encoding="utf-8")
+
+
+def test_standalone_lsa_per_head_select_strict_load_and_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stack = _build_v32_hssd_toy_stack(seed=335, blend_init=1.0, blend_warmup_steps=0)
+    base_pack = tmp_path / "base_pack_d4"
+    export_whole_model_pack(stack, base_pack, max_shard_size_bytes=65536, merge_in_place=False)
+
+    # 36 tokens > window (8) + 3 * block_size (24) so multiple Ward blocks + tree search are active
+    seq = torch.tensor([[((i * 23 + 7) % 230) + 5 for i in range(36)]], dtype=torch.long)
+
+    for search_mode in ("flat", "tree"):
+        d4_pack = tmp_path / f"d4_pack_{search_mode}"
+        _clone_pack_with_lsa_overrides(
+            base_pack,
+            d4_pack,
+            {
+                "mode": "sparse",
+                "per_head_select": True,
+                "compact_active_slots": True,
+                "max_selected_keys": 768,
+                "num_select": 1,
+                "search": search_mode,
+                "tree_group": 1,
+                "tree_beam": 1,
+            },
+            convert_wq_4d=True,
+            seed=910 if search_mode == "flat" else 920,
+        )
+
+        mod_sa = _load_standalone_modeling_without_qloop(d4_pack, monkeypatch)
+        sa_model = mod_sa.Qwen36LoopHSSDForCausalLM.from_pretrained(str(d4_pack), strict=True)
+
+        # Verify 4D wq=(2, 4, 8, 16) and empty q_proj_extra on installed standalone indexers
+        ix_found = [
+            getattr(getattr(ly, "inner", ly).self_attn, "lsa_indexer", None)
+            for ly in sa_model._find_tm().layers
+            if hasattr(getattr(ly, "inner", ly), "self_attn")
+        ]
+        ix_found = [ix for ix in ix_found if ix is not None]
+        assert len(ix_found) > 0
+        g_syn = torch.Generator().manual_seed(977)
+        q_base = torch.randn((1, 1, 32, 16), generator=g_syn)
+        # Identical query vectors across all 4 heads so any difference between h=0 and h=1 comes from per-head selection
+        q_same_heads = q_base.expand(1, 4, 32, 16).clone()
+        k_syn = torch.randn((1, 2, 32, 16), generator=g_syn)
+        v_syn = torch.randn((1, 2, 32, 16), generator=g_syn)
+        for ix in ix_found:
+            assert tuple(ix.wq.shape) == (2, 4, 8, 16)
+            assert len(ix.q_proj_extra) == 0
+            q_dummy = torch.randn((1, 4, 6, 16), generator=g_syn)
+            qz_p1 = ix.query_latent(q_dummy, pass_idx=1)
+            qz_p2 = ix.query_latent(q_dummy, pass_idx=2)
+            assert tuple(qz_p1.shape) == (1, 4, 6, 16)
+            assert (qz_p1 - qz_p2).abs().max().item() > 1e-3
+            sp_out = ix.sparse_attend(q_same_heads, k_syn, v_syn, 16 ** -0.5)
+            assert (sp_out[:, -8:, 0, :] - sp_out[:, -8:, 1, :]).abs().max().item() > 1e-4
+
+        with torch.no_grad():
+            with sa_model.depth(1):
+                out_r1 = sa_model(seq, use_cache=False).logits
+            with sa_model.depth(2):
+                out_r2 = sa_model(seq, use_cache=False).logits
+                p1 = sa_model(seq[:, :19], use_cache=True)
+                p2 = sa_model(seq[:, 19:], past_key_values=p1.past_key_values, use_cache=True)
+                out_r2_cached = torch.cat([p1.logits, p2.logits], dim=1)
+            assert torch.isfinite(out_r1).all() and torch.isfinite(out_r2).all()
+            assert (out_r1 - out_r2).abs().max().item() > 1e-3
+            assert (out_r2_cached - out_r2).abs().max().item() < 1e-5
+
+        if "per_head_select" in LSAConfig.__dataclass_fields__:
+            live_model = load_whole_model_pack(d4_pack)
+            with torch.no_grad():
+                for r in (1, 2):
+                    with live_model.depth(r), sa_model.depth(r):
+                        live_logits = live_model(seq, use_cache=False).logits
+                        sa_logits = sa_model(seq, use_cache=False).logits
+                        assert (sa_logits - live_logits).abs().max().item() < 1e-5
+
+
+def test_standalone_lsa_hybrid_mode_strict_load_and_recall_gate_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stack = _build_v32_hssd_toy_stack(seed=342, blend_init=1.0, blend_warmup_steps=0)
+    base_pack = tmp_path / "base_pack_d1"
+    export_whole_model_pack(stack, base_pack, max_shard_size_bytes=65536, merge_in_place=False)
+
+    # 36 tokens > sinks (2) + window (8) so historical bucket selection & sampled recall are exercised
+    seq = torch.tensor([[((i * 17 + 13) % 230) + 5 for i in range(36)]], dtype=torch.long)
+
+    dense_pack = tmp_path / "pack_dense_ref"
+    sparse_pack = tmp_path / "pack_sparse_ref"
+    hybrid_zero_pack = tmp_path / "pack_hybrid_thresh0"
+    hybrid_pass_pack = tmp_path / "pack_hybrid_recall_pass"
+    hybrid_fail_pack = tmp_path / "pack_hybrid_recall_fail"
+
+    common_lsa = {
+        "compact_active_slots": True,
+        "max_selected_keys": 768,
+        "num_select": 1,
+        "hybrid_sparse_every": 2,
+    }
+    _clone_pack_with_lsa_overrides(base_pack, dense_pack, {**common_lsa, "mode": "dense"})
+    _clone_pack_with_lsa_overrides(base_pack, sparse_pack, {**common_lsa, "mode": "sparse"})
+    _clone_pack_with_lsa_overrides(
+        base_pack,
+        hybrid_zero_pack,
+        {**common_lsa, "mode": "hybrid", "recall_threshold": 0.0},
+    )
+    _clone_pack_with_lsa_overrides(
+        base_pack,
+        hybrid_pass_pack,
+        {**common_lsa, "mode": "hybrid", "recall_threshold": 0.05},
+    )
+    _clone_pack_with_lsa_overrides(
+        base_pack,
+        hybrid_fail_pack,
+        {**common_lsa, "mode": "hybrid", "recall_threshold": 1.01},
+    )
+
+    mod_sa = _load_standalone_modeling_without_qloop(hybrid_zero_pack, monkeypatch)
+    m_dense = mod_sa.Qwen36LoopHSSDForCausalLM.from_pretrained(str(dense_pack), strict=True)
+    m_sparse = mod_sa.Qwen36LoopHSSDForCausalLM.from_pretrained(str(sparse_pack), strict=True)
+    m_hyb_0 = mod_sa.Qwen36LoopHSSDForCausalLM.from_pretrained(str(hybrid_zero_pack), strict=True)
+    m_hyb_pass = mod_sa.Qwen36LoopHSSDForCausalLM.from_pretrained(str(hybrid_pass_pack), strict=True)
+    m_hyb_fail = mod_sa.Qwen36LoopHSSDForCausalLM.from_pretrained(str(hybrid_fail_pack), strict=True)
+
+    with torch.no_grad():
+        for r in (1, 2):
+            with (
+                m_dense.depth(r),
+                m_sparse.depth(r),
+                m_hyb_0.depth(r),
+                m_hyb_pass.depth(r),
+                m_hyb_fail.depth(r),
+            ):
+                log_dense = m_dense(seq, use_cache=False).logits
+                log_sparse = m_sparse(seq, use_cache=False).logits
+                log_hyb_0 = m_hyb_0(seq, use_cache=False).logits
+                log_hyb_pass = m_hyb_pass(seq, use_cache=False).logits
+                log_hyb_fail = m_hyb_fail(seq, use_cache=False).logits
+
+                # Sparse genuinely differs from dense once num_select=1 drops non-selected historical buckets
+                assert (log_sparse - log_dense).abs().max().item() > 1e-3
+                # Hybrid with threshold <= 0 or passing sampled recall runs sparse at step 0
+                assert (log_hyb_0 - log_sparse).abs().max().item() < 1e-6
+                assert (log_hyb_pass - log_sparse).abs().max().item() < 1e-6
+                # Hybrid with unreachable recall_threshold falls back cleanly to dense
+                assert (log_hyb_fail - log_dense).abs().max().item() < 1e-6
+
+    if "recall_threshold" in LSAConfig.__dataclass_fields__:
+        for h_dir in (hybrid_zero_pack, hybrid_pass_pack, hybrid_fail_pack):
+            live_h = load_whole_model_pack(h_dir)
+            sa_h = mod_sa.Qwen36LoopHSSDForCausalLM.from_pretrained(str(h_dir), strict=True)
+            with torch.no_grad():
+                for r in (1, 2):
+                    with live_h.depth(r), sa_h.depth(r):
+                        sa_out_h = sa_h(seq, use_cache=False).logits
+                        live_out_h = live_h(seq, use_cache=False).logits
+                        assert (sa_out_h - live_out_h).abs().max().item() < 1e-5

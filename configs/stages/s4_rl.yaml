@@ -1,4 +1,4 @@
-# Gate 4 (S4 v3.1) - GRPO / RSI with Verifiable Rewards on Track-B Loop-HSSD v3.1 (88L A6B + 1M YaRN + Sparse D-LSA).
+# Gate 4 (S4 v3.2) - GRPO / RSI with Verifiable Rewards on Loop-HSSD v3.2 (88L A6B + 1M YaRN + Sparse D-LSA).
 # Architecture: [0,12) x1 + [12,36) xR + [36,40) x1 = 88L (`s0_probe` calibrated ETD core `[12,36)` + `w_anchor=0.85`).
 # Rollouts use the in-process cache sampler at the sampled loop depth (`R in {1, 2, 3}`, strictly on-policy).
 _base_: [../base.yaml, ../model/qwen36_fp8.yaml]
@@ -37,6 +37,11 @@ gdn2:
 
 hssd:
   enabled: true
+  write_mode: full
+  swa_recency_init: 0.05
+  horizon_tokens: 1048576
+  compact_active_pages: true
+  compact_decode_cache: true
   chunk_size: 64
   window_chunks: 8
   num_pages: 8
@@ -51,6 +56,8 @@ hssd:
 lsa:
   enabled: true
   mode: sparse
+  compact_active_slots: true
+  max_selected_keys: 768
   num_query_passes: 3
   index_dim: 64
   index_on: nope

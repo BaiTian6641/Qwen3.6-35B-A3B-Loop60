@@ -1,5 +1,5 @@
-# Gate 2a (S3 v3.1) - 1M GPU-Resident FP8 SharedKV + Per-Pass D-LSA + Long-Prefix / Short-Suffix Calibration.
-# Architecture: [0,12) x1 + [12,36) xR + [36,40) x1 = 88L (`s0_probe` calibrated ETD core `[12,36)` + Track-B HSSD v3.1).
+# Gate 2a (S3 v3.2) - 1M GPU-Resident FP8 SharedKV + Per-Pass D-LSA + Long-Prefix / Short-Suffix Calibration.
+# Architecture: [0,12) x1 + [12,36) xR + [36,40) x1 = 88L (`s0_probe` calibrated ETD core `[12,36)` + HSSD v3.2 + D-LSA).
 # Resolves Fix C1 & Decision 1/2:
 #   * 1M primary context (`1,048,576` tokens = `10.00 GiB` GPU FP8 KV + `320 MiB` GPU Ward centroids at 1.0x SharedKV)
 #   * Untied per-pass query indexers `W_q_idx^(r)` (`num_query_passes: 3`) with shared `W_k_idx` & Ward buckets
@@ -111,12 +111,12 @@ experts:
   enabled: false
 
 train:
-  init_from: runs/s1b_hssd_distill      # override `-s train.init_from=runs/s1_loop_a6b` if keeping Track-A GDN-2
+  init_from: runs/s1b_hssd_distill      # healed HSSD v3.2 + 88L loop checkpoint from Gate 1
   steps: 600                            # 540 x 64K hybrid steps + 60 x (512K-1M) calibration steps (~8-12h single Blackwell session)
   micro_batch: 1
   grad_accum: 2
   sha256_frozen_experts: true
-  train_hssd: false                     # carry forward healed HSSD/GDN-2 weights; train read-side & D-LSA only
+  train_hssd: false                     # carry forward healed HSSD v3.2 weights; train read-side & D-LSA only
   train_gdn2: false
   train_loop_adapters: true
   train_lsa: true

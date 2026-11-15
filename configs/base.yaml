@@ -31,12 +31,12 @@ loop:
   checkpoint: true            # activation checkpointing per virtual layer (non-reentrant)
   train_pass_probs: [0.25, 0.75]   # sample depth 1 sometimes: keeps the stock-graph path (vLLM-servable) healthy
 
-# ---------------------------------------------------------------- NVIDIA Gated DeltaNet-2 (GDN-2)
-# Upgrades all 30 Qwen3.6 Gated DeltaNet layers with decoupled channel-wise erase gates (b_t),
-# channel-wise write gates (w_t), and channel-wise decay (g_t <= 0) via chunkwise WY parallelization
-# (arXiv:2605.22791). Zero-init residual projections guarantee 100% step-0 bit-exactness.
+# ---------------------------------------------------------------- Legacy GDN-2 (retired; off by default)
+# Active v3.2 pipeline heals the loop directly over fast stock Qwen3.6 linear attention (`s0_probe`, `s1_loop_a6b`)
+# and upgrades all 30 linear layers to HSSD v3.2 + D-LSA (`s1b_hssd_distill` -> `s3_long_1m_lsa` -> `s2_joint_bptt` -> `s4_rl`).
+# Kept in schema (`enabled: false`) only for backward compatibility with legacy v2 GDN-2 checkpoints/tests.
 gdn2:
-  enabled: true
+  enabled: false
   rank: 64
   chunk_size: 64
   segment_chunks: 16
@@ -94,7 +94,7 @@ train:
     impl: auto                # apollo_torch if installed, else the built-in faithful APOLLO
     max_grad_norm_per_param: 1.0
     apollo: {enabled: true, rank: 256, scale_type: channel, scale: 1.0, update_proj_gap: 200, update_Gap: 200, min_dim: 128}
-    lr_mult: {"loop_adapters": 20.0, "lsa_indexer": 10.0, "gdn2_adapter": 5.0, "mlp\\.gate\\.weight$": 0.5}
+    lr_mult: {"loop_adapters": 20.0, "hssd_adapter": 10.0, "lsa_indexer": 10.0, "gdn2_adapter": 5.0, "mlp\\.gate\\.weight$": 0.5}
 
 eval_quick:
   n_batches: 8

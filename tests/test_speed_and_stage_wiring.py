@@ -1021,11 +1021,13 @@ def test_v32_stage_yaml_configs():
     assert base["train"]["optim"]["apollo"]["update_proj_gap"] == 200
 
     s1 = load_config(os.path.join(ROOT, "configs", "stages", "s1_loop_a6b.yaml"))
-    assert s1["train"]["micro_batch"] == 2
-    assert s1["train"]["grad_accum"] == 8
+    assert s1["gdn2"]["enabled"] is False
+    assert s1["train"]["micro_batch"] == 4
+    assert s1["train"]["grad_accum"] == 4
     assert s1["train"]["log_every"] == 5
 
     s1b = load_config(os.path.join(ROOT, "configs", "stages", "s1b_hssd_distill.yaml"))
+    assert s1b["distill"]["teacher_track"] == "stock"
     assert s1b["hssd"]["write_mode"] == "full"
     assert s1b["hssd"]["swa_recency_init"] == 0.05
     assert s1b["hssd"]["blend_init"] == 0.0

@@ -69,7 +69,10 @@ def test_every_config_loads_and_validates(path):
         if "stages/" in norm_path or "eval/" in norm_path:
             assert cfg.model.name == "Qwen/Qwen3.6-35B-A3B-FP8", f"{path}: stage/eval default must be FP8"
             assert loop.per_pass_router is True
-            assert (cfg.get("gdn2") or {}).get("enabled") is True or (cfg.get("hssd") or {}).get("enabled") is True
+            assert not (
+                (cfg.get("gdn2") or {}).get("enabled") is True
+                and (cfg.get("hssd") or {}).get("enabled") is True
+            ), f"{path}: gdn2 and hssd must not both be enabled"
             sync = (cfg.get("checkpoint") or {}).get("sync") or {}
             assert sync.get("hf_repo") == "TassP0lar/Qwen3.6-35B-A3B-Loop64"
             assert sync.get("private") is False
@@ -579,8 +582,9 @@ def test_v3_stages_calibrated_s0_probe_invariants():
         assert cfg["train"].get("init_from") == expected_init_chain[st], st
         assert list(cfg["eval_quick"]["depths"]) == [1, 2, 3], st
 
-    assert cfgs["s1_loop_a6b"]["gdn2"]["enabled"] is True
+    assert cfgs["s1_loop_a6b"]["gdn2"]["enabled"] is False
     assert cfgs["s1_loop_a6b"]["hssd"]["enabled"] is False
+    assert cfgs["s1b_hssd_distill"]["distill"]["teacher_track"] == "stock"
 
     expected_hssd = {
         "enabled": True,
@@ -867,26 +871,29 @@ def test_v3_five_stage_toy_chain_init_from_and_strict_restore(tmp_path, monkeypa
                 assert torch.allclose(got, expected[r], atol=1e-5), f"{stage_dir}: strict=True depth-{r} mismatch"
         return ck["params"]
 
-    # 1. Stage s1_loop_a6b (Track-A GDN-2 + 3-pass Loop)
+    # 1. Stage s1_loop_a6b (Stock Qwen3.6 GDN + 3-pass Loop)
     s1_cfg = load_config(
         os.path.join(ROOT, "configs", "stages", "s1_loop_a6b.yaml"),
         [*common_toy_overrides, *lm_data_overrides],
     )
     s1_dir = str(tmp_path / "s1_loop_a6b")
     s1_tr = LMTrainer(s1_cfg, s1_dir)
+    assert s1_tr.stack.gdn2 is None
     assert s1_tr.train()["step"] == 2
     _verify_strict_restore_parity(s1_cfg, s1_dir, s1_tr.stack)
 
-    # 2. Stage s1b_hssd_distill (init_from: runs/s1_loop_a6b -> swaps GDN-2 for Track-B HSSD v3.1)
+    # 2. Stage s1b_hssd_distill (init_from: runs/s1_loop_a6b -> upgrades stock GDN to HSSD v3.2)
     s1b_cfg = load_config(
         os.path.join(ROOT, "configs", "stages", "s1b_hssd_distill.yaml"),
         [*common_toy_overrides, *lm_data_overrides],
     )
     assert s1b_cfg.train.init_from == "runs/s1_loop_a6b"
+    assert s1b_cfg.distill.teacher_track == "stock"
     s1b_dir = str(tmp_path / "s1b_hssd_distill")
     s1b_tr = LMTrainer(s1b_cfg, s1b_dir)
     assert s1b_tr.train()["step"] == 2
-    assert s1b_tr.stack.carried_gdn2_cfg is not None
+    assert s1b_tr.stack.carried_gdn2_cfg is None
+    assert s1b_tr.shared_teacher is not None and len(s1b_tr.shared_teacher.gdn2_adapters) == 0
     s1b_params = _verify_strict_restore_parity(s1b_cfg, s1b_dir, s1b_tr.stack)
     s1b_hssd_tensors = {k: v.clone() for k, v in s1b_params.items() if "hssd_adapter." in k}
     assert s1b_hssd_tensors, "s1b_hssd_distill must save trained hssd_adapter tensors"

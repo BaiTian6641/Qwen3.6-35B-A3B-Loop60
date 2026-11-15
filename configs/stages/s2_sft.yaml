@@ -11,6 +11,8 @@ experts:
 loop:
   train_pass_probs: [0.15, 0.85]
   router_diversity_weight: 0.002
+gdn2:
+  enabled: true                      # legacy v2 GDN-2 stage (explicit since base.yaml disables gdn2 globally)
 train:
   init_from: runs/s1_loop_heal
   steps: 3000

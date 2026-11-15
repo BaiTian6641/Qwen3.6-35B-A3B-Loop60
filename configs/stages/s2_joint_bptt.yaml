@@ -1,7 +1,7 @@
-# Gate 3 (S2 v3.1) - Joint 32K High-Density CoT SFT + 4x32K (128K) Differentiable K/V-Replay Truncated BPTT.
-# Architecture: [0,12) x1 + [12,36) xR + [36,40) x1 = 88L (`s0_probe` calibrated ETD core `[12,36)` + Track-B HSSD v3.1 + 1M YaRN).
+# Gate 3 (S2 v3.2) - Joint 32K High-Density CoT SFT + 4x32K (128K) Differentiable K/V-Replay Truncated BPTT.
+# Architecture: [0,12) x1 + [12,36) xR + [36,40) x1 = 88L (`s0_probe` calibrated ETD core `[12,36)` + HSSD v3.2 + D-LSA + 1M YaRN).
 # Resolves Fix E3 (`src/qloop/train/bptt.py`):
-#   * Splits 128K sequences into `4 x 32,768` segments carrying live HSSD/GDN-2 states across segment boundaries
+#   * Splits 128K sequences into `4 x 32,768` segments carrying live HSSD v3.2 states across segment boundaries
 #   * Caches compact pre-attention hidden states (`< 1.92 GiB` across 10 full-attn layers) and re-projects ONLY the
 #     D-LSA selected Top-2,048 prior-segment keys/values with `requires_grad=True`, restoring exact cross-segment
 #     retrieval gradients into `k_proj`, `v_proj`, and `W_k_idx` at `< 6%` compute overhead!

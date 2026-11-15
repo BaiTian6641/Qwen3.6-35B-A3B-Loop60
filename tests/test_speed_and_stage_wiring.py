@@ -901,6 +901,115 @@ def test_lm_trainer_bptt_stage_wiring_and_short_seq_fallback(tmp_path):
     assert "loss/bptt_segments" not in res_short["last"]
 
 
+def test_bptt_gqa_per_head_select_lsa_replay(tmp_path):
+    """Verify SegmentedKVBPTTRunner handles GQA (H=4, G=2) when LSA query_latent is per-head [B, H, T, d_idx] (D4)."""
+    from types import SimpleNamespace
+
+    from qloop.train.bptt import SegmentedKVBPTTRunner
+
+    class _PerHeadGQAIndexer(nn.Module):
+        def __init__(self, nh: int = 4, nkv: int = 2, head_dim: int = 8, rot_dim: int = 4, idx_dim: int = 8) -> None:
+            super().__init__()
+            self.lo = rot_dim
+            din = head_dim - rot_dim
+            self.wq = nn.Parameter(torch.randn(nh, din, idx_dim) * 0.1)
+            self.wk = nn.Parameter(torch.randn(nkv, din, idx_dim) * 0.1)
+            self.cfg = SimpleNamespace(temperature=1.0)
+
+        def query_latent(self, q: torch.Tensor, pass_idx: int | None = None) -> torch.Tensor:
+            q_in = q[..., self.lo :].float()  # [B, H=4, T, din]
+            return F.normalize(torch.einsum("bhtd,hde->bhte", q_in, self.wq), dim=-1, eps=1e-6)
+
+        def k_proj(self, k: torch.Tensor) -> torch.Tensor:
+            k_in = k[..., self.lo :].float()  # [B, G=2, T, din]
+            return F.normalize(torch.einsum("bgtd,gde->bgte", k_in, self.wk), dim=-1, eps=1e-6)
+
+        def key_latent(self, k: torch.Tensor) -> torch.Tensor:
+            return self.k_proj(k)
+
+        def pop_losses(self) -> list[torch.Tensor]:
+            return []
+
+    # 1. Direct GQA [B, H=4, T, d_idx] vs [B, G=2, T, d_idx] SegmentedKVBPTTRunner verification (standalone + merged)
+    torch.manual_seed(99)
+    model, _, _ = load_model(
+        {
+            "name": "toy",
+            "dtype": "float32",
+            "device_map": "cpu",
+            "toy": {
+                "hidden_size": 32,
+                "num_hidden_layers": 4,
+                "full_attention_interval": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "vocab_size": 64,
+            },
+        }
+    )
+    indexers: list[_PerHeadGQAIndexer] = []
+    for mod in model.modules():
+        if hasattr(mod, "k_proj") and hasattr(mod, "q_proj") and hasattr(mod, "v_proj"):
+            ix = _PerHeadGQAIndexer(nh=4, nkv=2, head_dim=8, rot_dim=4, idx_dim=8)
+            mod.lsa_indexer = ix
+            indexers.append(ix)
+    assert len(indexers) >= 1
+
+    runner = SegmentedKVBPTTRunner(model, seg_len=16, replay_k=8, n_segments=4, replay_indexer_weight=0.2)
+    ids = torch.randint(0, 64, (2, 64))
+    step_res = runner.run_step(ids, labels=ids, backward=True)
+    assert step_res.num_segments == 4
+    assert sum(step_res.replayed_tokens_per_seg[1:]) > 0
+    assert any(ix.wq.grad is not None and ix.wq.grad.abs().sum() > 0 for ix in indexers)
+    assert any(ix.wk.grad is not None and ix.wk.grad.abs().sum() > 0 for ix in indexers)
+
+    # 2. Full LMTrainer + real LSAConfig(per_head_select=True) integration whenever D4 is present in LSAConfig
+    if "per_head_select" in {f.name for f in fields(LSAConfig)}:
+        cfg = _toy_base_cfg(
+            lsa={
+                "enabled": True,
+                "mode": "sparse",
+                "per_head_select": True,
+                "num_query_passes": 2,
+                "index_dim": 8,
+                "index_on": "nope",
+                "pool": 2,
+                "block_size": 16,
+                "avg_bucket_keys": 4,
+                "max_bucket_keys": 8,
+                "num_select": 2,
+                "window": 16,
+                "sinks": 4,
+                "query_chunk": 16,
+            },
+            bptt={
+                "enabled": True,
+                "n_segments": 4,
+                "seg_len": 16,
+                "replay_k": 8,
+                "offload_prior_hidden": True,
+            },
+            data={"seq_len": 64, "sources": [{"name": "toy_text", "weight": 1.0}]},
+            train={
+                "steps": 2,
+                "micro_batch": 1,
+                "grad_accum": 1,
+                "log_every": 1,
+                "ckpt_every": 10,
+                "train_loop_adapters": True,
+                "train_lsa": True,
+                "trainable": [r"self_attn\.(k_proj|v_proj|o_proj|q_norm|k_norm)"],
+                "allowed_groups": ["loop_adapters", "lsa_indexers", "attention", "norms"],
+                "optim": {"lr": 5e-3, "warmup_steps": 1, "fused": True, "impl": "builtin"},
+            },
+        )
+        tr = LMTrainer(cfg, str(tmp_path / "s2_bptt_per_head_lsa"))
+        res = tr.train()
+        assert res["step"] == 2
+        assert res["last"]["loss/bptt_segments"] == 4.0
+
+
 # ============================================================================ 5. Stage YAML configs
 
 def test_v32_stage_yaml_configs():

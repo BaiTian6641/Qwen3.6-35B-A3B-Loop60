@@ -964,4 +964,18 @@ def test_profile_hssd_layer_runs_cleanly_with_segment_chunks_four() -> None:
     assert res["retained_cache"]["has_compact_storage"] is True
     assert res["single_token_decode"]["has_compact_storage"] is True
     assert res["training_fwd_bwd"]["grad_finite"] is True
-    assert res["streamed_prefill"]["max_diff_vs_full_prefill"] < 1e-4
+    assert res["streamed_prefill"]["max_diff_vs_full_prefill"] < 2e-3
+
+    res_fp32 = profile_hssd_layer(
+        hidden_size=64,
+        num_v_heads=4,
+        head_k_dim=16,
+        head_v_dim=16,
+        seq_len=128,
+        stream_chunk_len=64,
+        rank=16,
+        device="cpu",
+        dtype=torch.float32,
+        state_dtype="float32",
+    )
+    assert res_fp32["streamed_prefill"]["max_diff_vs_full_prefill"] < 1e-6

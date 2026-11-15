@@ -30,6 +30,7 @@ import gc
 import logging
 import math
 import types
+import weakref
 from collections import Counter
 from typing import Any
 
@@ -833,6 +834,16 @@ def _dequant_linear_weight(
     if isinstance(w_plain, torch.Tensor) and w_plain.ndim == 2:
         return w_plain.to(dtype=dtype)
     raise TypeError(f"cannot dequantize 2D linear weight from module {type(mod).__name__}")
+
+
+def dequantize_linear_module(
+    mod: nn.Module,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    nvfp4_mode_override: str | None = None,
+) -> torch.Tensor:
+    """Public wrapper around `_dequant_linear_weight` for quantized or plain 2D linear modules."""
+    return _dequant_linear_weight(mod, dtype=dtype, nvfp4_mode_override=nvfp4_mode_override)
 
 
 def _linear_in_out_features(mod: nn.Module) -> tuple[int, int]:
@@ -2937,6 +2948,13 @@ def install_quantized_autograd_bridge(model: nn.Module) -> dict[str, Any]:
                 mod.in_features = in_f  # type: ignore[attr-defined]
             if not isinstance(getattr(mod, "out_features", None), int):
                 mod.out_features = out_f  # type: ignore[attr-defined]
+            for t_attr in ("weight", "weight_packed"):
+                t_val = getattr(mod, t_attr, None)
+                if isinstance(t_val, torch.Tensor):
+                    try:
+                        object.__setattr__(t_val, "_qloop_quant_owner_ref", weakref.ref(mod))
+                    except Exception:
+                        pass
 
         dev = _first_module_device(mod)
         if getattr(mod, "_qloop_quant_bridge_installed", False):
@@ -3010,6 +3028,7 @@ __all__ = [
     "NVFP4_E2M1_TABLE",
     "auto_dequant_expert_fn",
     "dequantize_fp8_tensor",
+    "dequantize_linear_module",
     "dequantize_nvfp4_tensor",
     "detect_model_quantization",
     "install_quantized_autograd_bridge",

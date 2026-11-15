@@ -19,10 +19,19 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from qloop.debug import require
+from qloop.model.quant_autograd import (
+    FP8_DTYPES,
+    _dequant_linear_weight,
+    dequantize_fp8_tensor,
+    is_quantized_module,
+)
 
 log = logging.getLogger("qloop")
+
+_PACKED_WEIGHT_DTYPES: tuple[torch.dtype, ...] = (torch.uint8, torch.int8, torch.int16, torch.int32)
 
 
 def cce_available() -> bool:
@@ -168,12 +177,46 @@ def _flatten_shift(hidden: torch.Tensor, labels: torch.Tensor, shift: bool) -> t
     return hidden.reshape(-1, hidden.shape[-1]), labels.reshape(-1)
 
 
+def _resolve_vocab_weight(weight: torch.Tensor | nn.Module, hidden: torch.Tensor) -> torch.Tensor:
+    """Resolve `weight` (dense `Tensor`, bridged FP8/NVFP4 `Tensor`, or `nn.Module` `lm_head`) to `[V, H]`."""
+    ref_dtype = hidden.dtype if hidden.is_floating_point() else torch.bfloat16
+    if isinstance(weight, nn.Module):
+        if is_quantized_module(weight):
+            return _dequant_linear_weight(weight, dtype=ref_dtype).to(device=hidden.device)
+        w_mod = getattr(weight, "weight", None)
+        require(
+            isinstance(w_mod, torch.Tensor),
+            f"lm_head module {type(weight).__name__} has no `.weight` tensor",
+        )
+        assert isinstance(w_mod, torch.Tensor)
+        weight = w_mod
+
+    require(isinstance(weight, torch.Tensor), "weight must be a torch.Tensor or nn.Module", weight=weight)
+    if weight.dtype in FP8_DTYPES or weight.dtype in _PACKED_WEIGHT_DTYPES:
+        owner_ref = getattr(weight, "_qloop_quant_owner_ref", None)
+        owner = owner_ref() if callable(owner_ref) else None
+        if isinstance(owner, nn.Module) and is_quantized_module(owner):
+            return _dequant_linear_weight(owner, dtype=ref_dtype).to(device=hidden.device)
+        if weight.dtype in FP8_DTYPES:
+            sc = getattr(weight, "_qloop_fp8_scale", None)
+            if isinstance(sc, torch.Tensor):
+                bsize = getattr(weight, "_qloop_fp8_block_size", None)
+                return dequantize_fp8_tensor(weight, sc, dtype=ref_dtype, block_size=bsize).to(device=hidden.device)
+            if getattr(weight, "_qloop_allow_unscaled_fp8", False):
+                return weight.to(device=hidden.device, dtype=ref_dtype)
+        raise RuntimeError(
+            f"lm_loss received quantized weight tensor of dtype {weight.dtype} without an attached scale/module; "
+            "pass the `lm_head` module directly or run `install_quantized_autograd_bridge(model)` first."
+        )
+    return weight
+
+
 def _check_vocab(weight: torch.Tensor, hidden: torch.Tensor) -> None:
     require(weight.dim() == 2 and weight.shape[1] == hidden.shape[-1], "weight must be [V, H] matching hidden",
             weight=weight, hidden=hidden)
 
 
-def lm_loss(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, impl: str = "auto",
+def lm_loss(hidden: torch.Tensor, weight: torch.Tensor | nn.Module, labels: torch.Tensor, impl: str = "auto",
             chunk_size: int = 4096, shift: bool = True, softcap: float | None = None, z_loss: float = 0.0,
             ignore_index: int = -100) -> tuple[torch.Tensor, torch.Tensor]:
     """Mean next-token cross-entropy of `hidden @ weight.T` against `labels` (+ z_loss * lse^2).
@@ -185,19 +228,20 @@ def lm_loss(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, im
     impl: "auto" (cce on CUDA bf16/fp16 when installed and z_loss == 0, else chunked) | "cce" |
     "chunked" | "naive".
     """
-    _check_vocab(weight, hidden)
+    w = _resolve_vocab_weight(weight, hidden)
+    _check_vocab(w, hidden)
     require(impl in ("auto", "cce", "chunked", "naive"), f"unknown lm_loss impl {impl!r}")
     require(chunk_size > 0, "chunk_size must be positive", chunk_size=chunk_size)
     if impl == "auto":
         ok = cce_available() and hidden.is_cuda and hidden.dtype in (torch.bfloat16, torch.float16) and not z_loss
         impl = "cce" if ok else "chunked"
     if impl == "cce":
-        return _lm_loss_cce(hidden, weight, labels, shift, softcap, z_loss, ignore_index)
+        return _lm_loss_cce(hidden, w, labels, shift, softcap, z_loss, ignore_index)
     h, y = _flatten_shift(hidden, labels, shift)
     valid = y != ignore_index
     n_tok = valid.sum()
     if impl == "naive":
-        logits = _softcap(_raw_logits(h, weight, _acc_dtype(h)), softcap)
+        logits = _softcap(_raw_logits(h, w, _acc_dtype(h)), softcap)
         total = F.cross_entropy(logits, y, ignore_index=ignore_index, reduction="sum")
         if z_loss:
             lse = torch.logsumexp(logits, dim=-1)
@@ -205,9 +249,9 @@ def lm_loss(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor, im
     else:
         idx = valid.nonzero(as_tuple=True)[0]
         hv, yv = h.index_select(0, idx), y.index_select(0, idx)
-        require(bool(((yv >= 0) & (yv < weight.shape[0])).all()) if yv.numel() else True,
-                "label id out of range [0, V)", labels=yv, vocab=weight.shape[0])
-        total = _ChunkedLinearCE.apply(hv, weight, yv, int(chunk_size), softcap, float(z_loss))
+        require(bool(((yv >= 0) & (yv < w.shape[0])).all()) if yv.numel() else True,
+                "label id out of range [0, V)", labels=yv, vocab=w.shape[0])
+        total = _ChunkedLinearCE.apply(hv, w, yv, int(chunk_size), softcap, float(z_loss))
     return total / n_tok.clamp_min(1).to(total.dtype), n_tok
 
 
@@ -238,32 +282,35 @@ def _lm_loss_cce(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tenso
     return total / n_tok.clamp_min(1).to(total.dtype), n_tok
 
 
-def token_logprobs(hidden: torch.Tensor, weight: torch.Tensor, target_ids: torch.Tensor, chunk_size: int = 4096,
-                   temperature: float = 1.0, softcap: float | None = None) -> torch.Tensor:
+def token_logprobs(hidden: torch.Tensor, weight: torch.Tensor | nn.Module, target_ids: torch.Tensor,
+                   chunk_size: int = 4096, temperature: float = 1.0,
+                   softcap: float | None = None) -> torch.Tensor:
     """log softmax(softcap(h W^T) / temperature)[target], differentiable w.r.t. hidden (and weight
     if it requires grad) without materialising [N, V] in the graph. hidden [..., H], target_ids
     [...]; returns fp32 (fp64 for fp64 input) with target_ids' shape ([N] for 2D input)."""
-    _check_vocab(weight, hidden)
+    w = _resolve_vocab_weight(weight, hidden)
+    _check_vocab(w, hidden)
     require(tuple(target_ids.shape) == tuple(hidden.shape[:-1]), "target_ids must match hidden[..., :-1]",
             hidden=hidden, target_ids=target_ids)
     require(temperature > 0, "temperature must be > 0", temperature=temperature)
     h = hidden.reshape(-1, hidden.shape[-1])
     y = target_ids.reshape(-1).long()
-    out = _ChunkedTokenLogprob.apply(h, weight, y, int(chunk_size), float(temperature), softcap)
+    out = _ChunkedTokenLogprob.apply(h, w, y, int(chunk_size), float(temperature), softcap)
     return out.view(target_ids.shape)
 
 
 @torch.no_grad()
-def token_entropy(hidden: torch.Tensor, weight: torch.Tensor, chunk_size: int = 4096, temperature: float = 1.0,
-                  softcap: float | None = None) -> torch.Tensor:
+def token_entropy(hidden: torch.Tensor, weight: torch.Tensor | nn.Module, chunk_size: int = 4096,
+                  temperature: float = 1.0, softcap: float | None = None) -> torch.Tensor:
     """Per-token entropy (nats) of softmax(softcap(h W^T) / temperature); no grad. Shape hidden[..., :-1]."""
-    _check_vocab(weight, hidden)
+    w = _resolve_vocab_weight(weight, hidden)
+    _check_vocab(w, hidden)
     h = hidden.reshape(-1, hidden.shape[-1])
     acc = _acc_dtype(h)
     out = torch.empty(h.shape[0], dtype=acc, device=h.device)
     for s in range(0, h.shape[0], chunk_size):
         e = min(s + chunk_size, h.shape[0])
-        z = _softcap(_raw_logits(h[s:e], weight, acc), softcap) / temperature
+        z = _softcap(_raw_logits(h[s:e], w, acc), softcap) / temperature
         lse = torch.logsumexp(z, dim=-1, keepdim=True)
         p = torch.exp(z - lse)
         out[s:e] = lse.squeeze(-1) - (p * z).sum(-1)

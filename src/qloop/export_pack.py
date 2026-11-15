@@ -59,7 +59,7 @@ from .model.introspect import (
 )
 from .model.loop import LoopController
 from .model.lsa import LSAIndexer, LSAManager
-from .model.quant_autograd import detect_model_quantization, is_quantized_module
+from .model.quant_autograd import FP8_DTYPES, detect_model_quantization, is_quantized_module
 from .train.stack import Stack
 
 log = logging.getLogger("qloop")
@@ -643,10 +643,14 @@ def extract_arch_spec(
 
     quant_info = detect_model_quantization(src.backbone)
     nvfp4_meta = _collect_nvfp4_module_metadata(src.backbone, tm, phys_pairs)
-    if nvfp4_meta:
+    fp8_meta = _collect_fp8_module_metadata(src.backbone, tm, phys_pairs)
+    if nvfp4_meta or fp8_meta:
         quant_info = dict(quant_info)
         quant_info["is_quantized"] = True
-        quant_info["nvfp4_modules"] = nvfp4_meta
+        if nvfp4_meta:
+            quant_info["nvfp4_modules"] = nvfp4_meta
+        if fp8_meta:
+            quant_info["fp8_modules"] = fp8_meta
     arch: dict[str, Any] = {
         "schema_version": 3,
         "backbone_kind": kind,
@@ -718,6 +722,46 @@ def _collect_nvfp4_module_metadata(
                 "scale_mode": str(smode),
                 "storage": "buffers" if (in_bufs and not in_params) else "parameters",
             }
+
+    meta: dict[str, dict[str, Any]] = {}
+    for phys_idx, layer in phys_pairs:
+        l_pfx = f"{tm_prefix}.layers.{phys_idx}" if tm_prefix else f"layers.{phys_idx}"
+        _inspect_subtree(layer, l_pfx, meta)
+    for cname, child in backbone.named_children():
+        if child is tm:
+            continue
+        _inspect_subtree(child, cname, meta)
+    return meta
+
+
+def _collect_fp8_module_metadata(
+    backbone: nn.Module,
+    tm: nn.Module,
+    phys_pairs: list[tuple[int, nn.Module]],
+) -> dict[str, dict[str, Any]]:
+    tm_prefix = ""
+    for mod_name, mod in backbone.named_modules():
+        if mod is tm:
+            tm_prefix = mod_name
+            break
+
+    def _inspect_subtree(root_mod: nn.Module, base_prefix: str, out: dict[str, dict[str, Any]]) -> None:
+        for sub_name, sub in root_mod.named_modules():
+            full_path = f"{base_prefix}.{sub_name}" if (base_prefix and sub_name) else (base_prefix or sub_name)
+            has_fp8 = any(
+                isinstance(getattr(sub, a, None), torch.Tensor) and getattr(sub, a).dtype in FP8_DTYPES
+                for a in ("gate_up_proj", "down_proj", "weight")
+            )
+            if not has_fp8:
+                continue
+            entry: dict[str, Any] = {}
+            for bs_attr in ("weight_block_size", "block_size"):
+                bs_val = getattr(sub, bs_attr, None)
+                if isinstance(bs_val, (list, tuple)) and len(bs_val) == 2:
+                    entry["weight_block_size"] = [int(bs_val[0]), int(bs_val[1])]
+                    break
+            if entry:
+                out[full_path] = entry
 
     meta: dict[str, dict[str, Any]] = {}
     for phys_idx, layer in phys_pairs:

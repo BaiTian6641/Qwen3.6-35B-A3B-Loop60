@@ -392,7 +392,63 @@ class CausalLMPackOutput:
         return items[key]
 
 
-def _build_physical_backbone(config: Qwen36LoopHSSDConfig, dtype_override: torch.dtype | None = None) -> nn.Module:
+def _materialize_non_moe_meta_backbone(backbone: nn.Module, fallback_cfg: Any) -> None:
+    """Materialize rotary & non-MoE-expert tensors on CPU while keeping 3D `mlp.experts` weights on `meta`."""
+    for _mpath, sub in backbone.named_modules():
+        is_rotary = (
+            "inv_freq" in sub._buffers
+            or hasattr(sub, "inv_freq")
+            or "rotary" in type(sub).__name__.lower()
+        )
+        if not is_rotary:
+            continue
+        rot_cfg = getattr(sub, "config", None) or fallback_cfg
+        rot_cls = type(sub)
+        fresh: nn.Module | None = None
+        with torch.device("cpu"):
+            for r_args, r_kw in (((rot_cfg,), {}), ((), {"config": rot_cfg}), ((rot_cfg,), {"device": "cpu"})):
+                try:
+                    fresh = rot_cls(*r_args, **r_kw)
+                    break
+                except TypeError:
+                    continue
+        if fresh is not None:
+            for bname, bval in fresh._buffers.items():
+                sub._buffers[bname] = bval.to(device="cpu") if isinstance(bval, torch.Tensor) else bval
+            if hasattr(fresh, "_non_persistent_buffers_set"):
+                sub._non_persistent_buffers_set = set(fresh._non_persistent_buffers_set)
+            for k, v in fresh.__dict__.items():
+                if k.startswith("_") or k in ("training",):
+                    continue
+                setattr(sub, k, v.to(device="cpu") if isinstance(v, torch.Tensor) else copy.deepcopy(v))
+
+    seen_meta_params: dict[int, nn.Parameter] = {}
+    for mod_name, sub in backbone.named_modules():
+        is_moe_experts = mod_name.endswith(".mlp.experts")
+        for pname, p in list(sub._parameters.items()):
+            if not isinstance(p, torch.Tensor) or not p.is_meta:
+                continue
+            if is_moe_experts and pname in ("gate_up_proj", "down_proj"):
+                continue
+            existing = seen_meta_params.get(id(p))
+            if existing is None:
+                existing = nn.Parameter(
+                    torch.zeros(p.shape, dtype=p.dtype, device="cpu"),
+                    requires_grad=p.requires_grad,
+                )
+                seen_meta_params[id(p)] = existing
+            sub._parameters[pname] = existing
+        for bname, b in list(sub._buffers.items()):
+            if isinstance(b, torch.Tensor) and b.is_meta:
+                sub._buffers[bname] = torch.zeros(b.shape, dtype=b.dtype, device="cpu")
+
+
+def _build_physical_backbone(
+    config: Qwen36LoopHSSDConfig,
+    dtype_override: torch.dtype | None = None,
+    *,
+    meta_moe_only: bool = False,
+) -> nn.Module:
     arch = config.qloop_v3_arch or {}
     bcfg = copy.deepcopy(dict(config.base_config or {}))
     base_dtype = dtype_override or resolve_dtype(arch.get("base_dtype", "float32"))
@@ -423,16 +479,41 @@ def _build_physical_backbone(config: Qwen36LoopHSSDConfig, dtype_override: torch
 
     base_model_type = str(arch.get("base_model_type") or bcfg.get("model_type") or "qwen3_5_moe")
     clean_bcfg = {k: v for k, v in bcfg.items() if k != "model_type"}
+    orig_qcfg = copy.deepcopy(clean_bcfg.pop("quantization_config", None))
     attn_impl = str(clean_bcfg.pop("_attn_implementation", "sdpa") or "sdpa")
     if attn_impl in ("qloop_lsa", "qloop_standalone_lsa"):
         attn_impl = "sdpa"
     hf_cfg = AutoConfig.for_model(base_model_type, **clean_bcfg)
     hf_cfg._attn_implementation = attn_impl
+    if hasattr(hf_cfg, "quantization_config"):
+        try:
+            hf_cfg.quantization_config = None
+        except Exception:
+            pass
     if arch.get("yarn_target_len"):
         apply_yarn(hf_cfg, int(arch["yarn_target_len"]))
     ver_head = str(getattr(transformers, "__version__", "5")).split(".", 1)[0]
     dtype_kw = "dtype" if (ver_head.isdigit() and int(ver_head) >= 5) else "torch_dtype"
-    return AutoModelForCausalLM.from_config(hf_cfg, attn_implementation=attn_impl, **{dtype_kw: base_dtype})
+    if meta_moe_only:
+        with torch.device("meta"):
+            try:
+                backbone = AutoModelForCausalLM.from_config(
+                    hf_cfg, attn_implementation=attn_impl, **{dtype_kw: base_dtype}
+                )
+            except TypeError:
+                backbone = AutoModelForCausalLM.from_config(hf_cfg, attn_implementation=attn_impl)
+        _materialize_non_moe_meta_backbone(backbone, hf_cfg)
+    else:
+        try:
+            backbone = AutoModelForCausalLM.from_config(
+                hf_cfg, attn_implementation=attn_impl, **{dtype_kw: base_dtype}
+            )
+        except TypeError:
+            backbone = AutoModelForCausalLM.from_config(hf_cfg, attn_implementation=attn_impl)
+            backbone.to(dtype=base_dtype)
+    if orig_qcfg is not None:
+        backbone.config.quantization_config = copy.deepcopy(orig_qcfg)
+    return backbone
 
 
 class Qwen36LoopHSSDForCausalLM(_ModelBase):
@@ -447,10 +528,13 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
         *,
         _defer_loop: bool = False,
         _dtype_override: torch.dtype | None = None,
+        _meta_moe_only: bool = False,
     ) -> None:
         super().__init__(config)
         self.config = config
-        self.backbone: nn.Module = _build_physical_backbone(config, dtype_override=_dtype_override)
+        self.backbone: nn.Module = _build_physical_backbone(
+            config, dtype_override=_dtype_override, meta_moe_only=_meta_moe_only
+        )
         install_quantized_autograd_bridge(self.backbone)
         self.gdn2_manager: GDN2Manager | None = None
         self.hssd_handle: Any = None
@@ -475,7 +559,7 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
             hcfg.setdefault("swa_recency_init", 0.0)
             hcfg.setdefault("blend_init", 1.0)
             hcfg_cls = getattr(hssd_mod, "HSSDConfig", None)
-            if hcfg_cls is not None and hasattr(hcfg_cls, "__dataclass_fields__"):
+            if hcfg_cls is not None and hasattr(hssd_mod.HSSDConfig, "__dataclass_fields__"):
                 known_h = set(hcfg_cls.__dataclass_fields__.keys()) | {"top_k_pages"}
                 hcfg = {k: v for k, v in hcfg.items() if k in known_h}
             self.hssd_handle = apply_fn(self.backbone, hcfg)
@@ -489,11 +573,17 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
             raw_hm = he_cfg.get("hot_map") or {}
             hot_map = {int(k): [int(e) for e in v] for k, v in raw_hm.items()}
             if hot_map:
+                q_arch = dict(arch.get("quantization") or {})
+                he_dt: torch.dtype | None = None
+                if q_arch.get("is_quantized"):
+                    emb_dt = self._text_model.embed_tokens.weight.dtype
+                    he_dt = torch.float64 if emb_dt == torch.float64 else torch.float32
                 self.hot_deltas = attach_hot_expert_deltas(
                     self.backbone,
                     hot_map,
                     rank=int(he_cfg.get("rank", 0)),
                     alpha=he_cfg.get("alpha"),
+                    dtype=he_dt,
                 )
 
         if not _defer_loop:
@@ -697,13 +787,40 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
                 cfg_dict = config.to_dict() if hasattr(config, "to_dict") else dict(vars(config))
                 config = Qwen36LoopHSSDConfig(**cfg_dict)
 
-            instance = cls(config, _defer_loop=True, _dtype_override=dt_override)
+            q_arch = dict((config.qloop_v3_arch or {}).get("quantization") or {})
+            use_meta_moe = bool(
+                (config.qloop_v3_arch or {}).get("backbone_kind") != "toy"
+                and (int(q_arch.get("moe_nvfp4_count", 0)) + int(q_arch.get("moe_fp8_count", 0)) > 0)
+            )
+            instance = cls(
+                config,
+                _defer_loop=True,
+                _dtype_override=dt_override,
+                _meta_moe_only=use_meta_moe,
+            )
             param_map = dict(instance.backbone.named_parameters())
             buf_map = dict(instance.backbone.named_buffers())
             mod_map = dict(instance.backbone.named_modules())
             expected_params = set(param_map.keys())
-            q_arch = dict((config.qloop_v3_arch or {}).get("quantization") or {})
             nvfp4_mod_meta = dict(q_arch.get("nvfp4_modules") or {})
+            fp8_mod_meta = dict(q_arch.get("fp8_modules") or {})
+            for f_path, f_meta in fp8_mod_meta.items():
+                f_mod = mod_map.get(f_path)
+                bs_val = f_meta.get("weight_block_size") if isinstance(f_meta, dict) else None
+                if f_mod is not None and isinstance(bs_val, (tuple, list)) and len(bs_val) == 2:
+                    f_mod.weight_block_size = (int(bs_val[0]), int(bs_val[1]))  # type: ignore[attr-defined]
+            buf_preferred_attrs = {
+                "scale_inv",
+                "k_scale",
+                "v_scale",
+                "q_scale",
+                "o_scale",
+                "quant_scale",
+                "input_scale",
+                "input_global_scale",
+                "activation_scale",
+                "weight_shape",
+            }
             dyn_quant_attrs = {
                 "weight_packed",
                 "weight_scale",
@@ -809,7 +926,12 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
                                 buf_map.pop(dense_key, None)
                                 expected_params.discard(dense_key)
                             m_meta = nvfp4_mod_meta.get(p_path) or {}
-                            if m_meta.get("storage") == "buffers":
+                            f_meta = fp8_mod_meta.get(p_path) or {}
+                            as_buffer = m_meta.get("storage") == "buffers" or (
+                                not m_meta
+                                and (a_name.endswith("_scale_inv") or a_name in buf_preferred_attrs)
+                            )
+                            if as_buffer:
                                 p_mod.register_buffer(a_name, tensor.clone())
                                 buf_map[key] = p_mod._buffers[a_name]  # type: ignore[assignment]
                             else:
@@ -818,6 +940,9 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
                                 param_map[key] = new_p
                                 expected_params.add(key)
                                 loaded_backbone.add(key)
+                            bs_val = f_meta.get("weight_block_size") if isinstance(f_meta, dict) else None
+                            if isinstance(bs_val, (tuple, list)) and len(bs_val) == 2:
+                                p_mod.weight_block_size = (int(bs_val[0]), int(bs_val[1]))  # type: ignore[attr-defined]
                             if a_name.endswith("_packed") or m_meta:
                                 if getattr(p_mod, "group_size", None) is None:
                                     p_mod.group_size = int(m_meta.get("group_size", 16))  # type: ignore[attr-defined]
@@ -835,6 +960,29 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
                         tuple(target.shape) == tuple(tensor.shape),
                         f"shape mismatch for {key}: model {tuple(target.shape)} vs shard {tuple(tensor.shape)}",
                     )
+                    if target.is_meta:
+                        p_path, _, a_nm = key.rpartition(".")
+                        p_mod = mod_map.get(p_path)
+                        require(
+                            p_mod is not None,
+                            f"cannot materialize meta tensor {key}: parent module {p_path!r} missing",
+                        )
+                        assert p_mod is not None
+                        if tensor.dtype in FP8_DTYPES or not tensor.is_floating_point():
+                            t_cpu = tensor.to(device="cpu").clone()
+                        elif dt_override is None:
+                            t_cpu = tensor.to(device="cpu", dtype=tensor.dtype).clone()
+                        else:
+                            t_cpu = tensor.to(device="cpu", dtype=target.dtype).clone()
+                        if is_param:
+                            new_p = nn.Parameter(t_cpu, requires_grad=False)
+                            p_mod._parameters[a_nm] = new_p
+                            param_map[key] = new_p
+                            loaded_backbone.add(key)
+                        else:
+                            p_mod._buffers[a_nm] = t_cpu
+                            buf_map[key] = t_cpu
+                        continue
                     with torch.no_grad():
                         if tensor.dtype in FP8_DTYPES or not tensor.is_floating_point():
                             if isinstance(target, nn.Parameter):
@@ -886,6 +1034,12 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
 
             install_quantized_autograd_bridge(instance.backbone)
             instance._finalize_loop(loop_tensors)
+            leftover_meta = [
+                f"param:{n}" for n, p in instance.named_parameters() if p.is_meta
+            ] + [
+                f"buffer:{n}" for n, b in instance.named_buffers() if b.is_meta
+            ]
+            require(not leftover_meta, "meta tensors remained after Whole Model Pack load", meta=leftover_meta[:10])
         finally:
             if tmp_handle is not None:
                 tmp_handle.cleanup()
@@ -6991,7 +7145,9 @@ else:
             mod._qloop_st_had_inst_fwd = had_inst_fwd  # type: ignore[attr-defined]
             mod._qloop_st_orig_inst_fwd = orig_inst_fwd  # type: ignore[attr-defined]
             if kind in ("linear_fp8", "linear_nvfp4"):
-                if kind == "linear_nvfp4" and not isinstance(getattr(mod, "weight", None), torch.Tensor):
+                if type(mod) is nn.Linear or (
+                    kind == "linear_nvfp4" and not isinstance(getattr(mod, "weight", None), torch.Tensor)
+                ):
                     mod._qloop_fb_only = True  # type: ignore[attr-defined]
 
                 def _make_qlin(ofn: Callable[..., Any] = orig_fwd, rfn: Callable[..., Any] = raw_fn):
@@ -7007,7 +7163,14 @@ else:
                         if not getattr(_self, "_qloop_fb_only", False):
                             try:
                                 return ofn(*a, **kw)
-                            except (ImportError, ModuleNotFoundError, NotImplementedError, AttributeError):
+                            except (
+                                ImportError,
+                                ModuleNotFoundError,
+                                NotImplementedError,
+                                AttributeError,
+                                RuntimeError,
+                                TypeError,
+                            ):
                                 _self._qloop_fb_only = True  # type: ignore[attr-defined]
                         x = a[0] if a else next(v for v in kw.values() if isinstance(v, torch.Tensor))
                         wd = _st_deq_lin(_self, x.dtype)
@@ -7030,7 +7193,14 @@ else:
                         if not getattr(_self, "_qloop_fb_only", False):
                             try:
                                 return ofn(*a, **kw)
-                            except (ImportError, ModuleNotFoundError, NotImplementedError, AttributeError):
+                            except (
+                                ImportError,
+                                ModuleNotFoundError,
+                                NotImplementedError,
+                                AttributeError,
+                                RuntimeError,
+                                TypeError,
+                            ):
                                 _self._qloop_fb_only = True  # type: ignore[attr-defined]
                         return _st_moe_fallback(_self, a, kw)
 
@@ -7172,6 +7342,233 @@ else:
                 h = st + coef * (h - st)
             return (h, *out[1:]) if is_tup else h
 
+    def _st_materialize_non_moe_meta_backbone(backbone: nn.Module, fallback_cfg: Any) -> None:
+        for _mpath, sub in backbone.named_modules():
+            is_rotary = (
+                "inv_freq" in sub._buffers
+                or hasattr(sub, "inv_freq")
+                or "rotary" in type(sub).__name__.lower()
+            )
+            if not is_rotary:
+                continue
+            rot_cfg = getattr(sub, "config", None) or fallback_cfg
+            rot_cls = type(sub)
+            fresh: nn.Module | None = None
+            with torch.device("cpu"):
+                for r_args, r_kw in (
+                    ((rot_cfg,), {}),
+                    ((), {"config": rot_cfg}),
+                    ((rot_cfg,), {"device": "cpu"}),
+                ):
+                    try:
+                        fresh = rot_cls(*r_args, **r_kw)
+                        break
+                    except TypeError:
+                        continue
+            if fresh is not None:
+                for bname, bval in fresh._buffers.items():
+                    sub._buffers[bname] = bval.to(device="cpu") if isinstance(bval, torch.Tensor) else bval
+                if hasattr(fresh, "_non_persistent_buffers_set"):
+                    sub._non_persistent_buffers_set = set(fresh._non_persistent_buffers_set)
+                for k, v in fresh.__dict__.items():
+                    if k.startswith("_") or k in ("training",):
+                        continue
+                    setattr(sub, k, v.to(device="cpu") if isinstance(v, torch.Tensor) else copy.deepcopy(v))
+
+        seen_meta: dict[int, nn.Parameter] = {}
+        for mod_name, sub in backbone.named_modules():
+            is_moe_experts = mod_name.endswith(".mlp.experts")
+            for pname, p in list(sub._parameters.items()):
+                if not isinstance(p, torch.Tensor) or not p.is_meta:
+                    continue
+                if is_moe_experts and pname in ("gate_up_proj", "down_proj"):
+                    continue
+                existing = seen_meta.get(id(p))
+                if existing is None:
+                    existing = nn.Parameter(
+                        torch.zeros(p.shape, dtype=p.dtype, device="cpu"),
+                        requires_grad=p.requires_grad,
+                    )
+                    seen_meta[id(p)] = existing
+                sub._parameters[pname] = existing
+            for bname, b in list(sub._buffers.items()):
+                if isinstance(b, torch.Tensor) and b.is_meta:
+                    sub._buffers[bname] = torch.zeros(b.shape, dtype=b.dtype, device="cpu")
+
+    class _StandaloneLayerDeltas(nn.Module):
+        def __init__(
+            self,
+            experts: list[int],
+            i2: int,
+            h: int,
+            i: int,
+            rank: int,
+            dtype: torch.dtype,
+            device: torch.device,
+        ) -> None:
+            super().__init__()
+            kw = {"dtype": dtype, "device": device}
+            if rank <= 0:
+                self.gate_up = nn.ParameterDict({str(e): nn.Parameter(torch.zeros(i2, h, **kw)) for e in experts})
+                self.down = nn.ParameterDict({str(e): nn.Parameter(torch.zeros(h, i, **kw)) for e in experts})
+            else:
+                self.gate_up_A = nn.ParameterDict({str(e): nn.Parameter(torch.zeros(rank, h, **kw)) for e in experts})
+                self.gate_up_B = nn.ParameterDict({str(e): nn.Parameter(torch.zeros(i2, rank, **kw)) for e in experts})
+                self.down_A = nn.ParameterDict({str(e): nn.Parameter(torch.zeros(rank, i, **kw)) for e in experts})
+                self.down_B = nn.ParameterDict({str(e): nn.Parameter(torch.zeros(h, rank, **kw)) for e in experts})
+
+    class _StandaloneHotExpertDeltas(nn.Module):
+        def __init__(
+            self,
+            tm: nn.Module,
+            hf_cfg: Any,
+            hot: dict[int, list[int]],
+            *,
+            rank: int = 0,
+            alpha: float | None = None,
+            dtype: torch.dtype = torch.float32,
+        ) -> None:
+            super().__init__()
+            self.num_experts = int(getattr(hf_cfg, "num_experts", 1))
+            self.top_k = int(getattr(hf_cfg, "num_experts_per_tok", 1))
+            self.norm_topk = bool(getattr(hf_cfg, "norm_topk_prob", True))
+            self.rank = int(rank)
+            self.scale = float(alpha if alpha is not None else max(self.rank, 1)) / max(self.rank, 1)
+            self.hot: dict[int, list[int]] = {}
+            self.deltas = nn.ModuleDict()
+            layer_meta: dict[int, tuple[nn.Module, bool]] = {}
+            h_cfg = int(getattr(hf_cfg, "hidden_size", 0) or 0)
+            for layer_idx, raw in sorted(hot.items()):
+                exps = sorted({int(x) for x in raw})
+                if not exps:
+                    continue
+                mlp = tm.layers[layer_idx].mlp
+                exp_mod = mlp.experts
+                gu = getattr(exp_mod, "gate_up_proj", None)
+                dn = getattr(exp_mod, "down_proj", None)
+                if isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor) and gu.ndim == 3 and dn.ndim == 3:
+                    h_dim = h_cfg or int(dn.shape[1])
+                    if int(gu.shape[-1]) == h_dim and int(dn.shape[-2]) == h_dim:
+                        transposed, i2_dim, i_dim = False, int(gu.shape[-2]), int(dn.shape[-1])
+                    else:
+                        transposed, i2_dim, i_dim = True, int(gu.shape[-1]), int(dn.shape[-2])
+                elif _st_quant_kind(exp_mod) is not None:
+                    with torch.no_grad():
+                        g0, d0 = _st_deq_moe_expert(exp_mod, 0, torch.float32)
+                    transposed, i2_dim, h_dim, i_dim = False, int(g0.shape[0]), int(g0.shape[1]), int(d0.shape[1])
+                else:
+                    h_dim = h_cfg
+                    i_dim = int(getattr(hf_cfg, "moe_intermediate_size", None) or hf_cfg.intermediate_size)
+                    transposed, i2_dim = False, 2 * i_dim
+                gate_w = getattr(mlp.gate, "weight", None)
+                dev = gate_w.device if isinstance(gate_w, torch.Tensor) and not gate_w.is_meta else torch.device("cpu")
+                self.deltas[f"L{layer_idx}"] = _StandaloneLayerDeltas(
+                    exps, i2_dim, h_dim, i_dim, self.rank, dtype, dev
+                )
+                self.hot[layer_idx] = exps
+                layer_meta[layer_idx] = (mlp, transposed)
+            object.__setattr__(self, "_layer_meta", layer_meta)
+            object.__setattr__(self, "_handles", [])
+            object.__setattr__(self, "_pending", {})
+            object.__setattr__(self, "_is_probs", {})
+
+        def _base_weights(self, layer_idx: int, e: int) -> tuple[torch.Tensor, torch.Tensor]:
+            mlp, transposed = self._layer_meta[layer_idx]
+            exp_mod = mlp.experts
+            if _st_quant_kind(exp_mod) is not None:
+                return _st_deq_moe_expert(exp_mod, e, torch.float32)
+            gu, dn = exp_mod.gate_up_proj, exp_mod.down_proj
+            return (gu[e].t(), dn[e].t()) if transposed else (gu[e], dn[e])
+
+        def _apply_gu(self, ld: _StandaloneLayerDeltas, k: str, x: torch.Tensor) -> torch.Tensor:
+            if self.rank <= 0:
+                return F.linear(x, ld.gate_up[k].to(x.dtype))
+            return F.linear(F.linear(x, ld.gate_up_A[k].to(x.dtype)), ld.gate_up_B[k].to(x.dtype)) * self.scale
+
+        def _apply_down(self, ld: _StandaloneLayerDeltas, k: str, x: torch.Tensor) -> torch.Tensor:
+            if self.rank <= 0:
+                return F.linear(x, ld.down[k].to(x.dtype))
+            return F.linear(F.linear(x, ld.down_A[k].to(x.dtype)), ld.down_B[k].to(x.dtype)) * self.scale
+
+        def attach(self) -> _StandaloneHotExpertDeltas:
+            if self._handles:
+                return self
+            for layer_idx, (mlp, _tr) in self._layer_meta.items():
+                self._handles.append(mlp.register_forward_pre_hook(self._make_pre_hook(layer_idx)))
+                self._handles.append(mlp.gate.register_forward_hook(self._make_gate_hook(layer_idx)))
+                self._handles.append(mlp.register_forward_hook(self._make_mlp_hook(layer_idx), with_kwargs=True))
+            return self
+
+        def _make_pre_hook(self, layer_idx: int):
+            def _hook(_mod: nn.Module, _args: Any) -> None:
+                self._pending[layer_idx] = None
+
+            return _hook
+
+        def _make_gate_hook(self, layer_idx: int):
+            def _hook(_mod: nn.Module, _inp: Any, out: Any) -> None:
+                outs = out if isinstance(out, (tuple, list)) else (out,)
+                ts = [o for o in outs if isinstance(o, torch.Tensor)]
+                full = next((o for o in ts if o.is_floating_point() and o.shape[-1] == self.num_experts), None)
+                if full is None:
+                    raise RuntimeError(f"router output on layer {layer_idx} lacks num_experts={self.num_experts}")
+                full2 = full.reshape(-1, self.num_experts)
+                if layer_idx not in self._is_probs:
+                    self._is_probs[layer_idx] = _looks_like_probs(full2)
+                probs = _upcast(full2) if self._is_probs[layer_idx] else F.softmax(_upcast(full2), dim=-1)
+                idx = next((o for o in ts if not o.is_floating_point() and o.shape[-1] == self.top_k), None)
+                sc = next(
+                    (o for o in ts if o.is_floating_point() and o.shape[-1] == self.top_k and o is not full),
+                    None,
+                )
+                if idx is not None and sc is not None and self.top_k != self.num_experts:
+                    top_w, top_idx = sc.reshape(-1, self.top_k), idx.reshape(-1, self.top_k).long()
+                else:
+                    top_w, top_idx = probs.topk(self.top_k, dim=-1)
+                    if self.norm_topk:
+                        top_w = top_w / top_w.sum(-1, keepdim=True)
+                self._pending[layer_idx] = (top_w, top_idx)
+
+            return _hook
+
+        def _make_mlp_hook(self, layer_idx: int):
+            def _hook(_mod: nn.Module, args: Any, kwargs: Any, out: Any) -> Any:
+                route = self._pending.pop(layer_idx, None)
+                if route is None:
+                    raise RuntimeError(f"layer {layer_idx}: mlp.gate hook did not fire before mlp hook")
+                top_w, top_idx = route
+                x = args[0] if args else next(v for v in kwargs.values() if isinstance(v, torch.Tensor))
+                flat = x.reshape(-1, x.shape[-1])
+                mlp, _tr = self._layer_meta[layer_idx]
+                act = getattr(mlp.experts, "act_fn", None) or F.silu
+                ld = self.deltas[f"L{layer_idx}"]
+                acc: torch.Tensor | None = None
+                for e in self.hot[layer_idx]:
+                    tok, slot = (top_idx == e).nonzero(as_tuple=True)
+                    if tok.numel() == 0:
+                        continue
+                    k = str(e)
+                    xe = flat[tok]
+                    gu_w, dn_w = self._base_weights(layer_idx, e)
+                    gu_b = F.linear(xe, gu_w.to(device=xe.device, dtype=xe.dtype))
+                    gu_m = gu_b + self._apply_gu(ld, k, xe)
+                    g_b, u_b = gu_b.chunk(2, dim=-1)
+                    g_m, u_m = gu_m.chunk(2, dim=-1)
+                    h_b = act(g_b) * u_b
+                    h_m = act(g_m) * u_m
+                    d = F.linear(h_m - h_b, dn_w.to(device=xe.device, dtype=xe.dtype)) + self._apply_down(ld, k, h_m)
+                    contrib = d * top_w[tok, slot, None].to(d.dtype)
+                    if acc is None:
+                        acc = torch.zeros(flat.shape, dtype=d.dtype, device=flat.device)
+                    acc = acc.index_add(0, tok, contrib)
+                if acc is None:
+                    return None
+                main = out[0] if isinstance(out, tuple) else out
+                new_main = main + acc.view(main.shape).to(main.dtype)
+                return (new_main, *out[1:]) if isinstance(out, tuple) else new_main
+
+            return _hook
+
     class Qwen36LoopHSSDForCausalLM(_BaseCls):  # type: ignore[no-redef,misc]
         config_class = Qwen36LoopHSSDConfig
 
@@ -7181,11 +7578,13 @@ else:
             *,
             _defer_loop: bool = False,
             _dtype_override: torch.dtype | None = None,
+            _meta_moe_only: bool = False,
         ) -> None:
             super().__init__(config)
             self.config = config
             arch = config.qloop_v3_arch or {}
             bcfg = copy.deepcopy(dict(config.base_config or {}))
+            orig_qcfg = copy.deepcopy(bcfg.pop("quantization_config", None))
             base_dt = _dtype_override or _resolve_dt(arch.get("base_dtype", "float32"))
             mtype = str(arch.get("base_model_type") or bcfg.pop("model_type", "qwen3_5_moe"))
             bcfg.pop("model_type", None)
@@ -7194,6 +7593,11 @@ else:
                 attn_impl = "sdpa"
             hf_cfg = AutoConfig.for_model(mtype, **bcfg)
             hf_cfg._attn_implementation = attn_impl
+            if hasattr(hf_cfg, "quantization_config"):
+                try:
+                    hf_cfg.quantization_config = None
+                except Exception:
+                    pass
             if arch.get("yarn_target_len"):
                 orig_l = getattr(hf_cfg, "max_position_embeddings", None) or 262144
                 fac = max(1.0, float(arch["yarn_target_len"]) / float(orig_l))
@@ -7205,13 +7609,37 @@ else:
                     hf_cfg.rope_parameters = rp
                 hf_cfg.rope_scaling = dict(rope)
                 hf_cfg.max_position_embeddings = int(max(int(arch["yarn_target_len"]), int(orig_l)))
-            try:
-                self.backbone = AutoModelForCausalLM.from_config(
-                    hf_cfg, attn_implementation=attn_impl, torch_dtype=base_dt
-                )
-            except TypeError:
-                self.backbone = AutoModelForCausalLM.from_config(hf_cfg, attn_implementation=attn_impl)
-                self.backbone.to(dtype=base_dt)
+            if _meta_moe_only:
+                with torch.device("meta"):
+                    built_bb: nn.Module | None = None
+                    for dt_kw in ("dtype", "torch_dtype"):
+                        try:
+                            built_bb = AutoModelForCausalLM.from_config(
+                                hf_cfg, attn_implementation=attn_impl, **{dt_kw: base_dt}
+                            )
+                            break
+                        except TypeError:
+                            continue
+                    if built_bb is None:
+                        built_bb = AutoModelForCausalLM.from_config(hf_cfg, attn_implementation=attn_impl)
+                    self.backbone = built_bb
+                _st_materialize_non_moe_meta_backbone(self.backbone, hf_cfg)
+            else:
+                built_bb = None
+                for dt_kw in ("dtype", "torch_dtype"):
+                    try:
+                        built_bb = AutoModelForCausalLM.from_config(
+                            hf_cfg, attn_implementation=attn_impl, **{dt_kw: base_dt}
+                        )
+                        break
+                    except TypeError:
+                        continue
+                if built_bb is None:
+                    built_bb = AutoModelForCausalLM.from_config(hf_cfg, attn_implementation=attn_impl)
+                    built_bb.to(dtype=base_dt)
+                self.backbone = built_bb
+            if orig_qcfg is not None:
+                self.backbone.config.quantization_config = copy.deepcopy(orig_qcfg)
             _st_install_quant_fallback(self.backbone)
             self._cur_pass = 0
             self._tuple_out = False
@@ -7678,6 +8106,20 @@ else:
 
                 if str(lcfg.get("mode", "dense")) in ("sparse", "hybrid"):
                     self._install_standalone_lsa_dispatch(tm)
+
+            he_cfg = dict(arch.get("hot_experts") or {})
+            if he_cfg.get("enabled", False) and not he_cfg.get("merged_into_base", True):
+                raw_hm = he_cfg.get("hot_map") or {}
+                hot_map = {int(k): [int(e) for e in v] for k, v in raw_hm.items()}
+                if hot_map:
+                    tm.expert_deltas = _StandaloneHotExpertDeltas(
+                        tm,
+                        hf_cfg,
+                        hot_map,
+                        rank=int(he_cfg.get("rank", 0)),
+                        alpha=he_cfg.get("alpha"),
+                        dtype=ref_dt,
+                    ).attach()
 
         def _install_standalone_lsa_dispatch(self, tm: nn.Module) -> None:
             tc = tm.config
@@ -8215,14 +8657,41 @@ else:
                 cdict = config.to_dict() if hasattr(config, "to_dict") else dict(vars(config))
                 config = Qwen36LoopHSSDConfig(**cdict)
 
-            inst = cls(config, _defer_loop=True, _dtype_override=dt_override)
+            q_arch = dict((config.qloop_v3_arch or {}).get("quantization") or {})
+            use_meta_moe = bool(
+                (config.qloop_v3_arch or {}).get("backbone_kind") != "toy"
+                and (int(q_arch.get("moe_nvfp4_count", 0)) + int(q_arch.get("moe_fp8_count", 0)) > 0)
+            )
+            inst = cls(
+                config,
+                _defer_loop=True,
+                _dtype_override=dt_override,
+                _meta_moe_only=use_meta_moe,
+            )
             pmap = dict(inst.backbone.named_parameters())
             bmap = dict(inst.backbone.named_buffers())
             mmap = dict(inst.backbone.named_modules())
             expected_bb = set(pmap.keys())
             tie_we = bool(getattr(config, "tie_word_embeddings", False))
-            q_arch = dict((config.qloop_v3_arch or {}).get("quantization") or {})
             nvfp4_meta_map = dict(q_arch.get("nvfp4_modules") or {})
+            fp8_meta_map = dict(q_arch.get("fp8_modules") or {})
+            for f_path, f_meta in fp8_meta_map.items():
+                f_mod = mmap.get(f_path)
+                bs_val = f_meta.get("weight_block_size") if isinstance(f_meta, dict) else None
+                if f_mod is not None and isinstance(bs_val, (tuple, list)) and len(bs_val) == 2:
+                    f_mod.weight_block_size = (int(bs_val[0]), int(bs_val[1]))  # type: ignore[attr-defined]
+            buf_pref_attrs = {
+                "scale_inv",
+                "k_scale",
+                "v_scale",
+                "q_scale",
+                "o_scale",
+                "quant_scale",
+                "input_scale",
+                "input_global_scale",
+                "activation_scale",
+                "weight_shape",
+            }
             dyn_qattrs = {
                 "weight_packed",
                 "weight_scale",
@@ -8321,7 +8790,12 @@ else:
                                 bmap.pop(d_key, None)
                                 expected_bb.discard(d_key)
                             m_meta = nvfp4_meta_map.get(p_path) or {}
-                            if m_meta.get("storage") == "buffers":
+                            f_meta = fp8_meta_map.get(p_path) or {}
+                            as_buf = m_meta.get("storage") == "buffers" or (
+                                not m_meta
+                                and (a_nm.endswith("_scale_inv") or a_nm in buf_pref_attrs)
+                            )
+                            if as_buf:
                                 p_mod.register_buffer(a_nm, t.clone())
                                 bmap[k] = p_mod._buffers[a_nm]  # type: ignore[assignment]
                             else:
@@ -8330,6 +8804,9 @@ else:
                                 pmap[k] = np_val
                                 expected_bb.add(k)
                                 loaded_bb.add(k)
+                            bs_val = f_meta.get("weight_block_size") if isinstance(f_meta, dict) else None
+                            if isinstance(bs_val, (tuple, list)) and len(bs_val) == 2:
+                                p_mod.weight_block_size = (int(bs_val[0]), int(bs_val[1]))  # type: ignore[attr-defined]
                             if a_nm.endswith("_packed") or m_meta:
                                 if getattr(p_mod, "group_size", None) is None:
                                     p_mod.group_size = int(m_meta.get("group_size", 16))  # type: ignore[attr-defined]
@@ -8347,6 +8824,26 @@ else:
                         raise RuntimeError(
                             f"shape mismatch for {k}: model {tuple(target.shape)} vs shard {tuple(t.shape)}"
                         )
+                    if target.is_meta:
+                        p_path, _, a_nm = k.rpartition(".")
+                        p_mod = mmap.get(p_path)
+                        if p_mod is None:
+                            raise RuntimeError(f"cannot materialize meta tensor {k}: parent {p_path!r} missing")
+                        if t.dtype in _FP8_DTYPES or not t.is_floating_point():
+                            t_cpu = t.to(device="cpu").clone()
+                        elif dt_override is None:
+                            t_cpu = t.to(device="cpu", dtype=t.dtype).clone()
+                        else:
+                            t_cpu = t.to(device="cpu", dtype=target.dtype).clone()
+                        if is_param:
+                            np_val = nn.Parameter(t_cpu, requires_grad=False)
+                            p_mod._parameters[a_nm] = np_val
+                            pmap[k] = np_val
+                            loaded_bb.add(k)
+                        else:
+                            p_mod._buffers[a_nm] = t_cpu
+                            bmap[k] = t_cpu
+                        continue
                     with torch.no_grad():
                         if t.dtype in _FP8_DTYPES or not t.is_floating_point():
                             if isinstance(target, nn.Parameter):
@@ -8416,6 +8913,14 @@ else:
                         f"missing_backbone={missing_bb[:10]}, unexpected_backbone={unexpected_bb[:10]}, "
                         f"missing_loop={missing_loop[:10]}, unexpected_loop={unexpected_loop[:10]}"
                     )
+
+            leftover_meta = [
+                f"param:{n}" for n, p in inst.named_parameters() if p.is_meta
+            ] + [
+                f"buffer:{n}" for n, b in inst.named_buffers() if b.is_meta
+            ]
+            if leftover_meta:
+                raise RuntimeError(f"meta tensors remained after standalone pack load: {leftover_meta[:10]}")
 
             if isinstance(device_map, torch.device):
                 inst.to(device_map)

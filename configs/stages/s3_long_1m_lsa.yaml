@@ -7,7 +7,7 @@
 #   * `prefix_suffix_calibration_step`: streams 512K-992K prefix tokens under `torch.no_grad()` to populate true 1M-scale
 #     FP8 KV + centroids, then backpropagates gradients on the final 32K query/answer suffix (`< 64 GiB` HBM on G4!).
 #   * Includes optional Tier-2 10M Host-DDR5 Block-64 Walsh-Hadamard INT4 offload config (`offload.enabled: false`).
-_base_: [../base.yaml, ../model/qwen36_fp8.yaml]
+_base_: [../base.yaml, ../model/qwen36_nvfp4.yaml]
 stage: s3_long_1m_lsa
 stage_type: lm
 run: {name: s3_long_1m_lsa}

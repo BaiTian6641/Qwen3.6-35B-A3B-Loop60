@@ -8,11 +8,11 @@ Designed for multi-session Google Colab training pushing by stage commits to a p
      authoritative `manifest.json` and auto-rendered `README.md` Model Card.
   2. **Zero-Drive cross-session auto-resume**: A fresh Colab runtime queries `manifest.json` (and
      Hub commit history), skips already-completed stages, pulls *only* the latest active or
-     prerequisite trainable bundle (~0.5-3.5 GB, never duplicating the 70 GB frozen base weights),
+     prerequisite trainable bundle (~0.5-3.5 GB, never duplicating the ~22.3 GiB frozen NVFP4 base weights),
      and resumes at the exact optimizer step and data-stream cursor.
   3. **230 GB Colab disk guard**: Keeps `keep_last=1` locally, strips completed-stage optimizer
      states, deletes superseded stage checkpoint directories once verified on Hub, and purges
-     transient HF xet/upload staging caches while preserving cached `Qwen/Qwen3.6-35B-A3B` weights.
+     transient HF xet/upload staging caches while preserving cached `unsloth/Qwen3.6-35B-A3B-NVFP4` weights.
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ log = logging.getLogger("qloop")
 
 DEFAULT_HF_REPO = "TassP0lar/Qwen3.6-35B-A3B-Loop64"
 DEFAULT_PACK_REPO = "TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack"
-DEFAULT_BASE_MODEL = "Qwen/Qwen3.6-35B-A3B"
+DEFAULT_BASE_MODEL = "unsloth/Qwen3.6-35B-A3B-NVFP4"
 MANIFEST_FILE = "manifest.json"
 PIPELINE_ORDER: tuple[str, ...] = (
     "s0_probe",

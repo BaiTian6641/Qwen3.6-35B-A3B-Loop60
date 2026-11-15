@@ -5,7 +5,7 @@
 # `bridge_mode: subspace`, `bridge_init: [0.05, 0.85, 0.10]` -> w_anchor=0.85) provides live step-1 gradients (Fixes A1-A3).
 # Pipeline: Stock Qwen3.6 GDN -> HSSD v3.2 + D-LSA. Heals the 88L loop directly over fast stock linear attention
 # (no GDN-2 overhead) before `s1b_hssd_distill` upgrades all 30 linear layers to HSSD v3.2; MoE experts stay 100% frozen.
-_base_: [../base.yaml, ../model/qwen36_fp8.yaml]
+_base_: [../base.yaml, ../model/qwen36_nvfp4.yaml]
 stage: s1_loop_a6b
 stage_type: lm
 run: {name: s1_loop_a6b}

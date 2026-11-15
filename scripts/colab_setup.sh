@@ -47,4 +47,4 @@ fi
 log "installing qloop package"
 $PY -m pip install -q --no-cache-dir --no-deps .
 
-log "done. next: python -m qloop doctor --freeze requirements/colab.lock.txt --model Qwen/Qwen3.6-35B-A3B-FP8"
+log "done. next: python -m qloop doctor --freeze requirements/colab.lock.txt --model unsloth/Qwen3.6-35B-A3B-NVFP4"

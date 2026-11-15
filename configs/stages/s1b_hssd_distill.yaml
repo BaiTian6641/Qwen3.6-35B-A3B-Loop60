@@ -7,7 +7,7 @@
 #   * Multi-page routed chunk-start root-surprise (`surprise_mode: routed` against `boundary_ring[-1]`, zero `sqrt(s)` singularity)
 #   * Compact lagged-replay `state_dtype: bfloat16` decode cache (`compact_decode_cache: true`, Fix H5) & `segment_chunks: 4` (256-tok WY ckpt)
 #   * Zero-duplicate-VRAM `SharedBackboneTeacher` (`teacher_track: stock`) using `hssd.teacher_mode()` zero-hook fast path in Phase 2.
-_base_: [../base.yaml, ../model/qwen36_fp8.yaml]
+_base_: [../base.yaml, ../model/qwen36_nvfp4.yaml]
 stage: s1b_hssd_distill
 stage_type: lm
 run: {name: s1b_hssd_distill}

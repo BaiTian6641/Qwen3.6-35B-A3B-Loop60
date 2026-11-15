@@ -7,7 +7,7 @@
 #     retrieval gradients into `k_proj`, `v_proj`, and `W_k_idx` at `< 6%` compute overhead!
 #   * Base 32.338B MoE experts stay 100% frozen; optional rank-64 `HotExpertDeltas` on top 2.5% Pass-2/3 experts
 #     can be enabled post-scan via `-s experts.enabled=true` (folded cleanly during Whole Model Pack export).
-_base_: [../base.yaml, ../model/qwen36_fp8.yaml]
+_base_: [../base.yaml, ../model/qwen36_nvfp4.yaml]
 stage: s2_joint_bptt
 stage_type: lm
 run: {name: s2_joint_bptt}

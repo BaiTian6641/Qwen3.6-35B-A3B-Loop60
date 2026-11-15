@@ -1,6 +1,6 @@
-"""Environment doctor: one table telling you exactly what is wrong before a 21-35 GB download.
+"""Environment doctor: one table telling you exactly what is wrong before a 20-35 GB download.
 
-    python -m qloop doctor [--freeze requirements/colab.lock.txt] [--datasets] [--model Qwen/Qwen3.6-35B-A3B-FP8]
+    python -m qloop doctor [--freeze requirements/colab.lock.txt] [--datasets] [--model unsloth/Qwen3.6-35B-A3B-NVFP4]
 
 Each check returns (status, detail, fix). FAIL => non-zero exit code.
 """
@@ -19,7 +19,7 @@ from typing import Callable
 log = logging.getLogger("qloop")
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
-DEFAULT_MODEL = "Qwen/Qwen3.6-35B-A3B-FP8"
+DEFAULT_MODEL = "unsloth/Qwen3.6-35B-A3B-NVFP4"
 
 
 @dataclass
@@ -190,7 +190,7 @@ def check_packages() -> list[Check]:
         ("kernels", '"kernels>=0.18.2,<0.19.0"', WARN,
          "HF finegrained_fp8 native Blackwell FP8 kernels (PyTorch fallback used otherwise)"),
         ("compressed_tensors", "compressed-tensors", WARN,
-         "needed for NVFP4 checkpoints (unsloth/Qwen3.6-35B-A3B-NVFP4-Fast); FP8 works natively without it"),
+         "optional NVFP4 fallback (qloop loads unsloth/Qwen3.6-35B-A3B-NVFP4[-Fast] directly from safetensors)"),
         ("fla", "flash-linear-attention", WARN, "Gated DeltaNet fast kernels; without them HF uses a slow torch path"),
         ("causal_conv1d", "causal-conv1d", WARN, "short-conv kernel for DeltaNet (fallback is slower)"),
         ("apollo_torch", "apollo-torch", WARN, "APOLLO optimizer (built-in faithful fallback is used otherwise)"),

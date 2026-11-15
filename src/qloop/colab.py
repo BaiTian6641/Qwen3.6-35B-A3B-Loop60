@@ -2,9 +2,9 @@
 
     from qloop.colab import setup_env, q, hub_status, resolve_base_model_name, run_pipeline, tail_metrics
     setup_env(hf_repo="TassP0lar/Qwen3.6-35B-A3B-Loop64")
-    q(f"doctor --freeze requirements/colab.lock.txt --model {resolve_base_model_name('fp8')}")
+    q(f"doctor --freeze requirements/colab.lock.txt --model {resolve_base_model_name('nvfp4')}")
     hub_status()
-    run_pipeline(base_precision="fp8", debug=1, time_budget_hours=21.5)
+    run_pipeline(base_precision="nvfp4", debug=1, time_budget_hours=21.5)
 
 Design:
 * Zero Google Drive dependency: every stage commits its trainable checkpoint + `manifest.json` +
@@ -36,8 +36,9 @@ DEFAULT_HF_REPO = "TassP0lar/Qwen3.6-35B-A3B-Loop64"
 DEFAULT_PACK_REPO = "TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack"
 DEFAULT_HF_KERNELS_PIP_SPEC = "kernels>=0.18.2,<0.19.0"
 BASE_MODEL_BY_PRECISION: dict[str, str] = {
+    "nvfp4": "unsloth/Qwen3.6-35B-A3B-NVFP4",
+    "nvfp4-fast": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
     "fp8": "Qwen/Qwen3.6-35B-A3B-FP8",
-    "nvfp4": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
     "bf16": "Qwen/Qwen3.6-35B-A3B",
 }
 SECRETS = (
@@ -70,7 +71,7 @@ DEFAULT_METRIC_KEYS = (
 
 
 def resolve_base_model_name(base_precision: str | None) -> str | None:
-    """Resolve `'fp8'`, `'nvfp4'`, `'bf16'`, or a direct `'org/model'` HF repo ID to a model name."""
+    """Resolve `'nvfp4'`, `'nvfp4-fast'`, `'fp8'`, `'bf16'`, or an `'org/model'` HF repo ID to a model name."""
     if base_precision is None:
         return None
     raw = str(base_precision).strip()
@@ -82,6 +83,9 @@ def resolve_base_model_name(base_precision: str | None) -> str | None:
     alias = raw.lower()
     if alias in BASE_MODEL_BY_PRECISION:
         return BASE_MODEL_BY_PRECISION[alias]
+    alias_norm = alias.replace("_", "-")
+    if alias_norm in BASE_MODEL_BY_PRECISION:
+        return BASE_MODEL_BY_PRECISION[alias_norm]
     parts = raw.split("/")
     if len(parts) == 2 and all(p and not any(ch.isspace() for ch in p) for p in parts):
         return raw
@@ -292,7 +296,7 @@ def _resolve_hf_kernels_pip_spec(message: str | None = None) -> tuple[bool, str]
 
 
 def _resolve_precision_mode(base_precision: str | None) -> str:
-    """Resolve `'fp8'`, `'nvfp4'`, `'bf16'`, or an `'org/model'` HF repo ID into a precision tag."""
+    """Resolve `'nvfp4'`, `'nvfp4-fast'`, `'fp8'`, `'bf16'`, or an `'org/model'` HF repo ID into a precision tag."""
     if base_precision is None:
         return "none"
     raw = str(base_precision).strip()
@@ -301,6 +305,8 @@ def _resolve_precision_mode(base_precision: str | None) -> str:
     low = raw.lower()
     if low in ("fp8", "nvfp4", "bf16"):
         return low
+    if low.replace("_", "-") in ("nvfp4", "nvfp4-fast"):
+        return "nvfp4"
     resolved = resolve_base_model_name(raw) or raw
     upper = resolved.upper()
     if "-NVFP4" in upper or upper.endswith("NVFP4"):
@@ -321,7 +327,7 @@ def _effective_precision_arg(base_precision: str | None, overrides: Sequence[str
 
 
 def ensure_quant_runtime_packages(
-    base_precision: str | None = "fp8",
+    base_precision: str | None = "nvfp4",
     *,
     auto_install: bool = True,
 ) -> dict[str, str]:
@@ -448,7 +454,7 @@ def setup_env(
     hf_home: str = "/content/hf_cache",
     *,
     require_hf_token: bool = True,
-    base_precision: str | None = "fp8",
+    base_precision: str | None = "nvfp4",
     auto_install_runtime_deps: bool = True,
 ) -> dict[str, str]:
     """Load Colab Secrets into `os.environ`, configure HF Hub sync + local SSD paths, and print disk budget."""
@@ -593,7 +599,7 @@ def reclaim_disk(keep: str | None = None, pip: bool = False) -> int:
 def run_pipeline(
     *,
     hf_repo: str | None = None,
-    base_precision: str | None = "fp8",
+    base_precision: str | None = "nvfp4",
     smoke_toy: bool = False,
     debug: int = 1,
     time_budget_hours: float = 21.5,
@@ -925,7 +931,7 @@ def run_probe_notebook_suite(
     *,
     config_path: str = "configs/stages/s0_probe.yaml",
     hf_repo: str | None = None,
-    base_precision: str | None = "fp8",
+    base_precision: str | None = "nvfp4",
     smoke_toy: bool = False,
     seq_len: int | None = None,
     n_seqs: int | None = None,
@@ -1137,7 +1143,7 @@ def run_v3_e2e_and_ship_pack(
     *,
     hf_repo: str | None = None,
     pack_repo: str | None = None,
-    base_precision: str | None = "fp8",
+    base_precision: str | None = "nvfp4",
     smoke_toy: bool = False,
     stages: Sequence[str] = (
         "s0_probe",

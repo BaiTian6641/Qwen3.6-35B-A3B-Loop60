@@ -1,9 +1,10 @@
-# Unsloth Blackwell-calibrated NVFP4-Fast (~20-22 GiB VRAM on RTX PRO 6000 Blackwell sm_120):
-# `compressed-tensors` `nvfp4-pack-quantized` group-16 checkpoint with full probing, serving, and
-# multi-stage training (`S1`, `S1b`, `S2`, `S3`, `S4`) support via `compressed-tensors` + qloop's
-# transient `quant_autograd` dL/dx bridge (HotExpertDeltas & Whole Model Pack export supported).
+# Unsloth Blackwell-calibrated NVFP4 Standard (~22.3 GiB text-only disk / ~24.1 GiB loaded VRAM on RTX PRO 6000 Blackwell sm_120):
+# Primary default base checkpoint across all probing, evaluation, and training stages (`S0`, `S1`, `S1b`, `S3`, `S2`, `S4`).
+# Keeps Layers 0-31 MoE experts in group-16 NVFP4 and Layers 32-39 coda experts + attention/lm_head in channel-wise FP8
+# for full BF16/FP8 benchmark parity; loaded directly from safetensors with zero 60 GiB BF16 spike via qloop's direct
+# loader + transient `quant_autograd` dL/dx bridge (HotExpertDeltas & Whole Model Pack export supported).
 model:
-  name: unsloth/Qwen3.6-35B-A3B-NVFP4-Fast
+  name: unsloth/Qwen3.6-35B-A3B-NVFP4
   dtype: bfloat16
   attn_implementation: sdpa     # RTX PRO 6000 = sm_120: FlashAttention-3 is Hopper-only
   device_map: cuda:0

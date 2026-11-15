@@ -1,6 +1,6 @@
 # Official Qwen [128, 128] block-scaled FP8 e4m3 weights (~35 GiB VRAM on RTX PRO 6000 Blackwell sm_120):
-# default base checkpoint across all probing & training stages. Loads natively in transformers>=5 with
-# zero extra packages; qloop's transient `quant_autograd` bridge provides exact dL/dx input gradients
+# optional FP8 base checkpoint preset (`configs/model/qwen36_nvfp4.yaml` is the primary default). Loads natively in
+# transformers>=5 or via direct safetensors; qloop's transient `quant_autograd` bridge provides exact dL/dx input gradients
 # (+ HotExpertDeltas auto-dequantization & Whole Model Pack export) with zero persistent BF16 copy.
 model:
   name: Qwen/Qwen3.6-35B-A3B-FP8

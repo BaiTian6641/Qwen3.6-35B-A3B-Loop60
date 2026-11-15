@@ -532,9 +532,10 @@ class LMTrainer:
                     loss_f = float(loss_d1)
                     raise RuntimeError(
                         f"Step-0 eval loss ({loss_f:.4f}) exceeds train.max_step0_loss={max_step0_loss:.2f} "
-                        "(uniform random vocab loss is ~12.42); base model weights appear corrupted or "
-                        "mis-dequantized (e.g. incompatible quantized checkpoint layout). "
-                        "Use model.name=Qwen/Qwen3.6-35B-A3B-FP8 or set train.max_step0_loss=0 to disable this check."
+                        "(uniform random vocab loss is ~12.42); base model weights appear corrupted, "
+                        "tokenizer vocabulary is mismatched, or an unsupported third-party quantizer altered scales. "
+                        "Verify model.name (default unsloth/Qwen3.6-35B-A3B-NVFP4) and cached safetensors shards, "
+                        "or set train.max_step0_loss=0 to disable this check."
                     )
         # Reset throughput timer AFTER step-0 quick_eval() so initial eval duration never pollutes step-1 tok/s.
         t_log, tok_log = time.time(), 0

@@ -67,7 +67,9 @@ def test_every_config_loads_and_validates(path):
         assert loop.virtual_layers(40) in (64, 88), f"{path}: Qwen configs must target 64 or 88 virtual layers"
         norm_path = path.replace("\\", "/")
         if "stages/" in norm_path or "eval/" in norm_path:
-            assert cfg.model.name == "Qwen/Qwen3.6-35B-A3B-FP8", f"{path}: stage/eval default must be FP8"
+            assert cfg.model.name == "unsloth/Qwen3.6-35B-A3B-NVFP4", (
+                f"{path}: stage/eval default must be unsloth/Qwen3.6-35B-A3B-NVFP4"
+            )
             assert loop.per_pass_router is True
             assert not (
                 (cfg.get("gdn2") or {}).get("enabled") is True
@@ -83,9 +85,19 @@ def test_every_config_loads_and_validates(path):
 
 
 def test_blackwell_fp8_nvfp4_and_bf16_model_configs():
+    from qloop.hub import DEFAULT_BASE_MODEL, HubManifest, render_model_card
+
     fp8 = load_config(os.path.join(ROOT, "configs", "model", "qwen36_fp8.yaml"))
     nvfp4 = load_config(os.path.join(ROOT, "configs", "model", "qwen36_nvfp4.yaml"))
+    nvfp4_fast = load_config(os.path.join(ROOT, "configs", "model", "qwen36_nvfp4_fast.yaml"))
     bf16 = load_config(os.path.join(ROOT, "configs", "model", "qwen36_bf16.yaml"))
+
+    assert DEFAULT_BASE_MODEL == "unsloth/Qwen3.6-35B-A3B-NVFP4"
+    default_manifest = HubManifest()
+    assert default_manifest.base_model == "unsloth/Qwen3.6-35B-A3B-NVFP4"
+    card = render_model_card(default_manifest)
+    assert "base_model: unsloth/Qwen3.6-35B-A3B-NVFP4" in card
+    assert "[`unsloth/Qwen3.6-35B-A3B-NVFP4`](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4)" in card
 
     assert fp8.model.name == "Qwen/Qwen3.6-35B-A3B-FP8"
     assert fp8.model.dtype == "bfloat16"
@@ -95,7 +107,7 @@ def test_blackwell_fp8_nvfp4_and_bf16_model_configs():
     assert fp8.model.trust_remote_code is False
     assert dict(fp8.model.expected) == EXPECTED_QWEN36_DIMS
 
-    assert nvfp4.model.name == "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"
+    assert nvfp4.model.name == "unsloth/Qwen3.6-35B-A3B-NVFP4"
     assert nvfp4.model.dtype == "bfloat16"
     assert nvfp4.model.attn_implementation == "sdpa"
     assert nvfp4.model.device_map == "cuda:0"
@@ -103,20 +115,40 @@ def test_blackwell_fp8_nvfp4_and_bf16_model_configs():
     assert nvfp4.model.trust_remote_code is False
     assert dict(nvfp4.model.expected) == EXPECTED_QWEN36_DIMS
 
+    assert nvfp4_fast.model.name == "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"
+    assert nvfp4_fast.model.dtype == "bfloat16"
+    assert nvfp4_fast.model.attn_implementation == "sdpa"
+    assert nvfp4_fast.model.device_map == "cuda:0"
+    assert nvfp4_fast.model.text_only is True
+    assert nvfp4_fast.model.trust_remote_code is False
+    assert dict(nvfp4_fast.model.expected) == EXPECTED_QWEN36_DIMS
+
     assert bf16.model.name == "Qwen/Qwen3.6-35B-A3B"
+
+    # Verify trainer max_step0_loss diagnostic hint cites default NVFP4 without blaming Unsloth NVFP4
+    with open(os.path.join(ROOT, "src", "qloop", "train", "trainer.py"), encoding="utf-8") as f:
+        trainer_src = f.read()
+    assert "default unsloth/Qwen3.6-35B-A3B-NVFP4" in trainer_src
+    assert "tokenizer vocabulary is mismatched" in trainer_src
+    assert "unsupported third-party quantizer" in trainer_src
+    assert "Use model.name=Qwen/Qwen3.6-35B-A3B-FP8" not in trainer_src
 
 
 def test_resolve_base_model_name_and_colab_precision_plumbing(tmp_path, monkeypatch):
     assert BASE_MODEL_BY_PRECISION == {
+        "nvfp4": "unsloth/Qwen3.6-35B-A3B-NVFP4",
+        "nvfp4-fast": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
         "fp8": "Qwen/Qwen3.6-35B-A3B-FP8",
-        "nvfp4": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
         "bf16": "Qwen/Qwen3.6-35B-A3B",
     }
     assert resolve_base_model_name(None) is None
+    assert resolve_base_model_name("nvfp4") == "unsloth/Qwen3.6-35B-A3B-NVFP4"
+    assert resolve_base_model_name("NVFP4") == "unsloth/Qwen3.6-35B-A3B-NVFP4"
+    assert resolve_base_model_name("nvfp4-fast") == "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"
+    assert resolve_base_model_name("NVFP4-Fast") == "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"
+    assert resolve_base_model_name("nvfp4_fast") == "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"
     assert resolve_base_model_name("fp8") == "Qwen/Qwen3.6-35B-A3B-FP8"
     assert resolve_base_model_name("FP8") == "Qwen/Qwen3.6-35B-A3B-FP8"
-    assert resolve_base_model_name("nvfp4") == "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"
-    assert resolve_base_model_name("NVFP4") == "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"
     assert resolve_base_model_name("bf16") == "Qwen/Qwen3.6-35B-A3B"
     assert resolve_base_model_name("org/custom-qwen36") == "org/custom-qwen36"
 
@@ -129,7 +161,7 @@ def test_resolve_base_model_name_and_colab_precision_plumbing(tmp_path, monkeypa
     monkeypatch.setattr("qloop.colab.q", lambda cmd, check=True: calls.append(cmd) or 0)
     monkeypatch.setattr(
         "qloop.colab.ensure_quant_runtime_packages",
-        lambda base_precision="fp8", *, auto_install=True: {
+        lambda base_precision="nvfp4", *, auto_install=True: {
             "precision": str(base_precision),
             "package": "stub",
             "pip_spec": "",
@@ -138,19 +170,23 @@ def test_resolve_base_model_name_and_colab_precision_plumbing(tmp_path, monkeypa
     )
 
     run_pipeline(hf_repo="test/repo")
-    assert "model.name=Qwen/Qwen3.6-35B-A3B-FP8" in calls[-1]
+    assert "model.name=unsloth/Qwen3.6-35B-A3B-NVFP4" in calls[-1]
+    assert "NVFP4-Fast" not in calls[-1]
 
-    run_pipeline(hf_repo="test/repo", base_precision="nvfp4")
+    run_pipeline(hf_repo="test/repo", base_precision="nvfp4-fast")
     assert "model.name=unsloth/Qwen3.6-35B-A3B-NVFP4-Fast" in calls[-1]
+
+    run_pipeline(hf_repo="test/repo", base_precision="fp8")
+    assert "model.name=Qwen/Qwen3.6-35B-A3B-FP8" in calls[-1]
 
     run_pipeline(hf_repo="test/repo", base_precision="nvfp4", overrides=("model.name=custom/override",))
     assert "model.name=custom/override" in calls[-1]
-    assert "NVFP4-Fast" not in calls[-1]
+    assert "Qwen3.6-35B-A3B-NVFP4" not in calls[-1]
 
     run_pipeline(hf_repo="test/repo", base_precision="nvfp4", smoke_toy=True)
     assert "model.name=" not in calls[-1]
 
-    # Verify run_v3_e2e_and_ship_pack propagates base_precision into BOTH pipeline and export-pack
+    # Verify run_v3_e2e_and_ship_pack propagates default base_precision="nvfp4" into BOTH pipeline and export-pack
     class _DoneManifest:
         def is_completed(self, _stage: str) -> bool:
             return True
@@ -160,16 +196,16 @@ def test_resolve_base_model_name_and_colab_precision_plumbing(tmp_path, monkeypa
     res = run_v3_e2e_and_ship_pack(
         hf_repo="test/repo",
         pack_repo="test/pack",
-        base_precision="nvfp4",
         stages=("s0_probe", "s1_loop_a6b"),
     )
     assert res["pack_shipped"] is True
     pipe_cmd = next(c for c in calls if c.startswith("sync pipeline"))
     pack_cmd = next(c for c in calls if c.startswith("export-pack"))
-    assert "model.name=unsloth/Qwen3.6-35B-A3B-NVFP4-Fast" in pipe_cmd
-    assert "model.name=unsloth/Qwen3.6-35B-A3B-NVFP4-Fast" in pack_cmd
+    assert "model.name=unsloth/Qwen3.6-35B-A3B-NVFP4" in pipe_cmd
+    assert "model.name=unsloth/Qwen3.6-35B-A3B-NVFP4" in pack_cmd
+    assert "NVFP4-Fast" not in pipe_cmd
 
-    # Verify run_probe_notebook_suite injects base_precision when smoke_toy=False and keeps toy when smoke_toy=True
+    # Verify run_probe_notebook_suite injects default base_precision="nvfp4" when smoke_toy=False
     def _fake_probe_q(cmd: str, check: bool = True) -> int:
         calls.append(cmd)
         probe_dir = tmp_path / "probe"
@@ -184,13 +220,14 @@ def test_resolve_base_model_name_and_colab_precision_plumbing(tmp_path, monkeypa
     monkeypatch.setattr("qloop.colab.q", _fake_probe_q)
     monkeypatch.setattr("qloop.model.probes.profile_hssd_layer", None, raising=False)
     calls.clear()
-    run_probe_notebook_suite(smoke_toy=False, base_precision="nvfp4", run_math_gate=False, push_to_hub=False)
-    assert "model.name=unsloth/Qwen3.6-35B-A3B-NVFP4-Fast" in calls[-1]
+    run_probe_notebook_suite(smoke_toy=False, run_math_gate=False, push_to_hub=False)
+    assert "model.name=unsloth/Qwen3.6-35B-A3B-NVFP4" in calls[-1]
+    assert "NVFP4-Fast" not in calls[-1]
 
     calls.clear()
     run_probe_notebook_suite(smoke_toy=True, base_precision="nvfp4", run_math_gate=False, push_to_hub=False)
     assert "model.name=toy" in calls[-1]
-    assert "NVFP4-Fast" not in calls[-1]
+    assert "Qwen3.6-35B-A3B-NVFP4" not in calls[-1]
 
 
 def test_setup_env_scrubs_deprecated_hf_transfer_and_enables_xet(tmp_path, monkeypatch):
@@ -272,12 +309,14 @@ def test_resolve_hf_kernels_pip_spec_and_runtime_auto_install(tmp_path, monkeypa
         "status": "missing (kernels>=0.18.2,<0.19.0)",
     }
     assert ensure_quant_runtime_packages("Qwen/Qwen3.6-35B-A3B-FP8", auto_install=False)["precision"] == "fp8"
-    assert ensure_quant_runtime_packages("nvfp4", auto_install=False) == {
+    assert ensure_quant_runtime_packages(auto_install=False) == {
         "precision": "nvfp4",
         "package": "compressed_tensors",
         "pip_spec": "compressed-tensors",
         "status": "missing (compressed-tensors)",
     }
+    assert ensure_quant_runtime_packages("nvfp4-fast", auto_install=False)["precision"] == "nvfp4"
+    assert ensure_quant_runtime_packages("unsloth/Qwen3.6-35B-A3B-NVFP4", auto_install=False)["precision"] == "nvfp4"
     assert (
         ensure_quant_runtime_packages("unsloth/Qwen3.6-35B-A3B-NVFP4-Fast", auto_install=False)["precision"] == "nvfp4"
     )
@@ -429,8 +468,8 @@ def test_hf5_underscore_loader_and_lru_cache_clear_on_pip_install(monkeypatch):
 
 
 def test_doctor_blackwell_fp8_nvfp4_and_compressed_tensors(monkeypatch):
-    assert doctor.DEFAULT_MODEL == "Qwen/Qwen3.6-35B-A3B-FP8"
-    assert doctor.build_parser().parse_args([]).model == "Qwen/Qwen3.6-35B-A3B-FP8"
+    assert doctor.DEFAULT_MODEL == "unsloth/Qwen3.6-35B-A3B-NVFP4"
+    assert doctor.build_parser().parse_args([]).model == "unsloth/Qwen3.6-35B-A3B-NVFP4"
 
     pkg_checks = {c.name: c for c in doctor.check_packages()}
     assert "kernels" in pkg_checks
@@ -485,7 +524,7 @@ def test_notebooks_and_setup_script_blackwell_conventions():
         nb = json.loads(raw)
         assert nb.get("nbformat") == 4
         code_cells = ["".join(c.get("source", [])) for c in nb.get("cells", []) if c.get("cell_type") == "code"]
-        assert any('BASE_PRECISION = "fp8"' in cell for cell in code_cells), f"{nb_path} missing BASE_PRECISION"
+        assert any('BASE_PRECISION = "nvfp4"' in cell for cell in code_cells), f"{nb_path} missing BASE_PRECISION"
         assert any(
             "setup_env(" in cell and "base_precision=BASE_PRECISION" in cell for cell in code_cells
         ), f"{nb_path} setup_env missing base_precision=BASE_PRECISION"
@@ -498,6 +537,7 @@ def test_notebooks_and_setup_script_blackwell_conventions():
     assert "HF_XET_HIGH_PERFORMANCE=1" in setup_sh
     assert '"kernels>=0.18.2,<0.19.0"' in setup_sh
     assert "compressed-tensors" in setup_sh
+    assert "unsloth/Qwen3.6-35B-A3B-NVFP4" in setup_sh
     assert "accelerate hf_transfer" not in setup_sh
 
     with open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8") as f:

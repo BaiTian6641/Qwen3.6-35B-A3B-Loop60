@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import logging
@@ -1695,6 +1696,147 @@ def _gdn_baseline_decode_step(
     return out, s_next.to(dtype=state.dtype).contiguous()
 
 
+@contextlib.contextmanager
+def _scoped_tf32_mode(allow_tf32: bool | None):
+    if allow_tf32 is None:
+        yield bool(getattr(torch.backends.cuda.matmul, "allow_tf32", False))
+        return
+    prev_matmul = bool(getattr(torch.backends.cuda.matmul, "allow_tf32", False))
+    prev_cudnn = bool(getattr(torch.backends.cudnn, "allow_tf32", False))
+    prev_prec = torch.get_float32_matmul_precision() if hasattr(torch, "get_float32_matmul_precision") else None
+    try:
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
+        yield bool(allow_tf32)
+    finally:
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = prev_matmul
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.allow_tf32 = prev_cudnn
+        if prev_prec is not None and hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision(prev_prec)
+
+
+def measure_hssd_tf32_drift(
+    *,
+    hidden_size: int = 256,
+    num_v_heads: int = 4,
+    head_k_dim: int = 32,
+    head_v_dim: int = 32,
+    seq_len: int = 32768,
+    stream_chunk_len: int = 1024,
+    rank: int = 32,
+    state_dtype: str = "bfloat16",
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> dict[str, Any]:
+    """Measure streamed long-horizon (`32K` default) output & state drift between strict FP32 and TF32."""
+    from .hssd import HSSDAdapter, HSSDConfig, chunk_hssd
+
+    dev = torch.device(device)
+    cfg = HSSDConfig(
+        rank=int(rank),
+        state_dtype=str(state_dtype),
+        checkpoint_segments=False,
+        horizon_tokens=int(seq_len),
+    )
+    gen = torch.Generator(device="cpu").manual_seed(32768)
+    adapter = HSSDAdapter(hidden_size, num_v_heads, head_k_dim, head_v_dim, cfg, layer_id=0).to(
+        device=dev, dtype=dtype
+    )
+    adapter.eval()
+
+    def _run_stream(tf32_flag: bool) -> tuple[torch.Tensor, Any, float]:
+        s_gen = torch.Generator(device="cpu").manual_seed(9991)
+        st_cur = None
+        last_out = torch.zeros(1, 1, num_v_heads, head_v_dim, device=dev, dtype=dtype)
+        with _scoped_tf32_mode(tf32_flag), torch.no_grad():
+            _sync_if_cuda(dev)
+            t0 = time.perf_counter()
+            for s0 in range(0, int(seq_len), int(stream_chunk_len)):
+                c_len = min(int(stream_chunk_len), int(seq_len) - s0)
+                x_s = (torch.randn(1, c_len, hidden_size, generator=s_gen, dtype=torch.float32) * 0.25).to(dev, dtype)
+                q_s = torch.randn(
+                    1, c_len, num_v_heads, head_k_dim, generator=s_gen, dtype=torch.float32
+                ).to(dev, dtype)
+                k_s = torch.randn(
+                    1, c_len, num_v_heads, head_k_dim, generator=s_gen, dtype=torch.float32
+                ).to(dev, dtype)
+                v_s = torch.randn(
+                    1, c_len, num_v_heads, head_v_dim, generator=s_gen, dtype=torch.float32
+                ).to(dev, dtype)
+                g_s = (-0.02 - 0.08 * torch.rand(1, c_len, num_v_heads, generator=s_gen, dtype=torch.float32)).to(
+                    dev, dtype
+                )
+                b_s = (0.15 + 0.5 * torch.rand(1, c_len, num_v_heads, generator=s_gen, dtype=torch.float32)).to(
+                    dev, dtype
+                )
+                ps = adapter.project_inputs(x_s, q_s, k_s, v_s, g_s, b_s, use_qk_l2norm=True)
+                last_out, st_cur = chunk_hssd(
+                    ps["query"],
+                    ps["key"],
+                    ps["value"],
+                    (ps["gamma_page_scale"], ps["gamma_chan_pair"]),
+                    ps["b_gate"],
+                    ps["w_gate"],
+                    ps["theta"],
+                    ps["surprise_bias"],
+                    adapter.log_surprise_slope.exp(),
+                    adapter.surprise_thresh,
+                    ps["write_logits"],
+                    ps["read_logits"],
+                    ps["q_swa"],
+                    ps["k_swa"],
+                    ps["v_swa"],
+                    boltzmann_gate=adapter.boltzmann_gate,
+                    swa_recency_slope=adapter.swa_recency_slope,
+                    chunk_size=cfg.chunk_size,
+                    window_chunks=cfg.window_chunks,
+                    num_pages=cfg.num_pages,
+                    top_k_pages=cfg.k_pages,
+                    segment_chunks=cfg.segment_chunks,
+                    checkpoint_segments=False,
+                    initial_state=st_cur,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=False,
+                    state_dtype=cfg.state_dtype,
+                    use_swa=cfg.use_swa,
+                    use_phase=cfg.use_phase,
+                    use_surprise=cfg.use_surprise,
+                    surprise_mode=cfg.surprise_mode,
+                    write_mode=cfg.write_mode,
+                    compact_active_pages=cfg.compact_active_pages,
+                    compact_decode_cache=cfg.compact_decode_cache,
+                )
+            _sync_if_cuda(dev)
+            elapsed = max(time.perf_counter() - t0, 1e-9)
+        return last_out.float(), st_cur, elapsed
+
+    del gen
+    out_strict, st_strict, sec_strict = _run_stream(False)
+    out_tf32, st_tf32, sec_tf32 = _run_stream(True)
+    assert st_strict is not None and st_tf32 is not None
+    out_diff = float((out_tf32 - out_strict).abs().max().item())
+    st_diff = (st_tf32.page_states.float() - st_strict.page_states.float())
+    rel_state_drift = float(st_diff.norm().item() / max(st_strict.page_states.float().norm().item(), 1e-12))
+    return _to_jsonable(
+        {
+            "seq_len": int(seq_len),
+            "stream_chunk_len": int(stream_chunk_len),
+            "device": str(dev),
+            "strict_fp32_seconds": float(sec_strict),
+            "tf32_seconds": float(sec_tf32),
+            "speedup": float(sec_strict / sec_tf32),
+            "tail_output_max_abs_diff": out_diff,
+            "rel_page_state_l2_drift": rel_state_drift,
+        }
+    )
+
+
 def profile_hssd_layer(
     *,
     hidden_size: int = 2048,
@@ -1708,8 +1850,15 @@ def profile_hssd_layer(
     rank: int = 64,
     device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float32,
+    compact_active_pages: bool = True,
+    compact_decode_cache: bool = True,
+    write_mode: str = "full",
+    surprise_mode: str = "routed",
+    allow_tf32: bool | None = None,
+    compare_tf32: bool = False,
+    drift_seq_len: int | None = None,
 ) -> dict[str, Any]:
-    """Profile a single HSSD v3.1 linear-attention layer vs single-state GDN (`Gate 0p-4`).
+    """Profile a single HSSD v3.2 linear-attention layer vs single-state GDN (`Gate 0p-4`).
 
     Benchmarks full-sequence prefill, streamed chunk prefill, retained decode cache unique backing
     bytes (at chunk boundaries and mid-chunk), single-token decode (`O(k)` active-page update), and
@@ -1742,69 +1891,152 @@ def profile_hssd_layer(
         theta_low_rank=bool(theta_low_rank),
         state_dtype=str(state_dtype),
         checkpoint_segments=True,
+        compact_active_pages=bool(compact_active_pages),
+        compact_decode_cache=bool(compact_decode_cache),
+        write_mode=str(write_mode),
+        surprise_mode=str(surprise_mode),
     )
     cfg.validate()
 
-    gen = torch.Generator(device="cpu").manual_seed(2026)
-    adapter = HSSDAdapter(
-        int(hidden_size),
-        int(num_v_heads),
-        int(head_k_dim),
-        int(head_v_dim),
-        cfg,
-        layer_id=0,
-    ).to(device=dev, dtype=dtype)
+    with _scoped_tf32_mode(allow_tf32) as eff_allow_tf32:
+        gen = torch.Generator(device="cpu").manual_seed(2026)
+        adapter = HSSDAdapter(
+            int(hidden_size),
+            int(num_v_heads),
+            int(head_k_dim),
+            int(head_v_dim),
+            cfg,
+            layer_id=0,
+        ).to(device=dev, dtype=dtype)
 
-    n_params = sum(p.numel() for p in adapter.parameters())
-    if adapter.theta_down is not None and adapter.theta_up is not None:
-        theta_params = adapter.theta_down.weight.numel() + adapter.theta_up.weight.numel()
-    elif adapter.theta_proj is not None:
-        theta_params = adapter.theta_proj.weight.numel()
-    else:
-        theta_params = 0
+        n_params = sum(p.numel() for p in adapter.parameters())
+        if adapter.theta_down is not None and adapter.theta_up is not None:
+            theta_params = adapter.theta_down.weight.numel() + adapter.theta_up.weight.numel()
+        elif adapter.theta_proj is not None:
+            theta_params = adapter.theta_proj.weight.numel()
+        else:
+            theta_params = 0
 
-    bsz = 1
-    tot_t = int(seq_len) + 1
-    x_all = (torch.randn(bsz, tot_t, hidden_size, generator=gen, dtype=torch.float32) * 0.25).to(dev, dtype)
-    q_all = torch.randn(bsz, tot_t, num_v_heads, head_k_dim, generator=gen, dtype=torch.float32).to(dev, dtype)
-    k_all = torch.randn(bsz, tot_t, num_v_heads, head_k_dim, generator=gen, dtype=torch.float32).to(dev, dtype)
-    v_all = torch.randn(bsz, tot_t, num_v_heads, head_v_dim, generator=gen, dtype=torch.float32).to(dev, dtype)
-    g_all = (-0.02 - 0.08 * torch.rand(bsz, tot_t, num_v_heads, generator=gen, dtype=torch.float32)).to(dev, dtype)
-    beta_all = (0.15 + 0.5 * torch.rand(bsz, tot_t, num_v_heads, generator=gen, dtype=torch.float32)).to(dev, dtype)
+        bsz = 1
+        tot_t = int(seq_len) + 1
+        x_all = (torch.randn(bsz, tot_t, hidden_size, generator=gen, dtype=torch.float32) * 0.25).to(dev, dtype)
+        q_all = torch.randn(bsz, tot_t, num_v_heads, head_k_dim, generator=gen, dtype=torch.float32).to(dev, dtype)
+        k_all = torch.randn(bsz, tot_t, num_v_heads, head_k_dim, generator=gen, dtype=torch.float32).to(dev, dtype)
+        v_all = torch.randn(bsz, tot_t, num_v_heads, head_v_dim, generator=gen, dtype=torch.float32).to(dev, dtype)
+        g_all = (-0.02 - 0.08 * torch.rand(bsz, tot_t, num_v_heads, generator=gen, dtype=torch.float32)).to(dev, dtype)
+        beta_all = (0.15 + 0.5 * torch.rand(bsz, tot_t, num_v_heads, generator=gen, dtype=torch.float32)).to(dev, dtype)
 
-    x_pre, q_pre, k_pre, v_pre = x_all[:, :seq_len], q_all[:, :seq_len], k_all[:, :seq_len], v_all[:, :seq_len]
-    g_pre, beta_pre = g_all[:, :seq_len], beta_all[:, :seq_len]
+        x_pre, q_pre, k_pre, v_pre = x_all[:, :seq_len], q_all[:, :seq_len], k_all[:, :seq_len], v_all[:, :seq_len]
+        g_pre, beta_pre = g_all[:, :seq_len], beta_all[:, :seq_len]
 
-    if dev.type == "cuda":
+        if dev.type == "cuda":
+            adapter.eval()
+            w_len = min(int(seq_len), 128)
+            with torch.no_grad():
+                pw = adapter.project_inputs(
+                    x_pre[:, :w_len],
+                    q_pre[:, :w_len],
+                    k_pre[:, :w_len],
+                    v_pre[:, :w_len],
+                    g_pre[:, :w_len],
+                    beta_pre[:, :w_len],
+                    use_qk_l2norm=True,
+                )
+                _, st_w = chunk_hssd(
+                    pw["query"],
+                    pw["key"],
+                    pw["value"],
+                    (pw["gamma_page_scale"], pw["gamma_chan_pair"]),
+                    pw["b_gate"],
+                    pw["w_gate"],
+                    pw["theta"],
+                    pw["surprise_bias"],
+                    adapter.log_surprise_slope.exp(),
+                    adapter.surprise_thresh,
+                    pw["write_logits"],
+                    pw["read_logits"],
+                    pw["q_swa"],
+                    pw["k_swa"],
+                    pw["v_swa"],
+                    boltzmann_gate=adapter.boltzmann_gate,
+                    swa_recency_slope=adapter.swa_recency_slope,
+                    chunk_size=cfg.chunk_size,
+                    window_chunks=cfg.window_chunks,
+                    num_pages=cfg.num_pages,
+                    top_k_pages=cfg.k_pages,
+                    segment_chunks=cfg.segment_chunks,
+                    checkpoint_segments=False,
+                    initial_state=None,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=False,
+                    state_dtype=cfg.state_dtype,
+                    use_swa=cfg.use_swa,
+                    use_phase=cfg.use_phase,
+                    use_surprise=cfg.use_surprise,
+                    surprise_mode=cfg.surprise_mode,
+                    write_mode=cfg.write_mode,
+                    compact_active_pages=cfg.compact_active_pages,
+                    compact_decode_cache=cfg.compact_decode_cache,
+                )
+                assert st_w is not None
+                recurrent_hssd_step(
+                    pw["query"][:, :1],
+                    pw["key"][:, :1],
+                    pw["value"][:, :1],
+                    (pw["gamma_page_scale"], pw["gamma_chan_pair"][:, :1]),
+                    pw["b_gate"][:, :1],
+                    pw["w_gate"][:, :1],
+                    pw["theta"][:, :1],
+                    pw["surprise_bias"][:, :1],
+                    adapter.log_surprise_slope.exp(),
+                    adapter.surprise_thresh,
+                    pw["write_logits"][:, :1],
+                    pw["read_logits"][:, :1],
+                    pw["q_swa"][:, :1],
+                    pw["k_swa"][:, :1],
+                    pw["v_swa"][:, :1],
+                    st_w,
+                    boltzmann_gate=adapter.boltzmann_gate,
+                    swa_recency_slope=adapter.swa_recency_slope,
+                    top_k_pages=cfg.k_pages,
+                    segment_chunks=cfg.segment_chunks,
+                    use_qk_l2norm_in_kernel=False,
+                    state_dtype=cfg.state_dtype,
+                    use_swa=cfg.use_swa,
+                    use_phase=cfg.use_phase,
+                    use_surprise=cfg.use_surprise,
+                    surprise_mode=cfg.surprise_mode,
+                    write_mode=cfg.write_mode,
+                    compact_decode_cache=cfg.compact_decode_cache,
+                )
+                del pw, st_w
+            _sync_if_cuda(dev)
+
+        # 1. Full prefill
         adapter.eval()
-        w_len = min(int(seq_len), 128)
         with torch.no_grad():
-            pw = adapter.project_inputs(
-                x_pre[:, :w_len],
-                q_pre[:, :w_len],
-                k_pre[:, :w_len],
-                v_pre[:, :w_len],
-                g_pre[:, :w_len],
-                beta_pre[:, :w_len],
-                use_qk_l2norm=True,
-            )
-            _, st_w = chunk_hssd(
-                pw["query"],
-                pw["key"],
-                pw["value"],
-                (pw["gamma_page_scale"], pw["gamma_chan_pair"]),
-                pw["b_gate"],
-                pw["w_gate"],
-                pw["theta"],
-                pw["surprise_bias"],
+            _reset_cuda_peak(dev)
+            t0 = time.perf_counter()
+            proj_pre = adapter.project_inputs(x_pre, q_pre, k_pre, v_pre, g_pre, beta_pre, use_qk_l2norm=True)
+            gamma_factored = (proj_pre["gamma_page_scale"], proj_pre["gamma_chan_pair"])
+            out_full, st_full = chunk_hssd(
+                proj_pre["query"],
+                proj_pre["key"],
+                proj_pre["value"],
+                gamma_factored,
+                proj_pre["b_gate"],
+                proj_pre["w_gate"],
+                proj_pre["theta"],
+                proj_pre["surprise_bias"],
                 adapter.log_surprise_slope.exp(),
                 adapter.surprise_thresh,
-                pw["write_logits"],
-                pw["read_logits"],
-                pw["q_swa"],
-                pw["k_swa"],
-                pw["v_swa"],
+                proj_pre["write_logits"],
+                proj_pre["read_logits"],
+                proj_pre["q_swa"],
+                proj_pre["k_swa"],
+                proj_pre["v_swa"],
                 boltzmann_gate=adapter.boltzmann_gate,
+                swa_recency_slope=adapter.swa_recency_slope,
                 chunk_size=cfg.chunk_size,
                 window_chunks=cfg.window_chunks,
                 num_pages=cfg.num_pages,
@@ -1819,273 +2051,226 @@ def profile_hssd_layer(
                 use_phase=cfg.use_phase,
                 use_surprise=cfg.use_surprise,
                 surprise_mode=cfg.surprise_mode,
+                write_mode=cfg.write_mode,
+                compact_active_pages=cfg.compact_active_pages,
+                compact_decode_cache=cfg.compact_decode_cache,
             )
-            assert st_w is not None
-            recurrent_hssd_step(
-                pw["query"][:, :1],
-                pw["key"][:, :1],
-                pw["value"][:, :1],
-                (pw["gamma_page_scale"], pw["gamma_chan_pair"][:, :1]),
-                pw["b_gate"][:, :1],
-                pw["w_gate"][:, :1],
-                pw["theta"][:, :1],
-                pw["surprise_bias"][:, :1],
+            _sync_if_cuda(dev)
+            full_sec = max(time.perf_counter() - t0, 1e-9)
+            full_peak = _peak_cuda_bytes(dev)
+
+        assert st_full is not None
+        gamma_factored_bytes = int(
+            proj_pre["gamma_page_scale"].numel() * proj_pre["gamma_page_scale"].element_size()
+            + proj_pre["gamma_chan_pair"].numel() * proj_pre["gamma_chan_pair"].element_size()
+        )
+        gamma_legacy_5d_bytes = int(
+            bsz * seq_len * cfg.num_pages * num_v_heads * head_k_dim * proj_pre["gamma_chan_pair"].element_size()
+        )
+
+        # 2. Streamed prefill in `stream_chunk_len` segments
+        with torch.no_grad():
+            _reset_cuda_peak(dev)
+            t0 = time.perf_counter()
+            st_stream = None
+            stream_outs: list[torch.Tensor] = []
+            n_segs = 0
+            for s0 in range(0, seq_len, stream_chunk_len):
+                s1 = min(seq_len, s0 + stream_chunk_len)
+                n_segs += 1
+                ps = adapter.project_inputs(
+                    x_pre[:, s0:s1],
+                    q_pre[:, s0:s1],
+                    k_pre[:, s0:s1],
+                    v_pre[:, s0:s1],
+                    g_pre[:, s0:s1],
+                    beta_pre[:, s0:s1],
+                    use_qk_l2norm=True,
+                )
+                o_seg, st_stream = chunk_hssd(
+                    ps["query"],
+                    ps["key"],
+                    ps["value"],
+                    (ps["gamma_page_scale"], ps["gamma_chan_pair"]),
+                    ps["b_gate"],
+                    ps["w_gate"],
+                    ps["theta"],
+                    ps["surprise_bias"],
+                    adapter.log_surprise_slope.exp(),
+                    adapter.surprise_thresh,
+                    ps["write_logits"],
+                    ps["read_logits"],
+                    ps["q_swa"],
+                    ps["k_swa"],
+                    ps["v_swa"],
+                    boltzmann_gate=adapter.boltzmann_gate,
+                    swa_recency_slope=adapter.swa_recency_slope,
+                    chunk_size=cfg.chunk_size,
+                    window_chunks=cfg.window_chunks,
+                    num_pages=cfg.num_pages,
+                    top_k_pages=cfg.k_pages,
+                    segment_chunks=cfg.segment_chunks,
+                    checkpoint_segments=False,
+                    initial_state=st_stream,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=False,
+                    state_dtype=cfg.state_dtype,
+                    use_swa=cfg.use_swa,
+                    use_phase=cfg.use_phase,
+                    use_surprise=cfg.use_surprise,
+                    surprise_mode=cfg.surprise_mode,
+                    write_mode=cfg.write_mode,
+                    compact_active_pages=cfg.compact_active_pages,
+                    compact_decode_cache=cfg.compact_decode_cache,
+                )
+                stream_outs.append(o_seg)
+            out_stream = torch.cat(stream_outs, dim=1)
+            _sync_if_cuda(dev)
+            stream_sec = max(time.perf_counter() - t0, 1e-9)
+            stream_peak = _peak_cuda_bytes(dev)
+
+        assert st_stream is not None
+        stream_diff = float((out_stream.float() - out_full.float()).abs().max().item())
+
+        # 3. Single-token decode (T = 1, active-page O(k) state update)
+        x_dec = x_all[:, seq_len : seq_len + 1]
+        q_dec = q_all[:, seq_len : seq_len + 1]
+        k_dec = k_all[:, seq_len : seq_len + 1]
+        v_dec = v_all[:, seq_len : seq_len + 1]
+        g_dec = g_all[:, seq_len : seq_len + 1]
+        beta_dec = beta_all[:, seq_len : seq_len + 1]
+
+        with torch.no_grad():
+            _reset_cuda_peak(dev)
+            t0 = time.perf_counter()
+            pd = adapter.project_inputs(x_dec, q_dec, k_dec, v_dec, g_dec, beta_dec, use_qk_l2norm=True)
+            _o_dec, st_decode = recurrent_hssd_step(
+                pd["query"],
+                pd["key"],
+                pd["value"],
+                (pd["gamma_page_scale"], pd["gamma_chan_pair"]),
+                pd["b_gate"],
+                pd["w_gate"],
+                pd["theta"],
+                pd["surprise_bias"],
                 adapter.log_surprise_slope.exp(),
                 adapter.surprise_thresh,
-                pw["write_logits"][:, :1],
-                pw["read_logits"][:, :1],
-                pw["q_swa"][:, :1],
-                pw["k_swa"][:, :1],
-                pw["v_swa"][:, :1],
-                st_w,
+                pd["write_logits"],
+                pd["read_logits"],
+                pd["q_swa"],
+                pd["k_swa"],
+                pd["v_swa"],
+                st_full,
                 boltzmann_gate=adapter.boltzmann_gate,
+                swa_recency_slope=adapter.swa_recency_slope,
                 top_k_pages=cfg.k_pages,
+                segment_chunks=cfg.segment_chunks,
                 use_qk_l2norm_in_kernel=False,
                 state_dtype=cfg.state_dtype,
                 use_swa=cfg.use_swa,
                 use_phase=cfg.use_phase,
                 use_surprise=cfg.use_surprise,
                 surprise_mode=cfg.surprise_mode,
+                write_mode=cfg.write_mode,
+                compact_decode_cache=cfg.compact_decode_cache,
             )
-            del pw, st_w
-        _sync_if_cuda(dev)
+            _sync_if_cuda(dev)
+            decode_sec = max(time.perf_counter() - t0, 1e-9)
+            decode_peak = _peak_cuda_bytes(dev)
 
-    # 1. Full prefill
-    adapter.eval()
-    with torch.no_grad():
+        # 4. Training forward + backward with actual sparse Top-k STE write-budget loss
+        adapter.train()
+        adapter.zero_grad(set_to_none=True)
+        x_tr = x_pre.detach().clone().requires_grad_(True)
+        q_tr = q_pre.detach().clone().requires_grad_(True)
+        k_tr = k_pre.detach().clone().requires_grad_(True)
+        v_tr = v_pre.detach().clone().requires_grad_(True)
+
         _reset_cuda_peak(dev)
         t0 = time.perf_counter()
-        proj_pre = adapter.project_inputs(x_pre, q_pre, k_pre, v_pre, g_pre, beta_pre, use_qk_l2norm=True)
-        gamma_factored = (proj_pre["gamma_page_scale"], proj_pre["gamma_chan_pair"])
-        out_full, st_full = chunk_hssd(
-            proj_pre["query"],
-            proj_pre["key"],
-            proj_pre["value"],
-            gamma_factored,
-            proj_pre["b_gate"],
-            proj_pre["w_gate"],
-            proj_pre["theta"],
-            proj_pre["surprise_bias"],
+        pt = adapter.project_inputs(x_tr, q_tr, k_tr, v_tr, g_pre, beta_pre, use_qk_l2norm=True)
+        out_tr, _st_tr, duty_tr = chunk_hssd(
+            pt["query"],
+            pt["key"],
+            pt["value"],
+            (pt["gamma_page_scale"], pt["gamma_chan_pair"]),
+            pt["b_gate"],
+            pt["w_gate"],
+            pt["theta"],
+            pt["surprise_bias"],
             adapter.log_surprise_slope.exp(),
             adapter.surprise_thresh,
-            proj_pre["write_logits"],
-            proj_pre["read_logits"],
-            proj_pre["q_swa"],
-            proj_pre["k_swa"],
-            proj_pre["v_swa"],
+            pt["write_logits"],
+            pt["read_logits"],
+            pt["q_swa"],
+            pt["k_swa"],
+            pt["v_swa"],
             boltzmann_gate=adapter.boltzmann_gate,
+            swa_recency_slope=adapter.swa_recency_slope,
             chunk_size=cfg.chunk_size,
             window_chunks=cfg.window_chunks,
             num_pages=cfg.num_pages,
             top_k_pages=cfg.k_pages,
             segment_chunks=cfg.segment_chunks,
-            checkpoint_segments=False,
+            checkpoint_segments=cfg.checkpoint_segments,
             initial_state=None,
-            output_final_state=True,
+            output_final_state=False,
             use_qk_l2norm_in_kernel=False,
             state_dtype=cfg.state_dtype,
             use_swa=cfg.use_swa,
             use_phase=cfg.use_phase,
             use_surprise=cfg.use_surprise,
             surprise_mode=cfg.surprise_mode,
+            write_mode=cfg.write_mode,
+            compact_active_pages=cfg.compact_active_pages,
+            compact_decode_cache=cfg.compact_decode_cache,
+            return_aux=True,
         )
+        mu_max_t = torch.tensor(cfg.effective_mu_max(), device=duty_tr.device, dtype=duty_tr.dtype)
+        bud_loss = compute_write_budget_loss(duty_tr, mu_max_t, mu_min_ratio=cfg.mu_min_ratio)
+        total_loss = out_tr.float().pow(2).mean() + cfg.budget_weight * bud_loss
+        total_loss.backward()
         _sync_if_cuda(dev)
-        full_sec = max(time.perf_counter() - t0, 1e-9)
-        full_peak = _peak_cuda_bytes(dev)
+        train_sec = max(time.perf_counter() - t0, 1e-9)
+        train_peak = _peak_cuda_bytes(dev)
 
-    assert st_full is not None
-    gamma_factored_bytes = int(
-        proj_pre["gamma_page_scale"].numel() * proj_pre["gamma_page_scale"].element_size()
-        + proj_pre["gamma_chan_pair"].numel() * proj_pre["gamma_chan_pair"].element_size()
-    )
-    gamma_legacy_5d_bytes = int(
-        bsz * seq_len * cfg.num_pages * num_v_heads * head_k_dim * proj_pre["gamma_chan_pair"].element_size()
-    )
+        grad_finite = bool(
+            x_tr.grad is not None
+            and torch.isfinite(x_tr.grad).all()
+            and all(p.grad is None or bool(torch.isfinite(p.grad).all()) for p in adapter.parameters())
+        )
+        dead_pages = int((duty_tr.detach() < 1e-6).sum().item())
+        adapter.zero_grad(set_to_none=True)
 
-    # 2. Streamed prefill in `stream_chunk_len` segments
-    with torch.no_grad():
-        _reset_cuda_peak(dev)
-        t0 = time.perf_counter()
-        st_stream = None
-        stream_outs: list[torch.Tensor] = []
-        n_segs = 0
-        for s0 in range(0, seq_len, stream_chunk_len):
-            s1 = min(seq_len, s0 + stream_chunk_len)
-            n_segs += 1
-            ps = adapter.project_inputs(
-                x_pre[:, s0:s1],
-                q_pre[:, s0:s1],
-                k_pre[:, s0:s1],
-                v_pre[:, s0:s1],
-                g_pre[:, s0:s1],
-                beta_pre[:, s0:s1],
-                use_qk_l2norm=True,
+        # 5. Single-state Gated DeltaNet baseline (prefill + decode + state bytes)
+        with torch.no_grad():
+            _sync_if_cuda(dev)
+            t0 = time.perf_counter()
+            _gdn_out, gdn_state = _chunked_gdn_baseline_prefill(
+                q_pre, k_pre, v_pre, g_pre, beta_pre, chunk_size=cfg.chunk_size, state_dtype=resolved_state_dt
             )
-            o_seg, st_stream = chunk_hssd(
-                ps["query"],
-                ps["key"],
-                ps["value"],
-                (ps["gamma_page_scale"], ps["gamma_chan_pair"]),
-                ps["b_gate"],
-                ps["w_gate"],
-                ps["theta"],
-                ps["surprise_bias"],
-                adapter.log_surprise_slope.exp(),
-                adapter.surprise_thresh,
-                ps["write_logits"],
-                ps["read_logits"],
-                ps["q_swa"],
-                ps["k_swa"],
-                ps["v_swa"],
-                boltzmann_gate=adapter.boltzmann_gate,
-                chunk_size=cfg.chunk_size,
-                window_chunks=cfg.window_chunks,
-                num_pages=cfg.num_pages,
-                top_k_pages=cfg.k_pages,
-                segment_chunks=cfg.segment_chunks,
-                checkpoint_segments=False,
-                initial_state=st_stream,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=False,
-                state_dtype=cfg.state_dtype,
-                use_swa=cfg.use_swa,
-                use_phase=cfg.use_phase,
-                use_surprise=cfg.use_surprise,
-                surprise_mode=cfg.surprise_mode,
+            _sync_if_cuda(dev)
+            gdn_pre_sec = max(time.perf_counter() - t0, 1e-9)
+
+            t0 = time.perf_counter()
+            _gdn_dec_out, gdn_state_dec = _gdn_baseline_decode_step(
+                q_dec, k_dec, v_dec, g_dec, beta_dec, gdn_state
             )
-            stream_outs.append(o_seg)
-        out_stream = torch.cat(stream_outs, dim=1)
-        _sync_if_cuda(dev)
-        stream_sec = max(time.perf_counter() - t0, 1e-9)
-        stream_peak = _peak_cuda_bytes(dev)
-
-    assert st_stream is not None
-    stream_diff = float((out_stream.float() - out_full.float()).abs().max().item())
-
-    # 3. Single-token decode (T = 1, active-page O(k) state update)
-    x_dec = x_all[:, seq_len : seq_len + 1]
-    q_dec = q_all[:, seq_len : seq_len + 1]
-    k_dec = k_all[:, seq_len : seq_len + 1]
-    v_dec = v_all[:, seq_len : seq_len + 1]
-    g_dec = g_all[:, seq_len : seq_len + 1]
-    beta_dec = beta_all[:, seq_len : seq_len + 1]
-
-    with torch.no_grad():
-        _reset_cuda_peak(dev)
-        t0 = time.perf_counter()
-        pd = adapter.project_inputs(x_dec, q_dec, k_dec, v_dec, g_dec, beta_dec, use_qk_l2norm=True)
-        _o_dec, st_decode = recurrent_hssd_step(
-            pd["query"],
-            pd["key"],
-            pd["value"],
-            (pd["gamma_page_scale"], pd["gamma_chan_pair"]),
-            pd["b_gate"],
-            pd["w_gate"],
-            pd["theta"],
-            pd["surprise_bias"],
-            adapter.log_surprise_slope.exp(),
-            adapter.surprise_thresh,
-            pd["write_logits"],
-            pd["read_logits"],
-            pd["q_swa"],
-            pd["k_swa"],
-            pd["v_swa"],
-            st_full,
-            boltzmann_gate=adapter.boltzmann_gate,
-            top_k_pages=cfg.k_pages,
-            use_qk_l2norm_in_kernel=False,
-            state_dtype=cfg.state_dtype,
-            use_swa=cfg.use_swa,
-            use_phase=cfg.use_phase,
-            use_surprise=cfg.use_surprise,
-            surprise_mode=cfg.surprise_mode,
-        )
-        _sync_if_cuda(dev)
-        decode_sec = max(time.perf_counter() - t0, 1e-9)
-        decode_peak = _peak_cuda_bytes(dev)
-
-    # 4. Training forward + backward with actual sparse Top-k STE write-budget loss
-    adapter.train()
-    adapter.zero_grad(set_to_none=True)
-    x_tr = x_pre.detach().clone().requires_grad_(True)
-    q_tr = q_pre.detach().clone().requires_grad_(True)
-    k_tr = k_pre.detach().clone().requires_grad_(True)
-    v_tr = v_pre.detach().clone().requires_grad_(True)
-
-    _reset_cuda_peak(dev)
-    t0 = time.perf_counter()
-    pt = adapter.project_inputs(x_tr, q_tr, k_tr, v_tr, g_pre, beta_pre, use_qk_l2norm=True)
-    out_tr, _st_tr, duty_tr = chunk_hssd(
-        pt["query"],
-        pt["key"],
-        pt["value"],
-        (pt["gamma_page_scale"], pt["gamma_chan_pair"]),
-        pt["b_gate"],
-        pt["w_gate"],
-        pt["theta"],
-        pt["surprise_bias"],
-        adapter.log_surprise_slope.exp(),
-        adapter.surprise_thresh,
-        pt["write_logits"],
-        pt["read_logits"],
-        pt["q_swa"],
-        pt["k_swa"],
-        pt["v_swa"],
-        boltzmann_gate=adapter.boltzmann_gate,
-        chunk_size=cfg.chunk_size,
-        window_chunks=cfg.window_chunks,
-        num_pages=cfg.num_pages,
-        top_k_pages=cfg.k_pages,
-        segment_chunks=cfg.segment_chunks,
-        checkpoint_segments=cfg.checkpoint_segments,
-        initial_state=None,
-        output_final_state=False,
-        use_qk_l2norm_in_kernel=False,
-        state_dtype=cfg.state_dtype,
-        use_swa=cfg.use_swa,
-        use_phase=cfg.use_phase,
-        use_surprise=cfg.use_surprise,
-        surprise_mode=cfg.surprise_mode,
-        return_aux=True,
-    )
-    mu_max_t = torch.tensor(cfg.resolved_mu_max(), device=duty_tr.device, dtype=duty_tr.dtype)
-    bud_loss = compute_write_budget_loss(duty_tr, mu_max_t, mu_min_ratio=cfg.mu_min_ratio)
-    total_loss = out_tr.float().pow(2).mean() + cfg.budget_weight * bud_loss
-    total_loss.backward()
-    _sync_if_cuda(dev)
-    train_sec = max(time.perf_counter() - t0, 1e-9)
-    train_peak = _peak_cuda_bytes(dev)
-
-    grad_finite = bool(
-        x_tr.grad is not None
-        and torch.isfinite(x_tr.grad).all()
-        and all(p.grad is None or bool(torch.isfinite(p.grad).all()) for p in adapter.parameters())
-    )
-    dead_pages = int((duty_tr.detach() < 1e-6).sum().item())
-    adapter.zero_grad(set_to_none=True)
-
-    # 5. Single-state Gated DeltaNet baseline (prefill + decode + state bytes)
-    with torch.no_grad():
-        _sync_if_cuda(dev)
-        t0 = time.perf_counter()
-        _gdn_out, gdn_state = _chunked_gdn_baseline_prefill(
-            q_pre, k_pre, v_pre, g_pre, beta_pre, chunk_size=cfg.chunk_size, state_dtype=resolved_state_dt
-        )
-        _sync_if_cuda(dev)
-        gdn_pre_sec = max(time.perf_counter() - t0, 1e-9)
-
-        t0 = time.perf_counter()
-        _gdn_dec_out, gdn_state_dec = _gdn_baseline_decode_step(
-            q_dec, k_dec, v_dec, g_dec, beta_dec, gdn_state
-        )
-        _sync_if_cuda(dev)
-        gdn_dec_sec = max(time.perf_counter() - t0, 1e-9)
+            _sync_if_cuda(dev)
+            gdn_dec_sec = max(time.perf_counter() - t0, 1e-9)
 
     gdn_state_bytes = int(gdn_state_dec.untyped_storage().nbytes())
     retained_bytes = int(st_full.unique_storage_bytes())
     mid_chunk_bytes = int(st_decode.unique_storage_bytes())
 
-    report = {
+    report: dict[str, Any] = {
+        "allow_tf32": bool(eff_allow_tf32),
+        "compact_active_pages": bool(cfg.compact_active_pages),
+        "compact_decode_cache": bool(cfg.compact_decode_cache),
+        "decode_state_bytes": mid_chunk_bytes,
+        "tokens_per_sec": float(seq_len / full_sec),
+        "decode_tokens_per_sec": float(1.0 / decode_sec),
+        "train_tokens_per_sec": float(seq_len / train_sec),
         "dimensions": {
             "batch_size": bsz,
             "hidden_size": int(hidden_size),
@@ -2101,6 +2286,11 @@ def profile_hssd_layer(
             "rank": int(cfg.rank),
             "theta_low_rank": bool(cfg.theta_low_rank),
             "state_dtype": str(cfg.state_dtype),
+            "write_mode": str(cfg.write_mode),
+            "surprise_mode": str(cfg.surprise_mode),
+            "compact_active_pages": bool(cfg.compact_active_pages),
+            "compact_decode_cache": bool(cfg.compact_decode_cache),
+            "allow_tf32": bool(eff_allow_tf32),
             "input_dtype": str(dtype).replace("torch.", ""),
             "device": str(dev),
         },
@@ -2135,6 +2325,7 @@ def profile_hssd_layer(
             "theta_cum_dtype": str(st_full.theta_cum.dtype).replace("torch.", ""),
             "theta_cum_storage_bytes": int(st_full.theta_cum.untyped_storage().nbytes()),
             "has_compact_storage": bool(st_full.has_compact_storage() and st_decode.has_compact_storage()),
+            "compact_decode_cache": bool(cfg.compact_decode_cache),
             "unique_storage_bytes": retained_bytes,
             "unique_storage_mib": float(retained_bytes / (1024.0 * 1024.0)),
             "mid_chunk_unique_storage_bytes": mid_chunk_bytes,
@@ -2147,6 +2338,7 @@ def profile_hssd_layer(
             "ms": float(decode_sec * 1000.0),
             "tokens_per_sec": float(1.0 / decode_sec),
             "peak_cuda_bytes": int(decode_peak),
+            "decode_state_bytes": mid_chunk_bytes,
             "active_write_pages": int(cfg.k_pages),
             "total_pages": int(cfg.num_pages),
             "has_compact_storage": bool(st_decode.has_compact_storage()),
@@ -2177,6 +2369,73 @@ def profile_hssd_layer(
             "has_fla": bool(has_fla()),
         },
     }
+    if compare_tf32:
+        strict_rep = profile_hssd_layer(
+            hidden_size=hidden_size,
+            num_v_heads=num_v_heads,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            seq_len=seq_len,
+            stream_chunk_len=stream_chunk_len,
+            state_dtype=state_dtype,
+            theta_low_rank=theta_low_rank,
+            rank=rank,
+            device=device,
+            dtype=dtype,
+            compact_active_pages=compact_active_pages,
+            compact_decode_cache=compact_decode_cache,
+            write_mode=write_mode,
+            surprise_mode=surprise_mode,
+            allow_tf32=False,
+            compare_tf32=False,
+        )
+        fast_rep = profile_hssd_layer(
+            hidden_size=hidden_size,
+            num_v_heads=num_v_heads,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            seq_len=seq_len,
+            stream_chunk_len=stream_chunk_len,
+            state_dtype=state_dtype,
+            theta_low_rank=theta_low_rank,
+            rank=rank,
+            device=device,
+            dtype=dtype,
+            compact_active_pages=compact_active_pages,
+            compact_decode_cache=compact_decode_cache,
+            write_mode=write_mode,
+            surprise_mode=surprise_mode,
+            allow_tf32=True,
+            compare_tf32=False,
+        )
+        eff_drift_len = (
+            int(drift_seq_len)
+            if drift_seq_len is not None
+            else (32768 if dev.type == "cuda" else max(int(seq_len), 512))
+        )
+        drift_rep = measure_hssd_tf32_drift(
+            hidden_size=min(int(hidden_size), 256) if dev.type == "cpu" and drift_seq_len is None else int(hidden_size),
+            num_v_heads=min(int(num_v_heads), 4) if dev.type == "cpu" and drift_seq_len is None else int(num_v_heads),
+            head_k_dim=min(int(head_k_dim), 32) if dev.type == "cpu" and drift_seq_len is None else int(head_k_dim),
+            head_v_dim=min(int(head_v_dim), 32) if dev.type == "cpu" and drift_seq_len is None else int(head_v_dim),
+            seq_len=eff_drift_len,
+            stream_chunk_len=min(eff_drift_len, max(int(stream_chunk_len), 256)),
+            rank=min(int(rank), 32) if dev.type == "cpu" and drift_seq_len is None else int(rank),
+            state_dtype=state_dtype,
+            device=device,
+            dtype=dtype,
+        )
+        report["tf32_comparison"] = {
+            "fp32_strict_tokens_per_sec": strict_rep["tokens_per_sec"],
+            "tf32_tokens_per_sec": fast_rep["tokens_per_sec"],
+            "prefill_speedup": float(
+                fast_rep["tokens_per_sec"] / max(float(strict_rep["tokens_per_sec"]), 1e-12)
+            ),
+            "train_speedup": float(
+                fast_rep["train_tokens_per_sec"] / max(float(strict_rep["train_tokens_per_sec"]), 1e-12)
+            ),
+            "drift": drift_rep,
+        }
     return _to_jsonable(report)
 
 
@@ -2360,6 +2619,7 @@ __all__ = [
     "device_ids",
     "format_probe_report_markdown",
     "hssd_ablation_matrix",
+    "measure_hssd_tf32_drift",
     "probe_backward",
     "probe_core_ranges",
     "probe_expert_headroom",

@@ -382,6 +382,8 @@ def _extract_hssd_mod_meta(mod: nn.Module) -> dict[str, Any]:
             ("k_pages", "k_pages"),
             ("chunk_size", "chunk_size"),
             ("window_chunks", "window_chunks"),
+            ("segment_chunks", "segment_chunks"),
+            ("checkpoint_segments", "checkpoint_segments"),
             ("rank", "rank"),
             ("gate_logit_cap", "cap_g"),
             ("decay_log_cap", "cap_d"),
@@ -392,10 +394,19 @@ def _extract_hssd_mod_meta(mod: nn.Module) -> dict[str, Any]:
             ("use_phase", "use_phase"),
             ("use_surprise", "use_surprise"),
             ("surprise_mode", "surprise_mode"),
+            ("write_mode", "write_mode"),
+            ("use_stock_decay_init", "use_stock_decay_init"),
+            ("horizon_tokens", "horizon_tokens"),
+            ("compact_active_pages", "compact_active_pages"),
+            ("compact_decode_cache", "compact_decode_cache"),
         )
         for out_k, attr_k in attr_map:
             if hasattr(mod, attr_k):
                 meta[out_k] = getattr(mod, attr_k)
+        if "swa_recency_init" not in meta and isinstance(getattr(mod, "swa_recency_slope", None), torch.Tensor):
+            slp_t = mod.swa_recency_slope.detach()
+            if slp_t.numel() > 0:
+                meta["swa_recency_init"] = float(slp_t.float().mean().item())
     if "theta_low_rank" not in meta:
         meta["theta_low_rank"] = bool(hasattr(mod, "theta_down"))
     return meta
@@ -410,6 +421,11 @@ def _with_hssd_v31_defaults(cfg_d: dict[str, Any], first_mod: nn.Module | None) 
         "use_phase": True,
         "use_surprise": True,
         "surprise_mode": "routed",
+        "write_mode": "split",
+        "use_stock_decay_init": False,
+        "swa_recency_init": 0.0,
+        "compact_active_pages": True,
+        "compact_decode_cache": True,
     }
     merged = {**defaults, **cfg_d}
     merged["enabled"] = True
@@ -442,11 +458,15 @@ def _infer_hssd_arch(src: _UnwrappedSource) -> dict[str, Any]:
         handle_meta = (
             asdict(h_handle.cfg) if hasattr(h_handle.cfg, "__dataclass_fields__") else dict(vars(h_handle.cfg))
         )
+        if hasattr(h_handle, "blend"):
+            handle_meta["blend_init"] = float(h_handle.blend)
         if hasattr(h_handle, "adapters") and isinstance(h_handle.adapters, dict):
             handle_meta["layers"] = sorted(int(i) for i in h_handle.adapters)
 
     if src.hssd_cfg is not None:
         combined = {**mod_meta, **handle_meta, **copy.deepcopy(src.hssd_cfg)}
+        if h_handle is not None and hasattr(h_handle, "blend"):
+            combined["blend_init"] = float(h_handle.blend)
         if "layers" not in combined and hssd_layers:
             combined["layers"] = hssd_layers
         return _with_hssd_v31_defaults(combined, first_mod)

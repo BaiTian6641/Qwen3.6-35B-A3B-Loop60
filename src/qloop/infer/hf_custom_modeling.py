@@ -2657,6 +2657,8 @@ else:
             self.window_chunks = int(hcfg.get("window_chunks", 8))
             self.segment_chunks = int(hcfg.get("segment_chunks", 4))
             self.checkpoint_segments = bool(hcfg.get("checkpoint_segments", True))
+            self.checkpoint_segments_min_len = max(0, int(hcfg.get("checkpoint_segments_min_len", 0)))
+            self.outer_checkpoint_max_tokens = max(0, int(hcfg.get("outer_checkpoint_max_tokens", 2048)))
             self.cap_g = float(hcfg.get("gate_logit_cap", 8.0))
             self.cap_d = float(hcfg.get("decay_log_cap", 2.0))
             self.decay_gamma_min = float(hcfg.get("decay_gamma_min", 1e-4))
@@ -2801,10 +2803,31 @@ else:
                 "vs": vs,
             }
 
+    def _in_backward() -> bool:
+        fn = getattr(torch._C, "_current_graph_task_id", None)
+        return fn is not None and fn() != -1
+
     def _is_compiling() -> bool:
         compiler = getattr(torch, "compiler", None)
         fn = getattr(compiler, "is_compiling", None) if compiler is not None else None
         return bool(fn()) if callable(fn) else False
+
+    def _in_outer_checkpoint() -> bool:
+        if _is_compiling():
+            return False
+        autograd_c = getattr(torch._C, "_autograd", None)
+        fn = getattr(autograd_c, "_top_saved_tensors_default_hooks", None) if autograd_c is not None else None
+        if not callable(fn):
+            return False
+        hooks = fn(False)
+        if not hooks:
+            return False
+        pack_hook = hooks[0]
+        if pack_hook is None:
+            return False
+        mod = getattr(pack_hook, "__module__", "") or ""
+        qual = getattr(pack_hook, "__qualname__", "") or ""
+        return "checkpoint" in mod or "_checkpoint_hook" in qual or "_recomputation_hook" in qual
 
     def _disjoint_horizon_bounds(t_1based: int, chunk_size: int = 64, window_chunks: int = 8) -> tuple[int, int, int]:
         n = (int(t_1based) - 1) // int(chunk_size)
@@ -2935,6 +2958,193 @@ else:
             l_mat = l_pad[..., :c_len, :c_len] if pad_t > 0 else l_pad
         return l_mat, cum_log_a
 
+    def _solve_unit_lower_wy(l_mat: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        c_len = l_mat.shape[-1]
+        if c_len == 0:
+            return rhs
+        if c_len == 1:
+            return rhs + l_mat * 0.0 if l_mat.requires_grad else rhs
+        if c_len == 2:
+            u0 = rhs[..., 0:1, :]
+            u1 = rhs[..., 1:2, :] - l_mat[..., 1:2, 0:1] * u0
+            return torch.cat([u0, u1], dim=-2)
+        if c_len > 64:
+            eye = torch.eye(c_len, dtype=l_mat.dtype, device=l_mat.device)
+            return torch.linalg.solve_triangular(eye + l_mat, rhs, upper=False, unitriangular=True)
+
+        c_pad = 1 << (c_len - 1).bit_length()
+        pad_t = c_pad - c_len
+        l_pad = F.pad(l_mat, (0, pad_t, 0, pad_t)) if pad_t > 0 else l_mat
+        r_pad = F.pad(rhs, (0, 0, 0, pad_t)) if pad_t > 0 else rhs
+        lead_shape = l_pad.shape[:-2]
+        half_pad = c_pad // 2
+
+        l_base_10 = l_pad.reshape(*lead_shape, half_pad, 2, half_pad, 2).diagonal(dim1=-4, dim2=-2)[..., 1, 0, :]
+        z = torch.zeros_like(l_base_10)
+        o = torch.ones_like(l_base_10)
+        inv_diag = torch.stack(
+            [
+                torch.stack([o, z], dim=-1),
+                torch.stack([-l_base_10, o], dim=-1),
+            ],
+            dim=-2,
+        )
+
+        b = 2
+        while b < half_pad:
+            half_blk = c_pad // (2 * b)
+            inv_00 = inv_diag[..., 0::2, :, :]
+            inv_11 = inv_diag[..., 1::2, :, :]
+            l_10 = (
+                l_pad.reshape(*lead_shape, half_blk, 2 * b, half_blk, 2 * b)
+                .diagonal(dim1=-4, dim2=-2)[..., b:, :b, :]
+                .movedim(-1, -3)
+            )
+            inv_10 = -(inv_11 @ l_10) @ inv_00
+            zeros_01 = torch.zeros_like(inv_10)
+            top = torch.cat([inv_00, zeros_01], dim=-1)
+            bot = torch.cat([inv_10, inv_11], dim=-1)
+            inv_diag = torch.cat([top, bot], dim=-2)
+            b *= 2
+
+        inv_00 = inv_diag[..., 0, :, :]
+        inv_11 = inv_diag[..., 1, :, :]
+        l_half = l_pad[..., half_pad:, :half_pad]
+        r_0 = r_pad[..., :half_pad, :]
+        r_1 = r_pad[..., half_pad:, :]
+        u_0 = inv_00 @ r_0
+        u_1 = inv_11 @ (r_1 - l_half @ u_0)
+        u_pad = torch.cat([u_0, u_1], dim=-2)
+        return u_pad[..., :c_len, :] if pad_t > 0 else u_pad
+
+    class _ActivePagePlan:
+        __slots__ = ("_tok_pos", "_valid_mask", "act_flat", "b_i", "lin_bm", "m_i", "max_tok", "n_act")
+
+        def __init__(
+            self,
+            lin_bm: torch.Tensor | None,
+            act_flat: torch.Tensor | None,
+            n_act: int,
+            max_tok: int,
+            num_pages: int,
+        ) -> None:
+            self.lin_bm = lin_bm
+            if lin_bm is not None:
+                self.b_i: torch.Tensor | None = torch.div(lin_bm, num_pages, rounding_mode="floor")
+                self.m_i: torch.Tensor | None = lin_bm - self.b_i * num_pages
+            else:
+                self.b_i = None
+                self.m_i = None
+            self.act_flat = act_flat
+            self.n_act = int(n_act)
+            self.max_tok = int(max_tok)
+            self._tok_pos: torch.Tensor | None = None
+            self._valid_mask: torch.Tensor | None = None
+
+        def compaction_indices(self) -> tuple[torch.Tensor, torch.Tensor]:
+            if self._tok_pos is None or self._valid_mask is None:
+                assert self.lin_bm is not None and self.act_flat is not None
+                c_len = self.act_flat.shape[-1]
+                act_sub = self.act_flat.index_select(0, self.lin_bm)
+                t_arange = torch.arange(c_len, device=act_sub.device).unsqueeze(0)
+                sort_key = (~act_sub).to(dtype=torch.long) * c_len + t_arange
+                tok_pos = torch.argsort(sort_key, dim=-1)[:, : self.max_tok]
+                valid_mask = act_sub.gather(1, tok_pos)
+                self._tok_pos = tok_pos
+                self._valid_mask = valid_mask
+            return self._tok_pos, self._valid_mask
+
+    def _build_active_page_plan(act_bm: torch.Tensor) -> _ActivePagePlan:
+        bsz, num_pages, c_len = act_bm.shape
+        tot_bm = bsz * num_pages
+        if tot_bm == 0 or c_len == 0:
+            return _ActivePagePlan(None, None, 0, 0, max(num_pages, 1))
+        act_flat = act_bm.reshape(tot_bm, c_len)
+        cnt_flat: list[int] = act_flat.sum(dim=-1, dtype=torch.int32).tolist()
+        active_lin: list[int] = []
+        max_tok = 0
+        for idx, cnt in enumerate(cnt_flat):
+            if cnt > 0:
+                active_lin.append(idx)
+                max_tok = max(max_tok, cnt)
+        n_act = len(active_lin)
+        if n_act == 0 or (n_act == tot_bm and max_tok >= c_len):
+            return _ActivePagePlan(None, None, n_act, max_tok, num_pages)
+        lin_bm = torch.tensor(active_lin, dtype=torch.long, device=act_bm.device)
+        return _ActivePagePlan(lin_bm, act_flat, n_act, max_tok, num_pages)
+
+    def _build_multi_span_active_plans(
+        top_idx_spans: list[torch.Tensor],
+        num_pages: int,
+    ) -> list[_ActivePagePlan]:
+        n_spans = len(top_idx_spans)
+        if n_spans == 0:
+            return []
+        device = top_idx_spans[0].device
+        bsz = top_idx_spans[0].shape[0]
+        tot_bm = bsz * num_pages
+        if tot_bm == 0:
+            return [_ActivePagePlan(None, None, 0, 0, max(num_pages, 1)) for _ in top_idx_spans]
+
+        valid_pos: list[int] = []
+        act_flats: list[torch.Tensor] = []
+        cnt_tensors: list[torch.Tensor] = []
+        span_lens: list[int] = []
+        for s_i, t_idx in enumerate(top_idx_spans):
+            c_len = int(t_idx.shape[1])
+            if c_len <= 1:
+                continue
+            act_flat = (
+                torch.zeros((bsz, c_len, num_pages), dtype=torch.bool, device=device)
+                .scatter_(2, t_idx, True)
+                .transpose(1, 2)
+                .reshape(tot_bm, c_len)
+            )
+            valid_pos.append(s_i)
+            act_flats.append(act_flat)
+            cnt_tensors.append(act_flat.sum(dim=-1, dtype=torch.int32))
+            span_lens.append(c_len)
+
+        out_plans: list[_ActivePagePlan] = [
+            _ActivePagePlan(None, None, 0, 0, num_pages) for _ in range(n_spans)
+        ]
+        if not cnt_tensors:
+            return out_plans
+
+        cnt_stack = cnt_tensors[0].unsqueeze(0) if len(cnt_tensors) == 1 else torch.stack(cnt_tensors, dim=0)
+        all_cnts: list[list[int]] = cnt_stack.tolist()
+        flat_active: list[int] = []
+        specs: list[tuple[int, int, int, int]] = []
+        for j, row in enumerate(all_cnts):
+            c_len = span_lens[j]
+            start = len(flat_active)
+            max_tok = 0
+            for idx, cnt in enumerate(row):
+                if cnt > 0:
+                    flat_active.append(idx)
+                    max_tok = max(max_tok, cnt)
+            n_act = len(flat_active) - start
+            if n_act == 0 or (n_act == tot_bm and max_tok >= c_len):
+                del flat_active[start:]
+                specs.append((0, 0, n_act, max_tok))
+            else:
+                specs.append((start, n_act, n_act, max_tok))
+
+        all_lin_t = torch.tensor(flat_active, dtype=torch.long, device=device) if flat_active else None
+        for j, s_i in enumerate(valid_pos):
+            offset, length, n_act, max_tok = specs[j]
+            if length == 0 or all_lin_t is None:
+                out_plans[s_i] = _ActivePagePlan(None, None, n_act, max_tok, num_pages)
+            else:
+                out_plans[s_i] = _ActivePagePlan(
+                    all_lin_t[offset : offset + length],
+                    act_flats[j],
+                    n_act,
+                    max_tok,
+                    num_pages,
+                )
+        return out_plans
+
     def _wy_kda_state_update(
         page_states: torch.Tensor,
         k_eff: torch.Tensor,
@@ -2943,31 +3153,29 @@ else:
         *,
         active_mask: torch.Tensor | None = None,
         compact_active_pages: bool = True,
+        active_plan: _ActivePagePlan | None = None,
     ) -> torch.Tensor:
         c_len = k_eff.shape[-2]
         if (
-            active_mask is not None
+            (active_plan is not None or active_mask is not None)
             and compact_active_pages
             and c_len > 1
             and not _is_compiling()
         ):
             bsz, num_pages, hv, dk, dv = page_states.shape
-            nz_bm = active_mask.any(dim=-1).nonzero(as_tuple=False)
-            n_act = int(nz_bm.shape[0])
-            if n_act == 0:
+            if active_plan is not None:
+                plan = active_plan
+            else:
+                assert active_mask is not None
+                plan = _build_active_page_plan(active_mask)
+            if plan.n_act == 0:
                 return page_states
-            b_i = nz_bm[:, 0]
-            m_i = nz_bm[:, 1]
-            act_sub = active_mask[b_i, m_i]
-            cnt_sub = act_sub.sum(dim=-1)
-            c_max = int(cnt_sub.max().item())
-            if n_act < bsz * num_pages or c_max < c_len:
-                t_arange = torch.arange(c_len, device=k_eff.device).unsqueeze(0)
-                sort_key = (~act_sub).to(dtype=torch.long) * c_len + t_arange
-                tok_pos = torch.argsort(sort_key, dim=-1)[:, :c_max]
-                valid_c = torch.arange(c_max, device=k_eff.device).unsqueeze(0) < cnt_sub.unsqueeze(1)
+            if plan.lin_bm is not None:
+                lin_bm = plan.lin_bm
+                n_act = plan.n_act
+                c_max = plan.max_tok
+                tok_pos, valid_c = plan.compaction_indices()
 
-                lin_bm = b_i * num_pages + m_i
                 p_flat = page_states.reshape(bsz * num_pages, hv, dk, dv)
                 p_sub = p_flat.index_select(0, lin_bm).unsqueeze(1)
 
@@ -3004,8 +3212,7 @@ else:
         l_mat, cum_log_a = _build_wy_unit_lower(k_eff, log_a_neg)
         gamma_from_0 = cum_log_a.exp()
         rhs = v_eff - (gamma_from_0 * k_eff) @ page_states
-        eye = torch.eye(c_len, dtype=k_eff.dtype, device=k_eff.device)
-        u_wy = torch.linalg.solve_triangular(eye + l_mat, rhs, upper=False, unitriangular=True)
+        u_wy = _solve_unit_lower_wy(l_mat, rhs)
 
         gamma_to_end = (cum_log_a[..., -1:, :] - cum_log_a).exp()
         d_chunk = cum_log_a[..., -1, :].exp().unsqueeze(-1)
@@ -3018,6 +3225,7 @@ else:
         top_w: torch.Tensor,
         *,
         compact_active_pages: bool = True,
+        active_plan: _ActivePagePlan | None = None,
     ) -> torch.Tensor:
         bsz, c_len, hv, dk = vec_c.shape
         num_pages = state_bank.shape[1]
@@ -3043,38 +3251,42 @@ else:
             return (picked_s * top_w.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
 
         if compact_active_pages and k_sel < num_pages and not _is_compiling():
-            act_bm = (
-                torch.zeros((bsz, c_len, num_pages), dtype=torch.bool, device=vec_c.device)
-                .scatter_(2, top_idx, True)
-                .transpose(1, 2)
-            )
-            nz_bm = act_bm.any(dim=-1).nonzero(as_tuple=False)
-            n_act = int(nz_bm.shape[0])
-            if n_act == 0:
+            if active_plan is not None:
+                plan = active_plan
+            else:
+                act_bm = (
+                    torch.zeros((bsz, c_len, num_pages), dtype=torch.bool, device=vec_c.device)
+                    .scatter_(2, top_idx, True)
+                    .transpose(1, 2)
+                )
+                plan = _build_active_page_plan(act_bm)
+            if plan.n_act == 0:
                 return vec_c.new_zeros(bsz, c_len, hv, dv)
-            b_i = nz_bm[:, 0]
-            m_i = nz_bm[:, 1]
-            act_sub = act_bm[b_i, m_i]
-            cnt_sub = act_sub.sum(dim=-1)
-            r_max = int(cnt_sub.max().item())
-            if n_act < bsz * num_pages or r_max < c_len:
-                w_bm = vec_c.new_zeros((bsz, c_len, num_pages)).scatter_add(2, top_idx, top_w).transpose(1, 2)
-                t_arange = torch.arange(c_len, device=vec_c.device).unsqueeze(0)
-                sort_key = (~act_sub).to(dtype=torch.long) * c_len + t_arange
-                tok_pos = torch.argsort(sort_key, dim=-1)[:, :r_max]
-                valid_r = torch.arange(r_max, device=vec_c.device).unsqueeze(0) < cnt_sub.unsqueeze(1)
+            if plan.lin_bm is not None:
+                assert plan.b_i is not None
+                lin_bm = plan.lin_bm
+                b_i = plan.b_i
+                n_act = plan.n_act
+                r_max = plan.max_tok
+                tok_pos, valid_r = plan.compaction_indices()
+                w_bm = (
+                    vec_c.new_zeros((bsz, c_len, num_pages))
+                    .scatter_add(2, top_idx, top_w)
+                    .transpose(1, 2)
+                    .reshape(bsz * num_pages, c_len)
+                )
 
                 lin_bt = b_i.unsqueeze(1) * c_len + tok_pos
                 vec_flat = vec_c.reshape(bsz * c_len, hv, dk)
                 q_sub = vec_flat.index_select(0, lin_bt.reshape(-1)).view(n_act, r_max, hv, dk).transpose(1, 2)
 
                 bank_flat = state_bank.reshape(bsz * num_pages, hv, dk, dv)
-                s_sub = bank_flat.index_select(0, b_i * num_pages + m_i)
+                s_sub = bank_flat.index_select(0, lin_bm)
                 if s_sub.dtype != vec_c.dtype:
                     s_sub = s_sub.to(dtype=vec_c.dtype)
 
                 out_sub = (q_sub @ s_sub).transpose(1, 2)
-                w_sub = w_bm[b_i, m_i].gather(1, tok_pos)
+                w_sub = w_bm.index_select(0, lin_bm).gather(1, tok_pos)
                 w_masked = torch.where(valid_r, w_sub, torch.zeros_like(w_sub))
                 weighted = (out_sub * w_masked.unsqueeze(-1).unsqueeze(-1)).reshape(n_act * r_max, hv, dv)
                 out_flat = vec_c.new_zeros((bsz * c_len, hv, dv)).scatter_add(
@@ -3096,11 +3308,23 @@ else:
         top_k_pages: int,
         *,
         compact_active_pages: bool = True,
+        precomputed_routing: tuple[torch.Tensor, torch.Tensor] | None = None,
+        active_plan: _ActivePagePlan | None = None,
     ) -> torch.Tensor:
-        pi_read = F.softmax(read_logits_c, dim=-1)
-        top_vals, top_idx = torch.topk(pi_read, k=top_k_pages, dim=-1)
-        top_w = top_vals / top_vals.sum(dim=-1, keepdim=True).clamp_min(1e-30)
-        return _routed_bank_readout(q_hat_c, s_far, top_idx, top_w, compact_active_pages=compact_active_pages)
+        if precomputed_routing is not None:
+            top_idx, top_w = precomputed_routing
+        else:
+            pi_read = F.softmax(read_logits_c, dim=-1)
+            top_vals, top_idx = torch.topk(pi_read, k=top_k_pages, dim=-1)
+            top_w = top_vals / top_vals.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+        return _routed_bank_readout(
+            q_hat_c,
+            s_far,
+            top_idx,
+            top_w,
+            compact_active_pages=compact_active_pages,
+            active_plan=active_plan,
+        )
 
     def _compute_surprise_and_routing(
         k_hat_c: torch.Tensor,
@@ -3117,10 +3341,15 @@ else:
         surprise_mode: str = "routed",
         write_mode: str = "full",
         compact_active_pages: bool = True,
+        precomputed_write_routing: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        active_plan: _ActivePagePlan | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, c_len, hv, _dk = k_hat_c.shape
-        pi_write = F.softmax(write_logits_c, dim=-1)
-        top_vals, top_idx = torch.topk(pi_write, k=top_k_pages, dim=-1)
+        if precomputed_write_routing is not None:
+            pi_write, top_vals, top_idx = precomputed_write_routing
+        else:
+            pi_write = F.softmax(write_logits_c, dim=-1)
+            top_vals, top_idx = torch.topk(pi_write, k=top_k_pages, dim=-1)
         top_probs = top_vals / top_vals.sum(dim=-1, keepdim=True).clamp_min(1e-30)
 
         if (not use_surprise) or surprise_mode == "none":
@@ -3133,6 +3362,7 @@ else:
                     top_idx,
                     top_probs,
                     compact_active_pages=compact_active_pages,
+                    active_plan=active_plan,
                 )
             else:
                 s0 = s_chunk_start_bank[:, 0] if s_chunk_start_bank.ndim == 5 else s_chunk_start_bank
@@ -3849,6 +4079,81 @@ else:
         p_cur = page_states
         s_init_ref = page_states if first_surprise_bank is None else first_surprise_bank
 
+        fut_map: dict[int, tuple[int, int]] = {
+            src_c: fb for src_c, fb in zip(fut_src_locals, fut_chunk_bounds)
+        }
+
+        seg_pi_write: torch.Tensor | None = None
+        seg_w_vals: torch.Tensor | None = None
+        seg_w_idx: torch.Tensor | None = None
+        intra_read_routing: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        fut_read_routing: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        seg_write_plan: _ActivePagePlan | None = None
+        chunk_write_plans: list[_ActivePagePlan | None] = [None] * n_grp
+        intra_read_plans: dict[int, _ActivePagePlan | None] = {}
+        fut_read_plans: dict[int, _ActivePagePlan | None] = {}
+
+        if n_grp > 0:
+            seg_pi_write = F.softmax(wl, dim=-1)
+            seg_w_vals, seg_w_idx = torch.topk(seg_pi_write, k=top_k_pages, dim=-1)
+
+            ti_rfut: torch.Tensor | None = None
+            tw_rfut: torch.Tensor | None = None
+            if rl_fut_seg.shape[1] > 0:
+                pi_rfut = F.softmax(rl_fut_seg, dim=-1)
+                tv_rfut, ti_rfut = torch.topk(pi_rfut, k=top_k_pages, dim=-1)
+                tw_rfut = tv_rfut / tv_rfut.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+
+            for c_i, (_l0, l1) in enumerate(chunk_bounds):
+                if (step_offset + l1) % chunk_size == 0:
+                    c_intra_dst = c_i + window_chunks + 1
+                    if c_intra_dst < n_grp:
+                        fl0, fl1 = chunk_bounds[c_intra_dst]
+                        pi_ri = F.softmax(rl[:, fl0:fl1], dim=-1)
+                        tv_ri, ti_ri = torch.topk(pi_ri, k=top_k_pages, dim=-1)
+                        tw_ri = tv_ri / tv_ri.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+                        intra_read_routing[c_i] = (ti_ri, tw_ri)
+                    elif c_i in fut_map and ti_rfut is not None and tw_rfut is not None:
+                        fl0, fl1 = fut_map[c_i]
+                        fut_read_routing[c_i] = (ti_rfut[:, fl0:fl1], tw_rfut[:, fl0:fl1])
+
+            if compact_active_pages and top_k_pages < num_pages and not _is_compiling():
+                plan_spans: list[torch.Tensor] = []
+                seg_plan_pos = -1
+                chunk_plan_start = -1
+                if surprise_mode == "segment_start":
+                    seg_plan_pos = len(plan_spans)
+                    plan_spans.append(seg_w_idx)
+                    if not (n_grp > 1 and is_uniform_full_chunks):
+                        chunk_plan_start = len(plan_spans)
+                        for l0, l1 in chunk_bounds:
+                            plan_spans.append(seg_w_idx[:, l0:l1])
+                else:
+                    chunk_plan_start = len(plan_spans)
+                    for l0, l1 in chunk_bounds:
+                        plan_spans.append(seg_w_idx[:, l0:l1])
+
+                intra_pos_map: dict[int, int] = {}
+                for c_i, (ti_ri, _tw_ri) in intra_read_routing.items():
+                    intra_pos_map[c_i] = len(plan_spans)
+                    plan_spans.append(ti_ri)
+
+                fut_pos_map: dict[int, int] = {}
+                for c_i, (ti_rf, _tw_rf) in fut_read_routing.items():
+                    fut_pos_map[c_i] = len(plan_spans)
+                    plan_spans.append(ti_rf)
+
+                built_plans = _build_multi_span_active_plans(plan_spans, num_pages)
+                if seg_plan_pos >= 0:
+                    seg_write_plan = built_plans[seg_plan_pos]
+                if chunk_plan_start >= 0:
+                    for c_i in range(n_grp):
+                        chunk_write_plans[c_i] = built_plans[chunk_plan_start + c_i]
+                for c_i, pos in intra_pos_map.items():
+                    intra_read_plans[c_i] = built_plans[pos]
+                for c_i, pos in fut_pos_map.items():
+                    fut_read_plans[c_i] = built_plans[pos]
+
         seg_g_page: torch.Tensor | None = None
         seg_top_idx: torch.Tensor | None = None
         seg_g_act: torch.Tensor | None = None
@@ -3857,6 +4162,7 @@ else:
         wy_d_batched: torch.Tensor | None = None
         wy_kt_batched: torch.Tensor | None = None
         if surprise_mode == "segment_start" and n_grp > 0:
+            assert seg_pi_write is not None and seg_w_vals is not None and seg_w_idx is not None
             seg_g_page, seg_top_idx, seg_g_act = _compute_surprise_and_routing(
                 k_hat,
                 v,
@@ -3871,6 +4177,8 @@ else:
                 surprise_mode="segment_start",
                 write_mode=write_mode,
                 compact_active_pages=compact_active_pages,
+                precomputed_write_routing=(seg_pi_write, seg_w_vals, seg_w_idx),
+                active_plan=seg_write_plan,
             )
             if n_grp > 1 and is_uniform_full_chunks:
                 chan_all = (
@@ -3897,7 +4205,6 @@ else:
                     .reshape(bsz, n_grp, chunk_size, num_pages, hv, dk)
                     .permute(0, 1, 3, 4, 2, 5)
                 )
-                eye_c = torch.eye(chunk_size, dtype=ke_all.dtype, device=ke_all.device)
                 if compact_active_pages and top_k_pages < num_pages and not _is_compiling():
                     act_bcm = (
                         torch.zeros(
@@ -3909,27 +4216,24 @@ else:
                         .reshape(bsz, n_grp, chunk_size, num_pages)
                         .permute(0, 1, 3, 2)
                     )
-                    nz_bcm = act_bcm.any(dim=-1).nonzero(as_tuple=False)
-                    n_act = int(nz_bcm.shape[0])
                     tot_bcm = bsz * n_grp * num_pages
+                    active_bcm = [
+                        idx for idx, flag in enumerate(act_bcm.any(dim=-1).reshape(-1).tolist()) if flag
+                    ]
+                    n_act = len(active_bcm)
                     if n_act == 0:
                         wy_w_batched = ke_all.new_zeros((bsz, n_grp, num_pages, hv, chunk_size, dk))
                         wy_u0_batched = ve_all.new_zeros((bsz, n_grp, num_pages, hv, chunk_size, dv))
                         wy_d_batched = ke_all.new_ones((bsz, n_grp, num_pages, hv, dk, 1))
                         wy_kt_batched = ke_all.new_zeros((bsz, n_grp, num_pages, hv, dk, chunk_size))
                     elif n_act < tot_bcm:
-                        lin_bcm = nz_bcm[:, 0] * (n_grp * num_pages) + nz_bcm[:, 1] * num_pages + nz_bcm[:, 2]
+                        lin_bcm = torch.tensor(active_bcm, dtype=torch.long, device=ke_all.device)
                         ke_s = ke_all.reshape(tot_bcm, hv, chunk_size, dk).index_select(0, lin_bcm)
                         ve_s = ve_all.reshape(tot_bcm, hv, chunk_size, dv).index_select(0, lin_bcm)
                         la_s = la_all.reshape(tot_bcm, hv, chunk_size, dk).index_select(0, lin_bcm)
                         l_s, cum_s = _build_wy_unit_lower(ke_s, la_s)
                         eb_s = cum_s.exp() * ke_s
-                        wv_s = torch.linalg.solve_triangular(
-                            eye_c + l_s,
-                            torch.cat([eb_s, ve_s], dim=-1),
-                            upper=False,
-                            unitriangular=True,
-                        )
+                        wv_s = _solve_unit_lower_wy(l_s, torch.cat([eb_s, ve_s], dim=-1))
                         w_s, u0_s = wv_s.split([dk, dv], dim=-1)
                         d_s = cum_s[..., -1, :].exp().unsqueeze(-1)
                         kt_s = ((cum_s[..., -1:, :] - cum_s).exp() * ke_s).transpose(-1, -2)
@@ -3953,20 +4257,12 @@ else:
                 if wy_w_batched is None:
                     l_all, cum_all = _build_wy_unit_lower(ke_all, la_all)
                     eb_all = cum_all.exp() * ke_all
-                    wv_all = torch.linalg.solve_triangular(
-                        eye_c + l_all,
-                        torch.cat([eb_all, ve_all], dim=-1),
-                        upper=False,
-                        unitriangular=True,
-                    )
+                    wv_all = _solve_unit_lower_wy(l_all, torch.cat([eb_all, ve_all], dim=-1))
                     wy_w_batched, wy_u0_batched = wv_all.split([dk, dv], dim=-1)
                     wy_d_batched = cum_all[..., -1, :].exp().unsqueeze(-1)
                     wy_kt_batched = ((cum_all[..., -1:, :] - cum_all).exp() * ke_all).transpose(-1, -2)
 
         o_far_intra: dict[int, torch.Tensor] = {}
-        fut_map: dict[int, tuple[int, int]] = {
-            src_c: fb for src_c, fb in zip(fut_src_locals, fut_chunk_bounds)
-        }
         save_set = set(save_boundary_locals)
         saved_map: dict[int, torch.Tensor] = {}
         fut_outs: list[torch.Tensor] = []
@@ -4035,12 +4331,14 @@ else:
             else:
                 outs.append(o_far)
 
+            w_plan_c = chunk_write_plans[c_i]
             if surprise_mode == "segment_start":
                 assert seg_g_page is not None and seg_top_idx is not None and seg_g_act is not None
                 g_page = seg_g_page[:, l0:l1]
                 top_idx = seg_top_idx[:, l0:l1]
                 g_act = seg_g_act[:, l0:l1]
             else:
+                assert seg_pi_write is not None and seg_w_vals is not None and seg_w_idx is not None
                 s_surp_c = s_init_ref if c_i == 0 else p_cur
                 g_page, top_idx, g_act = _compute_surprise_and_routing(
                     k_c,
@@ -4056,6 +4354,12 @@ else:
                     surprise_mode=surprise_mode,
                     write_mode=write_mode,
                     compact_active_pages=compact_active_pages,
+                    precomputed_write_routing=(
+                        seg_pi_write[:, l0:l1],
+                        seg_w_vals[:, l0:l1],
+                        seg_w_idx[:, l0:l1],
+                    ),
+                    active_plan=w_plan_c,
                 )
 
             sqrt_b = _safe_sqrt(bf[:, l0:l1])
@@ -4090,7 +4394,12 @@ else:
                 v_eff = (g_page.unsqueeze(-1) * ve_base_c.unsqueeze(2)).permute(0, 2, 3, 1, 4)
                 log_a = (-(g_page * g_page).unsqueeze(-1) * gamma_c).permute(0, 2, 3, 1, 4)
                 act_mask: torch.Tensor | None = None
-                if compact_active_pages and top_k_pages < num_pages and not _is_compiling():
+                if (
+                    w_plan_c is None
+                    and compact_active_pages
+                    and top_k_pages < num_pages
+                    and not _is_compiling()
+                ):
                     act_mask = (
                         torch.zeros((bsz, c_len, num_pages), dtype=torch.bool, device=k_c.device)
                         .scatter_(2, top_idx, True)
@@ -4103,6 +4412,7 @@ else:
                     log_a,
                     active_mask=act_mask,
                     compact_active_pages=compact_active_pages,
+                    active_plan=w_plan_c,
                 )
 
             if g1 % chunk_size == 0:
@@ -4117,6 +4427,8 @@ else:
                         rl[:, fl0:fl1],
                         top_k_pages,
                         compact_active_pages=compact_active_pages,
+                        precomputed_routing=intra_read_routing.get(c_i),
+                        active_plan=intra_read_plans.get(c_i),
                     )
                 elif c_i in fut_map:
                     fl0, fl1 = fut_map[c_i]
@@ -4127,6 +4439,8 @@ else:
                             rl_fut_seg[:, fl0:fl1],
                             top_k_pages,
                             compact_active_pages=compact_active_pages,
+                            precomputed_routing=fut_read_routing.get(c_i),
+                            active_plan=fut_read_plans.get(c_i),
                         )
                     )
 
@@ -4344,36 +4658,58 @@ else:
 
         o_far_slots: list[torch.Tensor | None] = [None] * n_chunks
         n_init_pre = min(n_chunks, w_chunks + 1)
-        if step_offset == 0:
-            for m in range(n_init_pre):
-                a_m, b_m = all_chunks[m]
-                o_far_slots[m] = _far_readout(
-                    q_hat[:, a_m:b_m],
-                    st_acc.page_states,
-                    rl[:, a_m:b_m],
+        if n_init_pre > 0:
+            init_end_tok = all_chunks[n_init_pre - 1][1]
+            pi_r_init = F.softmax(rl[:, :init_end_tok], dim=-1)
+            tv_r_init, ti_r_init = torch.topk(pi_r_init, k=tk_pages, dim=-1)
+            tw_r_init = tv_r_init / tv_r_init.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+            init_plans: list[_ActivePagePlan | None]
+            if eff_compact_pages and tk_pages < m_pages and not _is_compiling():
+                init_plans = list(
+                    _build_multi_span_active_plans(
+                        [ti_r_init[:, a_m:b_m] for a_m, b_m in all_chunks[:n_init_pre]],
+                        m_pages,
+                    )
+                )
+            else:
+                init_plans = [None] * n_init_pre
+
+            if step_offset == 0:
+                for m in range(n_init_pre):
+                    a_m, b_m = all_chunks[m]
+                    o_far_slots[m] = _far_readout(
+                        q_hat[:, a_m:b_m],
+                        st_acc.page_states,
+                        rl[:, a_m:b_m],
+                        tk_pages,
+                        compact_active_pages=eff_compact_pages,
+                        precomputed_routing=(ti_r_init[:, a_m:b_m], tw_r_init[:, a_m:b_m]),
+                        active_plan=init_plans[m],
+                    )
+            elif n_init_pre == 1:
+                a_0, b_0 = all_chunks[0]
+                o_far_slots[0] = _far_readout(
+                    q_hat[:, a_0:b_0],
+                    st_acc.s_far_bank,
+                    rl[:, a_0:b_0],
                     tk_pages,
                     compact_active_pages=eff_compact_pages,
+                    precomputed_routing=(ti_r_init[:, a_0:b_0], tw_r_init[:, a_0:b_0]),
+                    active_plan=init_plans[0],
                 )
-        elif n_init_pre == 1:
-            a_0, b_0 = all_chunks[0]
-            o_far_slots[0] = _far_readout(
-                q_hat[:, a_0:b_0],
-                st_acc.s_far_bank,
-                rl[:, a_0:b_0],
-                tk_pages,
-                compact_active_pages=eff_compact_pages,
-            )
-        elif n_init_pre > 1:
-            init_ring = st_acc.boundary_ring
-            for m in range(n_init_pre):
-                a_m, b_m = all_chunks[m]
-                o_far_slots[m] = _far_readout(
-                    q_hat[:, a_m:b_m],
-                    init_ring[m],
-                    rl[:, a_m:b_m],
-                    tk_pages,
-                    compact_active_pages=eff_compact_pages,
-                )
+            else:
+                init_ring = st_acc.boundary_ring
+                for m in range(n_init_pre):
+                    a_m, b_m = all_chunks[m]
+                    o_far_slots[m] = _far_readout(
+                        q_hat[:, a_m:b_m],
+                        init_ring[m],
+                        rl[:, a_m:b_m],
+                        tk_pages,
+                        compact_active_pages=eff_compact_pages,
+                        precomputed_routing=(ti_r_init[:, a_m:b_m], tw_r_init[:, a_m:b_m]),
+                        active_plan=init_plans[m],
+                    )
 
         n_0 = step_offset // c_size
         n_end = end_step // c_size
@@ -4428,7 +4764,19 @@ else:
                 st_acc.page_states,
             )
         )
-        use_ckpt = bool(adapter.checkpoint_segments and torch.is_grad_enabled() and need_grad and len(seg_groups) > 1)
+        skip_nested_ckpt = (
+            adapter.outer_checkpoint_max_tokens > 0
+            and bsz * seq_len <= adapter.outer_checkpoint_max_tokens
+            and (_in_backward() or _in_outer_checkpoint())
+        )
+        use_ckpt = bool(
+            adapter.checkpoint_segments
+            and seq_len >= adapter.checkpoint_segments_min_len
+            and torch.is_grad_enabled()
+            and need_grad
+            and len(seg_groups) > 1
+            and not skip_nested_ckpt
+        )
 
         p_cur = st_acc.page_states
         seg_outs: list[torch.Tensor] = []

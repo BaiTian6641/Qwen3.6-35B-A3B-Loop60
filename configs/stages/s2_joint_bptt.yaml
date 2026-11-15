@@ -43,6 +43,11 @@ gdn2:
 
 hssd:
   enabled: true
+  write_mode: full
+  swa_recency_init: 0.05
+  horizon_tokens: 1048576
+  compact_active_pages: true
+  compact_decode_cache: true
   chunk_size: 64
   window_chunks: 8
   num_pages: 8
@@ -57,6 +62,8 @@ hssd:
 lsa:
   enabled: true
   mode: sparse                          # sparse D-LSA active during 4x32K = 128K K/V-replayed BPTT
+  compact_active_slots: true
+  max_selected_keys: 768
   num_query_passes: 3
   index_dim: 64
   index_on: nope

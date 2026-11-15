@@ -1,6 +1,6 @@
-# Qwen3.6-35B-A6B-LoopHSSD (v3.1): Definitive Backbone Modification Specification
+# Qwen3.6-35B-A6B-LoopHSSD (v3.2): Definitive Backbone Modification Specification
 
-> **Status:** Canonical `v3.1` Architecture Specification (Supersedes `Loop-HSSD-10M v1`, `v2`, and initial `v3.0`, incorporating all 23 `v1` audit fixes, all 17 `Final-Pass Review` findings `A1–A6, B1–B6, C1–C2, E1–E3`, and all External `HSSD v3.1` Audit fixes `3A–3E, 4.1–4.3, 5–6`)
+> **Status:** Canonical `v3.2` Architecture Specification (Supersedes `Loop-HSSD-10M v1`, `v2`, `v3.0`, and `v3.1`, incorporating all External `HSSD v3.1` Audit fixes plus the `v3.2` Loop60 Mathematical, Scale & Blackwell Throughput Review fixes `H1–H9`, `D1–D8`, `Section 5.2`, and `Section 5.3`)
 > **Base Checkpoint:** `Qwen/Qwen3.6-35B-A3B` (`34.661B` text decoder; `>98.5%` pretrained weights reused directly)
 > **Target Sync Repository:** [`TassP0lar/Qwen3.6-35B-A3B-Loop64`](https://huggingface.co/TassP0lar/Qwen3.6-35B-A3B-Loop64)
 > **Zero-Weight Math & Falsification Gate:** [`test_loop_hssd_v3_math.py`](../tests/test_loop_hssd_v3_math.py) & `test_hssd_audit_regressions.py` (`float64` algebraic & storage invariants)
@@ -260,7 +260,11 @@ At Qwen3.6 dimensions (`hidden = 2048, H_v = 32, d_k = d_v = 128, M = 8, C = 64,
   - **Total Retained Decode Cache (`B = 1`):**
     - **`fp32` state storage:** **`162–178 MiB/layer`** $\implies$ **`4.75–5.21 GiB` across 30 layers (`R = 1`)**, scaling with independent core-pass slots to **`7.59–8.34 GiB` (`48` slots, `R = 2`)** and **`10.44–11.47 GiB` (`66` slots, `R = 3`)**.
     - **`bfloat16` state storage (`state_dtype="bfloat16"`, default for GPU serving & long-context):** **`81–89 MiB/layer`** $\implies$ **`2.37–2.61 GiB` across 30 layers (`R = 1`)**, **`3.80–4.17 GiB` (`48` slots, `R = 2`)**, and **`5.22–5.74 GiB` (`66` slots, `R = 3`)**, while still computing WY chunk updates in `fp32` and keeping `theta_cum` in `fp64`!
-- **Active-Page Decode vs. Chunk Kernel Fusion Caveat:** Single-token decoding (`recurrent_hssd_step`) gathers and updates only the `k_w = 2` active write pages (`4×` fewer state-update FLOPs/bytes), and `HSSDCacheState` / `HSSDHybridCache` satisfy full Hugging Face beam-search/tensor cache contracts. However, **Python/PyTorch multi-page WY chunk execution still requires custom fused Triton/FLA kernel development to match fused single-state GDN prefill/training latency**—benchmarked quantitatively in `Gate 0p-4` (`profile_hssd_layer`) prior to multi-layer training.
+- **Active-Page Decode, Compact Lagged-Replay Cache & Blackwell Speed Stack (`v3.2` `H1–H9`, `5.2–5.3`):**
+  - **Full-Strength Selected-Page Writes (`write_mode="full"`, `H1/H6`) & Local SWA Recency Slope (`H3`):** Eliminates the `0.5x` split-write averaging artifact so exact overwrites return `v_new`, while a learnable per-head SWA recency slope resolves repeated-key collisions inside the `513–576` local window.
+  - **Read-Ahead Far Readout (`H4`) & Lagged-Replay Decode Cache (`H5`):** Precomputing `_far_readout` at boundary creation removes the 9-entry `boundary_ring` from segment activation checkpoints (`~5×–9×` lower retained training state), while single-token decode stores `1` lagged boundary bank + a `512`-token replay buffer (`~3×–4×` smaller per pass-layer).
+  - **Zero-Duplicate-VRAM Distillation (`SharedBackboneTeacher` + Online Per-Layer Warm-Up, `5.2 #2, #7`):** `s1b_hssd_distill` shares the single `35 GiB` FP8 backbone (`0.00 GiB` duplicate frozen expert HBM), running `400` teacher-forced single-layer warm-up steps (`~0.5 GiB` peak extra VRAM, zero MoE backward) followed by scheduled $\lambda$-blend (`blend_init=0.0 -> 1.0`, `H2`) end-to-end `_ChunkedVocabKL`.
+  - **Global TF32 (`allow_tf32=True`, `5.2 #1`) & Zero-Host-Sync `FusedStepOptimizer` (`5.3`):** Routes `fp32` WY/Ward matmuls onto Blackwell TF32 Tensor Cores (`< 2e-2` 32K relative drift with `fp32` cumulative decay & `fp64` phase reduction), eliminates per-parameter `.item()` GPU$\to$CPU syncs via on-device norm/clipping + `defer_micro_step()`, and sets `apollo: {rank: 256, scale_type: channel, scale: 1.0, update_proj_gap: 200}` for full-rank $\ge 128 \times 128$ matrices.
 
 ---
 
@@ -272,7 +276,7 @@ Each of Qwen3.6's 10 Gated Full-Attention layers uses head dimension $d_{\text{h
 
 To bridge `262K -> 1M` (and `10M` stretch) without blind zero-shot extrapolation:
 1. **Gate `0p-3` Positional Mechanism Selection:** Benchmarks (a) `YaRN` (`factor = 4.0` for `1M`) vs. (b) **Dual Chunk Attention / ReRoPE Clamping** (exact relative mRoPE inside `131,072` tokens; smoothly clamped asymptotic relative phase $\Delta_{\text{eff}} = L_c + S_c \ln(1 + (\Delta - L_c)/S_c) \le 240{,}000$ for distant retrieved buckets so rotary angles **never leave the pretrained `[0, 262K]` arc**!).
-2. **Long-Prefix (`no_grad`) + Short-Suffix (`grad`) Calibration (`Gate 2a`):** Streaming `512K–992K` prefix tokens under `torch.no_grad()` populates true `1M`-scale FP8 KV caches and D-LSA Ward centroids on a single `96 GB` GPU, followed by full-gradient backpropagation on the final `32K` query/answer suffix (`QK-Norm` scales, sigmoid attention gates, per-pass Q/O LoRA, and `D-LSA` indexers). This directly trains the attention heads against `1M`-token log-partition entropy (`log(10^6) = 13.82`)!
+2. **Long-Prefix (`no_grad`) + Short-Suffix (`grad`) Calibration (`Gate 2a`, `v3.2` `D1–D6`):** `s3_long_1m_lsa` (`600` steps) alternates `64K` `hybrid` D-LSA steps (exposing downstream Q/O LoRA and loop bridges to real sparse attention while supervising `W_q_idx, W_k_idx` via sampled KL, with `compact_active_slots=True` `2×` smaller `BucketIndex` and `max_selected_keys=768`) with scheduled `prefix_suffix_calibration_step` passes every `10` steps—streaming `512K–992K` prefix tokens in sub-quadratic `sparse` D-LSA mode (`D3`) and computing `32K` suffix loss directly via chunked cross-entropy on pre-head hidden states without ever materializing `[B, 32768, 248320]` logits (`D2`).
 
 ### 6.2 Tier 1 (`1M` Primary Target): 100% GPU-Resident `FP8` + Per-Pass `D-LSA`
 

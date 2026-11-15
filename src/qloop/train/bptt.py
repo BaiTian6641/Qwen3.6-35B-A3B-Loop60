@@ -378,13 +378,22 @@ class SegmentedKVBPTTRunner:
 
         with torch.no_grad():
             if lsa_ix is not None:
-                qz = lsa_ix.query_latent(q_cur_detached)      # [B, G, T_seg, d_idx]
+                qz = lsa_ix.query_latent(q_cur_detached)      # [B, G | H, T_seg, d_idx]
                 kz = lsa_ix.key_latent(k_prior_cached)        # [B, G, T_prior, d_idx]
+                kz_m = kz.to(qz.dtype)
                 sim = qz.new_full((bsz, g_cnt, t_prior), float("-inf"))
-                for c0 in range(0, t_seg, chunk):
-                    qc = qz[:, :, c0 : c0 + chunk]
-                    sc = torch.einsum("bgcd,bgtd->bgct", qc, kz).amax(dim=2)
-                    sim = torch.maximum(sim, sc)
+                if qz.shape[1] != g_cnt:
+                    hg_q = qz.shape[1] // g_cnt
+                    qz_g = qz.view(bsz, g_cnt, hg_q, t_seg, -1)
+                    for c0 in range(0, t_seg, chunk):
+                        qc = qz_g[:, :, :, c0 : c0 + chunk]
+                        sc = torch.einsum("bghcd,bgtd->bghct", qc, kz_m).amax(dim=(2, 3))
+                        sim = torch.maximum(sim, sc)
+                else:
+                    for c0 in range(0, t_seg, chunk):
+                        qc = qz[:, :, c0 : c0 + chunk]
+                        sc = torch.einsum("bgcd,bgtd->bgct", qc, kz_m).amax(dim=2)
+                        sim = torch.maximum(sim, sc)
             else:
                 lo = rot_dim if rot_dim < dh else 0
                 scale_nope = 1.0 / math.sqrt(max(1, dh - lo))
@@ -566,11 +575,12 @@ class SegmentedKVBPTTRunner:
                             if (
                                 lsa_ix is not None
                                 and self.cfg.replay_indexer_weight > 0
-                                and (lsa_ix.wk.requires_grad or k_live.requires_grad)
+                                and (lsa_ix.wk.requires_grad or lsa_ix.wq.requires_grad or k_live.requires_grad)
                             ):
                                 kz_live = lsa_ix.k_proj(k_live)  # [B, G, K_sel, d_idx]
                                 q_live_for_idx, _, _, _ = self._extract_query_heads(attn_mod, x_cur.detach())
-                                qz_live = lsa_ix.query_latent(q_live_for_idx)  # [B, G, T_seg, d_idx]
+                                qz_live = lsa_ix.query_latent(q_live_for_idx)  # [B, G | H, T_seg, d_idx]
+                                per_head_q = qz_live.shape[1] != num_kv_heads
                                 with torch.no_grad():
                                     lo = lsa_ix.lo
                                     hg = q_det.shape[1] // num_kv_heads
@@ -579,13 +589,25 @@ class SegmentedKVBPTTRunner:
                                     raw_sc = torch.einsum("bghcd,bgkd->bghck", qn_t, kn_t) / math.sqrt(
                                         max(1, head_dim - lo)
                                     )
-                                    tgt_p = torch.softmax(raw_sc, dim=-1).mean(dim=2)  # [B, G, T_seg, K_sel]
-                                pred_logits = (
-                                    torch.einsum("bgcd,bgkd->bgck", qz_live, kz_live.to(qz_live.dtype))
-                                    / lsa_ix.cfg.temperature
-                                )
+                                    if per_head_q:
+                                        tgt_p = torch.softmax(raw_sc, dim=-1)  # [B, G, Hg, T_seg, K_sel]
+                                    else:
+                                        tgt_p = torch.softmax(raw_sc, dim=-1).mean(dim=2)  # [B, G, T_seg, K_sel]
+                                if per_head_q:
+                                    hg_q = qz_live.shape[1] // num_kv_heads
+                                    qz_ph = qz_live.view(bsz, num_kv_heads, hg_q, -1, qz_live.shape[-1])
+                                    pred_logits = (
+                                        torch.einsum("bghcd,bgkd->bghck", qz_ph, kz_live.to(qz_live.dtype))
+                                        / lsa_ix.cfg.temperature
+                                    )
+                                else:
+                                    pred_logits = (
+                                        torch.einsum("bgcd,bgkd->bgck", qz_live, kz_live.to(qz_live.dtype))
+                                        / lsa_ix.cfg.temperature
+                                    )
                                 log_pred = torch.log_softmax(pred_logits, dim=-1)
-                                kl_idx = (tgt_p * (torch.log(tgt_p.clamp_min(1e-30)) - log_pred)).sum(-1).mean()
+                                tgt_p_m = tgt_p.to(log_pred.dtype)
+                                kl_idx = (tgt_p_m * (torch.log(tgt_p_m.clamp_min(1e-30)) - log_pred)).sum(-1).mean()
                                 if not _in_backward():
                                     seg_replay_aux.append(float(self.cfg.replay_indexer_weight) * kl_idx)
 

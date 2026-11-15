@@ -400,6 +400,14 @@ def _load_hf(mcfg: dict[str, Any]):
 
 def load_model(mcfg: dict[str, Any]):
     """Returns (model, tokenizer, info). Base parameters are frozen on return."""
+    from ..utils.tf32 import configure_tf32, is_tf32_configured
+
+    if mcfg.get("allow_tf32") is not None:
+        tf32_info = configure_tf32(bool(mcfg["allow_tf32"]))
+    elif not is_tf32_configured():
+        tf32_info = configure_tf32(True)
+    else:
+        tf32_info = None
     name = mcfg.get("name", "toy")
     model, tok = _load_toy(mcfg) if name == "toy" else _load_hf(mcfg)
     repack_info: dict[str, Any] | None = None
@@ -417,6 +425,8 @@ def load_model(mcfg: dict[str, Any]):
     parts = inspect_model(model)
     info = param_report(model)
     info["quantization"] = quant_info
+    if tf32_info is not None:
+        info["tf32"] = tf32_info
     if repack_info is not None and int(repack_info.get("repacked_moe_modules", 0)) > 0:
         info["nvfp4_moe_repack"] = repack_info
     log.info("%s", summarize(parts))

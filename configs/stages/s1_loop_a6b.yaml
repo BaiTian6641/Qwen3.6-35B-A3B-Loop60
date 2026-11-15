@@ -51,9 +51,10 @@ experts:
   enabled: false                        # 100% frozen MoE experts (SHA-256 checksum verified before/after stage)
 
 train:
-  steps: 1000                           # 1000 x 16 x 8192 ≈ 131M tokens (~14-17h on single Colab G4 Blackwell)
-  micro_batch: 1
-  grad_accum: 16
+  steps: 1000                           # 1000 x 16 x 8192 ≈ 131M tokens (micro_batch=2 x grad_accum=8 utilizes 96 GiB Blackwell HBM)
+  micro_batch: 2
+  grad_accum: 8
+  log_every: 5
   sha256_frozen_experts: true
   train_loop_adapters: true
   train_gdn2: true

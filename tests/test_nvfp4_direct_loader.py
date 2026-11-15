@@ -39,7 +39,7 @@ from qloop.infer.hf_custom_modeling import CausalLMPackOutput, save_safetensors_
 from qloop.model.experts import attach_hot_expert_deltas
 from qloop.model.hssd import HSSDConfig, apply_hssd
 from qloop.model.introspect import find_text_model, inspect_model
-from qloop.model.loading import load_model
+from qloop.model.loading import load_compressed_safetensors_direct, load_model
 from qloop.model.loop import LoopSpec, apply_loop
 from qloop.model.lsa import LSAConfig, install_lsa
 from qloop.model.quant_autograd import (
@@ -735,6 +735,94 @@ def _install_qwen35_moe_transformers_shim(monkeypatch: pytest.MonkeyPatch) -> ty
             logits = self.lm_head(h[:, slice_idx, :])
             return CausalLMPackOutput(logits=logits, past_key_values=out.past_key_values)
 
+    class Qwen3_5MoeVisionRotaryEmbedding(nn.Module):
+        def __init__(self, dim: int, theta: float = 10000.0) -> None:
+            super().__init__()
+            self.theta = float(theta)
+            inv_freq = 1.0 / (self.theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / float(dim)))
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    class _VisionPatchEmbed(nn.Module):
+        def __init__(self, hidden_size: int) -> None:
+            super().__init__()
+            self.proj = nn.Conv2d(3, hidden_size, kernel_size=2, stride=2, bias=False)
+
+    class Qwen3_5MoeVisionTower(nn.Module):
+        def __init__(self, vision_config: dict[str, Any]) -> None:
+            super().__init__()
+            vhid = int(vision_config.get("hidden_size", 32))
+            self.patch_embed = _VisionPatchEmbed(vhid)
+            self.rotary_pos_emb = Qwen3_5MoeVisionRotaryEmbedding(dim=16)
+
+    class _MultimodalBackbone(nn.Module):
+        def __init__(self, config: Qwen3_5MoeConfig) -> None:
+            super().__init__()
+            self.visual = Qwen3_5MoeVisionTower(config.vision_config)
+            self.language_model = Qwen3_5MoeTextModel(config.text_config)
+
+    class Qwen3_5MoeForConditionalGeneration(PreTrainedModel):
+        config_class = Qwen3_5MoeConfig
+
+        def __init__(self, config: Qwen3_5MoeConfig) -> None:
+            super().__init__(config)
+            self.model = _MultimodalBackbone(config)
+            self.vocab_size = config.text_config.vocab_size
+            self.lm_head = nn.Linear(config.text_config.hidden_size, self.vocab_size, bias=False)
+
+        def get_input_embeddings(self) -> nn.Module:
+            return self.model.language_model.embed_tokens
+
+        def get_output_embeddings(self) -> nn.Module:
+            return self.lm_head
+
+        def forward(
+            self,
+            input_ids: torch.Tensor | None = None,
+            attention_mask: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            past_key_values: Any = None,
+            inputs_embeds: torch.Tensor | None = None,
+            use_cache: bool | None = None,
+            logits_to_keep: int | torch.Tensor = 0,
+            **_kwargs: Any,
+        ) -> CausalLMPackOutput:
+            out = self.model.language_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+            )
+            h = out.last_hidden_state
+            slice_idx = (
+                slice(-int(logits_to_keep), None)
+                if isinstance(logits_to_keep, int) and logits_to_keep > 0
+                else slice(None)
+            )
+            logits = self.lm_head(h[:, slice_idx, :])
+            return CausalLMPackOutput(logits=logits, past_key_values=out.past_key_values)
+
+    class AutoModelForImageTextToText:
+        @staticmethod
+        def from_config(config: Any, **kwargs: Any) -> nn.Module:
+            attn_impl = kwargs.get("attn_implementation")
+            dt = kwargs.get("dtype") or kwargs.get("torch_dtype")
+            if attn_impl and hasattr(config, "text_config"):
+                config.text_config._attn_implementation = str(attn_impl)
+            prev_dt = torch.get_default_dtype()
+            if isinstance(dt, torch.dtype):
+                torch.set_default_dtype(dt)
+            try:
+                m = Qwen3_5MoeForConditionalGeneration(config)
+            finally:
+                torch.set_default_dtype(prev_dt)
+            return m
+
+        @staticmethod
+        def from_pretrained(*_args: Any, **_kwargs: Any) -> nn.Module:
+            raise AssertionError("AutoModelForImageTextToText.from_pretrained must be bypassed by direct loader!")
+
     class AutoConfig:
         @staticmethod
         def for_model(model_type: str, **kwargs: Any) -> Any:
@@ -789,12 +877,17 @@ def _install_qwen35_moe_transformers_shim(monkeypatch: pytest.MonkeyPatch) -> ty
         Qwen3_5MoeAttention,
         Qwen3_5MoeTextModel,
         Qwen3_5MoeForCausalLM,
+        Qwen3_5MoeVisionRotaryEmbedding,
+        Qwen3_5MoeVisionTower,
+        Qwen3_5MoeForConditionalGeneration,
         AutoConfig,
         AutoModelForCausalLM,
+        AutoModelForImageTextToText,
         AutoTokenizer,
     ):
         cls_obj.__module__ = "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe"
     AutoModelForCausalLM.from_pretrained.__module__ = "transformers.models.auto.auto_factory"  # type: ignore[attr-defined]
+    AutoModelForImageTextToText.from_pretrained.__module__ = "transformers.models.auto.auto_factory"  # type: ignore[attr-defined]
 
     tf_mod.PretrainedConfig = PretrainedConfig  # type: ignore[attr-defined]
     tf_mod.PreTrainedModel = PreTrainedModel  # type: ignore[attr-defined]
@@ -803,10 +896,12 @@ def _install_qwen35_moe_transformers_shim(monkeypatch: pytest.MonkeyPatch) -> ty
     tf_mod.AttentionMaskInterface = AttentionMaskInterface  # type: ignore[attr-defined]
     tf_mod.AutoConfig = AutoConfig  # type: ignore[attr-defined]
     tf_mod.AutoModelForCausalLM = AutoModelForCausalLM  # type: ignore[attr-defined]
+    tf_mod.AutoModelForImageTextToText = AutoModelForImageTextToText  # type: ignore[attr-defined]
     tf_mod.AutoTokenizer = AutoTokenizer  # type: ignore[attr-defined]
     tf_mod.Qwen3_5MoeTextConfig = Qwen3_5MoeTextConfig  # type: ignore[attr-defined]
     tf_mod.Qwen3_5MoeConfig = Qwen3_5MoeConfig  # type: ignore[attr-defined]
     tf_mod.Qwen3_5MoeForCausalLM = Qwen3_5MoeForCausalLM  # type: ignore[attr-defined]
+    tf_mod.Qwen3_5MoeForConditionalGeneration = Qwen3_5MoeForConditionalGeneration  # type: ignore[attr-defined]
 
     sub_qwen_mod = types.ModuleType("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe")
     sub_qwen_mod._torch_recurrent_gated_delta_rule = _torch_recurrent_gated_delta_rule  # type: ignore[attr-defined]
@@ -1761,4 +1856,128 @@ def test_adapter_grad_parity_tie_embeddings_and_incomplete_expert_rejection(
     save_safetensors_file(s2_bad, str(s2_path))
     with pytest.raises(Exception, match="incomplete MoE weights"):
         load_model({"name": str(bad_dir), "dtype": "bfloat16", "device_map": "cpu", "text_only": True})
+
+
+# ============================================================================ 8. Direct Call & text_only=False
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="PyTorch float8_e4m3fn required")
+def test_direct_loader_call_and_text_only_false_mtp_and_pure_text_configs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qloop.infer.hf_custom_modeling import load_safetensors_file
+
+    tf_mod = _install_qwen35_moe_transformers_shim(monkeypatch)
+    ref_dense_init, tcfg_d = _seed_reference_dense_model(tf_mod, seed=919)
+    ids = torch.tensor([[3, 21, 57, 94, 12, 68]], dtype=torch.long)
+
+    # --- 8A. Direct `load_compressed_safetensors_direct(...)` call works out-of-the-box for forward + grad ---
+    std_dir = tmp_path / "direct_call_std"
+    ref_std_fp32 = _write_checkpoint_from_reference(std_dir, ref_dense_init, tcfg_d, layout="unsloth_standard")
+    (std_dir / "shard-visual-mtp.safetensors").unlink()
+
+    m_direct = load_compressed_safetensors_direct(std_dir, dtype=torch.float32, device_map="cpu", text_only=True)
+    assert all(not p.requires_grad for p in m_direct.parameters())
+    emb_d = find_text_model(m_direct).embed_tokens(ids).detach().clone().requires_grad_(True)
+    emb_r = find_text_model(ref_std_fp32).embed_tokens(ids).detach().clone().requires_grad_(True)
+    ld = m_direct(inputs_embeds=emb_d, use_cache=False).logits
+    lr = ref_std_fp32(inputs_embeds=emb_r, use_cache=False).logits
+    assert _cosine_sim(ld, lr) > 0.99999
+    assert (ld - lr).abs().max().item() < 1e-5
+    ld.mean().backward()
+    lr.mean().backward()
+    assert emb_d.grad is not None and emb_r.grad is not None
+    assert _cosine_sim(emb_d.grad, emb_r.grad) > 0.99999
+
+    # Also verify direct call with `keep_dense_quantized=True` (`linear_nvfp4` linears bridged!)
+    fast_dir = tmp_path / "direct_call_fast"
+    _write_checkpoint_from_reference(fast_dir, ref_dense_init, tcfg_d, layout="unsloth_fast")
+    (fast_dir / "shard-visual-mtp.safetensors").unlink()
+    m_fast_direct = load_compressed_safetensors_direct(
+        fast_dir, dtype=torch.bfloat16, device_map="cpu", keep_dense_quantized=True
+    )
+    assert torch.isfinite(m_fast_direct(ids, use_cache=False).logits).all()
+
+    # And `load_model` still reports exact `bridged_moe_count == 4` (`install_bridge=False` in `_load_hf`)
+    _m_lm, _tok_lm, info_lm = load_model(
+        {"name": str(std_dir), "dtype": "bfloat16", "device_map": "cpu", "text_only": True}
+    )
+    assert info_lm["quantization"]["bridged_moe_count"] == 4
+
+    # --- 8B. `text_only=False` on multimodal checkpoint skips `mtp.*` shard & inline `mtp.*` tensors ---
+    mm_dir = tmp_path / "multimodal_mtp_ckpt"
+    _write_checkpoint_from_reference(mm_dir, ref_dense_init, tcfg_d, layout="unsloth_standard")
+    vis_mtp_tensors = load_safetensors_file(str(mm_dir / "shard-visual-mtp.safetensors"))
+    (mm_dir / "shard-visual-mtp.safetensors").unlink()
+
+    vis_only = {"model.visual.patch_embed.proj.weight": vis_mtp_tensors["model.visual.patch_embed.proj.weight"]}
+    mtp_only = {
+        "mtp.fc.weight": torch.randn(64, 128, dtype=torch.bfloat16),
+        "model.mtp.norm.weight": vis_mtp_tensors["model.mtp.norm.weight"],
+    }
+    save_safetensors_file(vis_only, str(mm_dir / "shard-visual.safetensors"))
+    save_safetensors_file(mtp_only, str(mm_dir / "shard-mtp-only.safetensors"))
+
+    # Also inject an inline `mtp.*` key inside `model-00001-of-00004.safetensors`!
+    s1_p = mm_dir / "model-00001-of-00004.safetensors"
+    s1_d = load_safetensors_file(str(s1_p))
+    s1_d["mtp.inline_head.weight"] = torch.randn(64, 64, dtype=torch.bfloat16)
+    save_safetensors_file(s1_d, str(s1_p))
+
+    idx_mm = json.loads((mm_dir / SAFETENSORS_INDEX_FILE).read_text(encoding="utf-8"))
+    wm_mm = {k: v for k, v in idx_mm["weight_map"].items() if v != "shard-visual-mtp.safetensors"}
+    wm_mm["model.visual.patch_embed.proj.weight"] = "shard-visual.safetensors"
+    wm_mm["mtp.fc.weight"] = "shard-mtp-only.safetensors"
+    wm_mm["model.mtp.norm.weight"] = "shard-mtp-only.safetensors"
+    wm_mm["mtp.inline_head.weight"] = "model-00001-of-00004.safetensors"
+    idx_mm["weight_map"] = wm_mm
+    (mm_dir / SAFETENSORS_INDEX_FILE).write_text(json.dumps(idx_mm), encoding="utf-8")
+
+    # Delete `shard-mtp-only.safetensors`! Even with `text_only=False`, MTP-only shard must NEVER be opened!
+    (mm_dir / "shard-mtp-only.safetensors").unlink()
+
+    mm_model, _, mm_info = load_model(
+        {"name": str(mm_dir), "dtype": "float32", "device_map": "cpu", "text_only": False}
+    )
+    assert mm_info["direct_safetensors_load"] is True
+    assert hasattr(mm_model.model, "visual")
+    assert not mm_model.model.visual.rotary_pos_emb.inv_freq.is_meta
+    assert [n for n, p in mm_model.named_parameters() if p.is_meta] == []
+    assert [n for n, b in mm_model.named_buffers() if b.is_meta] == []
+    mm_logits = mm_model(ids, use_cache=False).logits
+    ref_logits_ids = ref_std_fp32(ids, use_cache=False).logits
+    assert _cosine_sim(mm_logits, ref_logits_ids) > 0.99999
+    assert (mm_logits - ref_logits_ids).abs().max().item() < 1e-5
+
+    # --- 8C. `text_only=False` on pure-text configs (no `vision_config`) + `model.language_model.*` + `mtp.*` ---
+    pure_text_dir = tmp_path / "pure_text_no_vision_cfg"
+    shutil.copytree(std_dir, pure_text_dir)
+    # Convert `config.json` to pure-text `qwen3_5_moe_text` config (no `vision_config`) while keeping
+    # `model.language_model.*` AND adding `mtp.fc.weight` in safetensors!
+    s1_pt = pure_text_dir / "model-00001-of-00004.safetensors"
+    s1_pt_d = load_safetensors_file(str(s1_pt))
+    s1_pt_d["mtp.fc.weight"] = torch.randn(64, 64, dtype=torch.bfloat16)
+    save_safetensors_file(s1_pt_d, str(s1_pt))
+    idx_pt = json.loads((pure_text_dir / SAFETENSORS_INDEX_FILE).read_text(encoding="utf-8"))
+    idx_pt["weight_map"] = {
+        k: v for k, v in idx_pt["weight_map"].items() if v != "shard-visual-mtp.safetensors"
+    }
+    idx_pt["weight_map"]["mtp.fc.weight"] = "model-00001-of-00004.safetensors"
+    (pure_text_dir / SAFETENSORS_INDEX_FILE).write_text(json.dumps(idx_pt), encoding="utf-8")
+    raw_root_cfg = json.loads((pure_text_dir / "config.json").read_text(encoding="utf-8"))
+    pure_cfg = {
+        **raw_root_cfg["text_config"],
+        "quantization_config": raw_root_cfg["quantization_config"],
+    }
+    (pure_text_dir / "config.json").write_text(json.dumps(pure_cfg), encoding="utf-8")
+
+    pt_model_lm, _, _ = load_model(
+        {"name": str(pure_text_dir), "dtype": "float32", "device_map": "cpu", "text_only": False}
+    )
+    pt_model_dir = load_compressed_safetensors_direct(
+        pure_text_dir, dtype=torch.float32, device_map="cpu", text_only=False
+    )
+    assert _cosine_sim(pt_model_lm(ids).logits, ref_logits_ids) > 0.99999
+    assert _cosine_sim(pt_model_dir(ids).logits, ref_logits_ids) > 0.99999
+
 

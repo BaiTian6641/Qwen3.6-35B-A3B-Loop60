@@ -436,13 +436,17 @@ def _open_safetensors_shard(path: str) -> Any:
         return _FallbackSafeOpenReader(path)
 
 
-def _is_visual_or_mtp_key(key: str) -> bool:
-    if key in ("visual", "model.visual", "mtp", "model.mtp"):
+def _is_visual_key(key: str) -> bool:
+    if key in ("visual", "model.visual"):
+        return True
+    return key.startswith(("visual.", "model.visual."))
+
+
+def _is_mtp_key(key: str) -> bool:
+    if key in ("mtp", "model.mtp", "language_model.mtp", "model.language_model.mtp"):
         return True
     return key.startswith(
         (
-            "visual.",
-            "model.visual.",
             "mtp.",
             "model.mtp.",
             "language_model.mtp.",
@@ -451,8 +455,25 @@ def _is_visual_or_mtp_key(key: str) -> bool:
     )
 
 
-def _normalize_direct_tensor_key(raw_key: str, *, text_only: bool) -> str | None:
-    if text_only and _is_visual_or_mtp_key(raw_key):
+def _is_visual_or_mtp_key(key: str) -> bool:
+    return _is_visual_key(key) or _is_mtp_key(key)
+
+
+def _should_skip_index_key(key: str, *, text_only: bool, skip_mtp: bool = True) -> bool:
+    if skip_mtp and _is_mtp_key(key):
+        return True
+    return bool(text_only and _is_visual_key(key))
+
+
+def _normalize_direct_tensor_key(
+    raw_key: str,
+    *,
+    text_only: bool,
+    skip_mtp: bool = True,
+) -> str | None:
+    if skip_mtp and _is_mtp_key(raw_key):
+        return None
+    if text_only and _is_visual_key(raw_key):
         return None
     key = raw_key
     if text_only:
@@ -486,6 +507,7 @@ def _resolve_direct_safetensors_shards(
     name: str | os.PathLike[str],
     *,
     text_only: bool,
+    skip_mtp: bool = True,
     revision: str | None = None,
     token: str | None = None,
 ) -> list[str]:
@@ -501,7 +523,7 @@ def _resolve_direct_safetensors_shards(
                 dict.fromkeys(
                     sfile
                     for k, sfile in weight_map.items()
-                    if not (text_only and _is_visual_or_mtp_key(k))
+                    if not _should_skip_index_key(k, text_only=text_only, skip_mtp=skip_mtp)
                 )
             )
             require(bool(needed_files), f"no language shards remained after filtering {index_path!r}")
@@ -546,7 +568,7 @@ def _resolve_direct_safetensors_shards(
             dict.fromkeys(
                 sfile
                 for k, sfile in weight_map.items()
-                if not (text_only and _is_visual_or_mtp_key(k))
+                if not _should_skip_index_key(k, text_only=text_only, skip_mtp=skip_mtp)
             )
         )
         require(bool(needed_files), f"no language shards remained after filtering {path_str!r}")
@@ -711,11 +733,20 @@ def _reinit_rotary_and_meta_buffers(
             is_multi_gpu=is_multi_gpu,
             tie_word_embeddings=tie_word_embeddings,
         )
-        rot_cfg = getattr(sub, "config", None) or fallback_cfg
+        rot_cfg = getattr(sub, "config", None) or getattr(fallback_cfg, "text_config", fallback_cfg)
         rot_cls = type(sub)
         fresh: nn.Module | None = None
+        inv_buf = sub._buffers.get("inv_freq")
+        inferred_dim = int(inv_buf.numel() * 2) if isinstance(inv_buf, torch.Tensor) and inv_buf.ndim == 1 else None
+        cand_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = [
+            ((rot_cfg,), {}),
+            ((), {"config": rot_cfg}),
+            ((rot_cfg,), {"device": "cpu"}),
+        ]
+        if inferred_dim is not None and inferred_dim > 0:
+            cand_calls.append(((inferred_dim,), {}))
         with torch.device("cpu"):
-            for r_args, r_kw in (((rot_cfg,), {}), ((), {"config": rot_cfg}), ((rot_cfg,), {"device": "cpu"})):
+            for r_args, r_kw in cand_calls:
                 try:
                     fresh = rot_cls(*r_args, **r_kw)
                     break
@@ -741,6 +772,12 @@ def _reinit_rotary_and_meta_buffers(
             if "original_inv_freq" in sub._buffers or hasattr(sub, "original_inv_freq"):
                 sub.register_buffer("original_inv_freq", inv_dev.clone(), persistent=False)
             sub.attention_scaling = attn_scaling  # type: ignore[attr-defined]
+        elif inferred_dim is not None and inferred_dim > 0:
+            theta = float(getattr(sub, "theta", getattr(rot_cfg, "rope_theta", 10000.0)))
+            inv_dev = 1.0 / (
+                theta ** (torch.arange(0, inferred_dim, 2, dtype=torch.float32, device=mod_dev) / float(inferred_dim))
+            )
+            sub.register_buffer("inv_freq", inv_dev, persistent=False)
 
 
 class _LayerMoEBuilder:
@@ -1196,6 +1233,7 @@ def load_compressed_safetensors_direct(
     device_map: Any = "cuda:0",
     attn_implementation: str = "sdpa",
     keep_dense_quantized: bool = False,
+    install_bridge: bool = True,
     revision: str | None = None,
     trust_remote_code: bool = False,
     token: str | None = None,
@@ -1216,25 +1254,31 @@ def load_compressed_safetensors_direct(
 
     if config is None:
         config = AutoConfig.from_pretrained(name, **common_cfg_kw)
+    has_vision_cfg = getattr(config, "vision_config", None) is not None
+    effective_text_only = bool(text_only) or not has_vision_cfg
     if text_cfg is None:
         raw_tc = getattr(config, "text_config", config)
-        text_cfg = _propagate_quantization_config_for_direct(config, raw_tc) if text_only else raw_tc
+        text_cfg = _propagate_quantization_config_for_direct(config, raw_tc)
 
     shard_paths = (
         list(_resolved_shards)
         if _resolved_shards is not None
         else _resolve_direct_safetensors_shards(
-            name, text_only=text_only, revision=revision, token=token
+            name,
+            text_only=effective_text_only,
+            skip_mtp=True,
+            revision=revision,
+            token=token,
         )
     )
 
-    target_cfg = text_cfg if text_only else config
+    target_cfg = text_cfg if effective_text_only else config
     clean_cfg, orig_qcfg = _strip_quantization_config_copy(target_cfg)
     ver_head = str(getattr(transformers, "__version__", "5")).split(".", 1)[0]
     dtype_key = "dtype" if (ver_head.isdigit() and int(ver_head) >= 5) else "torch_dtype"
 
     with torch.device("meta"):
-        if text_only or not hasattr(config, "vision_config"):
+        if effective_text_only:
             try:
                 model = AutoModelForCausalLM.from_config(
                     clean_cfg, attn_implementation=attn_implementation, **{dtype_key: target_dtype}
@@ -1260,10 +1304,11 @@ def load_compressed_safetensors_direct(
     meta_param_dtypes: dict[str, torch.dtype] = {k: p.dtype for k, p in model.named_parameters()}
     expected_param_keys: set[str] = set(meta_param_dtypes.keys())
     mod_map: dict[str, nn.Module] = dict(model.named_modules())
+    has_mtp_mod = any(mp == "mtp" or mp.endswith(".mtp") for mp in mod_map)
 
     tm = find_text_model(model)
     num_layers = int(getattr(tm.config, "num_hidden_layers", len(getattr(tm, "layers", ()))))
-    tie_we = bool(getattr(target_cfg, "tie_word_embeddings", False))
+    tie_we = bool(getattr(target_cfg, "tie_word_embeddings", False) or getattr(tm.config, "tie_word_embeddings", False))
     default_dev, layer_devs, is_multi_gpu = _resolve_direct_device_plan(
         model,
         device_map,
@@ -1301,9 +1346,28 @@ def load_compressed_safetensors_direct(
         with _open_safetensors_shard(spath) as reader:
             shard_keys = list(reader.keys())
             for raw_key in shard_keys:
-                key = _normalize_direct_tensor_key(raw_key, text_only=text_only)
+                key = _normalize_direct_tensor_key(
+                    raw_key,
+                    text_only=effective_text_only,
+                    skip_mtp=not has_mtp_mod,
+                )
                 if key is None:
                     continue
+                if not effective_text_only:
+                    if key.startswith("visual.") and "visual" not in mod_map and "model.visual" in mod_map:
+                        key = "model." + key
+                    elif (
+                        key.startswith("model.language_model.lm_head.")
+                        and "model.language_model.lm_head" not in mod_map
+                        and "lm_head" in mod_map
+                    ):
+                        key = "lm_head." + key[len("model.language_model.lm_head."):]
+                    elif (
+                        key.startswith("language_model.lm_head.")
+                        and "language_model.lm_head" not in mod_map
+                        and "lm_head" in mod_map
+                    ):
+                        key = "lm_head." + key[len("language_model.lm_head."):]
 
                 m_exp = _EXPERT_2D_KEY_RE.match(key)
                 if m_exp is not None:
@@ -1521,8 +1585,10 @@ def load_compressed_safetensors_direct(
                 sub._buffers[bname] = torch.zeros(buf.shape, dtype=buf.dtype, device=mdev)
 
     missing_params = sorted(expected_param_keys - loaded_param_keys - replaced_param_keys)
-    if text_only:
+    if effective_text_only:
         missing_params = [k for k in missing_params if not _is_visual_or_mtp_key(k)]
+    elif not has_mtp_mod:
+        missing_params = [k for k in missing_params if not _is_mtp_key(k)]
     require(
         not missing_params,
         f"direct safetensors loader left {len(missing_params)} parameter(s) uninitialized: {missing_params[:10]}",
@@ -1543,10 +1609,13 @@ def load_compressed_safetensors_direct(
     require(not meta_params_left, f"meta parameters remained after direct load: {meta_params_left[:10]}")
     require(not meta_bufs_left, f"meta buffers remained after direct load: {meta_bufs_left[:10]}")
 
-    if not text_only:
-        pass
-    else:
+    if effective_text_only:
         _prune_visual_tower(model)
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+    if install_bridge:
+        install_quantized_autograd_bridge(model)
 
     model._qloop_direct_safetensors_loaded = True  # type: ignore[attr-defined]
     gc.collect()
@@ -1616,8 +1685,10 @@ def _load_hf(mcfg: dict[str, Any]):
         config = AutoConfig.from_pretrained(name, **common)
         mt = getattr(config, "model_type", "?")
         log.info("model_type=%s transformers=%s", mt, transformers.__version__)
+        has_vision_cfg = getattr(config, "vision_config", None) is not None
+        effective_text_only = text_only or not has_vision_cfg
         raw_text_cfg = getattr(config, "text_config", config)
-        text_cfg = _propagate_quantization_config_to_text_config(config, raw_text_cfg) if text_only else raw_text_cfg
+        text_cfg = _propagate_quantization_config_to_text_config(config, raw_text_cfg)
         for k in ("num_hidden_layers", "hidden_size", "num_experts", "num_experts_per_tok", "num_attention_heads",
                   "num_key_value_heads", "head_dim", "full_attention_interval", "max_position_embeddings"):
             log.info("  text_config.%s = %s", k, getattr(text_cfg, k, "?"))
@@ -1656,7 +1727,8 @@ def _load_hf(mcfg: dict[str, Any]):
             try:
                 resolved_shards = _resolve_direct_safetensors_shards(
                     name,
-                    text_only=text_only,
+                    text_only=effective_text_only,
+                    skip_mtp=True,
                     revision=mcfg.get("revision"),
                     token=mcfg.get("token"),
                 )
@@ -1669,11 +1741,12 @@ def _load_hf(mcfg: dict[str, Any]):
                     name,
                     config=config,
                     text_cfg=text_cfg,
-                    text_only=text_only,
+                    text_only=effective_text_only,
                     dtype=target_dtype,
                     device_map=mcfg.get("device_map", "cuda:0"),
                     attn_implementation=str(mcfg.get("attn_implementation", "sdpa") or "sdpa"),
                     keep_dense_quantized=bool(mcfg.get("keep_dense_quantized", False)),
+                    install_bridge=False,
                     revision=mcfg.get("revision"),
                     trust_remote_code=bool(mcfg.get("trust_remote_code", False)),
                     token=mcfg.get("token"),

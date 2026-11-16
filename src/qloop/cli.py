@@ -24,7 +24,7 @@ import os
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, NoReturn
 
 from .config import Cfg, load_config
 from .debug import crash_guard, require, setup_run, stage
@@ -845,6 +845,67 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _normalize_exit_code(code: object) -> int:
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return int(code)
+    try:
+        print(code, file=sys.stderr)
+    except Exception:
+        pass
+    return 1
+
+
+def flush_and_hard_exit(rc: int) -> NoReturn:
+    """Synchronize CUDA, flush stdio/logs, and bypass threading._shutdown() via os._exit().
+
+    Third-party streaming stacks (`datasets` IterableDataset + `hf_xet` background pools)
+    can leave non-daemon worker threads alive after a stage finishes, causing standard
+    `sys.exit()` (`threading._shutdown()`) to block indefinitely while holding GPU VRAM.
+    Set `QLOOP_NO_FAST_EXIT=1` (`true`/`yes`) to fall back to `SystemExit`.
+    """
+    try:
+        if "torch" in sys.modules:
+            torch_mod = sys.modules["torch"]
+            if (
+                hasattr(torch_mod, "cuda")
+                and torch_mod.cuda.is_available()
+                and torch_mod.cuda.is_initialized()
+            ):
+                torch_mod.cuda.synchronize()
+    except Exception:
+        pass
+    try:
+        if sys.stdout is not None:
+            sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        if sys.stderr is not None:
+            sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        logging.shutdown()
+    except Exception:
+        pass
+    try:
+        if sys.stdout is not None:
+            sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        if sys.stderr is not None:
+            sys.stderr.flush()
+    except Exception:
+        pass
+    code = int(rc)
+    if os.environ.get("QLOOP_NO_FAST_EXIT", "").strip().lower() in ("1", "true", "yes"):
+        raise SystemExit(code)
+    os._exit(code)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -856,5 +917,21 @@ def main(argv: list[str] | None = None) -> int:
         return 1  # crash_guard already printed the summary + report path
 
 
+def entrypoint(argv: list[str] | None = None) -> None:
+    try:
+        rc = main(argv)
+    except SystemExit as exc:
+        rc = _normalize_exit_code(exc.code)
+    except KeyboardInterrupt:
+        try:
+            print("interrupted", file=sys.stderr)
+        except Exception:
+            pass
+        rc = 130
+    except BaseException:
+        rc = 1
+    flush_and_hard_exit(rc)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    entrypoint()

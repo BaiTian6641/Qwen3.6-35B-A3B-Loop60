@@ -197,8 +197,9 @@ def reclaim_disk_space(
 
     * Checkpoint directories (`<run_root>/<stage>/checkpoints`) for stages NOT in `keep_stages`
       are removed (small logs, `metrics.jsonl`, `probe.json`, and `esft_stats*.json` stay intact).
-    * Stages in `strip_optim_stages` keep `trainable.pt` + `state.json` (for `train.init_from`),
-      while their `optim.pt` / `rng.pt` and non-pointer step folders are removed.
+    * Stages in `strip_optim_stages` keep `trainable.pt` + `state.json` (for `train.init_from`
+      and `distill.teacher_ckpt`), while their `optim.pt` / `rng.pt` and non-pointer step folders
+      are removed.
     * Transient Hugging Face upload/xet caches are wiped so multi-GB commit staging blobs never
       accumulate across stages on Colab's 230 GB SSD.
     """
@@ -976,7 +977,7 @@ class HubSyncManager:
         cfg: dict[str, Any],
         run_root: str,
     ) -> dict[str, Any]:
-        """Pre-stage hook: pull missing ESFT stats + resume/prereq checkpoints, and prune old disk."""
+        """Pre-stage hook: pull missing ESFT stats + resume/prereq/teacher checkpoints, and prune old disk."""
         manifest = self.fetch_manifest()
         pulled_artifacts = self.pull_artifacts(run_root)
         resumed = self.pull_stage_checkpoint(stage_name, run_root, include_optim=True, manifest=manifest)
@@ -984,17 +985,36 @@ class HubSyncManager:
         prereq_stage: str | None = None
         init_from = (cfg.get("train") or {}).get("init_from")
         if init_from:
-            prereq_stage = os.path.basename(str(init_from).rstrip("/"))
+            prereq_stage = os.path.basename(str(init_from).replace("\\", "/").rstrip("/"))
             if resumed is None and prereq_stage:
                 # Only need trainable.pt + state.json from prerequisite stage (`include_optim=False`)
                 self.pull_stage_checkpoint(
                     prereq_stage, run_root, prefer_promoted=True, include_optim=False, manifest=manifest
                 )
 
+        teacher_stage: str | None = None
+        distill_cfg = cfg.get("distill") or {}
+        if bool(distill_cfg.get("enabled")) and distill_cfg.get("teacher_ckpt"):
+            cand_teacher = os.path.basename(str(distill_cfg["teacher_ckpt"]).replace("\\", "/").rstrip("/"))
+            if cand_teacher and cand_teacher != stage_name:
+                if cand_teacher in manifest.stages:
+                    teacher_stage = cand_teacher
+                    # SharedBackboneTeacher needs frozen teacher weights even when resuming mid-stage
+                    self.pull_stage_checkpoint(
+                        teacher_stage, run_root, prefer_promoted=True, include_optim=False, manifest=manifest
+                    )
+                elif os.path.isdir(os.path.join(run_root, cand_teacher, "checkpoints")):
+                    teacher_stage = cand_teacher
+
+        strip_stages = tuple(
+            dict.fromkeys(
+                s for s in (prereq_stage, teacher_stage) if s and s != stage_name
+            )
+        )
         cleanup = reclaim_disk_space(
             run_root,
             keep_stages=(stage_name,),
-            strip_optim_stages=(prereq_stage,) if prereq_stage else (),
+            strip_optim_stages=strip_stages,
             clean_hf_staging=True,
         )
         return {
@@ -1002,6 +1022,7 @@ class HubSyncManager:
             "pulled_artifacts": pulled_artifacts,
             "resumed_checkpoint": resumed,
             "prereq_stage": prereq_stage,
+            "teacher_stage": teacher_stage,
             "disk": cleanup,
         }
 

@@ -50,6 +50,7 @@ train:
   micro_batch: 4
   grad_accum: 4
   log_every: 5
+  ckpt_every: 25
   sha256_frozen_experts: true
   train_loop_adapters: true
   train_gdn2: false

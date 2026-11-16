@@ -115,6 +115,7 @@ train:
   steps: 600                            # 540 x 64K hybrid steps + 60 x (512K-1M) calibration steps (~8-12h single Blackwell session)
   micro_batch: 1
   grad_accum: 2
+  ckpt_every: 25
   sha256_frozen_experts: true
   train_hssd: false                     # carry forward healed HSSD v3.2 weights; train read-side & D-LSA only
   train_gdn2: false

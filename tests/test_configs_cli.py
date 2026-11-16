@@ -620,6 +620,7 @@ def test_v3_stages_calibrated_s0_probe_invariants():
         assert loop["write_mask"] is True, st
         assert loop["checkpoint"] is True, st
         assert cfg["train"].get("init_from") == expected_init_chain[st], st
+        assert cfg["train"]["ckpt_every"] == 25, st
         assert list(cfg["eval_quick"]["depths"]) == [1, 2, 3], st
 
     assert cfgs["s1_loop_a6b"]["gdn2"]["enabled"] is False

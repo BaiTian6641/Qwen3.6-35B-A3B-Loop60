@@ -98,6 +98,7 @@ train:
   steps: 1200                           # ~100M tokens (32K CoT SFT + 4x32K K/V-replay BPTT, ~12-16h on Colab G4)
   micro_batch: 1
   grad_accum: 2
+  ckpt_every: 25
   sha256_frozen_experts: true
   train_loop_adapters: true
   train_hssd: true

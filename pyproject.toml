@@ -44,7 +44,7 @@ colab = [
 dev = ["pytest"]
 
 [project.scripts]
-qloop = "qloop.cli:main"
+qloop = "qloop.cli:entrypoint"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

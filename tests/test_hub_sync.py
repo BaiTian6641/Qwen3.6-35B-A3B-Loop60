@@ -497,3 +497,202 @@ def test_hf_loading_tf5_dtype_and_missing_keys_multimodal_fallback(monkeypatch):
     assert seen_calls[0][1]["output_loading_info"] is True
     assert model.model.visual is None
     assert not any("visual" in n for n, _ in model.named_parameters())
+
+
+def test_mid_stage_distill_resume_pulls_and_preserves_teacher_ckpt(tmp_path, monkeypatch):
+    """Regression test: resuming `s1b_hssd_distill` mid-stage must still pull & preserve `s1_loop_a6b`
+    (`trainable.pt` + `state.json`, without `optim.pt`) so `SharedBackboneTeacher` loads frozen teacher
+    weights instead of snapshotting mid-stage student `loop_adapters`.
+    """
+    from qloop.train.distill import SharedBackboneTeacher
+
+    api = MockHfApi()
+    hub = HubSyncManager(repo_id=DEFAULT_HF_REPO, api=api)
+
+    loop_cfg = {
+        "enabled": True,
+        "prelude_end": 4,
+        "core_end": 12,
+        "num_passes": 3,
+        "target_virtual_layers": 32,
+        "bridge_mode": "subspace",
+        "bridge_rank": 8,
+        "bridge_init": [0.05, 0.85, 0.10],
+        "attn_adapter_rank": 4,
+        "router_adapter_rank": 4,
+        "per_pass_router": True,
+        "kv_share": True,
+        "checkpoint": False,
+    }
+    sync_cfg = {
+        "hf_repo": DEFAULT_HF_REPO,
+        "private": False,
+        "push_every_ckpt": True,
+        "push_optim": True,
+        "prune_local_after_push": True,
+    }
+
+    # 1. Complete `s1_loop_a6b` and push to Hub (including optim.pt on remote so we verify include_optim=False)
+    run_root_1 = tmp_path / "session1"
+    monkeypatch.setenv("QLOOP_RUN_ROOT", str(run_root_1))
+    s1_cfg = Cfg({
+        "seed": 11,
+        "stage": "s1_loop_a6b",
+        "model": {"name": "toy", "dtype": "float32", "device_map": "cpu", "toy": {"seed": 11}},
+        "loop": loop_cfg,
+        "gdn2": {"enabled": False},
+        "hssd": {"enabled": False},
+        "lsa": {"enabled": False},
+        "experts": {"enabled": False},
+        "data": {"seq_len": 16, "sources": [{"name": "toy_text", "weight": 1.0}]},
+        "checkpoint": {"sync": sync_cfg},
+        "train": {
+            "steps": 1,
+            "micro_batch": 1,
+            "grad_accum": 1,
+            "ckpt_every": 1,
+            "eval_every": 0,
+            "keep_last": 1,
+            "train_loop_adapters": True,
+            "train_gdn2": False,
+            "trainable": [r"input_layernorm|post_attention_layernorm"],
+            "allowed_groups": ["loop_adapters", "norms"],
+            "optim": {"lr": 5e-3, "warmup_steps": 1, "impl": "builtin"},
+        },
+    })
+    s1_tr = LMTrainer(s1_cfg, str(run_root_1 / "s1_loop_a6b"), hub_api=api)
+    s1_tr.train()
+    assert (DEFAULT_HF_REPO, "stages/s1_loop_a6b/latest/optim.pt") in api.files
+
+    ids = torch.randint(4, 100, (1, 16))
+    s1_tr.stack.model.eval()
+    assert s1_tr.stack.loop is not None
+    s1_tr.stack.loop.set_active_passes(2)
+    with torch.no_grad():
+        expected_teacher_h = s1_tr.stack.hidden(ids).detach().clone()
+
+    # 2. Simulate `s1b_hssd_distill` reaching step 250 with drifted student `loop_adapters` + `norms`,
+    #    then saving/pushing step 250 (which prunes `run_root_1/s1_loop_a6b/checkpoints` locally!).
+    s1b_dict = {
+        **s1_cfg.to_dict(),
+        "stage": "s1b_hssd_distill",
+        "hssd": {
+            "enabled": True,
+            "write_mode": "full",
+            "swa_recency_init": 0.05,
+            "blend_init": 0.5,
+            "blend_warmup_steps": 4,
+            "compact_active_pages": True,
+            "compact_decode_cache": True,
+            "chunk_size": 8,
+            "window_chunks": 2,
+            "num_pages": 4,
+            "k_pages": 2,
+            "theta_low_rank": True,
+            "segment_chunks": 2,
+            "checkpoint_segments": False,
+        },
+        "distill": {
+            "enabled": True,
+            "share_backbone": True,
+            "layerwise_warmup_steps": 0,
+            "teacher_ckpt": "runs/s1_loop_a6b",
+            "teacher_track": "stock",
+            "temperature": 1.0,
+            "kl_weight": 1.0,
+            "hidden_mse_weight": 0.1,
+            "vocab_chunk_size": 64,
+        },
+        "train": {
+            **dict(s1_cfg["train"]),
+            "init_from": "runs/s1_loop_a6b",
+            "steps": 251,
+            "ckpt_every": 25,
+            "train_hssd": True,
+            "allowed_groups": ["loop_adapters", "hssd_adapters", "norms"],
+        },
+    }
+    s1b_cfg = Cfg(s1b_dict)
+    tr_mid = LMTrainer(s1b_cfg, str(run_root_1 / "s1b_hssd_distill"), hub_api=api)
+    tr_mid.maybe_resume()
+    with torch.no_grad():
+        for name, p in tr_mid.stack.named_trainable.items():
+            if "hssd_adapter." not in name:
+                p.add_(0.35)
+    tr_mid.step = 250
+    tr_mid.tokens_seen = 250 * 16
+    tr_mid.save(completed=False, metrics={"loss/lm": 1.5})
+
+    # Confirm periodic checkpoint push pruned local `s1_loop_a6b/checkpoints` on `run_root_1`
+    assert not (run_root_1 / "s1_loop_a6b" / "checkpoints").exists()
+    tr_mid.stack.model.eval()
+    assert tr_mid.stack.loop is not None
+    tr_mid.stack.loop.set_active_passes(2)
+    with torch.no_grad():
+        drifted_student_h = tr_mid.stack.hidden(ids).detach().clone()
+    assert not torch.allclose(drifted_student_h, expected_teacher_h, atol=1e-3)
+
+    # 3. Fresh empty `run_root_2` (respawned Colab VM): `prepare_stage_workspace` must pull BOTH
+    #    `s1b_hssd_distill` (step 250 with optim.pt) AND `s1_loop_a6b` (without optim.pt, kept by reclaim_disk_space)
+    run_root_2 = tmp_path / "session2_fresh"
+    monkeypatch.setenv("QLOOP_RUN_ROOT", str(run_root_2))
+    ws = hub.prepare_stage_workspace("s1b_hssd_distill", s1b_cfg.to_dict(), str(run_root_2))
+    assert ws["resumed_checkpoint"] is not None
+    assert ws["resumed_checkpoint"].endswith("step_0000250")
+    assert ws["teacher_stage"] == "s1_loop_a6b"
+
+    s1b_ckpt = run_root_2 / "s1b_hssd_distill" / "checkpoints" / "step_0000250"
+    assert (s1b_ckpt / "trainable.pt").is_file()
+    assert (s1b_ckpt / "state.json").is_file()
+    assert (s1b_ckpt / "optim.pt").is_file()
+
+    s1_ckpt = run_root_2 / "s1_loop_a6b" / "checkpoints" / "step_0000001"
+    assert (run_root_2 / "s1_loop_a6b" / "checkpoints" / "LATEST").is_file()
+    assert (s1_ckpt / "trainable.pt").is_file()
+    assert (s1_ckpt / "state.json").is_file()
+    assert not (s1_ckpt / "optim.pt").exists()
+
+    # Verify `SharedBackboneTeacher` on the resumed step-250 workspace finds `runs/s1_loop_a6b` on disk
+    # and restores exact frozen `s1_loop_a6b` teacher outputs rather than drifted student `loop_adapters`.
+    teacher_check = SharedBackboneTeacher(
+        tr_mid.stack,
+        teacher_ckpt="runs/s1_loop_a6b",
+        teacher_track="stock",
+        run_root=str(run_root_2),
+    )
+    assert teacher_check.loaded_from_ckpt is True
+    with teacher_check.activate(), torch.no_grad():
+        got_teacher_h = tr_mid.stack.hidden(ids)
+    assert torch.allclose(got_teacher_h, expected_teacher_h, atol=1e-6)
+
+    # 4. Full end-to-end `LMTrainer` resume on another fresh empty `run_root_3` (step 250 -> 251)
+    run_root_3 = tmp_path / "session3_e2e_resume"
+    monkeypatch.setenv("QLOOP_RUN_ROOT", str(run_root_3))
+    tr_resumed = LMTrainer(s1b_cfg, str(run_root_3 / "s1b_hssd_distill"), hub_api=api)
+    res = tr_resumed.train()
+    assert res["step"] == 251
+    assert tr_resumed.shared_teacher is not None
+    assert tr_resumed.shared_teacher.loaded_from_ckpt is True
+    tr_resumed.stack.model.eval()
+    assert tr_resumed.stack.loop is not None
+    tr_resumed.stack.loop.set_active_passes(2)
+    with tr_resumed.shared_teacher.activate(), torch.no_grad():
+        e2e_teacher_h = tr_resumed.stack.hidden(ids)
+    assert torch.allclose(e2e_teacher_h, expected_teacher_h, atol=1e-6)
+
+    # 5. Same-VM restart (`run_root_1` already has local s1b step >= 250, while `s1_loop_a6b/checkpoints` was pruned)
+    ws_same_vm = hub.prepare_stage_workspace("s1b_hssd_distill", s1b_cfg.to_dict(), str(run_root_1))
+    assert ws_same_vm["teacher_stage"] == "s1_loop_a6b"
+    assert (run_root_1 / "s1_loop_a6b" / "checkpoints" / "step_0000001" / "trainable.pt").is_file()
+    assert not (run_root_1 / "s1_loop_a6b" / "checkpoints" / "step_0000001" / "optim.pt").exists()
+
+    # 6. Non-distill stage (`distill.enabled=False`) resuming mid-stage must NOT pull `teacher_ckpt`
+    run_root_4 = tmp_path / "session4_no_distill"
+    no_distill_cfg = {
+        **s1b_cfg.to_dict(),
+        "distill": {**dict(s1b_cfg["distill"]), "enabled": False},
+    }
+    ws_disabled = hub.prepare_stage_workspace("s1b_hssd_distill", no_distill_cfg, str(run_root_4))
+    assert ws_disabled["resumed_checkpoint"] is not None
+    assert ws_disabled["teacher_stage"] is None
+    assert not (run_root_4 / "s1_loop_a6b" / "checkpoints").exists()

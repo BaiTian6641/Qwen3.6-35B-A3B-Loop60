@@ -79,6 +79,7 @@ train:
   steps: 1500                           # 1500 x 4 x 16384 ≈ 98.3M tokens (micro_batch=2 x grad_accum=2 enabled by H4 + shared teacher)
   micro_batch: 2
   grad_accum: 2
+  ckpt_every: 25
   sha256_frozen_experts: true
   train_loop_adapters: true
   train_hssd: true

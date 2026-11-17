@@ -98,6 +98,8 @@ train:
   optim:
     lr: 1.0e-6
     warmup_steps: 10
+    fused: false                          # < 1 GiB grad HBM -> atomic whole-step guard + global clip + fused AdamW
+    max_grad_norm: 0.5
     max_grad_norm_per_param: 0.5
     lr_mult:
       loop_adapters: 5.0

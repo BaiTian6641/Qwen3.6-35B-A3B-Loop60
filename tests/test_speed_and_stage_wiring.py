@@ -456,17 +456,104 @@ def test_nonfused_batched_torch_adamw_global_clip_and_apollo_base_cfg():
     assert st["optim/clipped_params"] == 3.0
     opt.zero_grad()
 
-    # Non-finite gradient skip in batched torch.optim.AdamW mode
+    # Non-finite gradient in fused=False mode atomically aborts the ENTIRE step (0 params updated,
+    # 0 optimizer moments/step counters mutated, finite grads not poisoned by clip_grad_norm_)!
     w0_before = m[0].weight.detach().clone()
     w1_before = m[1].weight.detach().clone()
+    b1_before = m[1].bias.detach().clone()
+    st_before_step = {
+        k: (v.detach().clone() if isinstance(v, torch.Tensor) else v)
+        for k, v in opt._torch_adamw.state[m[1].weight].items()
+    }
+    ema_before = opt.norm_ema
     m(x).pow(2).mean().backward()
+    w1_grad_before = m[1].weight.grad.detach().clone()
     assert m[0].weight.grad is not None
     m[0].weight.grad.fill_(float("nan"))
     st_nan = opt.step()
+    assert torch.equal(m[1].weight.grad.detach(), w1_grad_before)  # clip_grad_norm_ did not poison finite grad
     opt.zero_grad()
     assert torch.equal(m[0].weight.detach(), w0_before)
-    assert not torch.equal(m[1].weight.detach(), w1_before)
+    assert torch.equal(m[1].weight.detach(), w1_before)
+    assert torch.equal(m[1].bias.detach(), b1_before)
+    assert st_nan["optim/stepped_params"] == 0.0
     assert st_nan["optim/skipped_params"] == 1.0
+    assert opt.norm_ema == pytest.approx(ema_before)
+    for k, v_old in st_before_step.items():
+        v_cur = opt._torch_adamw.state[m[1].weight][k]
+        if isinstance(v_old, torch.Tensor):
+            assert torch.equal(v_cur, v_old)
+        else:
+            assert v_cur == v_old
+
+    # Verify mixed fp32 adapters + bf16 norms with master_weights=True in fused=False mode:
+    # fp32 params route to batched torch.optim.AdamW while bf16 norms keep fp32 master weights!
+    fp32_w = nn.Parameter(torch.randn(16, 16, dtype=torch.float32))
+    bf16_norm = nn.Parameter(torch.ones(16, dtype=torch.bfloat16))
+    mix_groups = build_param_groups(
+        [
+            ("model.layers.0.linear_attn.hssd_adapter.down.weight", fp32_w),
+            ("model.layers.0.input_layernorm.weight", bf16_norm),
+        ],
+        {"lr": 4e-5, "lr_mult": {"hssd_adapter": 10.0}},
+    )
+    mix_opt = FusedStepOptimizer(mix_groups, fused=False, impl="auto", max_grad_norm=1.0, master_weights=True)
+    assert isinstance(mix_opt._torch_adamw, torch.optim.AdamW)
+    assert mix_opt.entries["model.layers.0.linear_attn.hssd_adapter.down.weight"].opt is mix_opt._torch_adamw
+    assert mix_opt.entries["model.layers.0.input_layernorm.weight"].opt is not mix_opt._torch_adamw
+    for _ in range(25):
+        fp32_w.grad = torch.ones_like(fp32_w) * 0.01
+        bf16_norm.grad = torch.ones_like(bf16_norm)
+        mix_opt.step()
+        mix_opt.zero_grad()
+    norm_ent = mix_opt.entries["model.layers.0.input_layernorm.weight"]
+    assert norm_ent.opt.state[bf16_norm]["master"].dtype == torch.float32
+    assert float(norm_ent.opt.state[bf16_norm]["master"][0]) < 1.0 - 5e-4
+
+    # Verify strict=True state_dict resume between fused=True (AdamWLite) and fused=False (torch.optim.AdamW):
+    w_src = nn.Parameter(torch.randn(8, 8, dtype=torch.float32))
+    n_src = nn.Parameter(torch.ones(8, dtype=torch.bfloat16))
+    src_opt = FusedStepOptimizer(
+        build_param_groups(
+            [
+                ("model.layers.0.linear_attn.hssd_adapter.down.weight", w_src),
+                ("model.layers.0.input_layernorm.weight", n_src),
+            ],
+            {"lr": 1e-3},
+        ),
+        fused=True,
+        impl="auto",
+        master_weights=True,
+    )
+    for _ in range(3):
+        src_opt.set_boundary(True)
+        (w_src.pow(2).sum() + n_src.float().pow(2).sum()).backward()
+        src_opt.step()
+        src_opt.zero_grad()
+    sd_fused = src_opt.state_dict()
+    w_dst = nn.Parameter(w_src.detach().clone())
+    n_dst = nn.Parameter(n_src.detach().clone())
+    dst_opt = FusedStepOptimizer(
+        build_param_groups(
+            [
+                ("model.layers.0.linear_attn.hssd_adapter.down.weight", w_dst),
+                ("model.layers.0.input_layernorm.weight", n_dst),
+            ],
+            {"lr": 1e-3},
+        ),
+        fused=False,
+        impl="auto",
+        max_grad_norm=1.0,
+        master_weights=True,
+    )
+    dst_opt.load_state_dict(sd_fused, strict=True)
+    assert dst_opt.step_count == 3
+    assert dst_opt._torch_adamw is not None
+    assert float(dst_opt._torch_adamw.state[w_dst]["step"].item()) == 3.0
+    (w_dst.pow(2).sum() + n_dst.float().pow(2).sum()).backward()
+    dst_opt.step()
+    dst_opt.zero_grad()
+    assert float(dst_opt._torch_adamw.state[w_dst]["step"].item()) == 4.0
 
     # Verify resolve_optim_cfg update_Gap alias & base.yaml APOLLO tuning
     resolved = resolve_optim_cfg({"apollo": {"rank": 256, "scale_type": "channel", "update_Gap": 150, "scale": 1.0}})

@@ -434,3 +434,121 @@ def test_cuda_triton_aligned_keys_no_neumann_blowup() -> None:
     assert torch.isfinite(out_tri).all()
     assert torch.isfinite(k_t.grad).all() and torch.isfinite(v_t.grad).all()
     assert F.cosine_similarity(out_ref.flatten(), out_tri.float().flatten(), dim=0).item() > 0.999
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for sync_debug_mode('error') test")
+def test_cuda_zero_host_sync_under_sync_debug_error() -> None:
+    """Ensure `project_inputs` + `chunk_hssd(..., return_aux=True)` fwd+bwd triggers 0 CUDA host syncs."""
+    device = torch.device("cuda")
+    cfg = HSSDConfig(rank=32, chunk_size=64, window_chunks=2, num_pages=8, k_pages=2, segment_chunks=4)
+    ad = HSSDAdapter(256, 8, 64, 64, cfg, 0).to(device=device, dtype=torch.float32)
+    x = torch.randn(1, 256, 256, device=device, dtype=torch.bfloat16, requires_grad=True)
+    q = torch.randn(1, 256, 4, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 256, 4, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 256, 8, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
+    g = -F.softplus(torch.randn(1, 256, 8, device=device, dtype=torch.float32)).detach().requires_grad_(True)
+    b = torch.sigmoid(torch.randn(1, 256, 8, device=device, dtype=torch.bfloat16)).detach().requires_grad_(True)
+
+    def _step() -> None:
+        ad.zero_grad(set_to_none=True)
+        x.grad = q.grad = k.grad = v.grad = g.grad = b.grad = None
+        pr = ad.project_inputs(x, q, k, v, g, b, use_qk_l2norm=True)
+        out, _, duty = chunk_hssd(
+            pr["query"],
+            pr["key"],
+            pr["value"],
+            (pr["gamma_page_scale"], pr["gamma_chan_pair"]),
+            pr["b_gate"],
+            pr["w_gate"],
+            pr["theta"],
+            pr["surprise_bias"],
+            ad.log_surprise_slope.exp(),
+            ad.surprise_thresh,
+            pr["write_logits"],
+            pr["read_logits"],
+            pr["q_swa"],
+            pr["k_swa"],
+            pr["v_swa"],
+            boltzmann_gate=ad.boltzmann_gate,
+            swa_recency_slope=ad.swa_recency_slope,
+            chunk_size=64,
+            window_chunks=2,
+            num_pages=8,
+            top_k_pages=2,
+            segment_chunks=4,
+            return_aux=True,
+        )
+        (out.sum() + duty.sum()).backward()
+
+    # Warm up Triton compilation outside sync_debug_mode("error")
+    _step()
+    torch.cuda.synchronize()
+
+    prev_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _step()
+    finally:
+        torch.cuda.set_sync_debug_mode(prev_mode)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for differentiable write_mask parity test")
+@pytest.mark.parametrize(("use_surprise", "nonzero_theta"), [(True, False), (True, True), (False, False)])
+def test_cuda_differentiable_write_mask_grad_parity(use_surprise: bool, nonzero_theta: bool) -> None:
+    """Ensure `write_mask.requires_grad=True` propagates exact `g_root`, `theta`, and `aux` gradients on CUDA BF16."""
+    device = torch.device("cuda")
+    torch.manual_seed(5150)
+    bsz, seq_len, hv, dk, dv = 1, 256, 4, 64, 64
+    q_r = F.normalize(torch.randn(bsz, seq_len, hv, dk, device=device, dtype=torch.float32), dim=-1)
+    k_r = F.normalize(torch.randn(bsz, seq_len, hv, dk, device=device, dtype=torch.float32), dim=-1)
+    v_r = torch.randn(bsz, seq_len, hv, dv, device=device, dtype=torch.float32)
+    ps = torch.linspace(0.005, 0.5, 8, device=device, dtype=torch.float32)
+    ch = torch.full((bsz, seq_len, hv, dk // 2), 0.02, device=device, dtype=torch.float32)
+    bg = torch.full((bsz, seq_len, hv, dk), 0.8, device=device, dtype=torch.float32)
+    wg = torch.full((bsz, seq_len, hv, dv), 0.8, device=device, dtype=torch.float32)
+    th = (
+        0.2 * torch.randn(bsz, seq_len, hv, dk // 2, device=device, dtype=torch.float32)
+        if nonzero_theta
+        else torch.zeros((bsz, seq_len, hv, dk // 2), device=device, dtype=torch.float32)
+    )
+    sb = torch.zeros((bsz, seq_len, hv), device=device, dtype=torch.float32)
+    slp = torch.full((hv,), 3.0, device=device, dtype=torch.float32)
+    thr = torch.full((hv,), 0.8, device=device, dtype=torch.float32)
+    wl = torch.randn(bsz, seq_len, 8, device=device, dtype=torch.float32)
+    rl = torch.randn(bsz, seq_len, 8, device=device, dtype=torch.float32)
+    wm_base = (0.6 + 0.35 * torch.rand(bsz, seq_len, device=device, dtype=torch.float32))
+    grad_o = torch.randn(bsz, seq_len, hv, dv, device=device, dtype=torch.float32)
+
+    wm_r = wm_base.detach().clone().requires_grad_(True)
+    out_r, _, du_r = chunk_hssd(
+        q_r, k_r, v_r, (ps, ch), bg, wg, th, sb, slp, thr, wl, rl, q_r, k_r, v_r,
+        chunk_size=64, window_chunks=1, num_pages=8, top_k_pages=2, segment_chunks=2,
+        write_mask=wm_r, use_surprise=use_surprise, return_aux=True,
+    )
+    ((out_r * grad_o).sum() + 0.5 * du_r.sum()).backward()
+
+    wm_t = wm_base.detach().clone().requires_grad_(True)
+    out_t, _, du_t = chunk_hssd(
+        q_r.to(torch.bfloat16), k_r.to(torch.bfloat16), v_r.to(torch.bfloat16),
+        (ps, ch), bg.to(torch.bfloat16), wg.to(torch.bfloat16), th, sb, slp, thr, wl, rl,
+        q_r.to(torch.bfloat16), k_r.to(torch.bfloat16), v_r.to(torch.bfloat16),
+        chunk_size=64, window_chunks=1, num_pages=8, top_k_pages=2, segment_chunks=2,
+        write_mask=wm_t, use_surprise=use_surprise, return_aux=True,
+    )
+    ((out_t.float() * grad_o).sum() + 0.5 * du_t.sum()).backward()
+
+    assert wm_t.grad is not None and wm_r.grad is not None
+    assert float(wm_r.grad.norm()) > 0.1
+    assert F.cosine_similarity(wm_r.grad.flatten(), wm_t.grad.float().flatten(), dim=0).item() > 0.999
+
+
+def test_hssd_hybrid_cache_init_transformers_v5_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure `HSSDHybridCache` handles `transformers >= 5.x` `Cache.__init__` raising `ValueError`."""
+    class _FakeV5Cache:
+        def __init__(self) -> None:
+            raise ValueError("You should provide exactly one of layers or layer_class_to_replicate")
+
+    monkeypatch.setattr(hssd_mod, "_HFCacheBase", _FakeV5Cache)
+    cache = hssd_mod.HSSDHybridCache(num_layers=4)
+    assert len(cache.recurrent_states) == 4

@@ -398,8 +398,8 @@ class PeakBoltzmannGate(nn.Module):
             n_val = float(sf.shape[-1])
             lse = torch.logsumexp(sf, dim=-1)
             max_sc = sf.max(dim=-1).values
-            log_n = sf.new_tensor(math.log(max(n_val, 1.0)))
-            gumbel = sf.new_tensor(math.sqrt(2.0 * math.log(max(n_val, 2.0))))
+            log_n = sf.new_full((), math.log(max(n_val, 1.0)))
+            gumbel = sf.new_full((), math.sqrt(2.0 * math.log(max(n_val, 2.0))))
             has_valid: torch.Tensor | None = None
         else:
             vm = valid_mask.to(dtype=torch.bool).expand_as(sf)
@@ -1858,7 +1858,7 @@ class HSSDHybridCache(_HFCacheBase):  # type: ignore[misc]
         if _HFCacheBase is not object:
             try:
                 super().__init__()
-            except TypeError:
+            except (TypeError, ValueError):
                 pass
         if layer_types is not None:
             ltypes = [str(x) for x in layer_types]
@@ -2855,7 +2855,7 @@ def _compute_root_surprise_and_routing(
         g_root = g_root * wmask_c.unsqueeze(-1)
         valid_toks = wmask_c.sum()
     else:
-        valid_toks = g_root.new_tensor(float(bsz * c_len))
+        valid_toks = g_root.new_full((), float(bsz * c_len))
 
     g_sq_mean = (g_root * g_root).mean(dim=-1, keepdim=True)
     if write_mode == "full":
@@ -7007,13 +7007,16 @@ if _HAS_TRITON:
     @triton.jit
     def _invert_unit_lower_16x16_fast(L_blk):
         offs = tl.arange(0, 16)
-        L_s = tl.where(offs[:, None] > offs[None, :], L_blk, 0.0)
-        inv = (offs[:, None] == offs[None, :]).to(tl.float32)
-        for i in tl.static_range(1, 16):
-            row_m = offs[:, None] == i
-            l_row = tl.sum(tl.where(row_m, L_s, 0.0), axis=0)
-            new_row = (offs == i).to(tl.float32) - tl.sum(l_row[:, None] * inv, axis=0)
-            inv = tl.where(row_m, new_row[None, :], inv)
+        r = offs[:, None]
+        c = offs[None, :]
+        L_s = tl.where(r > c, L_blk, 0.0)
+        inv = (r == c).to(tl.float32) - tl.where((r == c + 1) & ((c & 1) == 0), L_s, 0.0)
+        L_s1 = tl.where(((r >> 2) == (c >> 2)) & ((r >> 1) > (c >> 1)), L_s, 0.0)
+        inv = inv - tl.dot(tl.dot(inv, L_s1, input_precision="ieee"), inv, input_precision="ieee")
+        L_s2 = tl.where(((r >> 3) == (c >> 3)) & ((r >> 2) > (c >> 2)), L_s, 0.0)
+        inv = inv - tl.dot(tl.dot(inv, L_s2, input_precision="ieee"), inv, input_precision="ieee")
+        L_s3 = tl.where((r >> 3) > (c >> 3), L_s, 0.0)
+        inv = inv - tl.dot(tl.dot(inv, L_s3, input_precision="ieee"), inv, input_precision="ieee")
         return inv
 
     @triton.jit
@@ -8631,6 +8634,7 @@ if _HAS_TRITON:
         DSlopePart_ptr,
         DThreshPart_ptr,
         DSteWPart_ptr,
+        DWM_ptr,
         stride_vb,
         stride_vt,
         stride_vh,
@@ -8673,6 +8677,7 @@ if _HAS_TRITON:
         N_VB: tl.constexpr,
         N_KB: tl.constexpr,
         HAS_WM: tl.constexpr,
+        NEED_DWM: tl.constexpr,
         USE_SURPRISE: tl.constexpr,
     ):
         bt = tl.program_id(0)
@@ -8703,6 +8708,8 @@ if _HAS_TRITON:
             tl.store(DSteWPart_ptr + bh * stride_dswp_bh + t_loc * stride_dswp_t + r * stride_dswp_k, g_root * dgp_r)
 
         if not USE_SURPRISE:
+            if HAS_WM and NEED_DWM:
+                tl.atomic_add(DWM_ptr + b * stride_wmb + t_glob * stride_wmt, dg_root)
             return
 
         if HAS_WM:
@@ -8728,6 +8735,8 @@ if _HAS_TRITON:
         thresh_h = tl.load(Thresh_ptr + h).to(tl.float32)
         sb = tl.load(SBias_ptr + b * stride_sbb + t_glob * stride_sbt + h * stride_sbh).to(tl.float32)
         sig = tl.sigmoid(slope_h * (eps_err - thresh_h) + sb)
+        if HAS_WM and NEED_DWM:
+            tl.atomic_add(DWM_ptr + b * stride_wmb + t_glob * stride_wmt, dg_root * sig)
 
         dz = dsig * sig * (1.0 - sig)
         tl.store(DSBias_ptr + b * stride_sbb + t_glob * stride_sbt + h * stride_sbh, dz)
@@ -9290,7 +9299,17 @@ if _HAS_TRITON:
                     g_root,
                     s_ckpts,
                 )
-                ctx.meta = (chunk_size, window_chunks, ckpt_every, use_surprise, surprise_mode, use_bf16_dot, has_wm)
+                wm_dt = wm.dtype if has_wm else None
+                ctx.meta = (
+                    chunk_size,
+                    window_chunks,
+                    ckpt_every,
+                    use_surprise,
+                    surprise_mode,
+                    use_bf16_dot,
+                    has_wm,
+                    wm_dt,
+                )
             return o_far, g_root, s_final
 
         @staticmethod
@@ -9315,7 +9334,16 @@ if _HAS_TRITON:
                 g_root,
                 s_ckpts,
             ) = ctx.saved_tensors
-            chunk_size, window_chunks, ckpt_every, use_surprise, surprise_mode, use_bf16_dot, has_wm = ctx.meta
+            (
+                chunk_size,
+                window_chunks,
+                ckpt_every,
+                use_surprise,
+                surprise_mode,
+                use_bf16_dot,
+                has_wm,
+                wm_dt,
+            ) = ctx.meta
 
             B, T, H, D_k = qh_c.shape
             D_v = v_c.shape[-1]
@@ -9391,6 +9419,8 @@ if _HAS_TRITON:
             dpred_v_seg = torch.empty((B, ckpt_every * chunk_size, H, D_v), device=qh_c.device, dtype=torch.float32)
             dslp_part = torch.zeros((B * T * H,), device=qh_c.device, dtype=torch.float32)
             dthr_part = torch.zeros((B * T * H,), device=qh_c.device, dtype=torch.float32)
+            need_dwm = bool(has_wm and ctx.needs_input_grad[10])
+            dwm_acc = torch.zeros_like(wm_c) if need_dwm else wm_c.new_empty(1)
             dsw_part = torch.empty((BH, ckpt_every * chunk_size, K_sel), device=qh_c.device, dtype=torch.float32)
             dw_read_part = torch.empty((BH, max_seg_toks, max(K_sel, K_surp)), device=qh_c.device, dtype=torch.float32)
             dps_part = torch.empty(
@@ -9771,6 +9801,7 @@ if _HAS_TRITON:
                         dslp_part,
                         dthr_part,
                         dsw_part,
+                        dwm_acc,
                         *st_v,
                         *st_pv,
                         *st_sb,
@@ -9792,6 +9823,7 @@ if _HAS_TRITON:
                         N_VB=nv_64,
                         N_KB=nk_32,
                         HAS_WM=has_wm,
+                        NEED_DWM=need_dwm,
                         USE_SURPRISE=do_surp,
                         num_warps=4,
                         num_stages=1,
@@ -10021,7 +10053,7 @@ if _HAS_TRITON:
                 dsbias,
                 dslope_acc,
                 dthresh_acc,
-                None,
+                dwm_acc.to(wm_dt) if (need_dwm and wm_dt is not None) else None,
                 None,
                 dtw_probs,
                 dste_w,
@@ -10043,52 +10075,26 @@ if _HAS_TRITON:
         return _invert_unit_lower_16x16_fast(L_blk)
 
     @triton.jit
-    def _invert_unit_lower_64_kernel(
-        L_ptr,
-        AInv_ptr,
-        stride_ln,
-        stride_lr,
-        stride_lc,
-        stride_an,
-        stride_ar,
-        stride_ac,
-    ):
+    def _invert_unit_lower_64_contig_kernel(L_ptr, AInv_ptr):
         pid = tl.program_id(0)
         offs_16 = tl.arange(0, 16)
-        strict_16 = offs_16[:, None] > offs_16[None, :]
-        l_base = L_ptr + pid * stride_ln
+        l_base = L_ptr + pid * 4096
 
-        L00 = tl.where(
-            strict_16,
-            tl.load(l_base + (0 + offs_16[:, None]) * stride_lr + (0 + offs_16[None, :]) * stride_lc).to(tl.float32),
-            0.0,
-        )
-        L11 = tl.where(
-            strict_16,
-            tl.load(l_base + (16 + offs_16[:, None]) * stride_lr + (16 + offs_16[None, :]) * stride_lc).to(tl.float32),
-            0.0,
-        )
-        L22 = tl.where(
-            strict_16,
-            tl.load(l_base + (32 + offs_16[:, None]) * stride_lr + (32 + offs_16[None, :]) * stride_lc).to(tl.float32),
-            0.0,
-        )
-        L33 = tl.where(
-            strict_16,
-            tl.load(l_base + (48 + offs_16[:, None]) * stride_lr + (48 + offs_16[None, :]) * stride_lc).to(tl.float32),
-            0.0,
-        )
+        L00 = tl.load(l_base + (0 + offs_16[:, None]) * 64 + (0 + offs_16[None, :])).to(tl.float32)
+        L11 = tl.load(l_base + (16 + offs_16[:, None]) * 64 + (16 + offs_16[None, :])).to(tl.float32)
+        L22 = tl.load(l_base + (32 + offs_16[:, None]) * 64 + (32 + offs_16[None, :])).to(tl.float32)
+        L33 = tl.load(l_base + (48 + offs_16[:, None]) * 64 + (48 + offs_16[None, :])).to(tl.float32)
         inv00 = _invert_unit_lower_16x16_ieee(L00)
         inv11 = _invert_unit_lower_16x16_ieee(L11)
         inv22 = _invert_unit_lower_16x16_ieee(L22)
         inv33 = _invert_unit_lower_16x16_ieee(L33)
 
-        L10 = tl.load(l_base + (16 + offs_16[:, None]) * stride_lr + (0 + offs_16[None, :]) * stride_lc).to(tl.float32)
-        L20 = tl.load(l_base + (32 + offs_16[:, None]) * stride_lr + (0 + offs_16[None, :]) * stride_lc).to(tl.float32)
-        L21 = tl.load(l_base + (32 + offs_16[:, None]) * stride_lr + (16 + offs_16[None, :]) * stride_lc).to(tl.float32)
-        L30 = tl.load(l_base + (48 + offs_16[:, None]) * stride_lr + (0 + offs_16[None, :]) * stride_lc).to(tl.float32)
-        L31 = tl.load(l_base + (48 + offs_16[:, None]) * stride_lr + (16 + offs_16[None, :]) * stride_lc).to(tl.float32)
-        L32 = tl.load(l_base + (48 + offs_16[:, None]) * stride_lr + (32 + offs_16[None, :]) * stride_lc).to(tl.float32)
+        L10 = tl.load(l_base + (16 + offs_16[:, None]) * 64 + (0 + offs_16[None, :])).to(tl.float32)
+        L20 = tl.load(l_base + (32 + offs_16[:, None]) * 64 + (0 + offs_16[None, :])).to(tl.float32)
+        L21 = tl.load(l_base + (32 + offs_16[:, None]) * 64 + (16 + offs_16[None, :])).to(tl.float32)
+        L30 = tl.load(l_base + (48 + offs_16[:, None]) * 64 + (0 + offs_16[None, :])).to(tl.float32)
+        L31 = tl.load(l_base + (48 + offs_16[:, None]) * 64 + (16 + offs_16[None, :])).to(tl.float32)
+        L32 = tl.load(l_base + (48 + offs_16[:, None]) * 64 + (32 + offs_16[None, :])).to(tl.float32)
 
         inv10 = -tl.dot(tl.dot(inv11, L10, input_precision="ieee"), inv00, input_precision="ieee")
         inv32 = -tl.dot(tl.dot(inv33, L32, input_precision="ieee"), inv22, input_precision="ieee")
@@ -10101,24 +10107,24 @@ if _HAS_TRITON:
         inv30 = -(tl.dot(inv32, M20, input_precision="ieee") + tl.dot(inv33, M30, input_precision="ieee"))
         inv31 = -(tl.dot(inv32, M21, input_precision="ieee") + tl.dot(inv33, M31, input_precision="ieee"))
 
-        a_base = AInv_ptr + pid * stride_an
+        a_base = AInv_ptr + pid * 4096
         z16 = tl.zeros([16, 16], dtype=tl.float32)
-        tl.store(a_base + (0 + offs_16[:, None]) * stride_ar + (0 + offs_16[None, :]) * stride_ac, inv00)
-        tl.store(a_base + (0 + offs_16[:, None]) * stride_ar + (16 + offs_16[None, :]) * stride_ac, z16)
-        tl.store(a_base + (0 + offs_16[:, None]) * stride_ar + (32 + offs_16[None, :]) * stride_ac, z16)
-        tl.store(a_base + (0 + offs_16[:, None]) * stride_ar + (48 + offs_16[None, :]) * stride_ac, z16)
-        tl.store(a_base + (16 + offs_16[:, None]) * stride_ar + (0 + offs_16[None, :]) * stride_ac, inv10)
-        tl.store(a_base + (16 + offs_16[:, None]) * stride_ar + (16 + offs_16[None, :]) * stride_ac, inv11)
-        tl.store(a_base + (16 + offs_16[:, None]) * stride_ar + (32 + offs_16[None, :]) * stride_ac, z16)
-        tl.store(a_base + (16 + offs_16[:, None]) * stride_ar + (48 + offs_16[None, :]) * stride_ac, z16)
-        tl.store(a_base + (32 + offs_16[:, None]) * stride_ar + (0 + offs_16[None, :]) * stride_ac, inv20)
-        tl.store(a_base + (32 + offs_16[:, None]) * stride_ar + (16 + offs_16[None, :]) * stride_ac, inv21)
-        tl.store(a_base + (32 + offs_16[:, None]) * stride_ar + (32 + offs_16[None, :]) * stride_ac, inv22)
-        tl.store(a_base + (32 + offs_16[:, None]) * stride_ar + (48 + offs_16[None, :]) * stride_ac, z16)
-        tl.store(a_base + (48 + offs_16[:, None]) * stride_ar + (0 + offs_16[None, :]) * stride_ac, inv30)
-        tl.store(a_base + (48 + offs_16[:, None]) * stride_ar + (16 + offs_16[None, :]) * stride_ac, inv31)
-        tl.store(a_base + (48 + offs_16[:, None]) * stride_ar + (32 + offs_16[None, :]) * stride_ac, inv32)
-        tl.store(a_base + (48 + offs_16[:, None]) * stride_ar + (48 + offs_16[None, :]) * stride_ac, inv33)
+        tl.store(a_base + (0 + offs_16[:, None]) * 64 + (0 + offs_16[None, :]), inv00)
+        tl.store(a_base + (0 + offs_16[:, None]) * 64 + (16 + offs_16[None, :]), z16)
+        tl.store(a_base + (0 + offs_16[:, None]) * 64 + (32 + offs_16[None, :]), z16)
+        tl.store(a_base + (0 + offs_16[:, None]) * 64 + (48 + offs_16[None, :]), z16)
+        tl.store(a_base + (16 + offs_16[:, None]) * 64 + (0 + offs_16[None, :]), inv10)
+        tl.store(a_base + (16 + offs_16[:, None]) * 64 + (16 + offs_16[None, :]), inv11)
+        tl.store(a_base + (16 + offs_16[:, None]) * 64 + (32 + offs_16[None, :]), z16)
+        tl.store(a_base + (16 + offs_16[:, None]) * 64 + (48 + offs_16[None, :]), z16)
+        tl.store(a_base + (32 + offs_16[:, None]) * 64 + (0 + offs_16[None, :]), inv20)
+        tl.store(a_base + (32 + offs_16[:, None]) * 64 + (16 + offs_16[None, :]), inv21)
+        tl.store(a_base + (32 + offs_16[:, None]) * 64 + (32 + offs_16[None, :]), inv22)
+        tl.store(a_base + (32 + offs_16[:, None]) * 64 + (48 + offs_16[None, :]), z16)
+        tl.store(a_base + (48 + offs_16[:, None]) * 64 + (0 + offs_16[None, :]), inv30)
+        tl.store(a_base + (48 + offs_16[:, None]) * 64 + (16 + offs_16[None, :]), inv31)
+        tl.store(a_base + (48 + offs_16[:, None]) * 64 + (32 + offs_16[None, :]), inv32)
+        tl.store(a_base + (48 + offs_16[:, None]) * 64 + (48 + offs_16[None, :]), inv33)
 
     class _TritonSolveUnitLower64Fn(torch.autograd.Function):
         @staticmethod
@@ -10126,18 +10132,11 @@ if _HAS_TRITON:
             ctx.set_materialize_grads(False)
             lead_shape = l_mat.shape[:-2]
             d_rhs = int(rhs.shape[-1])
-            n_batch = int(l_mat.numel() // (64 * 64))
-            l_3d = l_mat.reshape(n_batch, 64, 64)
+            n_batch = int(l_mat.numel() // 4096)
+            l_c = l_mat.contiguous().view(n_batch, 64, 64)
             r_3d = rhs.reshape(n_batch, 64, d_rhs)
             a_inv = torch.empty((n_batch, 64, 64), device=l_mat.device, dtype=torch.float32)
-            _invert_unit_lower_64_kernel[(n_batch,)](
-                l_3d,
-                a_inv,
-                *l_3d.stride(),
-                *a_inv.stride(),
-                num_warps=4,
-                num_stages=1,
-            )
+            _invert_unit_lower_64_contig_kernel[(n_batch,)](l_c, a_inv, num_warps=4, num_stages=1)
             if rhs.dtype == torch.float32:
                 prev_tf32 = bool(torch.backends.cuda.matmul.allow_tf32)
                 if prev_tf32:
@@ -10161,9 +10160,25 @@ if _HAS_TRITON:
             if du is None:
                 return None, None
             n_batch = int(a_inv.shape[0])
-            du_3d = du.reshape(n_batch, 64, d_rhs)
             need_dl = bool(ctx.needs_input_grad[0])
             need_dr = bool(ctx.needs_input_grad[1])
+            if all(s == 0 for s in du.stride()):
+                scale_c = du.reshape(-1)[:1].float().view(1, 1, 1)
+                dr_col = a_inv.sum(dim=-2, keepdim=True).transpose(-1, -2) * scale_c
+                dr_out = (
+                    (dr_col.to(r_dt) if r_dt != torch.float32 else dr_col)
+                    .view(*lead_shape, 64, 1)
+                    .expand(*lead_shape, 64, d_rhs)
+                )
+                if need_dl:
+                    u_row = u_3d.float().sum(dim=-1, keepdim=True).transpose(-1, -2)
+                    dl_f = (-dr_col * u_row).tril_(-1)
+                    dl_out = (dl_f.to(l_dt) if l_dt != torch.float32 else dl_f).view(*lead_shape, 64, 64)
+                else:
+                    dl_out = None
+                return dl_out, dr_out if need_dr else None
+
+            du_3d = du.reshape(n_batch, 64, d_rhs)
             if r_dt == torch.float32:
                 prev_tf32 = bool(torch.backends.cuda.matmul.allow_tf32)
                 if prev_tf32:
@@ -10375,7 +10390,7 @@ def _chunk_hssd_triton_fast(
 
     g_sq_mean = (g_root * g_root).mean(dim=-1, keepdim=True)
     u_total = (pi_ste * g_sq_mean).sum(dim=(0, 1))
-    tok_total = wm_f.sum() if wm_f is not None else g_root.new_tensor(float(bsz * seq_len))
+    tok_total = wm_f.sum() if wm_f is not None else g_root.new_full((), float(bsz * seq_len))
 
     final_state: HSSDCacheState | None = None
     if output_final_state:
@@ -10886,6 +10901,7 @@ def _chunk_hssd_raw(
                 k_swa,
                 v_swa,
                 st.page_states,
+                write_mask,
                 swa_recency_slope,
                 None if boltzmann_gate is None else boltzmann_gate.log_kappa,
                 None if boltzmann_gate is None else boltzmann_gate.tau,

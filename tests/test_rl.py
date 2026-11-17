@@ -63,3 +63,41 @@ def test_grpo_end_to_end_with_gate_and_resume(tmp_path):
     tr2 = GRPOTrainer(_cfg(steps=4), run_dir)
     res2 = tr2.train()
     assert res2["step"] == 4
+
+
+def test_grpo_nonfused_zero_grad_after_update(tmp_path):
+    from qloop.train.rl import _Seq
+
+    run_dir = str(tmp_path / "rl_nonfused")
+    setup_run(run_dir, level=1)
+    cfg = _cfg(steps=1, gate_every=0)
+    cfg["train"]["optim"]["fused"] = False
+    cfg["train"]["optim"]["max_grad_norm"] = 0.5
+    cfg["rl"]["ppo_epochs"] = 2
+    tr = GRPOTrainer(cfg, run_dir)
+    seqs = [
+        _Seq([1, 2, 3, 4, 5, 6], 2, 1.0, "pg"),
+        _Seq([1, 2, 7, 8, 9, 10], 2, -1.0, "pg"),
+    ]
+    st1 = tr.update(seqs)
+    assert st1["optim/optim/stepped_params"] > 0
+    assert all(p.grad is None for p in tr.stack.named_trainable.values())
+
+    # Inject a one-shot Inf grad during epoch 1 and verify epoch 2 in the same update() recovers cleanly!
+    target_p = next(iter(tr.stack.named_trainable.values()))
+    fired = {"done": False}
+
+    def _poison(grad):
+        if not fired["done"] and tr.opt._boundary:
+            fired["done"] = True
+            return grad * float("inf")
+        return grad
+
+    h = target_p.register_hook(_poison)
+    try:
+        st2 = tr.update(seqs)
+    finally:
+        h.remove()
+    assert st2["optim/optim/skipped_params"] == 0.0
+    assert st2["optim/optim/stepped_params"] > 0
+    assert all(p.grad is None for p in tr.stack.named_trainable.values())

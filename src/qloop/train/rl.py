@@ -427,6 +427,7 @@ class GRPOTrainer:
         stats = {"loss/pg": 0.0, "loss/kl": 0.0, "loss/teacher_nll": 0.0, "clip_frac": 0.0}
         clip_n = tok_n = 0.0
         for _ep in range(epochs):
+            self.opt.zero_grad(set_to_none=True)
             for ci, chunk in enumerate(chunks):
                 self.opt.set_boundary(ci == len(chunks) - 1)
                 ids, mask, adv = self._batch(chunk)
@@ -455,6 +456,7 @@ class GRPOTrainer:
                     stats[f"loss/{a_name}"] = stats.get(f"loss/{a_name}", 0.0) + float(a_loss.detach())
                 loss.backward()
             stats.update({f"optim/{k}": v for k, v in self.opt.step().items()})
+            self.opt.zero_grad(set_to_none=True)
         stats["clip_frac"] = clip_n / max(tok_n, 1.0)
         if pg:
             with torch.no_grad():

@@ -540,6 +540,7 @@ class LMTrainer:
         # Reset throughput timer AFTER step-0 quick_eval() so initial eval duration never pollutes step-1 tok/s.
         t_log, tok_log = time.time(), 0
         last: dict[str, Any] = {}
+        self.opt.zero_grad(set_to_none=True)
         try:
             while self.step < steps and not self._stop:
                 if st.lsa is not None and callable(getattr(st.lsa, "set_step", None)):
@@ -590,6 +591,7 @@ class LMTrainer:
                             raise FloatingPointError(f"non-finite LM loss at step {self.step} (micro {k}, {n} tokens)")
 
                 ostats = self.opt.step()
+                self.opt.zero_grad(set_to_none=True)
                 self.step += 1
                 if self.step % log_every == 0 or self.step == 1:
                     dt = time.time() - t_log

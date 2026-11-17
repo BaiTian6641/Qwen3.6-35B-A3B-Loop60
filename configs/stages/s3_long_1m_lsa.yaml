@@ -128,6 +128,8 @@ train:
   optim:
     lr: 1.0e-4
     warmup_steps: 40
+    fused: false                          # ~23.5M trainable params (< 0.10 GiB grad HBM) -> atomic whole-step guard + global clip + fused AdamW
+    max_grad_norm: 1.0
     lr_mult:
       lsa_indexer: 10.0
       loop_adapters: 5.0

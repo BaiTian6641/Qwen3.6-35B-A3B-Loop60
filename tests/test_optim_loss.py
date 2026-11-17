@@ -242,7 +242,12 @@ def test_projection_clamp_and_nonfinite_skip():
         opt.zero_grad()
         assert torch.equal(m.norm_w.detach(), before)
         assert opt.skipped == {"norm_w": 1} and st["optim/skipped_params"] == 1
-        assert not torch.equal(m.core.weight.detach(), core_before)
+        if fused:
+            assert not torch.equal(m.core.weight.detach(), core_before)
+        else:
+            # fused=False performs an atomic whole-step abort when any param grad is non-finite!
+            assert torch.equal(m.core.weight.detach(), core_before)
+            assert st["optim/stepped_params"] == 0.0
 
 
 def test_state_dict_roundtrip_keyed_by_name():
@@ -309,7 +314,9 @@ def test_apollo_fallback_reduces_regression_loss(rank, scale_type, scale):
 
 @pytest.mark.skipif(not apollo_torch_available(), reason="apollo_torch not installed")
 def test_apollo_torch_path_constructs():
+    from apollo_torch import APOLLOAdamW
+
     m = TwiceNet()
     groups = build_param_groups(m.named_parameters(), OPT_CFG)
     opt = FusedStepOptimizer(groups, fused=False, impl="apollo_torch")
-    assert any(type(e.opt).__name__ == "APOLLOAdamW" for e in opt.entries.values())
+    assert any(isinstance(e.opt, APOLLOAdamW) for e in opt.entries.values())

@@ -552,3 +552,295 @@ def test_hssd_hybrid_cache_init_transformers_v5_value_error(monkeypatch: pytest.
     monkeypatch.setattr(hssd_mod, "_HFCacheBase", _FakeV5Cache)
     cache = hssd_mod.HSSDHybridCache(num_layers=4)
     assert len(cache.recurrent_states) == 4
+
+
+def test_phase2_theta_horizon_jacobian_and_blend_backward_stability() -> None:
+    """Regression test for s1b Phase-2 multi-layer gradient explosion root causes:
+    1) `theta` cumulative-phase Jacobian (`||cumsum_T||_2 = O(T)`) stays O(1) across `T = 64 -> 512`
+       while keeping forward outputs bit-identical.
+    2) Scheduled output blend (`0 <= lam < 1`) preserves live `(1 - lam) * d(stock)/dx + lam * d(hssd)/dx`
+       residual Jacobians without `25x` `max(lam, 0.1)` inflation.
+    3) Subnormal `beta` (`1e-38`) and dead-conv near-zero `q/k` (`silu(-25)`) produce finite bounded grads.
+    """
+    torch.manual_seed(9001)
+    cfg = HSSDConfig(
+        rank=16,
+        chunk_size=16,
+        window_chunks=2,
+        num_pages=4,
+        k_pages=2,
+        theta_low_rank=True,
+        segment_chunks=2,
+        checkpoint_segments=False,
+        blend_init=0.0,
+        blend_warmup_steps=250,
+    )
+    ad = HSSDAdapter(64, 4, 16, 16, cfg, 0)
+    with torch.no_grad():
+        assert ad.theta_up is not None
+        ad.theta_up.weight.normal_(0.0, 0.25)
+        ad.swa_v_up.weight.normal_(0.0, 0.05)
+
+    # 1) Compare per-token normalized residual Jacobian through theta at T=64 vs T=512 (8x longer)
+    dx_norms: list[float] = []
+    for seq_len in (64, 512):
+        ad.zero_grad(set_to_none=True)
+        x = torch.randn(1, seq_len, 64, requires_grad=True)
+        q = torch.randn(1, seq_len, 2, 16)
+        k = torch.randn(1, seq_len, 2, 16)
+        v = torch.randn(1, seq_len, 4, 16)
+        g = -0.001 * torch.ones(1, seq_len, 4)
+        b = 0.5 * torch.ones(1, seq_len, 4)
+        pr = ad.project_inputs(x, q, k, v, g, b, use_qk_l2norm=True)
+        out, _, _ = chunk_hssd(
+            pr["query"],
+            pr["key"],
+            pr["value"],
+            (pr["gamma_page_scale"], pr["gamma_chan_pair"]),
+            pr["b_gate"],
+            pr["w_gate"],
+            pr["theta"],
+            pr["surprise_bias"],
+            ad.log_surprise_slope.exp(),
+            ad.surprise_thresh,
+            pr["write_logits"],
+            pr["read_logits"],
+            pr["q_swa"],
+            pr["k_swa"],
+            pr["v_swa"],
+            boltzmann_gate=ad.boltzmann_gate,
+            swa_recency_slope=ad.swa_recency_slope,
+            chunk_size=16,
+            window_chunks=2,
+            num_pages=4,
+            top_k_pages=2,
+            segment_chunks=2,
+            return_aux=True,
+        )
+        u = torch.randn_like(out)
+        u = u / u.norm()
+        (out * u).sum().backward()
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+        dx_norms.append(float(x.grad.norm().item()))
+    # Without chunk_size / seq_len normalization, dx_norms[1] grew ~8x over dx_norms[0]; now stays bounded.
+    assert dx_norms[1] < 2.0 * dx_norms[0]
+
+    # 2) Subnormal beta (1e-38 in bf16) + dead-conv silu(-25) q/k must stay 100% finite & bounded
+    ad.zero_grad(set_to_none=True)
+    x_edge = torch.randn(1, 32, 64, dtype=torch.bfloat16, requires_grad=True)
+    q_edge = F.silu(torch.full((1, 32, 2, 16), -25.0, dtype=torch.bfloat16)).detach().requires_grad_(True)
+    k_edge = F.silu(torch.full((1, 32, 2, 16), -25.0, dtype=torch.bfloat16)).detach().requires_grad_(True)
+    v_edge = torch.randn(1, 32, 4, 16, dtype=torch.bfloat16, requires_grad=True)
+    g_edge = torch.full((1, 32, 4), -0.1, dtype=torch.float32, requires_grad=True)
+    b_edge = torch.full((1, 32, 4), 1.5e-38, dtype=torch.bfloat16, requires_grad=True)
+    pr_e = ad.project_inputs(x_edge, q_edge, k_edge, v_edge, g_edge, b_edge, use_qk_l2norm=True)
+    out_e, _, du_e = chunk_hssd(
+        pr_e["query"],
+        pr_e["key"],
+        pr_e["value"],
+        (pr_e["gamma_page_scale"], pr_e["gamma_chan_pair"]),
+        pr_e["b_gate"],
+        pr_e["w_gate"],
+        pr_e["theta"],
+        pr_e["surprise_bias"],
+        ad.log_surprise_slope.exp(),
+        ad.surprise_thresh,
+        pr_e["write_logits"],
+        pr_e["read_logits"],
+        pr_e["q_swa"],
+        pr_e["k_swa"],
+        pr_e["v_swa"],
+        boltzmann_gate=ad.boltzmann_gate,
+        swa_recency_slope=ad.swa_recency_slope,
+        chunk_size=16,
+        window_chunks=2,
+        num_pages=4,
+        top_k_pages=2,
+        segment_chunks=2,
+        return_aux=True,
+    )
+    (out_e.float().sum() + du_e.sum()).backward()
+    for t_chk in (x_edge, q_edge, k_edge, v_edge, g_edge, b_edge, *ad.parameters()):
+        if t_chk.grad is not None:
+            assert torch.isfinite(t_chk.grad).all()
+
+    # 3) Scheduled blend backward consistency at lam = 0.004 (no detached stock_out or 25x lam_eff=0.1 jump)
+    from qloop.model.toy import ToyConfig, ToyForCausalLM
+
+    tcfg = ToyConfig(
+        vocab_size=32,
+        hidden_size=32,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        partial_rotary_factor=0.5,
+        linear_num_heads=4,
+        linear_head_dim=8,
+        linear_conv_kernel_dim=4,
+        num_experts=4,
+        num_experts_per_tok=2,
+        layer_types=("linear_attention", "linear_attention", "linear_attention", "linear_attention"),
+    )
+    stock_m = ToyForCausalLM(tcfg).eval()
+    hssd_m = ToyForCausalLM(tcfg).eval()
+    hssd_m.load_state_dict(stock_m.state_dict())
+    h_handle = hssd_mod.apply_hssd(
+        hssd_m,
+        HSSDConfig(
+            rank=8,
+            chunk_size=8,
+            window_chunks=1,
+            num_pages=4,
+            k_pages=2,
+            blend_init=0.0,
+            blend_warmup_steps=250,
+        ),
+    )
+    for ad_i in h_handle.adapters.values():
+        with torch.no_grad():
+            ad_i.swa_v_up.weight.normal_(0.0, 0.2)
+    ids = torch.randint(0, 32, (1, 16))
+    emb_s = stock_m.model.embed_tokens(ids).detach().requires_grad_(True)
+    logits_s = stock_m.lm_head(stock_m.model(inputs_embeds=emb_s).last_hidden_state)
+    logits_s.pow(2).mean().backward()
+
+    h_handle.set_blend(0.004)
+    emb_h = hssd_m.model.embed_tokens(ids).detach().requires_grad_(True)
+    logits_h = hssd_m.lm_head(hssd_m.model(inputs_embeds=emb_h).last_hidden_state)
+    logits_h.pow(2).mean().backward()
+    assert emb_s.grad is not None and emb_h.grad is not None
+    assert F.cosine_similarity(emb_s.grad.flatten(), emb_h.grad.flatten(), dim=0).item() > 0.995
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for window_chunks=8 Triton norm parity test")
+def test_cuda_triton_window8_norm_and_edge_case_grad_parity() -> None:
+    """Verify exact gradient norm & cosine parity (including dq, dk, dtheta_up, dswa_v_up) at window_chunks=8."""
+    device = torch.device("cuda")
+    cfg = HSSDConfig(
+        rank=64,
+        chunk_size=64,
+        window_chunks=8,
+        num_pages=8,
+        k_pages=2,
+        theta_low_rank=True,
+        surprise_mode="routed",
+        write_mode="full",
+        segment_chunks=4,
+    )
+    torch.manual_seed(2026)
+    ad_ref = HSSDAdapter(2048, 32, 128, 128, cfg, 0).to(device=device, dtype=torch.float32)
+    with torch.no_grad():
+        assert ad_ref.theta_up is not None
+        ad_ref.theta_up.weight.normal_(0.0, 0.05)
+        ad_ref.swa_v_up.weight.normal_(0.0, 0.02)
+    ad_tri = HSSDAdapter(2048, 32, 128, 128, cfg, 0).to(device=device, dtype=torch.float32)
+    ad_tri.load_state_dict(ad_ref.state_dict())
+
+    seq_len = 1024
+    x_0 = torch.randn(1, seq_len, 2048, device=device, dtype=torch.float32)
+    pre_q = torch.randn(1, seq_len, 16, 128, device=device)
+    pre_k = torch.randn(1, seq_len, 16, 128, device=device)
+    pre_q[:, 70:74, 0, :] = -20.0  # near-zero dead-conv head
+    pre_k[:, 140:144, 1, :] = -20.0
+    q_0 = F.silu(pre_q)
+    k_0 = F.silu(pre_k)
+    v_0 = F.silu(torch.randn(1, seq_len, 32, 128, device=device))
+    g_0 = -F.softplus(torch.randn(1, seq_len, 32, device=device))
+    b_0 = torch.sigmoid(torch.randn(1, seq_len, 32, device=device))
+    b_0[:, 50:55, 2] = 1.5e-38  # subnormal bf16 beta
+    grad_o = torch.randn(1, seq_len, 32, 128, device=device, dtype=torch.float32)
+
+    xr = x_0.to(torch.bfloat16).float().detach().requires_grad_(True)
+    qr = q_0.to(torch.bfloat16).float().detach().requires_grad_(True)
+    kr = k_0.to(torch.bfloat16).float().detach().requires_grad_(True)
+    vr = v_0.to(torch.bfloat16).float().detach().requires_grad_(True)
+    gr = g_0.detach().clone().requires_grad_(True)
+    br = b_0.to(torch.bfloat16).float().detach().requires_grad_(True)
+
+    orig_tri = hssd_mod._HAS_TRITON
+    hssd_mod._HAS_TRITON = False
+    try:
+        pr_r = ad_ref.project_inputs(xr, qr, kr, vr, gr, br, use_qk_l2norm=True)
+        out_r, _, du_r = chunk_hssd(
+            pr_r["query"],
+            pr_r["key"],
+            pr_r["value"],
+            (pr_r["gamma_page_scale"], pr_r["gamma_chan_pair"]),
+            pr_r["b_gate"],
+            pr_r["w_gate"],
+            pr_r["theta"],
+            pr_r["surprise_bias"],
+            ad_ref.log_surprise_slope.exp(),
+            ad_ref.surprise_thresh,
+            pr_r["write_logits"],
+            pr_r["read_logits"],
+            pr_r["q_swa"],
+            pr_r["k_swa"],
+            pr_r["v_swa"],
+            boltzmann_gate=ad_ref.boltzmann_gate,
+            swa_recency_slope=ad_ref.swa_recency_slope,
+            chunk_size=64,
+            window_chunks=8,
+            num_pages=8,
+            top_k_pages=2,
+            segment_chunks=4,
+            return_aux=True,
+        )
+        ((out_r.float() * grad_o).sum() + du_r.sum()).backward()
+    finally:
+        hssd_mod._HAS_TRITON = orig_tri
+
+    xt = x_0.to(torch.bfloat16).detach().requires_grad_(True)
+    qt = q_0.to(torch.bfloat16).detach().requires_grad_(True)
+    kt = k_0.to(torch.bfloat16).detach().requires_grad_(True)
+    vt = v_0.to(torch.bfloat16).detach().requires_grad_(True)
+    gt = g_0.detach().clone().requires_grad_(True)
+    bt = b_0.to(torch.bfloat16).detach().requires_grad_(True)
+    pr_t = ad_tri.project_inputs(xt, qt, kt, vt, gt, bt, use_qk_l2norm=True)
+    out_t, _, du_t = chunk_hssd(
+        pr_t["query"],
+        pr_t["key"],
+        pr_t["value"],
+        (pr_t["gamma_page_scale"], pr_t["gamma_chan_pair"]),
+        pr_t["b_gate"],
+        pr_t["w_gate"],
+        pr_t["theta"],
+        pr_t["surprise_bias"],
+        ad_tri.log_surprise_slope.exp(),
+        ad_tri.surprise_thresh,
+        pr_t["write_logits"],
+        pr_t["read_logits"],
+        pr_t["q_swa"],
+        pr_t["k_swa"],
+        pr_t["v_swa"],
+        boltzmann_gate=ad_tri.boltzmann_gate,
+        swa_recency_slope=ad_tri.swa_recency_slope,
+        chunk_size=64,
+        window_chunks=8,
+        num_pages=8,
+        top_k_pages=2,
+        segment_chunks=4,
+        return_aux=True,
+    )
+    ((out_t.float() * grad_o).sum() + du_t.sum()).backward()
+
+    assert ad_tri.theta_up is not None and ad_ref.theta_up is not None
+    for name, tv, rv in [
+        ("out", out_t.float(), out_r.float()),
+        ("dx", xt.grad.float(), xr.grad.float()),
+        ("dq", qt.grad.float(), qr.grad.float()),
+        ("dk", kt.grad.float(), kr.grad.float()),
+        ("dv", vt.grad.float(), vr.grad.float()),
+        ("dg", gt.grad.float(), gr.grad.float()),
+        ("db", bt.grad.float(), br.grad.float()),
+        ("dtheta_up", ad_tri.theta_up.weight.grad.float(), ad_ref.theta_up.weight.grad.float()),
+        ("dswa_v_up", ad_tri.swa_v_up.weight.grad.float(), ad_ref.swa_v_up.weight.grad.float()),
+    ]:
+        assert torch.isfinite(tv).all(), f"non-finite {name}"
+        ratio = tv.norm().item() / max(rv.norm().item(), 1e-12)
+        cos = F.cosine_similarity(tv.flatten(), rv.flatten(), dim=0).item()
+        assert 0.97 <= ratio <= 1.03, f"{name} norm ratio={ratio:.4f}"
+        assert cos > 0.995, f"{name} cos={cos:.6f}"

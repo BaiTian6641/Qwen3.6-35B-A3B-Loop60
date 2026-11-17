@@ -326,6 +326,8 @@ DEFAULT_OPTIM_CFG: dict[str, Any] = {
         r"embed_tokens",
         r"lm_head",
         r"loop_adapters",
+        r"hssd_adapter\.",
+        r"lsa_indexer\.",
         r"gdn2_adapter\.",
     ],
     # regex -> lr multiplier; first match wins
@@ -506,51 +508,60 @@ class FusedStepOptimizer:
 
         all_adamw = all(g.get("kind", "adamw") == "adamw" for g in groups)
         self._torch_adamw: torch.optim.AdamW | None = None
-        use_batched_torch_adamw = (not self.fused) and (
-            impl == "torch_adamw" or (impl == "auto" and all_adamw and len(groups) > 0)
-        )
         if impl == "torch_adamw" and not all_adamw:
             log.warning("impl='torch_adamw' requested with APOLLO groups; routing all groups to torch.optim.AdamW")
 
+        batched_groups: list[dict[str, Any]] = []
+        batched_param_ids: set[int] = set()
+        if (not self.fused) and impl in ("auto", "torch_adamw") and len(groups) > 0:
+            for g in groups:
+                kind = g.get("kind", "adamw")
+                if impl != "torch_adamw" and kind != "adamw":
+                    continue
+                b_params = [
+                    p
+                    for p in g["params"]
+                    if impl == "torch_adamw" or not (self.master_weights and p.dtype in _LOWP)
+                ]
+                if b_params:
+                    for p in b_params:
+                        batched_param_ids.add(id(p))
+                    batched_groups.append(
+                        {
+                            "params": b_params,
+                            "lr": float(g["lr"]),
+                            "betas": g["betas"],
+                            "eps": float(g["eps"]),
+                            "weight_decay": float(g["weight_decay"]),
+                        }
+                    )
+            if batched_groups:
+                self._torch_adamw = self._build_batched_torch_adamw(batched_groups)
+
         self.entries: dict[str, _Entry] = {}
         ids: set[int] = set()
-        if use_batched_torch_adamw:
-            self._torch_adamw = self._build_batched_torch_adamw(groups)
-            idx_counter = 0
-            for g in groups:
-                names = g.get("names")
-                require(
-                    names is not None and len(names) == len(g["params"]),
-                    "each group needs `names` aligned with `params` (use build_param_groups)",
-                    group=g.get("group"),
-                )
-                for name, p in zip(names, g["params"]):
-                    require(name not in self.entries, f"duplicate parameter name {name!r}")
-                    require(id(p) not in ids, f"parameter {name!r} appears in more than one group")
-                    require(p.requires_grad, f"parameter {name!r} does not require grad", param=p)
-                    ids.add(id(p))
+        idx_counter = 0
+        for g in groups:
+            names = g.get("names")
+            require(
+                names is not None and len(names) == len(g["params"]),
+                "each group needs `names` aligned with `params` (use build_param_groups)",
+                group=g.get("group"),
+            )
+            for name, p in zip(names, g["params"]):
+                require(name not in self.entries, f"duplicate parameter name {name!r}")
+                require(id(p) not in ids, f"parameter {name!r} appears in more than one group")
+                require(p.requires_grad, f"parameter {name!r} does not require grad", param=p)
+                ids.add(id(p))
+                if self._torch_adamw is not None and id(p) in batched_param_ids:
                     self.entries[name] = _Entry(
                         idx_counter, name, p, self._torch_adamw, float(g["lr"]), "adamw"
                     )
-                    idx_counter += 1
-        else:
-            idx_counter = 0
-            for g in groups:
-                names = g.get("names")
-                require(
-                    names is not None and len(names) == len(g["params"]),
-                    "each group needs `names` aligned with `params` (use build_param_groups)",
-                    group=g.get("group"),
-                )
-                for name, p in zip(names, g["params"]):
-                    require(name not in self.entries, f"duplicate parameter name {name!r}")
-                    require(id(p) not in ids, f"parameter {name!r} appears in more than one group")
-                    require(p.requires_grad, f"parameter {name!r} does not require grad", param=p)
-                    ids.add(id(p))
+                else:
                     self.entries[name] = _Entry(
                         idx_counter, name, p, self._make_opt(name, p, g), float(g["lr"]), g.get("kind", "adamw")
                     )
-                    idx_counter += 1
+                idx_counter += 1
 
         self.step_count = 0
         self.skipped: dict[str, int] = {}
@@ -559,6 +570,7 @@ class FusedStepOptimizer:
         self.last_global_norm: float | None = None
         self._boundary = True
         self._boundary_explicit = False
+        self._atomic_step_aborted = False
         self._defer_depth = 0
         self._micro: list[int] = [0] * len(self.entries)
         self._stepped: set[str] = set()
@@ -812,63 +824,88 @@ class FusedStepOptimizer:
         self._clamp_projected_param(p, ent.opt)
         return True
 
-    def _step_batched_torch_adamw(self) -> None:
-        assert self._torch_adamw is not None
+    def _step_nonfused(self) -> None:
+        """Classic post-backward update with atomic whole-step non-finite guard, true global
+        `clip_grad_norm_(max_grad_norm)`, and fused CUDA `torch.optim.AdamW` + master-weight / APOLLO support."""
         active = [ent for ent in self.entries.values() if ent.param.grad is not None]
         if not active:
             return
-        lrf = self.lr_factor
-        for pg in self._torch_adamw.param_groups:
-            pg["lr"] = float(pg.get("_qloop_base_lr", pg["lr"])) * lrf
 
-        global_clip_val = self.max_grad_norm
-        if global_clip_val is None and self.global_clip is not None:
-            global_clip_val = self.global_clip
-
-        saved_nonfinite: list[tuple[_Entry, torch.Tensor, dict[str, Any]]] = []
+        gnorms: dict[str, torch.Tensor] = {}
+        finites: dict[str, torch.Tensor] = {}
         with torch.no_grad():
             for ent in active:
                 grad = ent.param.grad
                 assert grad is not None
-                self._stepped.add(ent.name)
                 acc = torch.float64 if grad.dtype == torch.float64 else torch.float32
                 gnorm = torch.linalg.vector_norm(grad.detach(), dtype=acc)
                 finite = torch.isfinite(gnorm)
+                gnorms[ent.name] = gnorm
+                finites[ent.name] = finite
                 self._accumulate_device_norm(ent.name, gnorm, finite)
-                if self.max_norm is not None and global_clip_val is None:
-                    scale = torch.clamp(float(self.max_norm) / (gnorm + 1e-12), max=1.0)
-                    self._accumulate_device_clip(finite & (gnorm > float(self.max_norm)))
-                    grad.mul_(torch.where(finite, scale, torch.ones_like(scale)).to(dtype=grad.dtype))
-                if self.skip_nonfinite:
-                    fmask = finite.to(device=ent.param.device, dtype=torch.bool)
-                    saved_nonfinite.append(
-                        (ent, ent.param.detach().clone(), _copy_state(self._torch_adamw.state.get(ent.param, {})))
-                    )
-                    ent.param.grad = torch.where(fmask, grad, torch.zeros_like(grad))
 
-            if global_clip_val is not None:
+            if self.skip_nonfinite:
+                ref_dev = self._step_gnorm_sq.device if self._step_gnorm_sq is not None else active[0].param.device
+                finite_stack = torch.stack(
+                    [finites[ent.name].to(device=ref_dev, dtype=torch.bool) for ent in active]
+                )
+                all_finite_dev = finite_stack.all()
+                if self._step_gnorm_sq is not None:
+                    all_finite_dev = all_finite_dev & torch.isfinite(self._step_gnorm_sq.to(device=ref_dev))
+                if not bool(all_finite_dev.item()):
+                    self._atomic_step_aborted = True
+                    return
+
+            for ent in active:
+                self._stepped.add(ent.name)
+
+            if self.max_grad_norm is not None:
                 tot = torch.nn.utils.clip_grad_norm_(
-                    [ent.param for ent in active], max_norm=float(global_clip_val)
+                    [ent.param for ent in active], max_norm=float(self.max_grad_norm)
                 )
                 tot_t = tot if isinstance(tot, torch.Tensor) else torch.tensor(float(tot))
                 self._accumulate_device_clip(
-                    (torch.isfinite(tot_t) & (tot_t > float(global_clip_val))).to(dtype=torch.float64)
+                    (torch.isfinite(tot_t) & (tot_t > float(self.max_grad_norm))).to(dtype=torch.float64)
                     * float(len(active))
                 )
+            else:
+                for ent in active:
+                    grad = ent.param.grad
+                    assert grad is not None
+                    gnorm = gnorms[ent.name]
+                    finite = finites[ent.name]
+                    scale: torch.Tensor | None = None
+                    if self.max_norm is not None:
+                        scale = torch.clamp(float(self.max_norm) / (gnorm + 1e-12), max=1.0)
+                        self._accumulate_device_clip(finite & (gnorm > float(self.max_norm)))
+                    if (
+                        self.global_clip is not None
+                        and self.prev_global_norm
+                        and self.prev_global_norm > self.global_clip
+                    ):
+                        gcoef = float(self.global_clip) / float(self.prev_global_norm)
+                        scale = (scale * gcoef) if scale is not None else torch.full_like(gnorm, gcoef)
+                    if scale is not None:
+                        safe_scale = torch.where(finite, scale, torch.ones_like(scale)).to(dtype=grad.dtype)
+                        grad.mul_(safe_scale)
 
-        self._torch_adamw.step()
+        lrf = self.lr_factor
+        if self._torch_adamw is not None and any(ent.opt is self._torch_adamw for ent in active):
+            for pg in self._torch_adamw.param_groups:
+                pg["lr"] = float(pg.get("_qloop_base_lr", pg["lr"])) * lrf
+            self._torch_adamw.step()
+
+        for ent in active:
+            if ent.opt is self._torch_adamw:
+                continue
+            lr = ent.base_lr * lrf
+            for g in ent.opt.param_groups:
+                g["lr"] = lr
+            ent.opt.step()
+
         with torch.no_grad():
-            for ent, p_before, st_before in saved_nonfinite:
-                fmask = self._param_finite[ent.name].to(device=ent.param.device, dtype=torch.bool)
-                ent.param.copy_(torch.where(fmask, ent.param, p_before))
-                cur_st = self._torch_adamw.state.get(ent.param)
-                if isinstance(cur_st, dict):
-                    for k, v_old in st_before.items():
-                        v_cur = cur_st.get(k)
-                        if isinstance(v_cur, torch.Tensor) and isinstance(v_old, torch.Tensor):
-                            cur_st[k] = torch.where(fmask, v_cur, v_old.to(device=v_cur.device))
             for ent in active:
-                self._clamp_projected_param(ent.param, self._torch_adamw)
+                self._clamp_projected_param(ent.param, ent.opt)
 
     # ---------------------------------------------------------------- public API
     def set_boundary(self, is_last_microbatch: bool) -> None:
@@ -880,37 +917,7 @@ class FusedStepOptimizer:
         """Non-fused: update every param with a grad. Fused: post-backward bookkeeping (global
         grad norm, schedule advance, sanity checks). Call once per optimizer step in both modes."""
         if not self.fused:
-            if self._torch_adamw is not None:
-                self._step_batched_torch_adamw()
-            else:
-                active = [ent for ent in self.entries.values() if ent.param.grad is not None]
-                if self.max_grad_norm is not None and active:
-                    with torch.no_grad():
-                        for ent in active:
-                            assert ent.param.grad is not None
-                            acc = torch.float64 if ent.param.grad.dtype == torch.float64 else torch.float32
-                            gn = torch.linalg.vector_norm(ent.param.grad.detach(), dtype=acc)
-                            self._accumulate_device_norm(ent.name, gn, torch.isfinite(gn))
-                        tot = torch.nn.utils.clip_grad_norm_(
-                            [ent.param for ent in active], max_norm=float(self.max_grad_norm)
-                        )
-                        tot_t = tot if isinstance(tot, torch.Tensor) else torch.tensor(float(tot))
-                        self._accumulate_device_clip(
-                            (torch.isfinite(tot_t) & (tot_t > float(self.max_grad_norm))).to(dtype=torch.float64)
-                            * float(len(active))
-                        )
-                    # Temporarily bypass duplicate norm accumulation in _step_param since pre-clip norm was recorded.
-                    saved_pf = dict(self._param_finite)
-                    saved_sq = self._step_gnorm_sq
-                    saved_cl = self._clipped_dev
-                    for ent in active:
-                        self._step_param(ent)
-                    self._param_finite = saved_pf
-                    self._step_gnorm_sq = saved_sq
-                    self._clipped_dev = saved_cl
-                else:
-                    for ent in active:
-                        self._step_param(ent)
+            self._step_nonfused()
         else:
             if self._boundary_explicit and not self._boundary:
                 log.warning("FusedStepOptimizer.step() called while set_boundary(False): nothing was stepped")
@@ -958,10 +965,17 @@ class FusedStepOptimizer:
             # Single host transfer for the entire optimizer step (zero per-param .item() syncs!).
             packed_cpu = torch.stack([sq_dev, clip_dev, skipped_dev]).to(device="cpu", dtype=torch.float64)
             sq_val, clip_val, skip_val = (float(x) for x in packed_cpu.numpy())
-            gnorm = math.sqrt(max(0.0, sq_val))
+            gnorm = math.sqrt(max(0.0, sq_val)) if math.isfinite(sq_val) else float("inf")
             self._clipped = round(clip_val)
             self._skipped_now = round(skip_val)
-            has_finite_norm = len(names) > self._skipped_now
+            if self._atomic_step_aborted and self._skipped_now == 0:
+                self._skipped_now = len(names)
+            has_finite_norm = (
+                len(names) > 0
+                and self._skipped_now == 0
+                and not self._atomic_step_aborted
+                and math.isfinite(gnorm)
+            )
 
             if self._skipped_now > 0:
                 finite_flags_cpu = finite_vec.to(device="cpu").numpy()
@@ -969,7 +983,7 @@ class FusedStepOptimizer:
                     if not bool(is_fin):
                         self.skipped[n] = self.skipped.get(n, 0) + 1
                         ent = self.entries[n]
-                        if self.skip_nonfinite:
+                        if self.skip_nonfinite and not self._atomic_step_aborted:
                             st = ent.opt.state.get(ent.param)
                             if isinstance(st, dict) and "step" in st:
                                 st_step = st["step"]
@@ -982,7 +996,12 @@ class FusedStepOptimizer:
                                     st.clear()
                                 else:
                                     st["step"] = int(st_step) - 1
-                        act = "skipping its update" if self.skip_nonfinite else "APPLYING anyway (skip_nonfinite=False)"
+                        if self._atomic_step_aborted:
+                            act = "skipping entire optimizer step atomically (0 params updated)"
+                        elif self.skip_nonfinite:
+                            act = "skipping its update"
+                        else:
+                            act = "APPLYING anyway (skip_nonfinite=False)"
                         log.warning(
                             "non-finite gradient for '%s' at step %d: %s - %s (skips for this param: %d)",
                             n,
@@ -1020,6 +1039,7 @@ class FusedStepOptimizer:
         self._clipped = 0
         self._skipped_now = 0
         self._boundary_explicit = False
+        self._atomic_step_aborted = False
         return stats
 
     def zero_grad(self, set_to_none: bool = True) -> None:
@@ -1084,16 +1104,71 @@ class FusedStepOptimizer:
                 saved=rec.get("shape"),
                 param=ent.param,
             )
-            if rec.get("impl") != type(ent.opt).__name__:
-                msg = f"optimizer impl changed for {name!r}: saved {rec.get('impl')} vs now {type(ent.opt).__name__}"
+            saved_impl = rec.get("impl")
+            cur_impl = type(ent.opt).__name__
+            dev = ent.param.device
+            if saved_impl != cur_impl:
+                if (
+                    {saved_impl, cur_impl} == {"AdamWLite", "AdamW"}
+                    and isinstance(ent.opt, (AdamWLite, torch.optim.AdamW))
+                    and "exp_avg" in rec.get("state", {})
+                    and "exp_avg_sq" in rec.get("state", {})
+                ):
+                    st_in = rec["state"]
+                    raw_step = st_in.get("step", 0)
+                    step_val = (
+                        float(raw_step.detach().to("cpu").item())
+                        if isinstance(raw_step, torch.Tensor)
+                        else float(raw_step)
+                    )
+                    if isinstance(ent.opt, torch.optim.AdamW):
+                        pg_fused = any(
+                            bool(pg.get("fused", False) or pg.get("capturable", False))
+                            for pg in ent.opt.param_groups
+                        )
+                        step_dev = dev if pg_fused else torch.device("cpu")
+                        ent.opt.state[ent.param] = {
+                            "step": torch.tensor(step_val, dtype=torch.float32, device=step_dev),
+                            "exp_avg": st_in["exp_avg"].detach().clone().to(device=dev, dtype=ent.param.dtype),
+                            "exp_avg_sq": st_in["exp_avg_sq"].detach().clone().to(device=dev, dtype=ent.param.dtype),
+                        }
+                    else:
+                        sd_dt = _state_dtype(ent.param)
+                        new_st: dict[str, Any] = {
+                            "step": round(step_val),
+                            "exp_avg": st_in["exp_avg"].detach().clone().to(device=dev, dtype=sd_dt),
+                            "exp_avg_sq": st_in["exp_avg_sq"].detach().clone().to(device=dev, dtype=sd_dt),
+                        }
+                        if self.master_weights and ent.param.dtype in _LOWP:
+                            new_st["master"] = (
+                                st_in["master"].detach().clone().to(device=dev, dtype=sd_dt)
+                                if "master" in st_in
+                                else ent.param.detach().to(device=dev, dtype=sd_dt)
+                            )
+                        ent.opt.state[ent.param] = new_st
+                    continue
+                if {saved_impl, cur_impl} == {"AdamWLite", "AdamW"} and not rec.get("state"):
+                    ent.opt.state.pop(ent.param, None)
+                    continue
+                msg = f"optimizer impl changed for {name!r}: saved {saved_impl} vs now {cur_impl}"
                 require(not strict, msg + " (state layouts are incompatible)")
                 log.warning("%s - starting this param with fresh state", msg)
                 continue
-            dev = ent.param.device
-            ent.opt.state[ent.param] = {
+            if not rec["state"]:
+                ent.opt.state.pop(ent.param, None)
+                continue
+            new_state: dict[str, Any] = {
                 k: (v.detach().clone().to(dev) if isinstance(v, torch.Tensor) else copy.deepcopy(v))
                 for k, v in rec["state"].items()
             }
+            if isinstance(ent.opt, torch.optim.AdamW) and isinstance(new_state.get("step"), torch.Tensor):
+                pg_fused = any(
+                    bool(pg.get("fused", False) or pg.get("capturable", False))
+                    for pg in ent.opt.param_groups
+                )
+                step_dev = dev if pg_fused else torch.device("cpu")
+                new_state["step"] = new_state["step"].to(device=step_dev, dtype=torch.float32)
+            ent.opt.state[ent.param] = new_state
         self.step_count = int(sd.get("step_count", 0))
         self.skipped = dict(sd.get("skipped", {}))
         self.norm_ema = sd.get("norm_ema")

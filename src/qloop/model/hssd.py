@@ -314,9 +314,10 @@ class HSSDConfig:
 # ============================================================================ math primitives
 
 def _safe_sqrt(x: torch.Tensor) -> torch.Tensor:
-    """Singularity-free `sqrt(max(x, 0))` with exact 0 value and finite 0 derivative at `x <= 0`."""
+    """Singularity-free `sqrt(max(x, 0))` with exact 0 value and bounded derivative near `x -> 0+`."""
     pos = x > 0.0
-    safe = torch.where(pos, x, torch.ones_like(x))
+    x_pos = x if x.dtype == torch.float64 else x.clamp_min(1e-12)
+    safe = torch.where(pos, x_pos, torch.ones_like(x))
     return torch.where(pos, torch.sqrt(safe), torch.zeros_like(x))
 
 
@@ -327,7 +328,11 @@ def _safe_norm(x: torch.Tensor, dim: int = -1, keepdim: bool = False) -> torch.T
 
 def _rms_norm_scaled(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     xf = upcast(x)
-    normed = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    r_rms = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    normed = xf * r_rms
+    if x.dtype != torch.float64 and normed.requires_grad:
+        s_bwd = (r_rms.clamp(max=10.0) / r_rms).detach()
+        normed = normed.detach() + s_bwd * (normed - normed.detach())
     return normed * upcast(weight)
 
 
@@ -4529,7 +4534,19 @@ def _get_compiled_chunk_group() -> Callable[..., Any]:
     global _COMPILED_CHUNK_GROUP_FN
     if _COMPILED_CHUNK_GROUP_FN is None:
         if hasattr(torch, "compile"):
-            _COMPILED_CHUNK_GROUP_FN = torch.compile(_run_chunk_group, dynamic=True)
+            raw_compiled = torch.compile(_run_chunk_group, dynamic=True)
+
+            def _safe_compiled(*args: Any, **kwargs: Any) -> Any:
+                global _COMPILED_CHUNK_GROUP_FN
+                try:
+                    return raw_compiled(*args, **kwargs)
+                except Exception as exc:
+                    if "CppCompileError" in type(exc).__name__ or "CppCompileError" in str(exc):
+                        _COMPILED_CHUNK_GROUP_FN = _run_chunk_group
+                        return _run_chunk_group(*args, **kwargs)
+                    raise
+
+            _COMPILED_CHUNK_GROUP_FN = _safe_compiled
         else:
             _COMPILED_CHUNK_GROUP_FN = _run_chunk_group
     return _COMPILED_CHUNK_GROUP_FN
@@ -5230,8 +5247,8 @@ if _HAS_TRITON:
         dkb0 = tl.load(DKBase_ptr + out_k_off + d0 * stride_qhd).to(tl.float32)
         dkb1 = tl.load(DKBase_ptr + out_k_off + d1 * stride_qhd).to(tl.float32)
 
-        dbg0 = tl.where(bg0 > 0.0, 0.5 * dkb0 * kr0 / tl.where(bg0 > 0.0, sb0, 1.0), 0.0)
-        dbg1 = tl.where(bg1 > 0.0, 0.5 * dkb1 * kr1 / tl.where(bg1 > 0.0, sb1, 1.0), 0.0)
+        dbg0 = tl.where(bg0 > 0.0, 0.5 * dkb0 * kr0 / tl.maximum(sb0, 1e-6), 0.0)
+        dbg1 = tl.where(bg1 > 0.0, 0.5 * dkb1 * kr1 / tl.maximum(sb1, 1e-6), 0.0)
         dbg_p = DBGate_ptr + b * stride_bgb + t * stride_bgt + h * stride_bgh
         tl.store(dbg_p + d0 * stride_bgd, dbg0.to(DBGate_ptr.dtype.element_ty))
         tl.store(dbg_p + d1 * stride_bgd, dbg1.to(DBGate_ptr.dtype.element_ty))
@@ -5283,7 +5300,7 @@ if _HAS_TRITON:
         dvtc = tl.load(DVTc_ptr + out_v_off).to(tl.float32)
         dvb = tl.load(DVBase_ptr + out_v_off).to(tl.float32)
         dv_tot = dvtc + sw * dvb
-        dwg = tl.where(wg > 0.0, 0.5 * dvb * vv / tl.where(wg > 0.0, sw, 1.0), 0.0)
+        dwg = tl.where(wg > 0.0, 0.5 * dvb * vv / tl.maximum(sw, 1e-6), 0.0)
         tl.store(
             DV_ptr + b * stride_vb + t * stride_vt + h * stride_vh + offs_v * stride_vd,
             dv_tot.to(DV_ptr.dtype.element_ty),
@@ -5317,8 +5334,8 @@ if _HAS_TRITON:
             v_c = v.contiguous()
             bg_c = b_gate.contiguous()
             wg_c = w_gate.contiguous()
-            cos_c = cos_t.contiguous() if use_phase else q_c.new_empty((1, 1, 1, 1), dtype=tc_dt)
-            sin_c = sin_t.contiguous() if use_phase else q_c.new_empty((1, 1, 1, 1), dtype=tc_dt)
+            cos_c = cos_t.contiguous() if use_phase else q_c.new_empty((1, 1, 1, 1), dtype=torch.float32)
+            sin_c = sin_t.contiguous() if use_phase else q_c.new_empty((1, 1, 1, 1), dtype=torch.float32)
 
             q_hat = torch.empty((B, T, H, D_k), device=q_c.device, dtype=tc_dt)
             k_hat = torch.empty((B, T, H, D_k), device=q_c.device, dtype=tc_dt)
@@ -5822,8 +5839,8 @@ if _HAS_TRITON:
         o_v = b * stride_ovb + t * stride_ovt + h * stride_ovh + offs_dv * stride_ovd
         tl.store(QOut_ptr + o_k, qf.to(out_dt))
         tl.store(KOut_ptr + o_k, kf.to(out_dt))
-        tl.store(BGate_ptr + o_k, bg.to(out_dt))
-        tl.store(WGate_ptr + o_v, wg.to(out_dt))
+        tl.store(BGate_ptr + o_k, bg.to(BGate_ptr.dtype.element_ty))
+        tl.store(WGate_ptr + o_v, wg.to(WGate_ptr.dtype.element_ty))
         tl.store(QSwa_ptr + o_k, q_swa.to(out_dt))
         tl.store(KSwa_ptr + o_k, k_swa.to(out_dt))
         tl.store(VSwa_ptr + o_v, v_swa.to(out_dt))
@@ -5977,8 +5994,10 @@ if _HAS_TRITON:
 
         dqn = dqs * qnw
         dkn = dks * knw
-        ddq_s = rq_s * (dqn - qn * (tl.sum(dqn * qn, axis=0) * inv_dk))
-        ddk_s = rk_s * (dkn - kn * (tl.sum(dkn * kn, axis=0) * inv_dk))
+        rq_s_bwd = tl.minimum(rq_s, 10.0)
+        rk_s_bwd = tl.minimum(rk_s, 10.0)
+        ddq_s = rq_s_bwd * (dqn - qn * (tl.sum(dqn * qn, axis=0) * inv_dk))
+        ddk_s = rk_s_bwd * (dkn - kn * (tl.sum(dkn * kn, axis=0) * inv_dk))
 
         dau_base = DAllUp_ptr + b * stride_aub + t * stride_aut
         tl.store(dau_base + er_off * stride_aud, draw_er)
@@ -6039,8 +6058,8 @@ if _HAS_TRITON:
 
             q_out = torch.empty((B, T, hv, D_k), device=qc.device, dtype=out_dt)
             k_out = torch.empty((B, T, hv, D_k), device=qc.device, dtype=out_dt)
-            b_gate = torch.empty((B, T, hv, D_k), device=qc.device, dtype=out_dt)
-            w_gate = torch.empty((B, T, hv, D_v), device=qc.device, dtype=out_dt)
+            b_gate = torch.empty((B, T, hv, D_k), device=qc.device, dtype=torch.float32)
+            w_gate = torch.empty((B, T, hv, D_v), device=qc.device, dtype=torch.float32)
             q_swa = torch.empty((B, T, hv, D_k), device=qc.device, dtype=out_dt)
             k_swa = torch.empty((B, T, hv, D_k), device=qc.device, dtype=out_dt)
             v_swa = torch.empty((B, T, hv, D_v), device=qc.device, dtype=out_dt)
@@ -6105,8 +6124,16 @@ if _HAS_TRITON:
 
             dqo_c = dq_out.contiguous() if dq_out is not None else _z_k()
             dko_c = dk_out.contiguous() if dk_out is not None else _z_k()
-            dbg_c = db_gate.contiguous() if db_gate is not None else _z_k()
-            dwg_c = dw_gate.contiguous() if dw_gate is not None else _z_v()
+            dbg_c = (
+                db_gate.contiguous()
+                if db_gate is not None
+                else torch.zeros((B, T, hv, D_k), device=qc.device, dtype=torch.float32)
+            )
+            dwg_c = (
+                dw_gate.contiguous()
+                if dw_gate is not None
+                else torch.zeros((B, T, hv, D_v), device=qc.device, dtype=torch.float32)
+            )
             dqs_c = dq_swa.contiguous() if dq_swa is not None else _z_k()
             dks_c = dk_swa.contiguous() if dk_swa is not None else _z_k()
             dvs_c = dv_swa.contiguous() if dv_swa is not None else _z_v()
@@ -10279,10 +10306,10 @@ def _chunk_hssd_triton_fast(
         )
 
     if use_phase:
-        cos_t, sin_t, term_theta = _TritonPhaseTrigFn.apply(theta, st.theta_cum, wm_f, tc_dt)
+        cos_t, sin_t, term_theta = _TritonPhaseTrigFn.apply(theta, st.theta_cum, wm_f, acc_dt)
     else:
-        cos_t = query.new_empty(0, dtype=tc_dt)
-        sin_t = query.new_empty(0, dtype=tc_dt)
+        cos_t = query.new_empty(0, dtype=acc_dt)
+        sin_t = query.new_empty(0, dtype=acc_dt)
         term_theta = st.theta_cum.to(dtype=torch.float64).clone().contiguous()
 
     sc = float(dk ** -0.5) if scale is None else float(scale)
@@ -11908,6 +11935,10 @@ class HSSDAdapter(nn.Module):
                 theta = math.pi * torch.tanh(F.linear(xf, upcast(self.theta_proj.weight))).view(
                     bsz, seq_len, hv, half_dk
                 )
+            if theta.requires_grad and seq_len > self.cfg.chunk_size:
+                # Normalize cumulative-phase backward spectral norm ||cumsum_T||_2 = O(T) to chunk scale O(C).
+                theta_grad_scale = float(self.cfg.chunk_size) / float(seq_len)
+                theta = theta.detach() + theta_grad_scale * (theta - theta.detach())
             surprise_bias = F.linear(xf, upcast(self.surprise_proj.weight), upcast(self.surprise_proj.bias))
             write_logits = F.linear(xf, upcast(self.write_router.weight), upcast(self.write_router.bias))
             q_flat = q_out.float().reshape(bsz, seq_len, hv * dk)
@@ -11977,6 +12008,9 @@ class HSSDAdapter(nn.Module):
         else:
             assert self.theta_proj is not None
             theta = math.pi * torch.tanh(F.linear(xf, upcast(self.theta_proj.weight))).view(bsz, seq_len, hv, half_dk)
+        if theta.requires_grad and seq_len > self.cfg.chunk_size:
+            theta_grad_scale = float(self.cfg.chunk_size) / float(seq_len)
+            theta = theta.detach() + theta_grad_scale * (theta - theta.detach())
 
         surprise_bias = F.linear(xf, upcast(self.surprise_proj.weight), upcast(self.surprise_proj.bias))
         write_logits = F.linear(xf, upcast(self.write_router.weight), upcast(self.write_router.bias))
@@ -12531,21 +12565,36 @@ def _make_hssd_rule_wrapper(
 
             adapter.record_duty(duty_vec, write_logits=proj["write_logits"], pad_mask=pad_mask)
 
-            # H2: Scheduled stock-to-HSSD output blend (stateless training forward; skipped when lam >= 1.0)
+            # H2: Scheduled stock-to-HSSD output blend (stateless training forward; skipped when lam >= 1.0).
+            # Keep live gradients through `(1 - lam) * stock_out` so multi-layer backward Jacobians match the
+            # actual forward computation instead of substituting an amplified `0.1 * J_hssd` surrogate.
             lam = 1.0 if runtime is None else float(runtime.blend)
             if lam < 1.0 and init_st is None and not out_final and orig_fn is not None:
-                with torch.no_grad():
+                need_stock_grad = bool(
+                    torch.is_grad_enabled()
+                    and out.requires_grad
+                    and (
+                        orig_q.requires_grad
+                        or orig_k.requires_grad
+                        or orig_v.requires_grad
+                        or g.requires_grad
+                        or beta.requires_grad
+                    )
+                )
+                with torch.enable_grad() if need_stock_grad else torch.no_grad():
                     stock_res = orig_fn(orig_q, orig_k, orig_v, *args, **kwargs)
                     stock_out = stock_res[0] if isinstance(stock_res, tuple) else stock_res
                     if head_first:
                         stock_out = stock_out.transpose(1, 2)
                     stock_out = stock_out.to(dtype=out.dtype)
                 if lam <= 0.0:
-                    fwd_out = stock_out
+                    if out.requires_grad:
+                        ste_eps = 1.0 / float(max(int(c_cfg.blend_warmup_steps), 100))
+                        out = stock_out + ste_eps * (out - out.detach())
+                    else:
+                        out = stock_out
                 else:
-                    fwd_out = ((1.0 - lam) * upcast(stock_out) + lam * upcast(out)).to(dtype=out.dtype)
-                lam_eff = max(lam, 0.1)
-                out = fwd_out.detach() + lam_eff * (out - out.detach()) if out.requires_grad else fwd_out
+                    out = ((1.0 - lam) * upcast(stock_out) + lam * upcast(out)).to(dtype=out.dtype)
 
             if head_first:
                 out = out.transpose(1, 2)

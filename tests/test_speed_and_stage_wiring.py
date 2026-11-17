@@ -1036,8 +1036,8 @@ def test_v32_stage_yaml_configs():
     assert s1b["hssd"]["compact_decode_cache"] is True
     assert s1b["distill"]["share_backbone"] is True
     assert s1b["distill"]["layerwise_warmup_steps"] == 400
-    assert s1b["train"]["micro_batch"] == 2
-    assert s1b["train"]["grad_accum"] == 2
+    assert s1b["train"]["micro_batch"] == 1
+    assert s1b["train"]["grad_accum"] == 4
 
     s3 = load_config(os.path.join(ROOT, "configs", "stages", "s3_long_1m_lsa.yaml"))
     assert s3["lsa"]["mode"] == "hybrid"

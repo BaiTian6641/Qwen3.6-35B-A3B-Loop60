@@ -398,8 +398,8 @@ class PeakBoltzmannGate(nn.Module):
             n_val = float(sf.shape[-1])
             lse = torch.logsumexp(sf, dim=-1)
             max_sc = sf.max(dim=-1).values
-            log_n = sf.new_tensor(math.log(max(n_val, 1.0)))
-            gumbel = sf.new_tensor(math.sqrt(2.0 * math.log(max(n_val, 2.0))))
+            log_n = sf.new_full((), math.log(max(n_val, 1.0)))
+            gumbel = sf.new_full((), math.sqrt(2.0 * math.log(max(n_val, 2.0))))
             has_valid: torch.Tensor | None = None
         else:
             vm = valid_mask.to(dtype=torch.bool).expand_as(sf)
@@ -1858,7 +1858,7 @@ class HSSDHybridCache(_HFCacheBase):  # type: ignore[misc]
         if _HFCacheBase is not object:
             try:
                 super().__init__()
-            except TypeError:
+            except (TypeError, ValueError):
                 pass
         if layer_types is not None:
             ltypes = [str(x) for x in layer_types]
@@ -2392,6 +2392,16 @@ def _solve_unit_lower_wy(l_mat: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor
         eye = torch.eye(c_len, dtype=l_mat.dtype, device=l_mat.device)
         return torch.linalg.solve_triangular(eye + l_mat, rhs, upper=False, unitriangular=True)
 
+    if (
+        _HAS_TRITON
+        and l_mat.is_cuda
+        and not _is_compiling()
+        and c_len == 64
+        and l_mat.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        and rhs.dtype == l_mat.dtype
+    ):
+        return _TritonSolveUnitLower64Fn.apply(l_mat, rhs)
+
     c_pad = 1 << (c_len - 1).bit_length()
     pad_t = c_pad - c_len
     l_pad = F.pad(l_mat, (0, pad_t, 0, pad_t)) if pad_t > 0 else l_mat
@@ -2845,7 +2855,7 @@ def _compute_root_surprise_and_routing(
         g_root = g_root * wmask_c.unsqueeze(-1)
         valid_toks = wmask_c.sum()
     else:
-        valid_toks = g_root.new_tensor(float(bsz * c_len))
+        valid_toks = g_root.new_full((), float(bsz * c_len))
 
     g_sq_mean = (g_root * g_root).mean(dim=-1, keepdim=True)
     if write_mode == "full":
@@ -4081,7 +4091,7 @@ def _run_chunk_group(
             .reshape(bsz, n_grp, chunk_size, hv, dk)
             .transpose(2, 3)
         )                                                                     # [B, n_grp, H_v, C, d_k]
-        scores_b = (q_loc_b @ k_win_t) * (dk ** -0.5)                         # [B, n_grp, H_v, C, win_full]
+        scores_b = (q_loc_b @ k_win_t).to(dtype=q_hat.dtype) * (dk ** -0.5)
 
         r_idx = torch.arange(chunk_size, device=qs.device)[:, None]
         w_idx = torch.arange(win_full, device=qs.device)[None, :]
@@ -4101,7 +4111,7 @@ def _run_chunk_group(
 
         probs_b = torch.softmax(masked_sc_b, dim=-1)
         probs_b = torch.where(has_valid_b.unsqueeze(-1), probs_b, torch.zeros_like(probs_b))
-        o_loc_batched = (probs_b @ v_win_b).transpose(2, 3)                   # [B, n_grp, C, H_v, d_v]
+        o_loc_batched = (probs_b.to(dtype=v_win_b.dtype) @ v_win_b).to(dtype=q_hat.dtype).transpose(2, 3)
 
         counts_b = valid_mask_b.expand_as(scores_b).sum(dim=-1)
         has_v_sc_b = counts_b > 0
@@ -4349,7 +4359,7 @@ def _run_chunk_group(
             valid_mask = (k_pos <= q_pos)[None, None, :, :] & val_keys[:, None, None, :]
 
             q_loc = qs[:, l0:l1].transpose(1, 2)                   # [B, H_v, c_len, d_k]
-            scores = (q_loc @ k_win.transpose(-1, -2)) * (dk ** -0.5)
+            scores = (q_loc @ k_win.transpose(-1, -2)).to(dtype=q_hat.dtype) * (dk ** -0.5)
             if swa_recency_slope is not None and swa_recency_slope.numel() > 0:
                 dist_c = (q_pos - k_pos).clamp_min(0).to(dtype=scores.dtype) * (1.0 / float(chunk_size))
                 scores = scores - swa_recency_slope.view(1, hv, 1, 1) * dist_c[None, None, :, :]
@@ -4359,7 +4369,7 @@ def _run_chunk_group(
 
             probs = torch.softmax(masked_sc, dim=-1)
             probs = torch.where(has_valid.unsqueeze(-1), probs, torch.zeros_like(probs))
-            o_loc = (probs @ v_win).transpose(1, 2)
+            o_loc = (probs.to(dtype=v_win.dtype) @ v_win).to(dtype=q_hat.dtype).transpose(1, 2)
 
             counts = valid_mask.expand_as(scores).sum(dim=-1)
             has_v_sc = counts > 0
@@ -4523,6 +4533,5986 @@ def _get_compiled_chunk_group() -> Callable[..., Any]:
         else:
             _COMPILED_CHUNK_GROUP_FN = _run_chunk_group
     return _COMPILED_CHUNK_GROUP_FN
+
+
+# ============================================================================ Triton CUDA fast-path kernels
+
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:  # pragma: no cover - optional on CPU / macOS dev hosts
+    triton = None  # type: ignore[assignment]
+    tl = None  # type: ignore[assignment]
+    _HAS_TRITON = False
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _phase_chunk_sum_fwd_kernel(
+        Theta_ptr,
+        WM_ptr,
+        ChunkSum_ptr,
+        stride_tb,
+        stride_tt,
+        stride_th,
+        stride_td,
+        stride_wmb,
+        stride_wmt,
+        stride_csb,
+        stride_csc,
+        stride_csh,
+        stride_csd,
+        T_len,
+        H,
+        CHUNK_C: tl.constexpr,
+        D_HALF: tl.constexpr,
+        HAS_WM: tl.constexpr,
+    ):
+        c_id = tl.program_id(0)
+        bh = tl.program_id(1)
+        b = bh // H
+        h = bh % H
+
+        t0 = c_id * CHUNK_C
+        offs_t = t0 + tl.arange(0, CHUNK_C)
+        mask_t = offs_t < T_len
+        offs_d = tl.arange(0, D_HALF)
+
+        th = tl.load(
+            Theta_ptr + b * stride_tb + offs_t[:, None] * stride_tt + h * stride_th + offs_d[None, :] * stride_td,
+            mask=mask_t[:, None],
+            other=0.0,
+        ).to(tl.float64)
+        if HAS_WM:
+            wm = tl.load(WM_ptr + b * stride_wmb + offs_t * stride_wmt, mask=mask_t, other=0.0).to(tl.float64)
+            th = th * wm[:, None]
+        csum = tl.sum(th, axis=0)
+        tl.store(ChunkSum_ptr + b * stride_csb + c_id * stride_csc + h * stride_csh + offs_d * stride_csd, csum)
+
+    @triton.jit
+    def _phase_chunk_scan_fwd_kernel(
+        InitTheta_ptr,
+        ChunkSum_ptr,
+        ChunkPrefix_ptr,
+        TermTheta_ptr,
+        stride_ib,
+        stride_ih,
+        stride_id,
+        stride_csb,
+        stride_csc,
+        stride_csh,
+        stride_csd,
+        N_chunks,
+        H,
+        D_HALF: tl.constexpr,
+    ):
+        bh = tl.program_id(0)
+        b = bh // H
+        h = bh % H
+        offs_d = tl.arange(0, D_HALF)
+        two_pi = tl.full([D_HALF], 6.283185307179586476925286766559, dtype=tl.float64)
+
+        acc = tl.load(InitTheta_ptr + b * stride_ib + h * stride_ih + offs_d * stride_id).to(tl.float64)
+        for c in range(N_chunks):
+            tl.store(ChunkPrefix_ptr + b * stride_csb + c * stride_csc + h * stride_csh + offs_d * stride_csd, acc)
+            cs = tl.load(ChunkSum_ptr + b * stride_csb + c * stride_csc + h * stride_csh + offs_d * stride_csd)
+            acc = acc + cs
+        q = tl.floor(acc / two_pi)
+        term = acc - q * two_pi
+        tl.store(TermTheta_ptr + b * stride_ib + h * stride_ih + offs_d * stride_id, term)
+
+    @triton.jit
+    def _phase_trig_emit_fwd_kernel(
+        Theta_ptr,
+        WM_ptr,
+        ChunkPrefix_ptr,
+        Cos_ptr,
+        Sin_ptr,
+        ModF32_ptr,
+        stride_tb,
+        stride_tt,
+        stride_th,
+        stride_td,
+        stride_wmb,
+        stride_wmt,
+        stride_cpb,
+        stride_cpc,
+        stride_cph,
+        stride_cpd,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        T_len,
+        H,
+        CHUNK_C: tl.constexpr,
+        D_HALF: tl.constexpr,
+        HAS_WM: tl.constexpr,
+        SAVE_MOD: tl.constexpr,
+    ):
+        c_id = tl.program_id(0)
+        bh = tl.program_id(1)
+        b = bh // H
+        h = bh % H
+
+        t0 = c_id * CHUNK_C
+        offs_t = t0 + tl.arange(0, CHUNK_C)
+        mask_t = offs_t < T_len
+        offs_d = tl.arange(0, D_HALF)
+        two_pi = tl.full([1, D_HALF], 6.283185307179586476925286766559, dtype=tl.float64)
+
+        th = tl.load(
+            Theta_ptr + b * stride_tb + offs_t[:, None] * stride_tt + h * stride_th + offs_d[None, :] * stride_td,
+            mask=mask_t[:, None],
+            other=0.0,
+        ).to(tl.float64)
+        if HAS_WM:
+            wm = tl.load(WM_ptr + b * stride_wmb + offs_t * stride_wmt, mask=mask_t, other=0.0).to(tl.float64)
+            th = th * wm[:, None]
+
+        pref = tl.load(ChunkPrefix_ptr + b * stride_cpb + c_id * stride_cpc + h * stride_cph + offs_d * stride_cpd)
+        th_cum = pref[None, :] + tl.cumsum(th, axis=0)
+        q_pos = tl.floor(th_cum / two_pi)
+        th_mod = th_cum - q_pos * two_pi
+        neg_th = -th_mod
+        q_neg = tl.floor(neg_th / two_pi)
+        neg_mod = (neg_th - q_neg * two_pi).to(tl.float32)
+
+        cos_v = tl.cos(neg_mod)
+        sin_v = tl.sin(neg_mod)
+        o_ptrs = b * stride_ob + offs_t[:, None] * stride_ot + h * stride_oh + offs_d[None, :] * stride_od
+        tl.store(Cos_ptr + o_ptrs, cos_v.to(Cos_ptr.dtype.element_ty), mask=mask_t[:, None])
+        tl.store(Sin_ptr + o_ptrs, sin_v.to(Sin_ptr.dtype.element_ty), mask=mask_t[:, None])
+        if SAVE_MOD:
+            tl.store(ModF32_ptr + o_ptrs, neg_mod, mask=mask_t[:, None])
+
+    @triton.jit
+    def _phase_bwd_chunk_sum_kernel(
+        DCos_ptr,
+        DSin_ptr,
+        ModF32_ptr,
+        DTerm_ptr,
+        DChunkSum_ptr,
+        DLocal_ptr,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        stride_ib,
+        stride_ih,
+        stride_id,
+        stride_csb,
+        stride_csc,
+        stride_csh,
+        stride_csd,
+        T_len,
+        H,
+        CHUNK_C: tl.constexpr,
+        D_HALF: tl.constexpr,
+        HAS_DTERM: tl.constexpr,
+    ):
+        c_id = tl.program_id(0)
+        bh = tl.program_id(1)
+        b = bh // H
+        h = bh % H
+
+        t0 = c_id * CHUNK_C
+        offs_t = t0 + tl.arange(0, CHUNK_C)
+        mask_t = offs_t < T_len
+        offs_d = tl.arange(0, D_HALF)
+
+        o_ptrs = b * stride_ob + offs_t[:, None] * stride_ot + h * stride_oh + offs_d[None, :] * stride_od
+        dcos = tl.load(DCos_ptr + o_ptrs, mask=mask_t[:, None], other=0.0).to(tl.float32)
+        dsin = tl.load(DSin_ptr + o_ptrs, mask=mask_t[:, None], other=0.0).to(tl.float32)
+        neg_mod = tl.load(ModF32_ptr + o_ptrs, mask=mask_t[:, None], other=0.0)
+        dth_cum = tl.where(mask_t[:, None], dcos * tl.sin(neg_mod) - dsin * tl.cos(neg_mod), 0.0)
+        if HAS_DTERM:
+            is_last = offs_t == (T_len - 1)
+            dterm = tl.load(DTerm_ptr + b * stride_ib + h * stride_ih + offs_d * stride_id).to(tl.float32)
+            dth_cum = dth_cum + tl.where(is_last[:, None], dterm[None, :], 0.0)
+
+        tl.store(DLocal_ptr + o_ptrs, dth_cum, mask=mask_t[:, None])
+        tl.store(
+            DChunkSum_ptr + b * stride_csb + c_id * stride_csc + h * stride_csh + offs_d * stride_csd,
+            tl.sum(dth_cum, axis=0),
+        )
+
+    @triton.jit
+    def _phase_bwd_scan_suffix_kernel(
+        DChunkSum_ptr,
+        DSuffix_ptr,
+        DInit_ptr,
+        stride_csb,
+        stride_csc,
+        stride_csh,
+        stride_csd,
+        stride_ib,
+        stride_ih,
+        stride_id,
+        N_chunks,
+        H,
+        D_HALF: tl.constexpr,
+    ):
+        bh = tl.program_id(0)
+        b = bh // H
+        h = bh % H
+        offs_d = tl.arange(0, D_HALF)
+        acc = tl.zeros([D_HALF], dtype=tl.float32)
+        for c_rev in range(N_chunks):
+            c = N_chunks - 1 - c_rev
+            tl.store(DSuffix_ptr + b * stride_csb + c * stride_csc + h * stride_csh + offs_d * stride_csd, acc)
+            acc += tl.load(DChunkSum_ptr + b * stride_csb + c * stride_csc + h * stride_csh + offs_d * stride_csd)
+        tl.store(DInit_ptr + b * stride_ib + h * stride_ih + offs_d * stride_id, acc.to(tl.float64))
+
+    @triton.jit
+    def _phase_bwd_emit_kernel(
+        DLocal_ptr,
+        DSuffix_ptr,
+        Theta_ptr,
+        WM_ptr,
+        DTheta_ptr,
+        DWM_ptr,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        stride_csb,
+        stride_csc,
+        stride_csh,
+        stride_csd,
+        stride_tb,
+        stride_tt,
+        stride_th,
+        stride_td,
+        stride_wmb,
+        stride_wmt,
+        T_len,
+        H,
+        CHUNK_C: tl.constexpr,
+        D_HALF: tl.constexpr,
+        HAS_WM: tl.constexpr,
+        NEED_DWM: tl.constexpr,
+    ):
+        c_id = tl.program_id(0)
+        bh = tl.program_id(1)
+        b = bh // H
+        h = bh % H
+
+        t0 = c_id * CHUNK_C
+        offs_t = t0 + tl.arange(0, CHUNK_C)
+        mask_t = offs_t < T_len
+        offs_d = tl.arange(0, D_HALF)
+
+        o_ptrs = b * stride_ob + offs_t[:, None] * stride_ot + h * stride_oh + offs_d[None, :] * stride_od
+        dloc = tl.load(DLocal_ptr + o_ptrs, mask=mask_t[:, None], other=0.0)
+        suff = tl.load(DSuffix_ptr + b * stride_csb + c_id * stride_csc + h * stride_csh + offs_d * stride_csd)
+        tot_c = tl.sum(dloc, axis=0)
+        rev_c = tot_c[None, :] - tl.cumsum(dloc, axis=0) + dloc + suff[None, :]
+        rev_c = tl.where(mask_t[:, None], rev_c, 0.0)
+
+        if HAS_WM:
+            wm = tl.load(WM_ptr + b * stride_wmb + offs_t * stride_wmt, mask=mask_t, other=0.0).to(tl.float32)
+            if NEED_DWM:
+                th = tl.load(
+                    Theta_ptr
+                    + b * stride_tb
+                    + offs_t[:, None] * stride_tt
+                    + h * stride_th
+                    + offs_d[None, :] * stride_td,
+                    mask=mask_t[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                dwm_h = tl.sum(rev_c * th, axis=1)
+                tl.atomic_add(DWM_ptr + b * stride_wmb + offs_t * stride_wmt, dwm_h, mask=mask_t)
+            rev_c = rev_c * wm[:, None]
+
+        tl.store(
+            DTheta_ptr + b * stride_tb + offs_t[:, None] * stride_tt + h * stride_th + offs_d[None, :] * stride_td,
+            rev_c.to(DTheta_ptr.dtype.element_ty),
+            mask=mask_t[:, None],
+        )
+
+    class _TritonPhaseTrigFn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, theta, init_theta_cum, wm, out_dtype: torch.dtype):
+            ctx.set_materialize_grads(False)
+            B, T, H, D_half = theta.shape
+            chunk_c = 64
+            n_chunks = (T + chunk_c - 1) // chunk_c
+            th_c = theta.contiguous()
+            init_c = init_theta_cum.to(torch.float64).contiguous()
+            has_wm = wm is not None
+            wm_c = wm.float().contiguous() if has_wm else th_c.new_empty((1, 1), dtype=torch.float32)
+
+            csum = torch.empty((B, n_chunks, H, D_half), device=th_c.device, dtype=torch.float64)
+            cpref = torch.empty((B, n_chunks, H, D_half), device=th_c.device, dtype=torch.float64)
+            term_th = torch.empty((B, H, D_half), device=th_c.device, dtype=torch.float64)
+            cos_t = torch.empty((B, T, H, D_half), device=th_c.device, dtype=out_dtype)
+            sin_t = torch.empty((B, T, H, D_half), device=th_c.device, dtype=out_dtype)
+            need_bwd = any(ctx.needs_input_grad)
+            mod_f32 = (
+                torch.empty((B, T, H, D_half), device=th_c.device, dtype=torch.float32)
+                if need_bwd
+                else cos_t.new_empty(0, dtype=torch.float32)
+            )
+
+            _phase_chunk_sum_fwd_kernel[(n_chunks, B * H)](
+                th_c,
+                wm_c,
+                csum,
+                *th_c.stride(),
+                *wm_c.stride(),
+                *csum.stride(),
+                T,
+                H,
+                CHUNK_C=chunk_c,
+                D_HALF=D_half,
+                HAS_WM=has_wm,
+                num_warps=4,
+                num_stages=1,
+            )
+            _phase_chunk_scan_fwd_kernel[(B * H,)](
+                init_c,
+                csum,
+                cpref,
+                term_th,
+                *init_c.stride(),
+                *csum.stride(),
+                n_chunks,
+                H,
+                D_HALF=D_half,
+                num_warps=2,
+                num_stages=1,
+            )
+            _phase_trig_emit_fwd_kernel[(n_chunks, B * H)](
+                th_c,
+                wm_c,
+                cpref,
+                cos_t,
+                sin_t,
+                mod_f32,
+                *th_c.stride(),
+                *wm_c.stride(),
+                *cpref.stride(),
+                *cos_t.stride(),
+                T,
+                H,
+                CHUNK_C=chunk_c,
+                D_HALF=D_half,
+                HAS_WM=has_wm,
+                SAVE_MOD=need_bwd,
+                num_warps=4,
+                num_stages=1,
+            )
+            if need_bwd:
+                ctx.save_for_backward(th_c, wm_c, mod_f32)
+                ctx.meta = (has_wm, B, T, H, D_half)
+            return cos_t, sin_t, term_th
+
+        @staticmethod
+        def backward(ctx, dcos, dsin, dterm):
+            th_c, wm_c, mod_f32 = ctx.saved_tensors
+            has_wm, B, T, H, D_half = ctx.meta
+            chunk_c = 64
+            n_chunks = (T + chunk_c - 1) // chunk_c
+            dcos_c = (
+                dcos.contiguous()
+                if dcos is not None
+                else torch.zeros((B, T, H, D_half), device=th_c.device, dtype=torch.float32)
+            )
+            dsin_c = (
+                dsin.contiguous()
+                if dsin is not None
+                else torch.zeros((B, T, H, D_half), device=th_c.device, dtype=torch.float32)
+            )
+            dterm_c = (
+                dterm.contiguous() if dterm is not None else mod_f32.new_zeros((B, H, D_half), dtype=torch.float64)
+            )
+
+            dcsum = torch.empty((B, n_chunks, H, D_half), device=th_c.device, dtype=torch.float32)
+            dsuff = torch.empty((B, n_chunks, H, D_half), device=th_c.device, dtype=torch.float32)
+            dloc = torch.empty((B, T, H, D_half), device=th_c.device, dtype=torch.float32)
+            dinit = torch.empty((B, H, D_half), device=th_c.device, dtype=torch.float64)
+            dtheta = torch.empty_like(th_c)
+            need_dwm = bool(has_wm and ctx.needs_input_grad[2])
+            dwm = torch.zeros_like(wm_c) if need_dwm else wm_c.new_empty(1)
+
+            _phase_bwd_chunk_sum_kernel[(n_chunks, B * H)](
+                dcos_c,
+                dsin_c,
+                mod_f32,
+                dterm_c,
+                dcsum,
+                dloc,
+                *mod_f32.stride(),
+                *dterm_c.stride(),
+                *dcsum.stride(),
+                T,
+                H,
+                CHUNK_C=chunk_c,
+                D_HALF=D_half,
+                HAS_DTERM=(dterm is not None),
+                num_warps=4,
+                num_stages=1,
+            )
+            _phase_bwd_scan_suffix_kernel[(B * H,)](
+                dcsum,
+                dsuff,
+                dinit,
+                *dcsum.stride(),
+                *dinit.stride(),
+                n_chunks,
+                H,
+                D_HALF=D_half,
+                num_warps=2,
+                num_stages=1,
+            )
+            _phase_bwd_emit_kernel[(n_chunks, B * H)](
+                dloc,
+                dsuff,
+                th_c,
+                wm_c,
+                dtheta,
+                dwm,
+                *dloc.stride(),
+                *dsuff.stride(),
+                *th_c.stride(),
+                *wm_c.stride(),
+                T,
+                H,
+                CHUNK_C=chunk_c,
+                D_HALF=D_half,
+                HAS_WM=has_wm,
+                NEED_DWM=need_dwm,
+                num_warps=4,
+                num_stages=1,
+            )
+            return (
+                dtheta if ctx.needs_input_grad[0] else None,
+                dinit if ctx.needs_input_grad[1] else None,
+                dwm if need_dwm else None,
+                None,
+            )
+
+    @triton.jit
+    def _scan_prep_fwd_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        BGate_ptr,
+        WGate_ptr,
+        Cos_ptr,
+        Sin_ptr,
+        QHat_ptr,
+        KHat_ptr,
+        VTc_ptr,
+        KBase_ptr,
+        VBase_ptr,
+        stride_qb,
+        stride_qt,
+        stride_qh,
+        stride_qd,
+        stride_kb,
+        stride_kt,
+        stride_kh,
+        stride_kd,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_bgb,
+        stride_bgt,
+        stride_bgh,
+        stride_bgd,
+        stride_wgb,
+        stride_wgt,
+        stride_wgh,
+        stride_wgd,
+        stride_cb,
+        stride_ct,
+        stride_ch,
+        stride_cd,
+        stride_qhb,
+        stride_qht,
+        stride_qhh,
+        stride_qhd,
+        stride_vtb,
+        stride_vtt,
+        stride_vth,
+        stride_vtd,
+        T_len,
+        H,
+        scale,
+        D_HALF: tl.constexpr,
+        D_V: tl.constexpr,
+        USE_PHASE: tl.constexpr,
+        USE_L2: tl.constexpr,
+    ):
+        bt = tl.program_id(0)
+        h = tl.program_id(1)
+        b = bt // T_len
+        t = bt % T_len
+
+        offs_p = tl.arange(0, D_HALF)
+        d0 = 2 * offs_p
+        d1 = d0 + 1
+
+        q_base = Q_ptr + b * stride_qb + t * stride_qt + h * stride_qh
+        k_base_p = K_ptr + b * stride_kb + t * stride_kt + h * stride_kh
+        q0 = tl.load(q_base + d0 * stride_qd).to(tl.float32)
+        q1 = tl.load(q_base + d1 * stride_qd).to(tl.float32)
+        k0 = tl.load(k_base_p + d0 * stride_kd).to(tl.float32)
+        k1 = tl.load(k_base_p + d1 * stride_kd).to(tl.float32)
+
+        if USE_L2:
+            rq = tl.rsqrt(tl.sum(q0 * q0 + q1 * q1, axis=0) + 1e-6)
+            rk = tl.rsqrt(tl.sum(k0 * k0 + k1 * k1, axis=0) + 1e-6)
+            q0 = q0 * rq
+            q1 = q1 * rq
+            k0 = k0 * rk
+            k1 = k1 * rk
+
+        if USE_PHASE:
+            c_base = b * stride_cb + t * stride_ct + h * stride_ch + offs_p * stride_cd
+            cs = tl.load(Cos_ptr + c_base).to(tl.float32)
+            sn = tl.load(Sin_ptr + c_base).to(tl.float32)
+            qr0 = q0 * cs - q1 * sn
+            qr1 = q0 * sn + q1 * cs
+            kr0 = k0 * cs - k1 * sn
+            kr1 = k0 * sn + k1 * cs
+        else:
+            qr0 = q0
+            qr1 = q1
+            kr0 = k0
+            kr1 = k1
+
+        bg_p = BGate_ptr + b * stride_bgb + t * stride_bgt + h * stride_bgh
+        bg0 = tl.load(bg_p + d0 * stride_bgd).to(tl.float32)
+        bg1 = tl.load(bg_p + d1 * stride_bgd).to(tl.float32)
+        sb0 = tl.where(bg0 > 0.0, tl.sqrt(tl.where(bg0 > 0.0, bg0, 1.0)), 0.0)
+        sb1 = tl.where(bg1 > 0.0, tl.sqrt(tl.where(bg1 > 0.0, bg1, 1.0)), 0.0)
+
+        out_k_off = b * stride_qhb + t * stride_qht + h * stride_qhh
+        out_dt = QHat_ptr.dtype.element_ty
+        tl.store(QHat_ptr + out_k_off + d0 * stride_qhd, (qr0 * scale).to(out_dt))
+        tl.store(QHat_ptr + out_k_off + d1 * stride_qhd, (qr1 * scale).to(out_dt))
+        tl.store(KHat_ptr + out_k_off + d0 * stride_qhd, kr0.to(out_dt))
+        tl.store(KHat_ptr + out_k_off + d1 * stride_qhd, kr1.to(out_dt))
+        tl.store(KBase_ptr + out_k_off + d0 * stride_qhd, (sb0 * kr0).to(out_dt))
+        tl.store(KBase_ptr + out_k_off + d1 * stride_qhd, (sb1 * kr1).to(out_dt))
+
+        offs_v = tl.arange(0, D_V)
+        vv = tl.load(V_ptr + b * stride_vb + t * stride_vt + h * stride_vh + offs_v * stride_vd).to(tl.float32)
+        wg = tl.load(WGate_ptr + b * stride_wgb + t * stride_wgt + h * stride_wgh + offs_v * stride_wgd).to(tl.float32)
+        sw = tl.where(wg > 0.0, tl.sqrt(tl.where(wg > 0.0, wg, 1.0)), 0.0)
+        out_v_off = b * stride_vtb + t * stride_vtt + h * stride_vth + offs_v * stride_vtd
+        tl.store(VTc_ptr + out_v_off, vv.to(out_dt))
+        tl.store(VBase_ptr + out_v_off, (sw * vv).to(out_dt))
+
+    @triton.jit
+    def _scan_prep_bwd_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        BGate_ptr,
+        WGate_ptr,
+        Cos_ptr,
+        Sin_ptr,
+        DQHat_ptr,
+        DKHat_ptr,
+        DVTc_ptr,
+        DKBase_ptr,
+        DVBase_ptr,
+        DQ_ptr,
+        DK_ptr,
+        DV_ptr,
+        DBGate_ptr,
+        DWGate_ptr,
+        DCos_ptr,
+        DSin_ptr,
+        stride_qb,
+        stride_qt,
+        stride_qh,
+        stride_qd,
+        stride_kb,
+        stride_kt,
+        stride_kh,
+        stride_kd,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_bgb,
+        stride_bgt,
+        stride_bgh,
+        stride_bgd,
+        stride_wgb,
+        stride_wgt,
+        stride_wgh,
+        stride_wgd,
+        stride_cb,
+        stride_ct,
+        stride_ch,
+        stride_cd,
+        stride_qhb,
+        stride_qht,
+        stride_qhh,
+        stride_qhd,
+        stride_vtb,
+        stride_vtt,
+        stride_vth,
+        stride_vtd,
+        T_len,
+        H,
+        scale,
+        D_HALF: tl.constexpr,
+        D_V: tl.constexpr,
+        USE_PHASE: tl.constexpr,
+        USE_L2: tl.constexpr,
+    ):
+        bt = tl.program_id(0)
+        h = tl.program_id(1)
+        b = bt // T_len
+        t = bt % T_len
+
+        offs_p = tl.arange(0, D_HALF)
+        d0 = 2 * offs_p
+        d1 = d0 + 1
+
+        q_base = Q_ptr + b * stride_qb + t * stride_qt + h * stride_qh
+        k_base_p = K_ptr + b * stride_kb + t * stride_kt + h * stride_kh
+        q0_raw = tl.load(q_base + d0 * stride_qd).to(tl.float32)
+        q1_raw = tl.load(q_base + d1 * stride_qd).to(tl.float32)
+        k0_raw = tl.load(k_base_p + d0 * stride_kd).to(tl.float32)
+        k1_raw = tl.load(k_base_p + d1 * stride_kd).to(tl.float32)
+
+        if USE_L2:
+            rq = tl.rsqrt(tl.sum(q0_raw * q0_raw + q1_raw * q1_raw, axis=0) + 1e-6)
+            rk = tl.rsqrt(tl.sum(k0_raw * k0_raw + k1_raw * k1_raw, axis=0) + 1e-6)
+            q0 = q0_raw * rq
+            q1 = q1_raw * rq
+            k0 = k0_raw * rk
+            k1 = k1_raw * rk
+        else:
+            rq = 1.0
+            rk = 1.0
+            q0 = q0_raw
+            q1 = q1_raw
+            k0 = k0_raw
+            k1 = k1_raw
+
+        if USE_PHASE:
+            c_base = b * stride_cb + t * stride_ct + h * stride_ch + offs_p * stride_cd
+            cs = tl.load(Cos_ptr + c_base).to(tl.float32)
+            sn = tl.load(Sin_ptr + c_base).to(tl.float32)
+            kr0 = k0 * cs - k1 * sn
+            kr1 = k0 * sn + k1 * cs
+        else:
+            cs = tl.zeros([D_HALF], dtype=tl.float32) + 1.0
+            sn = tl.zeros([D_HALF], dtype=tl.float32)
+            kr0 = k0
+            kr1 = k1
+
+        bg_p = BGate_ptr + b * stride_bgb + t * stride_bgt + h * stride_bgh
+        bg0 = tl.load(bg_p + d0 * stride_bgd).to(tl.float32)
+        bg1 = tl.load(bg_p + d1 * stride_bgd).to(tl.float32)
+        sb0 = tl.where(bg0 > 0.0, tl.sqrt(tl.where(bg0 > 0.0, bg0, 1.0)), 0.0)
+        sb1 = tl.where(bg1 > 0.0, tl.sqrt(tl.where(bg1 > 0.0, bg1, 1.0)), 0.0)
+
+        out_k_off = b * stride_qhb + t * stride_qht + h * stride_qhh
+        dqh0 = tl.load(DQHat_ptr + out_k_off + d0 * stride_qhd).to(tl.float32) * scale
+        dqh1 = tl.load(DQHat_ptr + out_k_off + d1 * stride_qhd).to(tl.float32) * scale
+        dkh0 = tl.load(DKHat_ptr + out_k_off + d0 * stride_qhd).to(tl.float32)
+        dkh1 = tl.load(DKHat_ptr + out_k_off + d1 * stride_qhd).to(tl.float32)
+        dkb0 = tl.load(DKBase_ptr + out_k_off + d0 * stride_qhd).to(tl.float32)
+        dkb1 = tl.load(DKBase_ptr + out_k_off + d1 * stride_qhd).to(tl.float32)
+
+        dbg0 = tl.where(bg0 > 0.0, 0.5 * dkb0 * kr0 / tl.where(bg0 > 0.0, sb0, 1.0), 0.0)
+        dbg1 = tl.where(bg1 > 0.0, 0.5 * dkb1 * kr1 / tl.where(bg1 > 0.0, sb1, 1.0), 0.0)
+        dbg_p = DBGate_ptr + b * stride_bgb + t * stride_bgt + h * stride_bgh
+        tl.store(dbg_p + d0 * stride_bgd, dbg0.to(DBGate_ptr.dtype.element_ty))
+        tl.store(dbg_p + d1 * stride_bgd, dbg1.to(DBGate_ptr.dtype.element_ty))
+
+        dkr0 = dkh0 + sb0 * dkb0
+        dkr1 = dkh1 + sb1 * dkb1
+
+        if USE_PHASE:
+            dcos = (dqh0 * q0 + dqh1 * q1) + (dkr0 * k0 + dkr1 * k1)
+            dsin = (-dqh0 * q1 + dqh1 * q0) + (-dkr0 * k1 + dkr1 * k0)
+            c_base = b * stride_cb + t * stride_ct + h * stride_ch + offs_p * stride_cd
+            tl.store(DCos_ptr + c_base, dcos.to(DCos_ptr.dtype.element_ty))
+            tl.store(DSin_ptr + c_base, dsin.to(DSin_ptr.dtype.element_ty))
+            dqn0 = dqh0 * cs + dqh1 * sn
+            dqn1 = -dqh0 * sn + dqh1 * cs
+            dkn0 = dkr0 * cs + dkr1 * sn
+            dkn1 = -dkr0 * sn + dkr1 * cs
+        else:
+            dqn0 = dqh0
+            dqn1 = dqh1
+            dkn0 = dkr0
+            dkn1 = dkr1
+
+        if USE_L2:
+            q_dot = tl.sum(dqn0 * q0 + dqn1 * q1, axis=0)
+            k_dot = tl.sum(dkn0 * k0 + dkn1 * k1, axis=0)
+            dq0 = rq * (dqn0 - q0 * q_dot)
+            dq1 = rq * (dqn1 - q1 * q_dot)
+            dk0 = rk * (dkn0 - k0 * k_dot)
+            dk1 = rk * (dkn1 - k1 * k_dot)
+        else:
+            dq0 = dqn0
+            dq1 = dqn1
+            dk0 = dkn0
+            dk1 = dkn1
+
+        dq_p = DQ_ptr + b * stride_qb + t * stride_qt + h * stride_qh
+        dk_p = DK_ptr + b * stride_kb + t * stride_kt + h * stride_kh
+        tl.store(dq_p + d0 * stride_qd, dq0.to(DQ_ptr.dtype.element_ty))
+        tl.store(dq_p + d1 * stride_qd, dq1.to(DQ_ptr.dtype.element_ty))
+        tl.store(dk_p + d0 * stride_kd, dk0.to(DK_ptr.dtype.element_ty))
+        tl.store(dk_p + d1 * stride_kd, dk1.to(DK_ptr.dtype.element_ty))
+
+        offs_v = tl.arange(0, D_V)
+        vv = tl.load(V_ptr + b * stride_vb + t * stride_vt + h * stride_vh + offs_v * stride_vd).to(tl.float32)
+        wg = tl.load(WGate_ptr + b * stride_wgb + t * stride_wgt + h * stride_wgh + offs_v * stride_wgd).to(tl.float32)
+        sw = tl.where(wg > 0.0, tl.sqrt(tl.where(wg > 0.0, wg, 1.0)), 0.0)
+        out_v_off = b * stride_vtb + t * stride_vtt + h * stride_vth + offs_v * stride_vtd
+        dvtc = tl.load(DVTc_ptr + out_v_off).to(tl.float32)
+        dvb = tl.load(DVBase_ptr + out_v_off).to(tl.float32)
+        dv_tot = dvtc + sw * dvb
+        dwg = tl.where(wg > 0.0, 0.5 * dvb * vv / tl.where(wg > 0.0, sw, 1.0), 0.0)
+        tl.store(
+            DV_ptr + b * stride_vb + t * stride_vt + h * stride_vh + offs_v * stride_vd,
+            dv_tot.to(DV_ptr.dtype.element_ty),
+        )
+        tl.store(
+            DWGate_ptr + b * stride_wgb + t * stride_wgt + h * stride_wgh + offs_v * stride_wgd,
+            dwg.to(DWGate_ptr.dtype.element_ty),
+        )
+
+    class _TritonScanPrepFn(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx,
+            q,
+            k,
+            v,
+            b_gate,
+            w_gate,
+            cos_t,
+            sin_t,
+            scale: float,
+            use_phase: bool,
+            use_l2: bool,
+            tc_dt: torch.dtype,
+        ):
+            ctx.set_materialize_grads(False)
+            B, T, H, D_k = q.shape
+            D_v = v.shape[-1]
+            q_c = q.contiguous()
+            k_c = k.contiguous()
+            v_c = v.contiguous()
+            bg_c = b_gate.contiguous()
+            wg_c = w_gate.contiguous()
+            cos_c = cos_t.contiguous() if use_phase else q_c.new_empty((1, 1, 1, 1), dtype=tc_dt)
+            sin_c = sin_t.contiguous() if use_phase else q_c.new_empty((1, 1, 1, 1), dtype=tc_dt)
+
+            q_hat = torch.empty((B, T, H, D_k), device=q_c.device, dtype=tc_dt)
+            k_hat = torch.empty((B, T, H, D_k), device=q_c.device, dtype=tc_dt)
+            v_tc = torch.empty((B, T, H, D_v), device=q_c.device, dtype=tc_dt)
+            k_base = torch.empty((B, T, H, D_k), device=q_c.device, dtype=tc_dt)
+            v_base = torch.empty((B, T, H, D_v), device=q_c.device, dtype=tc_dt)
+
+            _scan_prep_fwd_kernel[(B * T, H)](
+                q_c,
+                k_c,
+                v_c,
+                bg_c,
+                wg_c,
+                cos_c,
+                sin_c,
+                q_hat,
+                k_hat,
+                v_tc,
+                k_base,
+                v_base,
+                *q_c.stride(),
+                *k_c.stride(),
+                *v_c.stride(),
+                *bg_c.stride(),
+                *wg_c.stride(),
+                *cos_c.stride(),
+                *q_hat.stride(),
+                *v_tc.stride(),
+                T,
+                H,
+                scale,
+                D_HALF=D_k // 2,
+                D_V=D_v,
+                USE_PHASE=use_phase,
+                USE_L2=use_l2,
+                num_warps=4,
+                num_stages=1,
+            )
+            if any(ctx.needs_input_grad):
+                ctx.save_for_backward(q_c, k_c, v_c, bg_c, wg_c, cos_c, sin_c)
+                ctx.meta = (scale, use_phase, use_l2, tc_dt)
+            return q_hat, k_hat, v_tc, k_base, v_base
+
+        @staticmethod
+        def backward(ctx, dq_hat, dk_hat, dv_tc, dk_base, dv_base):
+            q_c, k_c, v_c, bg_c, wg_c, cos_c, sin_c = ctx.saved_tensors
+            scale, use_phase, use_l2, tc_dt = ctx.meta
+            B, T, H, D_k = q_c.shape
+            D_v = v_c.shape[-1]
+
+            dqh_c = (
+                dq_hat.contiguous()
+                if dq_hat is not None
+                else torch.zeros((B, T, H, D_k), device=q_c.device, dtype=tc_dt)
+            )
+            dkh_c = (
+                dk_hat.contiguous()
+                if dk_hat is not None
+                else torch.zeros((B, T, H, D_k), device=q_c.device, dtype=tc_dt)
+            )
+            dvtc_c = (
+                dv_tc.contiguous() if dv_tc is not None else torch.zeros((B, T, H, D_v), device=q_c.device, dtype=tc_dt)
+            )
+            dkb_c = (
+                dk_base.contiguous()
+                if dk_base is not None
+                else torch.zeros((B, T, H, D_k), device=q_c.device, dtype=tc_dt)
+            )
+            dvb_c = (
+                dv_base.contiguous()
+                if dv_base is not None
+                else torch.zeros((B, T, H, D_v), device=q_c.device, dtype=tc_dt)
+            )
+
+            dq = torch.empty_like(q_c)
+            dk = torch.empty_like(k_c)
+            dv = torch.empty_like(v_c)
+            dbg = torch.empty_like(bg_c)
+            dwg = torch.empty_like(wg_c)
+            dcos = torch.empty_like(cos_c) if use_phase else cos_c
+            dsin = torch.empty_like(sin_c) if use_phase else sin_c
+
+            _scan_prep_bwd_kernel[(B * T, H)](
+                q_c,
+                k_c,
+                v_c,
+                bg_c,
+                wg_c,
+                cos_c,
+                sin_c,
+                dqh_c,
+                dkh_c,
+                dvtc_c,
+                dkb_c,
+                dvb_c,
+                dq,
+                dk,
+                dv,
+                dbg,
+                dwg,
+                dcos,
+                dsin,
+                *q_c.stride(),
+                *k_c.stride(),
+                *v_c.stride(),
+                *bg_c.stride(),
+                *wg_c.stride(),
+                *cos_c.stride(),
+                *dqh_c.stride(),
+                *dvtc_c.stride(),
+                T,
+                H,
+                scale,
+                D_HALF=D_k // 2,
+                D_V=D_v,
+                USE_PHASE=use_phase,
+                USE_L2=use_l2,
+                num_warps=4,
+                num_stages=1,
+            )
+            return (
+                dq if ctx.needs_input_grad[0] else None,
+                dk if ctx.needs_input_grad[1] else None,
+                dv if ctx.needs_input_grad[2] else None,
+                dbg if ctx.needs_input_grad[3] else None,
+                dwg if ctx.needs_input_grad[4] else None,
+                dcos if (use_phase and ctx.needs_input_grad[5]) else None,
+                dsin if (use_phase and ctx.needs_input_grad[6]) else None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+    @triton.jit
+    def _boltzmann_blend_fwd_kernel(
+        OLoc_ptr,
+        OFar_ptr,
+        LSE_ptr,
+        MaxSc_ptr,
+        Counts_ptr,
+        LogKappa_ptr,
+        Tau_ptr,
+        Out_ptr,
+        stride_olb,
+        stride_olt,
+        stride_olh,
+        stride_old,
+        stride_ofb,
+        stride_oft,
+        stride_ofh,
+        stride_ofd,
+        stride_lb,
+        stride_lt,
+        stride_lh,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        T_len,
+        H,
+        SCALAR_GATE: tl.constexpr,
+        D_V: tl.constexpr,
+    ):
+        bt = tl.program_id(0)
+        h = tl.program_id(1)
+        b = bt // T_len
+        t = bt % T_len
+
+        l_off = b * stride_lb + t * stride_lt + h * stride_lh
+        cnt = tl.load(Counts_ptr + l_off)
+        offs_v = tl.arange(0, D_V)
+        o_far = tl.load(OFar_ptr + b * stride_ofb + t * stride_oft + h * stride_ofh + offs_v * stride_ofd).to(
+            tl.float32
+        )
+
+        if cnt > 0:
+            lse = tl.load(LSE_ptr + l_off).to(tl.float32)
+            msc = tl.load(MaxSc_ptr + l_off).to(tl.float32)
+            n_eff = cnt.to(tl.float32)
+            n_gum = tl.maximum(n_eff, 2.0)
+            stat = 0.5 * (lse - tl.log(n_eff)) + 0.5 * (msc - tl.sqrt(2.0 * tl.log(n_gum)))
+            g_idx = 0 if SCALAR_GATE else h
+            kappa = tl.exp(tl.load(LogKappa_ptr + g_idx).to(tl.float32))
+            tau = tl.load(Tau_ptr + g_idx).to(tl.float32)
+            p_hit = tl.sigmoid(kappa * (stat - tau))
+            o_loc = tl.load(OLoc_ptr + b * stride_olb + t * stride_olt + h * stride_olh + offs_v * stride_old).to(
+                tl.float32
+            )
+            res = p_hit * o_loc + (1.0 - p_hit) * o_far
+        else:
+            res = o_far
+
+        tl.store(
+            Out_ptr + b * stride_ob + t * stride_ot + h * stride_oh + offs_v * stride_od,
+            res.to(Out_ptr.dtype.element_ty),
+        )
+
+    @triton.jit
+    def _boltzmann_blend_bwd_kernel(
+        OLoc_ptr,
+        OFar_ptr,
+        LSE_ptr,
+        MaxSc_ptr,
+        Counts_ptr,
+        LogKappa_ptr,
+        Tau_ptr,
+        DOut_ptr,
+        DOLoc_ptr,
+        DOFar_ptr,
+        DLSE_ptr,
+        DMaxSc_ptr,
+        DLogKappaPart_ptr,
+        DTauPart_ptr,
+        stride_olb,
+        stride_olt,
+        stride_olh,
+        stride_old,
+        stride_ofb,
+        stride_oft,
+        stride_ofh,
+        stride_ofd,
+        stride_lb,
+        stride_lt,
+        stride_lh,
+        stride_dob,
+        stride_dot,
+        stride_doh,
+        stride_dod,
+        T_len,
+        H,
+        SCALAR_GATE: tl.constexpr,
+        D_V: tl.constexpr,
+    ):
+        bt = tl.program_id(0)
+        h = tl.program_id(1)
+        b = bt // T_len
+        t = bt % T_len
+
+        l_off = b * stride_lb + t * stride_lt + h * stride_lh
+        cnt = tl.load(Counts_ptr + l_off)
+        offs_v = tl.arange(0, D_V)
+        do = tl.load(DOut_ptr + b * stride_dob + t * stride_dot + h * stride_doh + offs_v * stride_dod).to(tl.float32)
+        o_far = tl.load(OFar_ptr + b * stride_ofb + t * stride_oft + h * stride_ofh + offs_v * stride_ofd).to(
+            tl.float32
+        )
+        part_idx = bt * H + h
+
+        if cnt > 0:
+            lse = tl.load(LSE_ptr + l_off).to(tl.float32)
+            msc = tl.load(MaxSc_ptr + l_off).to(tl.float32)
+            n_eff = cnt.to(tl.float32)
+            n_gum = tl.maximum(n_eff, 2.0)
+            stat = 0.5 * (lse - tl.log(n_eff)) + 0.5 * (msc - tl.sqrt(2.0 * tl.log(n_gum)))
+            g_idx = 0 if SCALAR_GATE else h
+            kappa = tl.exp(tl.load(LogKappa_ptr + g_idx).to(tl.float32))
+            tau = tl.load(Tau_ptr + g_idx).to(tl.float32)
+            p_hit = tl.sigmoid(kappa * (stat - tau))
+            o_loc = tl.load(OLoc_ptr + b * stride_olb + t * stride_olt + h * stride_olh + offs_v * stride_old).to(
+                tl.float32
+            )
+            do_loc = p_hit * do
+            do_far = (1.0 - p_hit) * do
+            dp_hit = tl.sum(do * (o_loc - o_far), axis=0)
+            dz = dp_hit * p_hit * (1.0 - p_hit)
+            dstat = dz * kappa
+            tl.store(DLSE_ptr + l_off, 0.5 * dstat)
+            tl.store(DMaxSc_ptr + l_off, 0.5 * dstat)
+            tl.store(DLogKappaPart_ptr + part_idx, dz * kappa * (stat - tau))
+            tl.store(DTauPart_ptr + part_idx, -dz * kappa)
+        else:
+            do_loc = tl.zeros([D_V], dtype=tl.float32)
+            do_far = do
+            tl.store(DLSE_ptr + l_off, 0.0)
+            tl.store(DMaxSc_ptr + l_off, 0.0)
+            tl.store(DLogKappaPart_ptr + part_idx, 0.0)
+            tl.store(DTauPart_ptr + part_idx, 0.0)
+
+        tl.store(
+            DOLoc_ptr + b * stride_olb + t * stride_olt + h * stride_olh + offs_v * stride_old,
+            do_loc.to(DOLoc_ptr.dtype.element_ty),
+        )
+        tl.store(DOFar_ptr + b * stride_ofb + t * stride_oft + h * stride_ofh + offs_v * stride_ofd, do_far)
+
+    class _TritonBoltzmannBlendFn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, o_loc, o_far, lse, max_sc, counts, log_kappa, tau, out_dtype: torch.dtype):
+            ctx.set_materialize_grads(False)
+            B, T, H, D_v = o_far.shape
+            ol_c = o_loc.contiguous()
+            of_c = o_far.contiguous()
+            lse_c = lse.contiguous()
+            msc_c = max_sc.contiguous()
+            cnt_c = counts.contiguous()
+            lk_c = log_kappa.float().contiguous()
+            tau_c = tau.float().contiguous()
+            scalar_gate = lk_c.numel() == 1
+
+            out = torch.empty((B, T, H, D_v), device=of_c.device, dtype=out_dtype)
+            _boltzmann_blend_fwd_kernel[(B * T, H)](
+                ol_c,
+                of_c,
+                lse_c,
+                msc_c,
+                cnt_c,
+                lk_c,
+                tau_c,
+                out,
+                *ol_c.stride(),
+                *of_c.stride(),
+                *lse_c.stride(),
+                *out.stride(),
+                T,
+                H,
+                SCALAR_GATE=scalar_gate,
+                D_V=D_v,
+                num_warps=4,
+                num_stages=1,
+            )
+            if any(ctx.needs_input_grad):
+                ctx.save_for_backward(ol_c, of_c, lse_c, msc_c, cnt_c, lk_c, tau_c)
+                ctx.meta = (scalar_gate, log_kappa.dtype, tau.dtype)
+            return out
+
+        @staticmethod
+        def backward(ctx, dout):
+            ol_c, of_c, lse_c, msc_c, cnt_c, lk_c, tau_c = ctx.saved_tensors
+            scalar_gate, lk_dt, tau_dt = ctx.meta
+            B, T, H, D_v = of_c.shape
+            if dout is None:
+                return None, None, None, None, None, None, None, None
+            do_c = dout.contiguous()
+            do_loc = torch.empty_like(ol_c)
+            do_far = torch.empty_like(of_c)
+            dlse = torch.empty_like(lse_c)
+            dmsc = torch.empty_like(msc_c)
+            dlk_part = torch.empty((B * T * H,), device=of_c.device, dtype=torch.float32)
+            dtau_part = torch.empty((B * T * H,), device=of_c.device, dtype=torch.float32)
+
+            _boltzmann_blend_bwd_kernel[(B * T, H)](
+                ol_c,
+                of_c,
+                lse_c,
+                msc_c,
+                cnt_c,
+                lk_c,
+                tau_c,
+                do_c,
+                do_loc,
+                do_far,
+                dlse,
+                dmsc,
+                dlk_part,
+                dtau_part,
+                *ol_c.stride(),
+                *of_c.stride(),
+                *lse_c.stride(),
+                *do_c.stride(),
+                T,
+                H,
+                SCALAR_GATE=scalar_gate,
+                D_V=D_v,
+                num_warps=4,
+                num_stages=1,
+            )
+            if scalar_gate:
+                dlk = dlk_part.sum().view_as(lk_c).to(lk_dt)
+                dtau = dtau_part.sum().view_as(tau_c).to(tau_dt)
+            else:
+                dlk = dlk_part.view(B * T, H).sum(dim=0).to(lk_dt)
+                dtau = dtau_part.view(B * T, H).sum(dim=0).to(tau_dt)
+            return (
+                do_loc if ctx.needs_input_grad[0] else None,
+                do_far if ctx.needs_input_grad[1] else None,
+                dlse if ctx.needs_input_grad[2] else None,
+                dmsc if ctx.needs_input_grad[3] else None,
+                None,
+                dlk if ctx.needs_input_grad[5] else None,
+                dtau if ctx.needs_input_grad[6] else None,
+                None,
+            )
+
+    @triton.jit
+    def _proj_gates_swa_fwd_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        Beta_ptr,
+        AllUp_ptr,
+        QNormW_ptr,
+        KNormW_ptr,
+        QOut_ptr,
+        KOut_ptr,
+        BGate_ptr,
+        WGate_ptr,
+        QSwa_ptr,
+        KSwa_ptr,
+        VSwa_ptr,
+        stride_qb,
+        stride_qt,
+        stride_qh,
+        stride_qd,
+        stride_kb,
+        stride_kt,
+        stride_kh,
+        stride_kd,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_bb,
+        stride_bt,
+        stride_bh,
+        stride_aub,
+        stride_aut,
+        stride_aud,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        stride_ovb,
+        stride_ovt,
+        stride_ovh,
+        stride_ovd,
+        T_len,
+        H_v,
+        gqa_q,
+        gqa_k,
+        cap_g,
+        root_dk,
+        D_K: tl.constexpr,
+        D_V: tl.constexpr,
+        USE_L2: tl.constexpr,
+        PAIRED_B: tl.constexpr,
+    ):
+        bt = tl.program_id(0)
+        h = tl.program_id(1)
+        b = bt // T_len
+        t = bt % T_len
+        hq = h // gqa_q
+        hk = h // gqa_k
+
+        offs_dk = tl.arange(0, D_K)
+        offs_dv = tl.arange(0, D_V)
+
+        qf = tl.load(Q_ptr + b * stride_qb + t * stride_qt + hq * stride_qh + offs_dk * stride_qd).to(tl.float32)
+        kf = tl.load(K_ptr + b * stride_kb + t * stride_kt + hk * stride_kh + offs_dk * stride_kd).to(tl.float32)
+        vf = tl.load(V_ptr + b * stride_vb + t * stride_vt + h * stride_vh + offs_dv * stride_vd).to(tl.float32)
+
+        if USE_L2:
+            qf = qf * tl.rsqrt(tl.sum(qf * qf, axis=0) + 1e-6)
+            kf = kf * tl.rsqrt(tl.sum(kf * kf, axis=0) + 1e-6)
+
+        au_base = AllUp_ptr + b * stride_aub + t * stride_aut
+        er_off = h * D_K + offs_dk
+        wr_off = H_v * D_K + h * D_V + offs_dv
+        sq_off = H_v * (D_K + D_V) + h * D_K + offs_dk
+        sk_off = H_v * (2 * D_K + D_V) + h * D_K + offs_dk
+        sv_off = H_v * (3 * D_K + D_V) + h * D_V + offs_dv
+
+        raw_er = tl.load(au_base + er_off * stride_aud).to(tl.float32)
+        raw_wr = tl.load(au_base + wr_off * stride_aud).to(tl.float32)
+        dq_s = tl.load(au_base + sq_off * stride_aud).to(tl.float32)
+        dk_s = tl.load(au_base + sk_off * stride_aud).to(tl.float32)
+        dv_s = tl.load(au_base + sv_off * stride_aud).to(tl.float32)
+
+        # tanh(x) = 2 * sigmoid(2 * x) - 1 (immune to exp overflow on large inputs!)
+        th_er = 2.0 * tl.sigmoid(2.0 * raw_er) - 1.0
+        th_wr = 2.0 * tl.sigmoid(2.0 * raw_wr) - 1.0
+        d_er = cap_g * th_er
+        d_wr = cap_g * th_wr
+
+        beta = tl.minimum(
+            tl.maximum(tl.load(Beta_ptr + b * stride_bb + t * stride_bt + h * stride_bh).to(tl.float32), 0.0), 1.0
+        )
+        bh_val = 0.5 * beta
+        s_e = 2.0 * tl.sigmoid(d_er) - 1.0
+        den_e = tl.maximum(1.0 + (2.0 * bh_val - 1.0) * s_e, 1e-12)
+        bg = 2.0 * tl.minimum(tl.maximum(bh_val + (2.0 * bh_val * (1.0 - bh_val) * s_e) / den_e, 0.0), 1.0)
+        if PAIRED_B:
+            bg_2d = tl.reshape(bg, [D_K // 2, 2])
+            bg_m = tl.sum(bg_2d, axis=1) * 0.5
+            bg = tl.reshape(tl.broadcast_to(bg_m[:, None], [D_K // 2, 2]), [D_K])
+
+        s_w = 2.0 * tl.sigmoid(d_wr) - 1.0
+        den_w = tl.maximum(1.0 + (2.0 * beta - 1.0) * s_w, 1e-12)
+        wg = tl.minimum(tl.maximum(beta + (2.0 * beta * (1.0 - beta) * s_w) / den_w, 0.0), 1.0)
+
+        qx = root_dk * qf + dq_s
+        kx = root_dk * kf + dk_s
+        rq_s = tl.rsqrt(tl.sum(qx * qx, axis=0) * (1.0 / D_K) + 1e-6)
+        rk_s = tl.rsqrt(tl.sum(kx * kx, axis=0) * (1.0 / D_K) + 1e-6)
+        qnw = tl.load(QNormW_ptr + offs_dk).to(tl.float32)
+        knw = tl.load(KNormW_ptr + offs_dk).to(tl.float32)
+        q_swa = qx * rq_s * qnw
+        k_swa = kx * rk_s * knw
+        v_swa = vf + dv_s
+
+        out_dt = QOut_ptr.dtype.element_ty
+        o_k = b * stride_ob + t * stride_ot + h * stride_oh + offs_dk * stride_od
+        o_v = b * stride_ovb + t * stride_ovt + h * stride_ovh + offs_dv * stride_ovd
+        tl.store(QOut_ptr + o_k, qf.to(out_dt))
+        tl.store(KOut_ptr + o_k, kf.to(out_dt))
+        tl.store(BGate_ptr + o_k, bg.to(out_dt))
+        tl.store(WGate_ptr + o_v, wg.to(out_dt))
+        tl.store(QSwa_ptr + o_k, q_swa.to(out_dt))
+        tl.store(KSwa_ptr + o_k, k_swa.to(out_dt))
+        tl.store(VSwa_ptr + o_v, v_swa.to(out_dt))
+
+    @triton.jit
+    def _proj_gates_swa_bwd_kernel(
+        Q_ptr,
+        K_ptr,
+        Beta_ptr,
+        AllUp_ptr,
+        QNormW_ptr,
+        KNormW_ptr,
+        DQOut_ptr,
+        DKOut_ptr,
+        DBGate_ptr,
+        DWGate_ptr,
+        DQSwa_ptr,
+        DKSwa_ptr,
+        DVSwa_ptr,
+        DQFull_ptr,
+        DKFull_ptr,
+        DVSub_ptr,
+        DBeta_ptr,
+        DAllUp_ptr,
+        DQNormPart_ptr,
+        DKNormPart_ptr,
+        stride_qb,
+        stride_qt,
+        stride_qh,
+        stride_qd,
+        stride_kb,
+        stride_kt,
+        stride_kh,
+        stride_kd,
+        stride_bb,
+        stride_bt,
+        stride_bh,
+        stride_aub,
+        stride_aut,
+        stride_aud,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        stride_ovb,
+        stride_ovt,
+        stride_ovh,
+        stride_ovd,
+        T_len,
+        H_v,
+        gqa_q,
+        gqa_k,
+        cap_g,
+        root_dk,
+        D_K: tl.constexpr,
+        D_V: tl.constexpr,
+        USE_L2: tl.constexpr,
+        PAIRED_B: tl.constexpr,
+    ):
+        bt = tl.program_id(0)
+        h = tl.program_id(1)
+        b = bt // T_len
+        t = bt % T_len
+        hq = h // gqa_q
+        hk = h // gqa_k
+
+        offs_dk = tl.arange(0, D_K)
+        offs_dv = tl.arange(0, D_V)
+
+        qf_raw = tl.load(Q_ptr + b * stride_qb + t * stride_qt + hq * stride_qh + offs_dk * stride_qd).to(tl.float32)
+        kf_raw = tl.load(K_ptr + b * stride_kb + t * stride_kt + hk * stride_kh + offs_dk * stride_kd).to(tl.float32)
+        if USE_L2:
+            rq_l2 = tl.rsqrt(tl.sum(qf_raw * qf_raw, axis=0) + 1e-6)
+            rk_l2 = tl.rsqrt(tl.sum(kf_raw * kf_raw, axis=0) + 1e-6)
+            qf = qf_raw * rq_l2
+            kf = kf_raw * rk_l2
+        else:
+            rq_l2 = 1.0
+            rk_l2 = 1.0
+            qf = qf_raw
+            kf = kf_raw
+
+        au_base = AllUp_ptr + b * stride_aub + t * stride_aut
+        er_off = h * D_K + offs_dk
+        wr_off = H_v * D_K + h * D_V + offs_dv
+        sq_off = H_v * (D_K + D_V) + h * D_K + offs_dk
+        sk_off = H_v * (2 * D_K + D_V) + h * D_K + offs_dk
+        sv_off = H_v * (3 * D_K + D_V) + h * D_V + offs_dv
+
+        raw_er = tl.load(au_base + er_off * stride_aud).to(tl.float32)
+        raw_wr = tl.load(au_base + wr_off * stride_aud).to(tl.float32)
+        dq_s = tl.load(au_base + sq_off * stride_aud).to(tl.float32)
+        dk_s = tl.load(au_base + sk_off * stride_aud).to(tl.float32)
+
+        o_k = b * stride_ob + t * stride_ot + h * stride_oh + offs_dk * stride_od
+        o_v = b * stride_ovb + t * stride_ovt + h * stride_ovh + offs_dv * stride_ovd
+        dq_o = tl.load(DQOut_ptr + o_k).to(tl.float32)
+        dk_o = tl.load(DKOut_ptr + o_k).to(tl.float32)
+        dbg = tl.load(DBGate_ptr + o_k).to(tl.float32)
+        dwg = tl.load(DWGate_ptr + o_v).to(tl.float32)
+        dqs = tl.load(DQSwa_ptr + o_k).to(tl.float32)
+        dks = tl.load(DKSwa_ptr + o_k).to(tl.float32)
+        dvs = tl.load(DVSwa_ptr + o_v).to(tl.float32)
+
+        if PAIRED_B:
+            dbg_2d = tl.reshape(dbg, [D_K // 2, 2])
+            dbg_m = tl.sum(dbg_2d, axis=1) * 0.5
+            dbg = tl.reshape(tl.broadcast_to(dbg_m[:, None], [D_K // 2, 2]), [D_K])
+
+        # Exact derivatives of 2*logistic_shift(0.5*beta, d_er) and logistic_shift(beta, d_wr)
+        beta_raw = tl.load(Beta_ptr + b * stride_bb + t * stride_bt + h * stride_bh).to(tl.float32)
+        in_b_range = (beta_raw > 0.0) & (beta_raw < 1.0)
+        beta = tl.minimum(tl.maximum(beta_raw, 0.0), 1.0)
+        bh_val = 0.5 * beta
+
+        th_er = 2.0 * tl.sigmoid(2.0 * raw_er) - 1.0
+        d_er = cap_g * th_er
+        s_e = 2.0 * tl.sigmoid(d_er) - 1.0
+        den_e = tl.maximum(1.0 + (2.0 * bh_val - 1.0) * s_e, 1e-12)
+        qe = (1.0 - s_e * s_e) / (den_e * den_e)
+        # bg = 2.0 * ls_e => d(ls_e) = 2.0 * dbg; d(bh_val) = 0.5 * d(beta) => factor 2.0 * 0.5 == 1.0!
+        dd_er = (2.0 * dbg) * bh_val * (1.0 - bh_val) * qe
+        draw_er = dd_er * cap_g * (1.0 - th_er * th_er)
+        dbeta_e = tl.sum(dbg * qe, axis=0)
+
+        th_wr = 2.0 * tl.sigmoid(2.0 * raw_wr) - 1.0
+        d_wr = cap_g * th_wr
+        s_w = 2.0 * tl.sigmoid(d_wr) - 1.0
+        den_w = tl.maximum(1.0 + (2.0 * beta - 1.0) * s_w, 1e-12)
+        qw = (1.0 - s_w * s_w) / (den_w * den_w)
+        dd_wr = dwg * beta * (1.0 - beta) * qw
+        draw_wr = dd_wr * cap_g * (1.0 - th_wr * th_wr)
+        dbeta_w = tl.sum(dwg * qw, axis=0)
+        dbeta_tot = tl.where(in_b_range, dbeta_e + dbeta_w, 0.0)
+        tl.store(DBeta_ptr + b * stride_bb + t * stride_bt + h * stride_bh, dbeta_tot.to(DBeta_ptr.dtype.element_ty))
+
+        # SWA RMSNorm backward
+        qx = root_dk * qf + dq_s
+        kx = root_dk * kf + dk_s
+        inv_dk = 1.0 / D_K
+        rq_s = tl.rsqrt(tl.sum(qx * qx, axis=0) * inv_dk + 1e-6)
+        rk_s = tl.rsqrt(tl.sum(kx * kx, axis=0) * inv_dk + 1e-6)
+        qn = qx * rq_s
+        kn = kx * rk_s
+        qnw = tl.load(QNormW_ptr + offs_dk).to(tl.float32)
+        knw = tl.load(KNormW_ptr + offs_dk).to(tl.float32)
+
+        row_id = bt * H_v + h
+        tl.store(DQNormPart_ptr + row_id * D_K + offs_dk, dqs * qn)
+        tl.store(DKNormPart_ptr + row_id * D_K + offs_dk, dks * kn)
+
+        dqn = dqs * qnw
+        dkn = dks * knw
+        ddq_s = rq_s * (dqn - qn * (tl.sum(dqn * qn, axis=0) * inv_dk))
+        ddk_s = rk_s * (dkn - kn * (tl.sum(dkn * kn, axis=0) * inv_dk))
+
+        dau_base = DAllUp_ptr + b * stride_aub + t * stride_aut
+        tl.store(dau_base + er_off * stride_aud, draw_er)
+        tl.store(dau_base + wr_off * stride_aud, draw_wr)
+        tl.store(dau_base + sq_off * stride_aud, ddq_s)
+        tl.store(dau_base + sk_off * stride_aud, ddk_s)
+        tl.store(dau_base + sv_off * stride_aud, dvs)
+
+        dq_prep = dq_o + root_dk * ddq_s
+        dk_prep = dk_o + root_dk * ddk_s
+        if USE_L2:
+            dq_h = rq_l2 * (dq_prep - qf * tl.sum(dq_prep * qf, axis=0))
+            dk_h = rk_l2 * (dk_prep - kf * tl.sum(dk_prep * kf, axis=0))
+        else:
+            dq_h = dq_prep
+            dk_h = dk_prep
+
+        tl.store(DQFull_ptr + o_k, dq_h)
+        tl.store(DKFull_ptr + o_k, dk_h)
+        tl.store(DVSub_ptr + o_v, dvs)
+
+    class _FusedAdapterProjFn(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx,
+            q_raw,
+            k_raw,
+            v_raw,
+            h_f,
+            beta_base,
+            w_er,
+            w_wr,
+            w_sq,
+            w_sk,
+            w_sv,
+            q_norm_w,
+            k_norm_w,
+            hv: int,
+            cap_g: float,
+            use_l2: bool,
+            paired_b: bool,
+        ):
+            ctx.set_materialize_grads(False)
+            B, T, H_q, D_k = q_raw.shape
+            H_k = k_raw.shape[2]
+            D_v = v_raw.shape[-1]
+            out_dt = q_raw.dtype
+
+            cat_w = torch.cat([w_er.float(), w_wr.float(), w_sq.float(), w_sk.float(), w_sv.float()], dim=0)
+            all_up = F.linear(h_f, cat_w).contiguous()
+
+            qc = q_raw.contiguous()
+            kc = k_raw.contiguous()
+            vc = v_raw.contiguous()
+            bc = beta_base.contiguous()
+            qnw_c = q_norm_w.float().contiguous()
+            knw_c = k_norm_w.float().contiguous()
+
+            q_out = torch.empty((B, T, hv, D_k), device=qc.device, dtype=out_dt)
+            k_out = torch.empty((B, T, hv, D_k), device=qc.device, dtype=out_dt)
+            b_gate = torch.empty((B, T, hv, D_k), device=qc.device, dtype=out_dt)
+            w_gate = torch.empty((B, T, hv, D_v), device=qc.device, dtype=out_dt)
+            q_swa = torch.empty((B, T, hv, D_k), device=qc.device, dtype=out_dt)
+            k_swa = torch.empty((B, T, hv, D_k), device=qc.device, dtype=out_dt)
+            v_swa = torch.empty((B, T, hv, D_v), device=qc.device, dtype=out_dt)
+
+            _proj_gates_swa_fwd_kernel[(B * T, hv)](
+                qc,
+                kc,
+                vc,
+                bc,
+                all_up,
+                qnw_c,
+                knw_c,
+                q_out,
+                k_out,
+                b_gate,
+                w_gate,
+                q_swa,
+                k_swa,
+                v_swa,
+                *qc.stride(),
+                *kc.stride(),
+                *vc.stride(),
+                *bc.stride(),
+                *all_up.stride(),
+                *q_out.stride(),
+                *w_gate.stride(),
+                T,
+                hv,
+                hv // H_q,
+                hv // H_k,
+                float(cap_g),
+                float(math.sqrt(D_k)),
+                D_K=D_k,
+                D_V=D_v,
+                USE_L2=use_l2,
+                PAIRED_B=paired_b,
+                num_warps=4,
+                num_stages=1,
+            )
+            if any(ctx.needs_input_grad):
+                ctx.save_for_backward(qc, kc, h_f, bc, w_er, w_wr, w_sq, w_sk, w_sv, qnw_c, knw_c)
+                ctx.meta = (hv, cap_g, use_l2, paired_b, v_raw.dtype, q_norm_w.dtype, k_norm_w.dtype)
+            return q_out, k_out, b_gate, w_gate, q_swa, k_swa, v_swa
+
+        @staticmethod
+        def backward(ctx, dq_out, dk_out, db_gate, dw_gate, dq_swa, dk_swa, dv_swa):
+            qc, kc, h_f, bc, w_er, w_wr, w_sq, w_sk, w_sv, qnw_c, knw_c = ctx.saved_tensors
+            hv, cap_g, use_l2, paired_b, v_dt, qnw_dt, knw_dt = ctx.meta
+            B, T, H_q, D_k = qc.shape
+            H_k = kc.shape[2]
+            D_v = w_wr.shape[0] // hv
+            out_dt = qc.dtype
+
+            cat_w = torch.cat([w_er.float(), w_wr.float(), w_sq.float(), w_sk.float(), w_sv.float()], dim=0)
+            all_up = F.linear(h_f, cat_w).contiguous()
+
+            def _z_k() -> torch.Tensor:
+                return torch.zeros((B, T, hv, D_k), device=qc.device, dtype=out_dt)
+
+            def _z_v() -> torch.Tensor:
+                return torch.zeros((B, T, hv, D_v), device=qc.device, dtype=out_dt)
+
+            dqo_c = dq_out.contiguous() if dq_out is not None else _z_k()
+            dko_c = dk_out.contiguous() if dk_out is not None else _z_k()
+            dbg_c = db_gate.contiguous() if db_gate is not None else _z_k()
+            dwg_c = dw_gate.contiguous() if dw_gate is not None else _z_v()
+            dqs_c = dq_swa.contiguous() if dq_swa is not None else _z_k()
+            dks_c = dk_swa.contiguous() if dk_swa is not None else _z_k()
+            dvs_c = dv_swa.contiguous() if dv_swa is not None else _z_v()
+
+            dq_full = torch.empty((B, T, hv, D_k), device=qc.device, dtype=torch.float32)
+            dk_full = torch.empty((B, T, hv, D_k), device=qc.device, dtype=torch.float32)
+            dv_sub = torch.empty((B, T, hv, D_v), device=qc.device, dtype=torch.float32)
+            dbeta = torch.empty_like(bc)
+            d_all_up = torch.empty_like(all_up)
+            dqn_part = torch.empty((B * T * hv, D_k), device=qc.device, dtype=torch.float32)
+            dkn_part = torch.empty((B * T * hv, D_k), device=qc.device, dtype=torch.float32)
+
+            _proj_gates_swa_bwd_kernel[(B * T, hv)](
+                qc,
+                kc,
+                bc,
+                all_up,
+                qnw_c,
+                knw_c,
+                dqo_c,
+                dko_c,
+                dbg_c,
+                dwg_c,
+                dqs_c,
+                dks_c,
+                dvs_c,
+                dq_full,
+                dk_full,
+                dv_sub,
+                dbeta,
+                d_all_up,
+                dqn_part,
+                dkn_part,
+                *qc.stride(),
+                *kc.stride(),
+                *bc.stride(),
+                *all_up.stride(),
+                *dqo_c.stride(),
+                *dwg_c.stride(),
+                T,
+                hv,
+                hv // H_q,
+                hv // H_k,
+                float(cap_g),
+                float(math.sqrt(D_k)),
+                D_K=D_k,
+                D_V=D_v,
+                USE_L2=use_l2,
+                PAIRED_B=paired_b,
+                num_warps=4,
+                num_stages=1,
+            )
+
+            gqa_q = hv // H_q
+            gqa_k = hv // H_k
+            dq_raw = dq_full.view(B, T, H_q, gqa_q, D_k).sum(dim=3).to(out_dt) if gqa_q > 1 else dq_full.to(out_dt)
+            dk_raw = dk_full.view(B, T, H_k, gqa_k, D_k).sum(dim=3).to(out_dt) if gqa_k > 1 else dk_full.to(out_dt)
+            dv_raw = dv_sub.to(v_dt)
+
+            dau_2d = d_all_up.view(B * T, -1)
+            hf_2d = h_f.reshape(B * T, -1)
+            dh = (dau_2d @ cat_w).view_as(h_f) if ctx.needs_input_grad[3] else None
+            dcat_w = dau_2d.t() @ hf_2d
+            dw_er, dw_wr, dw_sq, dw_sk, dw_sv = dcat_w.split([hv * D_k, hv * D_v, hv * D_k, hv * D_k, hv * D_v], dim=0)
+            dqnw = dqn_part.sum(dim=0).to(qnw_dt) if ctx.needs_input_grad[10] else None
+            dknw = dkn_part.sum(dim=0).to(knw_dt) if ctx.needs_input_grad[11] else None
+
+            return (
+                dq_raw if ctx.needs_input_grad[0] else None,
+                dk_raw if ctx.needs_input_grad[1] else None,
+                dv_raw if ctx.needs_input_grad[2] else None,
+                dh,
+                dbeta if ctx.needs_input_grad[4] else None,
+                dw_er.to(w_er.dtype) if ctx.needs_input_grad[5] else None,
+                dw_wr.to(w_wr.dtype) if ctx.needs_input_grad[6] else None,
+                dw_sq.to(w_sq.dtype) if ctx.needs_input_grad[7] else None,
+                dw_sk.to(w_sk.dtype) if ctx.needs_input_grad[8] else None,
+                dw_sv.to(w_sv.dtype) if ctx.needs_input_grad[9] else None,
+                dqnw,
+                dknw,
+                None,
+                None,
+                None,
+                None,
+            )
+
+    @triton.jit
+    def _disjoint_swa_fwd_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        Valid_ptr,
+        Slope_ptr,
+        Out_ptr,
+        LSE_ptr,
+        Max_ptr,
+        Argmax_ptr,
+        Counts_ptr,
+        stride_qb,
+        stride_qt,
+        stride_qh,
+        stride_qd,
+        stride_kb,
+        stride_kt,
+        stride_kh,
+        stride_kd,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_val_b,
+        stride_val_t,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        stride_lb,
+        stride_lt,
+        stride_lh,
+        T_q,
+        H,
+        scale,
+        inv_c,
+        CHUNK_C: tl.constexpr,
+        WIN_CHUNKS: tl.constexpr,
+        D_K: tl.constexpr,
+        D_V: tl.constexpr,
+        HAS_SLOPE: tl.constexpr,
+        HAS_VALID: tl.constexpr,
+    ):
+        chunk_n = tl.program_id(0)
+        bh = tl.program_id(1)
+        b = bh // H
+        h = bh % H
+
+        q_start = chunk_n * CHUNK_C
+        offs_m = q_start + tl.arange(0, CHUNK_C)
+        offs_dk = tl.arange(0, D_K)
+        offs_dv = tl.arange(0, D_V)
+        mask_m = offs_m < T_q
+
+        q = tl.load(
+            Q_ptr + b * stride_qb + offs_m[:, None] * stride_qt + h * stride_qh + offs_dk[None, :] * stride_qd,
+            mask=mask_m[:, None],
+            other=0.0,
+        )
+        slope_h = tl.load(Slope_ptr + h).to(tl.float32) if HAS_SLOPE else 0.0
+
+        m_i = tl.full([CHUNK_C], -float("inf"), dtype=tl.float32)
+        l_i = tl.zeros([CHUNK_C], dtype=tl.float32)
+        acc = tl.zeros([CHUNK_C, D_V], dtype=tl.float32)
+        argmax_i = tl.zeros([CHUNK_C], dtype=tl.int32)
+        cnt_i = tl.zeros([CHUNK_C], dtype=tl.int32)
+
+        k_far = tl.maximum(0, chunk_n - WIN_CHUNKS)
+        for c_k in range(k_far, chunk_n + 1):
+            k_start = c_k * CHUNK_C
+            offs_n = k_start + tl.arange(0, CHUNK_C)
+            mask_n = offs_n < T_q
+            if HAS_VALID:
+                val_n = tl.load(Valid_ptr + b * stride_val_b + offs_n * stride_val_t, mask=mask_n, other=False).to(
+                    tl.int1
+                )
+                mask_n = mask_n & val_n
+
+            k_blk = tl.load(
+                K_ptr + b * stride_kb + offs_n[None, :] * stride_kt + h * stride_kh + offs_dk[:, None] * stride_kd,
+                mask=mask_n[None, :],
+                other=0.0,
+            )
+            qk = tl.dot(q, k_blk).to(tl.float32) * scale
+            if HAS_SLOPE:
+                dist = tl.maximum(0, offs_m[:, None] - offs_n[None, :]).to(tl.float32) * inv_c
+                qk = qk - slope_h * dist
+
+            valid = mask_m[:, None] & mask_n[None, :] & (offs_n[None, :] <= offs_m[:, None])
+            cnt_i += tl.sum(valid.to(tl.int32), axis=1)
+            qk = tl.where(valid, qk, -float("inf"))
+
+            blk_max, blk_idx = tl.max(qk, axis=1, return_indices=True)
+            better = blk_max > m_i
+            argmax_i = tl.where(better, k_start + blk_idx.to(tl.int32), argmax_i)
+
+            m_ij = tl.maximum(m_i, blk_max)
+            has_any = m_ij > -float("inf")
+            safe_m_ij = tl.where(has_any, m_ij, 0.0)
+            safe_m_i = tl.where(m_i > -float("inf"), m_i, 0.0)
+            p = tl.where(valid, tl.exp(qk - safe_m_ij[:, None]), 0.0)
+            alpha = tl.where(m_i > -float("inf"), tl.exp(safe_m_i - safe_m_ij), 0.0)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+
+            v_blk = tl.load(
+                V_ptr + b * stride_vb + offs_n[:, None] * stride_vt + h * stride_vh + offs_dv[None, :] * stride_vd,
+                mask=mask_n[:, None],
+                other=0.0,
+            )
+            acc = acc * alpha[:, None] + tl.dot(p.to(v_blk.dtype), v_blk)
+            m_i = m_ij
+
+        has_v = cnt_i > 0
+        safe_l = tl.where(has_v, l_i, 1.0)
+        out = tl.where(has_v[:, None], acc / safe_l[:, None], 0.0)
+        safe_m = tl.where(has_v, m_i, 0.0)
+        lse = tl.where(has_v, safe_m + tl.log(safe_l), 0.0)
+
+        tl.store(
+            Out_ptr + b * stride_ob + offs_m[:, None] * stride_ot + h * stride_oh + offs_dv[None, :] * stride_od,
+            out.to(Out_ptr.dtype.element_ty),
+            mask=mask_m[:, None],
+        )
+        l_base = b * stride_lb + offs_m * stride_lt + h * stride_lh
+        tl.store(LSE_ptr + l_base, lse, mask=mask_m)
+        tl.store(Max_ptr + l_base, safe_m, mask=mask_m)
+        tl.store(Argmax_ptr + l_base, tl.where(has_v, argmax_i, -1), mask=mask_m)
+        tl.store(Counts_ptr + l_base, cnt_i, mask=mask_m)
+
+    @triton.jit
+    def _disjoint_swa_bwd_dq_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        Valid_ptr,
+        Slope_ptr,
+        DO_ptr,
+        Delta_ptr,
+        DLSE_ptr,
+        DMax_ptr,
+        LSE_ptr,
+        Argmax_ptr,
+        Counts_ptr,
+        DQ_ptr,
+        DSlope_part_ptr,
+        stride_qb,
+        stride_qt,
+        stride_qh,
+        stride_qd,
+        stride_kb,
+        stride_kt,
+        stride_kh,
+        stride_kd,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_val_b,
+        stride_val_t,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        stride_lb,
+        stride_lt,
+        stride_lh,
+        T_q,
+        H,
+        scale,
+        inv_c,
+        CHUNK_C: tl.constexpr,
+        WIN_CHUNKS: tl.constexpr,
+        D_K: tl.constexpr,
+        D_V: tl.constexpr,
+        HAS_SLOPE: tl.constexpr,
+        HAS_VALID: tl.constexpr,
+    ):
+        chunk_n = tl.program_id(0)
+        bh = tl.program_id(1)
+        b = bh // H
+        h = bh % H
+
+        q_start = chunk_n * CHUNK_C
+        offs_m = q_start + tl.arange(0, CHUNK_C)
+        offs_dk = tl.arange(0, D_K)
+        offs_dv = tl.arange(0, D_V)
+        mask_m = offs_m < T_q
+
+        l_base = b * stride_lb + offs_m * stride_lt + h * stride_lh
+        cnt_i = tl.load(Counts_ptr + l_base, mask=mask_m, other=0)
+        active_m = mask_m & (cnt_i > 0)
+
+        q = tl.load(
+            Q_ptr + b * stride_qb + offs_m[:, None] * stride_qt + h * stride_qh + offs_dk[None, :] * stride_qd,
+            mask=active_m[:, None],
+            other=0.0,
+        )
+        do = tl.load(
+            DO_ptr + b * stride_ob + offs_m[:, None] * stride_ot + h * stride_oh + offs_dv[None, :] * stride_od,
+            mask=active_m[:, None],
+            other=0.0,
+        )
+        lse = tl.load(LSE_ptr + l_base, mask=active_m, other=0.0)
+        delta = tl.load(Delta_ptr + l_base, mask=active_m, other=0.0)
+        dlse = tl.load(DLSE_ptr + l_base, mask=active_m, other=0.0)
+        dmax = tl.load(DMax_ptr + l_base, mask=active_m, other=0.0)
+        argmax_i = tl.load(Argmax_ptr + l_base, mask=active_m, other=-1)
+        slope_h = tl.load(Slope_ptr + h).to(tl.float32) if HAS_SLOPE else 0.0
+
+        dq_acc = tl.zeros([CHUNK_C, D_K], dtype=tl.float32)
+        dslope_acc = 0.0
+
+        k_far = tl.maximum(0, chunk_n - WIN_CHUNKS)
+        for c_k in range(k_far, chunk_n + 1):
+            k_start = c_k * CHUNK_C
+            offs_n = k_start + tl.arange(0, CHUNK_C)
+            mask_n = offs_n < T_q
+            if HAS_VALID:
+                val_n = tl.load(Valid_ptr + b * stride_val_b + offs_n * stride_val_t, mask=mask_n, other=False).to(
+                    tl.int1
+                )
+                mask_n = mask_n & val_n
+
+            k_blk = tl.load(
+                K_ptr + b * stride_kb + offs_n[:, None] * stride_kt + h * stride_kh + offs_dk[None, :] * stride_kd,
+                mask=mask_n[:, None],
+                other=0.0,
+            )
+            v_blk = tl.load(
+                V_ptr + b * stride_vb + offs_n[:, None] * stride_vt + h * stride_vh + offs_dv[None, :] * stride_vd,
+                mask=mask_n[:, None],
+                other=0.0,
+            )
+
+            qk = tl.dot(q, tl.trans(k_blk)).to(tl.float32) * scale
+            dist = tl.maximum(0, offs_m[:, None] - offs_n[None, :]).to(tl.float32) * inv_c
+            if HAS_SLOPE:
+                qk = qk - slope_h * dist
+
+            valid = active_m[:, None] & mask_n[None, :] & (offs_n[None, :] <= offs_m[:, None])
+            p = tl.where(valid, tl.exp(qk - lse[:, None]), 0.0)
+            dp = tl.dot(do, tl.trans(v_blk)).to(tl.float32)
+            is_max = valid & (offs_n[None, :] == argmax_i[:, None])
+            ds = p * (dp - delta[:, None] + dlse[:, None]) + tl.where(is_max, dmax[:, None], 0.0)
+            if HAS_SLOPE:
+                dslope_acc -= tl.sum(ds * dist)
+            dq_acc += tl.dot(ds.to(k_blk.dtype), k_blk)
+
+        dq_acc = dq_acc * scale
+        tl.store(
+            DQ_ptr + b * stride_qb + offs_m[:, None] * stride_qt + h * stride_qh + offs_dk[None, :] * stride_qd,
+            dq_acc.to(DQ_ptr.dtype.element_ty),
+            mask=mask_m[:, None],
+        )
+        if HAS_SLOPE:
+            tl.store(DSlope_part_ptr + chunk_n * tl.num_programs(1) + bh, dslope_acc)
+
+    @triton.jit
+    def _disjoint_swa_bwd_dkv_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        Valid_ptr,
+        Slope_ptr,
+        DO_ptr,
+        Delta_ptr,
+        DLSE_ptr,
+        DMax_ptr,
+        LSE_ptr,
+        Argmax_ptr,
+        Counts_ptr,
+        DK_ptr,
+        DV_ptr,
+        stride_qb,
+        stride_qt,
+        stride_qh,
+        stride_qd,
+        stride_kb,
+        stride_kt,
+        stride_kh,
+        stride_kd,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_val_b,
+        stride_val_t,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        stride_lb,
+        stride_lt,
+        stride_lh,
+        T_q,
+        N_chunks,
+        H,
+        scale,
+        inv_c,
+        CHUNK_C: tl.constexpr,
+        WIN_CHUNKS: tl.constexpr,
+        D_K: tl.constexpr,
+        D_V: tl.constexpr,
+        HAS_SLOPE: tl.constexpr,
+        HAS_VALID: tl.constexpr,
+    ):
+        chunk_k = tl.program_id(0)
+        bh = tl.program_id(1)
+        b = bh // H
+        h = bh % H
+
+        k_start = chunk_k * CHUNK_C
+        offs_n = k_start + tl.arange(0, CHUNK_C)
+        offs_dk = tl.arange(0, D_K)
+        offs_dv = tl.arange(0, D_V)
+        mask_n_raw = offs_n < T_q
+        mask_n = mask_n_raw
+        if HAS_VALID:
+            val_n = tl.load(Valid_ptr + b * stride_val_b + offs_n * stride_val_t, mask=mask_n_raw, other=False).to(
+                tl.int1
+            )
+            mask_n = mask_n_raw & val_n
+
+        k_blk = tl.load(
+            K_ptr + b * stride_kb + offs_n[:, None] * stride_kt + h * stride_kh + offs_dk[None, :] * stride_kd,
+            mask=mask_n[:, None],
+            other=0.0,
+        )
+        v_blk = tl.load(
+            V_ptr + b * stride_vb + offs_n[:, None] * stride_vt + h * stride_vh + offs_dv[None, :] * stride_vd,
+            mask=mask_n[:, None],
+            other=0.0,
+        )
+        slope_h = tl.load(Slope_ptr + h).to(tl.float32) if HAS_SLOPE else 0.0
+
+        dk_acc = tl.zeros([CHUNK_C, D_K], dtype=tl.float32)
+        dv_acc = tl.zeros([CHUNK_C, D_V], dtype=tl.float32)
+
+        q_end = tl.minimum(N_chunks, chunk_k + WIN_CHUNKS + 1)
+        for c_q in range(chunk_k, q_end):
+            q_start = c_q * CHUNK_C
+            offs_m = q_start + tl.arange(0, CHUNK_C)
+            mask_m = offs_m < T_q
+            l_base = b * stride_lb + offs_m * stride_lt + h * stride_lh
+            cnt_i = tl.load(Counts_ptr + l_base, mask=mask_m, other=0)
+            active_m = mask_m & (cnt_i > 0)
+
+            q = tl.load(
+                Q_ptr + b * stride_qb + offs_m[:, None] * stride_qt + h * stride_qh + offs_dk[None, :] * stride_qd,
+                mask=active_m[:, None],
+                other=0.0,
+            )
+            do = tl.load(
+                DO_ptr + b * stride_ob + offs_m[:, None] * stride_ot + h * stride_oh + offs_dv[None, :] * stride_od,
+                mask=active_m[:, None],
+                other=0.0,
+            )
+            lse = tl.load(LSE_ptr + l_base, mask=active_m, other=0.0)
+            delta = tl.load(Delta_ptr + l_base, mask=active_m, other=0.0)
+            dlse = tl.load(DLSE_ptr + l_base, mask=active_m, other=0.0)
+            dmax = tl.load(DMax_ptr + l_base, mask=active_m, other=0.0)
+            argmax_i = tl.load(Argmax_ptr + l_base, mask=active_m, other=-1)
+
+            qk = tl.dot(q, tl.trans(k_blk)).to(tl.float32) * scale
+            if HAS_SLOPE:
+                dist = tl.maximum(0, offs_m[:, None] - offs_n[None, :]).to(tl.float32) * inv_c
+                qk = qk - slope_h * dist
+
+            valid = active_m[:, None] & mask_n[None, :] & (offs_n[None, :] <= offs_m[:, None])
+            p = tl.where(valid, tl.exp(qk - lse[:, None]), 0.0)
+            dv_acc += tl.dot(tl.trans(p.to(do.dtype)), do)
+            dp = tl.dot(do, tl.trans(v_blk)).to(tl.float32)
+            is_max = valid & (offs_n[None, :] == argmax_i[:, None])
+            ds = p * (dp - delta[:, None] + dlse[:, None]) + tl.where(is_max, dmax[:, None], 0.0)
+            dk_acc += tl.dot(tl.trans(ds.to(q.dtype)), q)
+
+        dk_acc = dk_acc * scale
+        tl.store(
+            DK_ptr + b * stride_kb + offs_n[:, None] * stride_kt + h * stride_kh + offs_dk[None, :] * stride_kd,
+            dk_acc.to(DK_ptr.dtype.element_ty),
+            mask=mask_n_raw[:, None],
+        )
+        tl.store(
+            DV_ptr + b * stride_vb + offs_n[:, None] * stride_vt + h * stride_vh + offs_dv[None, :] * stride_vd,
+            dv_acc.to(DV_ptr.dtype.element_ty),
+            mask=mask_n_raw[:, None],
+        )
+
+    class _DisjointFlashSWAFn(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx, q_swa, k_swa, v_swa, valid_swa, slope, chunk_size: int, window_chunks: int, has_valid_mask: bool
+        ):
+            B, T, H, D_k = q_swa.shape
+            D_v = v_swa.shape[-1]
+            q_c = q_swa.contiguous()
+            k_c = k_swa.contiguous()
+            v_c = v_swa.contiguous()
+            val_c = valid_swa.contiguous() if has_valid_mask else q_c.new_empty((1, 1), dtype=torch.bool)
+            has_slope = slope is not None and slope.numel() > 0
+            slp_c = slope.detach().float().contiguous() if has_slope else q_c.new_empty(1, dtype=torch.float32)
+
+            out = torch.empty((B, T, H, D_v), device=q_c.device, dtype=q_c.dtype)
+            lse = torch.empty((B, T, H), device=q_c.device, dtype=torch.float32)
+            max_sc = torch.empty((B, T, H), device=q_c.device, dtype=torch.float32)
+            argmax = torch.empty((B, T, H), device=q_c.device, dtype=torch.int32)
+            counts = torch.empty((B, T, H), device=q_c.device, dtype=torch.int32)
+
+            n_chunks = (T + chunk_size - 1) // chunk_size
+            scale = D_k**-0.5
+            inv_c = 1.0 / float(chunk_size)
+
+            _disjoint_swa_fwd_kernel[(n_chunks, B * H)](
+                q_c,
+                k_c,
+                v_c,
+                val_c,
+                slp_c,
+                out,
+                lse,
+                max_sc,
+                argmax,
+                counts,
+                *q_c.stride(),
+                *k_c.stride(),
+                *v_c.stride(),
+                *val_c.stride(),
+                *out.stride(),
+                *lse.stride(),
+                T,
+                H,
+                scale,
+                inv_c,
+                CHUNK_C=chunk_size,
+                WIN_CHUNKS=window_chunks,
+                D_K=D_k,
+                D_V=D_v,
+                HAS_SLOPE=has_slope,
+                HAS_VALID=has_valid_mask,
+                num_warps=4,
+                num_stages=2,
+            )
+            ctx.set_materialize_grads(False)
+            if any(ctx.needs_input_grad):
+                ctx.save_for_backward(q_c, k_c, v_c, val_c, slp_c, out, lse, argmax, counts)
+                ctx.meta = (chunk_size, window_chunks, has_slope, has_valid_mask, slope.dtype if has_slope else None)
+            return out, lse, max_sc, counts
+
+        @staticmethod
+        def backward(ctx, do, dlse, dmax, _dcounts):
+            q_c, k_c, v_c, val_c, slp_c, out, lse, argmax, counts = ctx.saved_tensors
+            chunk_size, window_chunks, has_slope, has_valid_mask, slp_dt = ctx.meta
+            B, T, H, D_k = q_c.shape
+            D_v = v_c.shape[-1]
+            do_c = do.to(v_c.dtype).contiguous() if do is not None else torch.zeros_like(v_c)
+            dlse_c = dlse.float().contiguous() if dlse is not None else torch.zeros_like(lse)
+            dmax_c = dmax.float().contiguous() if dmax is not None else torch.zeros_like(lse)
+            delta = (do.float() * out.float()).sum(dim=-1).contiguous() if do is not None else torch.zeros_like(lse)
+
+            dq = torch.empty_like(q_c)
+            dk = torch.empty_like(k_c)
+            dv = torch.empty_like(v_c)
+            n_chunks = (T + chunk_size - 1) // chunk_size
+            dslope_part = (
+                torch.empty((n_chunks, B * H), device=q_c.device, dtype=torch.float32)
+                if has_slope
+                else q_c.new_empty(1, dtype=torch.float32)
+            )
+            scale = D_k**-0.5
+            inv_c = 1.0 / float(chunk_size)
+
+            _disjoint_swa_bwd_dq_kernel[(n_chunks, B * H)](
+                q_c,
+                k_c,
+                v_c,
+                val_c,
+                slp_c,
+                do_c,
+                delta,
+                dlse_c,
+                dmax_c,
+                lse,
+                argmax,
+                counts,
+                dq,
+                dslope_part,
+                *q_c.stride(),
+                *k_c.stride(),
+                *v_c.stride(),
+                *val_c.stride(),
+                *do_c.stride(),
+                *lse.stride(),
+                T,
+                H,
+                scale,
+                inv_c,
+                CHUNK_C=chunk_size,
+                WIN_CHUNKS=window_chunks,
+                D_K=D_k,
+                D_V=D_v,
+                HAS_SLOPE=has_slope,
+                HAS_VALID=has_valid_mask,
+                num_warps=4,
+                num_stages=1,
+            )
+            _disjoint_swa_bwd_dkv_kernel[(n_chunks, B * H)](
+                q_c,
+                k_c,
+                v_c,
+                val_c,
+                slp_c,
+                do_c,
+                delta,
+                dlse_c,
+                dmax_c,
+                lse,
+                argmax,
+                counts,
+                dk,
+                dv,
+                *q_c.stride(),
+                *k_c.stride(),
+                *v_c.stride(),
+                *val_c.stride(),
+                *do_c.stride(),
+                *lse.stride(),
+                T,
+                n_chunks,
+                H,
+                scale,
+                inv_c,
+                CHUNK_C=chunk_size,
+                WIN_CHUNKS=window_chunks,
+                D_K=D_k,
+                D_V=D_v,
+                HAS_SLOPE=has_slope,
+                HAS_VALID=has_valid_mask,
+                num_warps=4,
+                num_stages=1,
+            )
+            dslope = dslope_part.view(n_chunks, B, H).sum(dim=(0, 1)).to(slp_dt) if has_slope else None
+            return dq, dk, dv, None, dslope, None, None, None
+
+    @triton.jit
+    def _routed_readout_bwd_vec_w_kernel(
+        Vec_ptr,
+        Bank_ptr,
+        TopIdx_ptr,
+        TopW_ptr,
+        DOut_ptr,
+        DVec_ptr,
+        DW_part_ptr,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_sb,
+        stride_sm,
+        stride_sh,
+        stride_sk,
+        stride_sv,
+        stride_ib,
+        stride_it,
+        stride_ik,
+        stride_wb,
+        stride_wt,
+        stride_wk,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        stride_dwp_bh,
+        stride_dwp_t,
+        stride_dwp_k,
+        T_len,
+        M,
+        H,
+        K_SEL: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+        D_K: tl.constexpr,
+        D_V: tl.constexpr,
+        USE_BF16: tl.constexpr,
+    ):
+        t_blk = tl.program_id(0)
+        bh = tl.program_id(1)
+        b = bh // H
+        h = bh % H
+
+        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T)
+        mask_t = offs_t < T_len
+        offs_dk = tl.arange(0, D_K)
+        offs_64 = tl.arange(0, 64)
+
+        vec = tl.load(
+            Vec_ptr + b * stride_vb + offs_t[:, None] * stride_vt + h * stride_vh + offs_dk[None, :] * stride_vd,
+            mask=mask_t[:, None],
+            other=0.0,
+        )
+        dvec_acc = tl.zeros([BLOCK_T, D_K], dtype=tl.float32)
+
+        # Zero DW_part for this (bh, offs_t)
+        for r in tl.static_range(0, K_SEL):
+            tl.store(DW_part_ptr + bh * stride_dwp_bh + offs_t * stride_dwp_t + r * stride_dwp_k, 0.0, mask=mask_t)
+
+        for m in range(M):
+            any_sel = tl.zeros([BLOCK_T], dtype=tl.int32)
+            wm = tl.zeros([BLOCK_T], dtype=tl.float32)
+            for r in tl.static_range(0, K_SEL):
+                idx_r = tl.load(TopIdx_ptr + b * stride_ib + offs_t * stride_it + r * stride_ik, mask=mask_t, other=-1)
+                w_r = tl.load(TopW_ptr + b * stride_wb + offs_t * stride_wt + r * stride_wk, mask=mask_t, other=0.0).to(
+                    tl.float32
+                )
+                sel_r = idx_r == m
+                any_sel += sel_r.to(tl.int32)
+                wm += tl.where(sel_r, w_r, 0.0)
+
+            if tl.max(any_sel) > 0:
+                dot_m = tl.zeros([BLOCK_T], dtype=tl.float32)
+                for v_off in range(0, D_V, 64):
+                    v_cols = v_off + offs_64
+                    dout_tile = tl.load(
+                        DOut_ptr
+                        + b * stride_ob
+                        + offs_t[:, None] * stride_ot
+                        + h * stride_oh
+                        + v_cols[None, :] * stride_od,
+                        mask=mask_t[:, None],
+                        other=0.0,
+                    )
+                    s_tile = tl.load(
+                        Bank_ptr
+                        + b * stride_sb
+                        + m * stride_sm
+                        + h * stride_sh
+                        + offs_dk[:, None] * stride_sk
+                        + v_cols[None, :] * stride_sv
+                    )
+                    if USE_BF16:
+                        prod = tl.dot(vec.to(tl.bfloat16), s_tile.to(tl.bfloat16)).to(tl.float32)
+                        dvec_acc += wm[:, None] * tl.dot(
+                            dout_tile.to(tl.bfloat16), tl.trans(s_tile.to(tl.bfloat16))
+                        ).to(tl.float32)
+                    else:
+                        prod = tl.dot(vec.to(tl.float32), s_tile.to(tl.float32))
+                        dvec_acc += wm[:, None] * tl.dot(dout_tile.to(tl.float32), tl.trans(s_tile.to(tl.float32)))
+                    dot_m += tl.sum(dout_tile.to(tl.float32) * prod, axis=1)
+
+                for r in tl.static_range(0, K_SEL):
+                    idx_r = tl.load(
+                        TopIdx_ptr + b * stride_ib + offs_t * stride_it + r * stride_ik, mask=mask_t, other=-1
+                    )
+                    prev_dw = tl.load(
+                        DW_part_ptr + bh * stride_dwp_bh + offs_t * stride_dwp_t + r * stride_dwp_k,
+                        mask=mask_t,
+                        other=0.0,
+                    )
+                    tl.store(
+                        DW_part_ptr + bh * stride_dwp_bh + offs_t * stride_dwp_t + r * stride_dwp_k,
+                        prev_dw + tl.where(idx_r == m, dot_m, 0.0),
+                        mask=mask_t,
+                    )
+
+        tl.store(
+            DVec_ptr + b * stride_vb + offs_t[:, None] * stride_vt + h * stride_vh + offs_dk[None, :] * stride_vd,
+            dvec_acc.to(DVec_ptr.dtype.element_ty),
+            mask=mask_t[:, None],
+        )
+
+    @triton.jit
+    def _routed_readout_bwd_ds_kernel(
+        Vec_ptr,
+        TopIdx_ptr,
+        TopW_ptr,
+        DOut_ptr,
+        DBank_ptr,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_ib,
+        stride_it,
+        stride_ik,
+        stride_wb,
+        stride_wt,
+        stride_wk,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        stride_sb,
+        stride_sm,
+        stride_sh,
+        stride_sk,
+        stride_sv,
+        T_len,
+        M,
+        H,
+        K_SEL: tl.constexpr,
+        D_K: tl.constexpr,
+        B_V: tl.constexpr,
+        USE_BF16: tl.constexpr,
+    ):
+        bmh = tl.program_id(0)
+        v_blk = tl.program_id(1)
+        h = bmh % H
+        bm = bmh // H
+        m = bm % M
+        b = bm // M
+
+        offs_64 = tl.arange(0, 64)
+        offs_bv = v_blk * B_V + tl.arange(0, B_V)
+
+        # Fast early-exit for single-chunk T_len <= 64 if page m is untouched!
+        if T_len <= 64:
+            t_mask0 = offs_64 < T_len
+            wm0 = tl.zeros([64], dtype=tl.float32)
+            for r in tl.static_range(0, K_SEL):
+                idx_r = tl.load(
+                    TopIdx_ptr + b * stride_ib + offs_64 * stride_it + r * stride_ik, mask=t_mask0, other=-1
+                )
+                w_r = tl.load(
+                    TopW_ptr + b * stride_wb + offs_64 * stride_wt + r * stride_wk, mask=t_mask0, other=0.0
+                ).to(tl.float32)
+                wm0 += tl.where(idx_r == m, w_r, 0.0)
+            if tl.max(tl.abs(wm0)) == 0.0:
+                return
+            dout_sub = tl.load(
+                DOut_ptr + b * stride_ob + offs_64[:, None] * stride_ot + h * stride_oh + offs_bv[None, :] * stride_od,
+                mask=t_mask0[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            for k_off in range(0, D_K, 64):
+                dk_sub = k_off + offs_64
+                vec_sub = tl.load(
+                    Vec_ptr
+                    + b * stride_vb
+                    + offs_64[:, None] * stride_vt
+                    + h * stride_vh
+                    + dk_sub[None, :] * stride_vd,
+                    mask=t_mask0[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                w_vec = wm0[:, None] * vec_sub
+                if USE_BF16:
+                    ds_acc = tl.dot(tl.trans(w_vec.to(tl.bfloat16)), dout_sub.to(tl.bfloat16)).to(tl.float32)
+                else:
+                    ds_acc = tl.dot(tl.trans(w_vec), dout_sub)
+                ds_ptrs = (
+                    DBank_ptr
+                    + b * stride_sb
+                    + m * stride_sm
+                    + h * stride_sh
+                    + dk_sub[:, None] * stride_sk
+                    + offs_bv[None, :] * stride_sv
+                )
+                tl.store(ds_ptrs, tl.load(ds_ptrs) + ds_acc)
+            return
+
+        for k_off in range(0, D_K, 64):
+            dk_sub = k_off + offs_64
+            ds_acc = tl.zeros([64, B_V], dtype=tl.float32)
+            has_any = 0
+            for t0 in range(0, T_len, 64):
+                t_offs = t0 + offs_64
+                t_mask = t_offs < T_len
+                wm = tl.zeros([64], dtype=tl.float32)
+                for r in tl.static_range(0, K_SEL):
+                    idx_r = tl.load(
+                        TopIdx_ptr + b * stride_ib + t_offs * stride_it + r * stride_ik, mask=t_mask, other=-1
+                    )
+                    w_r = tl.load(
+                        TopW_ptr + b * stride_wb + t_offs * stride_wt + r * stride_wk, mask=t_mask, other=0.0
+                    ).to(tl.float32)
+                    wm += tl.where(idx_r == m, w_r, 0.0)
+                if tl.max(tl.abs(wm)) > 0.0:
+                    has_any = 1
+                    vec_sub = tl.load(
+                        Vec_ptr
+                        + b * stride_vb
+                        + t_offs[:, None] * stride_vt
+                        + h * stride_vh
+                        + dk_sub[None, :] * stride_vd,
+                        mask=t_mask[:, None],
+                        other=0.0,
+                    ).to(tl.float32)
+                    dout_sub = tl.load(
+                        DOut_ptr
+                        + b * stride_ob
+                        + t_offs[:, None] * stride_ot
+                        + h * stride_oh
+                        + offs_bv[None, :] * stride_od,
+                        mask=t_mask[:, None],
+                        other=0.0,
+                    ).to(tl.float32)
+                    w_vec = wm[:, None] * vec_sub
+                    if USE_BF16:
+                        ds_acc += tl.dot(tl.trans(w_vec.to(tl.bfloat16)), dout_sub.to(tl.bfloat16)).to(tl.float32)
+                    else:
+                        ds_acc += tl.dot(tl.trans(w_vec), dout_sub)
+            if has_any == 1:
+                ds_ptrs = (
+                    DBank_ptr
+                    + b * stride_sb
+                    + m * stride_sm
+                    + h * stride_sh
+                    + dk_sub[:, None] * stride_sk
+                    + offs_bv[None, :] * stride_sv
+                )
+                tl.store(ds_ptrs, tl.load(ds_ptrs) + ds_acc)
+
+    @triton.jit
+    def _invert_unit_lower_16x16_fast(L_blk):
+        offs = tl.arange(0, 16)
+        r = offs[:, None]
+        c = offs[None, :]
+        L_s = tl.where(r > c, L_blk, 0.0)
+        inv = (r == c).to(tl.float32) - tl.where((r == c + 1) & ((c & 1) == 0), L_s, 0.0)
+        L_s1 = tl.where(((r >> 2) == (c >> 2)) & ((r >> 1) > (c >> 1)), L_s, 0.0)
+        inv = inv - tl.dot(tl.dot(inv, L_s1, input_precision="ieee"), inv, input_precision="ieee")
+        L_s2 = tl.where(((r >> 3) == (c >> 3)) & ((r >> 2) > (c >> 2)), L_s, 0.0)
+        inv = inv - tl.dot(tl.dot(inv, L_s2, input_precision="ieee"), inv, input_precision="ieee")
+        L_s3 = tl.where((r >> 3) > (c >> 3), L_s, 0.0)
+        inv = inv - tl.dot(tl.dot(inv, L_s3, input_precision="ieee"), inv, input_precision="ieee")
+        return inv
+
+    @triton.jit
+    def _wy_merge_inv_fwd_kernel(
+        Act_ptr,
+        L_work_ptr,
+        A_inv_ptr,
+        stride_l_bmh,
+        stride_l_r,
+        stride_l_c,
+        stride_a_bmh,
+        stride_a_r,
+        stride_a_c,
+    ):
+        bmh = tl.program_id(0)
+        if tl.load(Act_ptr + bmh) == 0:
+            return
+        offs_16 = tl.arange(0, 16)
+        l_base = L_work_ptr + bmh * stride_l_bmh
+        a_base = A_inv_ptr + bmh * stride_a_bmh
+
+        inv00 = tl.load(l_base + (0 + offs_16[:, None]) * stride_l_r + (0 + offs_16[None, :]) * stride_l_c)
+        inv11 = tl.load(l_base + (16 + offs_16[:, None]) * stride_l_r + (16 + offs_16[None, :]) * stride_l_c)
+        inv22 = tl.load(l_base + (32 + offs_16[:, None]) * stride_l_r + (32 + offs_16[None, :]) * stride_l_c)
+        inv33 = tl.load(l_base + (48 + offs_16[:, None]) * stride_l_r + (48 + offs_16[None, :]) * stride_l_c)
+        L10 = tl.load(l_base + (16 + offs_16[:, None]) * stride_l_r + (0 + offs_16[None, :]) * stride_l_c)
+        L20 = tl.load(l_base + (32 + offs_16[:, None]) * stride_l_r + (0 + offs_16[None, :]) * stride_l_c)
+        L21 = tl.load(l_base + (32 + offs_16[:, None]) * stride_l_r + (16 + offs_16[None, :]) * stride_l_c)
+        L30 = tl.load(l_base + (48 + offs_16[:, None]) * stride_l_r + (0 + offs_16[None, :]) * stride_l_c)
+        L31 = tl.load(l_base + (48 + offs_16[:, None]) * stride_l_r + (16 + offs_16[None, :]) * stride_l_c)
+        L32 = tl.load(l_base + (48 + offs_16[:, None]) * stride_l_r + (32 + offs_16[None, :]) * stride_l_c)
+
+        inv10 = -tl.dot(tl.dot(inv11, L10, input_precision="ieee"), inv00, input_precision="ieee")
+        inv32 = -tl.dot(tl.dot(inv33, L32, input_precision="ieee"), inv22, input_precision="ieee")
+        M20 = tl.dot(L20, inv00, input_precision="ieee") + tl.dot(L21, inv10, input_precision="ieee")
+        M21 = tl.dot(L21, inv11, input_precision="ieee")
+        M30 = tl.dot(L30, inv00, input_precision="ieee") + tl.dot(L31, inv10, input_precision="ieee")
+        M31 = tl.dot(L31, inv11, input_precision="ieee")
+        inv20 = -tl.dot(inv22, M20, input_precision="ieee")
+        inv21 = -tl.dot(inv22, M21, input_precision="ieee")
+        inv30 = -(tl.dot(inv32, M20, input_precision="ieee") + tl.dot(inv33, M30, input_precision="ieee"))
+        inv31 = -(tl.dot(inv32, M21, input_precision="ieee") + tl.dot(inv33, M31, input_precision="ieee"))
+        z16 = tl.zeros([16, 16], dtype=tl.float32)
+
+        tl.store(a_base + (0 + offs_16[:, None]) * stride_a_r + (0 + offs_16[None, :]) * stride_a_c, inv00)
+        tl.store(a_base + (0 + offs_16[:, None]) * stride_a_r + (16 + offs_16[None, :]) * stride_a_c, z16)
+        tl.store(a_base + (0 + offs_16[:, None]) * stride_a_r + (32 + offs_16[None, :]) * stride_a_c, z16)
+        tl.store(a_base + (0 + offs_16[:, None]) * stride_a_r + (48 + offs_16[None, :]) * stride_a_c, z16)
+        tl.store(a_base + (16 + offs_16[:, None]) * stride_a_r + (0 + offs_16[None, :]) * stride_a_c, inv10)
+        tl.store(a_base + (16 + offs_16[:, None]) * stride_a_r + (16 + offs_16[None, :]) * stride_a_c, inv11)
+        tl.store(a_base + (16 + offs_16[:, None]) * stride_a_r + (32 + offs_16[None, :]) * stride_a_c, z16)
+        tl.store(a_base + (16 + offs_16[:, None]) * stride_a_r + (48 + offs_16[None, :]) * stride_a_c, z16)
+        tl.store(a_base + (32 + offs_16[:, None]) * stride_a_r + (0 + offs_16[None, :]) * stride_a_c, inv20)
+        tl.store(a_base + (32 + offs_16[:, None]) * stride_a_r + (16 + offs_16[None, :]) * stride_a_c, inv21)
+        tl.store(a_base + (32 + offs_16[:, None]) * stride_a_r + (32 + offs_16[None, :]) * stride_a_c, inv22)
+        tl.store(a_base + (32 + offs_16[:, None]) * stride_a_r + (48 + offs_16[None, :]) * stride_a_c, z16)
+        tl.store(a_base + (48 + offs_16[:, None]) * stride_a_r + (0 + offs_16[None, :]) * stride_a_c, inv30)
+        tl.store(a_base + (48 + offs_16[:, None]) * stride_a_r + (16 + offs_16[None, :]) * stride_a_c, inv31)
+        tl.store(a_base + (48 + offs_16[:, None]) * stride_a_r + (32 + offs_16[None, :]) * stride_a_c, inv32)
+        tl.store(a_base + (48 + offs_16[:, None]) * stride_a_r + (48 + offs_16[None, :]) * stride_a_c, inv33)
+
+    @triton.jit
+    def _wy_L_blocks_batched_kernel(
+        K_base_ptr,
+        G_page_ptr,
+        CumG_ptr,
+        Act_ptr,
+        L_work_ptr,
+        stride_kb_b,
+        stride_kb_t,
+        stride_kb_h,
+        stride_kb_d,
+        stride_gp_c,
+        stride_gp_b,
+        stride_gp_t,
+        stride_gp_m,
+        stride_gp_h,
+        stride_cg_cbmh,
+        stride_cg_t,
+        stride_cg_d,
+        stride_l_cbmh,
+        stride_l_r,
+        stride_l_c,
+        T_total,
+        c_start,
+        BMH,
+        chunk_size: tl.constexpr,
+        M,
+        H,
+        D_K: tl.constexpr,
+        USE_BF16_DOT: tl.constexpr,
+    ):
+        slot = tl.program_id(0)
+        if tl.load(Act_ptr + slot) == 0:
+            return
+        blk_id = tl.program_id(1)
+        loc = slot // BMH
+        bmh = slot % BMH
+        n = c_start + loc
+        t0 = n * chunk_size
+        c_len = tl.minimum(chunk_size, T_total - t0)
+
+        h = bmh % H
+        bm = bmh // H
+        m = bm % M
+        b = bm // M
+        offs_16 = tl.arange(0, 16)
+        offs_dk = tl.arange(0, D_K)
+
+        gp_base = G_page_ptr + loc * stride_gp_c + b * stride_gp_b + m * stride_gp_m + h * stride_gp_h
+        kb_base = K_base_ptr + b * stride_kb_b + h * stride_kb_h
+        cg_base = CumG_ptr + slot * stride_cg_cbmh
+
+        if blk_id < 4:
+            br = blk_id
+            r_offs = br * 16 + offs_16
+            r_mask = r_offs < c_len
+            strict_lo = offs_16[:, None] > offs_16[None, :]
+            g_r = tl.load(gp_base + r_offs * stride_gp_t, mask=r_mask, other=0.0).to(tl.float32)
+            cg_0 = tl.load(cg_base + (br * 16) * stride_cg_t + offs_dk * stride_cg_d)
+            cg_15 = tl.load(cg_base + (br * 16 + 15) * stride_cg_t + offs_dk * stride_cg_d)
+            if tl.max(cg_0 - cg_15) < 12.0:
+                kb_r = tl.load(
+                    kb_base + (t0 + r_offs[:, None]) * stride_kb_t + offs_dk[None, :] * stride_kb_d,
+                    mask=r_mask[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                cg_r = tl.load(cg_base + r_offs[:, None] * stride_cg_t + offs_dk[None, :] * stride_cg_d)
+                ke_r = g_r[:, None] * kb_r
+                lhs_d = ke_r * tl.exp(cg_r - cg_0[None, :])
+                rhs_d = ke_r * tl.exp(cg_0[None, :] - cg_r)
+                L_diag = tl.where(strict_lo, tl.dot(lhs_d, tl.trans(rhs_d), input_precision="ieee"), 0.0)
+            else:
+                L_diag = tl.zeros([16, 16], dtype=tl.float32)
+                for d0 in range(0, D_K, 8):
+                    d_offs = d0 + tl.arange(0, 8)
+                    kb_s = tl.load(
+                        kb_base + (t0 + r_offs[:, None]) * stride_kb_t + d_offs[None, :] * stride_kb_d,
+                        mask=r_mask[:, None],
+                        other=0.0,
+                    ).to(tl.float32)
+                    ke_s = g_r[:, None] * kb_s
+                    cg_s = tl.load(cg_base + r_offs[:, None] * stride_cg_t + d_offs[None, :] * stride_cg_d)
+                    diff = tl.where(strict_lo[:, :, None], cg_s[:, None, :] - cg_s[None, :, :], 0.0)
+                    L_diag += tl.sum(ke_s[:, None, :] * ke_s[None, :, :] * tl.exp(diff), axis=2)
+                L_diag = tl.where(strict_lo, L_diag, 0.0)
+            inv_b = _invert_unit_lower_16x16_fast(L_diag)
+            tl.store(
+                L_work_ptr + slot * stride_l_cbmh + r_offs[:, None] * stride_l_r + r_offs[None, :] * stride_l_c, inv_b
+            )
+        else:
+            if blk_id == 4:
+                br, bc = 1, 0
+            elif blk_id == 5:
+                br, bc = 2, 0
+            elif blk_id == 6:
+                br, bc = 2, 1
+            elif blk_id == 7:
+                br, bc = 3, 0
+            elif blk_id == 8:
+                br, bc = 3, 1
+            else:
+                br, bc = 3, 2
+            r_offs = br * 16 + offs_16
+            c_offs = bc * 16 + offs_16
+            r_mask = r_offs < c_len
+            c_mask = c_offs < c_len
+            piv_row = bc * 16 + 15
+            g_r = tl.load(gp_base + r_offs * stride_gp_t, mask=r_mask, other=0.0).to(tl.float32)
+            g_c = tl.load(gp_base + c_offs * stride_gp_t, mask=c_mask, other=0.0).to(tl.float32)
+            kb_r = tl.load(
+                kb_base + (t0 + r_offs[:, None]) * stride_kb_t + offs_dk[None, :] * stride_kb_d,
+                mask=r_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            kb_c = tl.load(
+                kb_base + (t0 + c_offs[:, None]) * stride_kb_t + offs_dk[None, :] * stride_kb_d,
+                mask=c_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            cg_r = tl.load(cg_base + r_offs[:, None] * stride_cg_t + offs_dk[None, :] * stride_cg_d)
+            cg_c = tl.load(cg_base + c_offs[:, None] * stride_cg_t + offs_dk[None, :] * stride_cg_d)
+            cg_piv = tl.load(cg_base + piv_row * stride_cg_t + offs_dk * stride_cg_d)
+            lhs = (g_r[:, None] * kb_r) * tl.exp(cg_r - cg_piv[None, :])
+            rhs = (g_c[:, None] * kb_c) * tl.exp(cg_piv[None, :] - cg_c)
+            blk = tl.dot(lhs, tl.trans(rhs), input_precision="ieee")
+            tl.store(
+                L_work_ptr + slot * stride_l_cbmh + r_offs[:, None] * stride_l_r + c_offs[None, :] * stride_l_c, blk
+            )
+
+    @triton.jit
+    def _batched_chunk_readout_fwd_kernel(
+        Vec_ptr,
+        Banks_ptr,
+        TopIdx_ptr,
+        TopW_ptr,
+        Out_ptr,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_sc,
+        stride_sb,
+        stride_sm,
+        stride_sh,
+        stride_sk,
+        stride_sv,
+        stride_ib,
+        stride_it,
+        stride_ik,
+        stride_wb,
+        stride_wt,
+        stride_wk,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        T_span,
+        chunk_size: tl.constexpr,
+        M,
+        H,
+        K_SEL: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+        D_K: tl.constexpr,
+        B_V: tl.constexpr,
+        USE_BF16: tl.constexpr,
+    ):
+        t_blk = tl.program_id(0)
+        bh = tl.program_id(1)
+        v_blk = tl.program_id(2)
+        b = bh // H
+        h = bh % H
+
+        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T)
+        mask_t = offs_t < T_span
+        c_loc = (t_blk * BLOCK_T) // chunk_size
+        offs_dk = tl.arange(0, D_K)
+        offs_bv = v_blk * B_V + tl.arange(0, B_V)
+
+        vec = tl.load(
+            Vec_ptr + b * stride_vb + offs_t[:, None] * stride_vt + h * stride_vh + offs_dk[None, :] * stride_vd,
+            mask=mask_t[:, None],
+            other=0.0,
+        )
+        acc = tl.zeros([BLOCK_T, B_V], dtype=tl.float32)
+        s_base = Banks_ptr + c_loc * stride_sc + b * stride_sb + h * stride_sh
+
+        for m in range(M):
+            wm = tl.zeros([BLOCK_T], dtype=tl.float32)
+            for r in tl.static_range(0, K_SEL):
+                idx_r = tl.load(TopIdx_ptr + b * stride_ib + offs_t * stride_it + r * stride_ik, mask=mask_t, other=-1)
+                w_r = tl.load(TopW_ptr + b * stride_wb + offs_t * stride_wt + r * stride_wk, mask=mask_t, other=0.0).to(
+                    tl.float32
+                )
+                wm += tl.where(idx_r == m, w_r, 0.0)
+            if tl.max(tl.abs(wm)) > 0.0:
+                s_tile = tl.load(s_base + m * stride_sm + offs_dk[:, None] * stride_sk + offs_bv[None, :] * stride_sv)
+                if USE_BF16:
+                    prod = tl.dot(vec.to(tl.bfloat16), s_tile.to(tl.bfloat16)).to(tl.float32)
+                else:
+                    prod = tl.dot(vec.to(tl.float32), s_tile.to(tl.float32))
+                acc += wm[:, None] * prod
+
+        tl.store(
+            Out_ptr + b * stride_ob + offs_t[:, None] * stride_ot + h * stride_oh + offs_bv[None, :] * stride_od,
+            acc.to(Out_ptr.dtype.element_ty),
+            mask=mask_t[:, None],
+        )
+
+    @triton.jit
+    def _batched_chunk_readout_bwd_vec_w_kernel(
+        Vec_ptr,
+        Banks_ptr,
+        TopIdx_ptr,
+        TopW_ptr,
+        DOut_ptr,
+        DVec_ptr,
+        DW_part_ptr,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_sc,
+        stride_sb,
+        stride_sm,
+        stride_sh,
+        stride_sk,
+        stride_sv,
+        stride_ib,
+        stride_it,
+        stride_ik,
+        stride_wb,
+        stride_wt,
+        stride_wk,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        stride_dwp_bh,
+        stride_dwp_t,
+        stride_dwp_k,
+        T_span,
+        chunk_size: tl.constexpr,
+        M,
+        H,
+        K_SEL: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+        D_K: tl.constexpr,
+        D_V: tl.constexpr,
+        USE_BF16: tl.constexpr,
+    ):
+        t_blk = tl.program_id(0)
+        bh = tl.program_id(1)
+        b = bh // H
+        h = bh % H
+
+        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T)
+        mask_t = offs_t < T_span
+        c_loc = (t_blk * BLOCK_T) // chunk_size
+        offs_dk = tl.arange(0, D_K)
+        offs_64 = tl.arange(0, 64)
+
+        vec = tl.load(
+            Vec_ptr + b * stride_vb + offs_t[:, None] * stride_vt + h * stride_vh + offs_dk[None, :] * stride_vd,
+            mask=mask_t[:, None],
+            other=0.0,
+        )
+        dvec_acc = tl.zeros([BLOCK_T, D_K], dtype=tl.float32)
+        s_base = Banks_ptr + c_loc * stride_sc + b * stride_sb + h * stride_sh
+
+        for r in tl.static_range(0, K_SEL):
+            tl.store(DW_part_ptr + bh * stride_dwp_bh + offs_t * stride_dwp_t + r * stride_dwp_k, 0.0, mask=mask_t)
+
+        for m in range(M):
+            any_sel = tl.zeros([BLOCK_T], dtype=tl.int32)
+            wm = tl.zeros([BLOCK_T], dtype=tl.float32)
+            for r in tl.static_range(0, K_SEL):
+                idx_r = tl.load(TopIdx_ptr + b * stride_ib + offs_t * stride_it + r * stride_ik, mask=mask_t, other=-1)
+                w_r = tl.load(TopW_ptr + b * stride_wb + offs_t * stride_wt + r * stride_wk, mask=mask_t, other=0.0).to(
+                    tl.float32
+                )
+                sel_r = idx_r == m
+                any_sel += sel_r.to(tl.int32)
+                wm += tl.where(sel_r, w_r, 0.0)
+            if tl.max(any_sel) > 0:
+                dot_m = tl.zeros([BLOCK_T], dtype=tl.float32)
+                for v_off in range(0, D_V, 64):
+                    v_cols = v_off + offs_64
+                    dout_tile = tl.load(
+                        DOut_ptr
+                        + b * stride_ob
+                        + offs_t[:, None] * stride_ot
+                        + h * stride_oh
+                        + v_cols[None, :] * stride_od,
+                        mask=mask_t[:, None],
+                        other=0.0,
+                    )
+                    s_tile = tl.load(
+                        s_base + m * stride_sm + offs_dk[:, None] * stride_sk + v_cols[None, :] * stride_sv
+                    )
+                    if USE_BF16:
+                        prod = tl.dot(vec.to(tl.bfloat16), s_tile.to(tl.bfloat16)).to(tl.float32)
+                        dvec_acc += wm[:, None] * tl.dot(
+                            dout_tile.to(tl.bfloat16), tl.trans(s_tile.to(tl.bfloat16))
+                        ).to(tl.float32)
+                    else:
+                        prod = tl.dot(vec.to(tl.float32), s_tile.to(tl.float32))
+                        dvec_acc += wm[:, None] * tl.dot(dout_tile.to(tl.float32), tl.trans(s_tile.to(tl.float32)))
+                    dot_m += tl.sum(dout_tile.to(tl.float32) * prod, axis=1)
+                for r in tl.static_range(0, K_SEL):
+                    idx_r = tl.load(
+                        TopIdx_ptr + b * stride_ib + offs_t * stride_it + r * stride_ik, mask=mask_t, other=-1
+                    )
+                    prev_dw = tl.load(
+                        DW_part_ptr + bh * stride_dwp_bh + offs_t * stride_dwp_t + r * stride_dwp_k,
+                        mask=mask_t,
+                        other=0.0,
+                    )
+                    tl.store(
+                        DW_part_ptr + bh * stride_dwp_bh + offs_t * stride_dwp_t + r * stride_dwp_k,
+                        prev_dw + tl.where(idx_r == m, dot_m, 0.0),
+                        mask=mask_t,
+                    )
+
+        tl.store(
+            DVec_ptr + b * stride_vb + offs_t[:, None] * stride_vt + h * stride_vh + offs_dk[None, :] * stride_vd,
+            dvec_acc.to(DVec_ptr.dtype.element_ty),
+            mask=mask_t[:, None],
+        )
+
+    @triton.jit
+    def _routed_readout_off_fwd_kernel(
+        Vec_ptr,
+        Bank_ptr,
+        TopIdx_ptr,
+        TopW_ptr,
+        Out_ptr,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_sb,
+        stride_sm,
+        stride_sh,
+        stride_sk,
+        stride_sv,
+        stride_ib,
+        stride_it,
+        stride_ik,
+        stride_wb,
+        stride_wt,
+        stride_wk,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        vec_t0,
+        out_t0,
+        c_len,
+        M,
+        H,
+        K_SEL: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+        D_K: tl.constexpr,
+        B_V: tl.constexpr,
+        USE_BF16: tl.constexpr,
+    ):
+        t_blk = tl.program_id(0)
+        bh = tl.program_id(1)
+        v_blk = tl.program_id(2)
+        b = bh // H
+        h = bh % H
+
+        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T)
+        mask_t = offs_t < c_len
+        t_in = vec_t0 + offs_t
+        t_out = out_t0 + offs_t
+        offs_dk = tl.arange(0, D_K)
+        offs_bv = v_blk * B_V + tl.arange(0, B_V)
+
+        vec = tl.load(
+            Vec_ptr + b * stride_vb + t_in[:, None] * stride_vt + h * stride_vh + offs_dk[None, :] * stride_vd,
+            mask=mask_t[:, None],
+            other=0.0,
+        )
+        acc = tl.zeros([BLOCK_T, B_V], dtype=tl.float32)
+
+        for m in range(M):
+            wm = tl.zeros([BLOCK_T], dtype=tl.float32)
+            for r in tl.static_range(0, K_SEL):
+                idx_r = tl.load(TopIdx_ptr + b * stride_ib + t_in * stride_it + r * stride_ik, mask=mask_t, other=-1)
+                w_r = tl.load(TopW_ptr + b * stride_wb + t_in * stride_wt + r * stride_wk, mask=mask_t, other=0.0).to(
+                    tl.float32
+                )
+                wm += tl.where(idx_r == m, w_r, 0.0)
+            if tl.max(tl.abs(wm)) > 0.0:
+                s_tile = tl.load(
+                    Bank_ptr
+                    + b * stride_sb
+                    + m * stride_sm
+                    + h * stride_sh
+                    + offs_dk[:, None] * stride_sk
+                    + offs_bv[None, :] * stride_sv
+                )
+                if USE_BF16:
+                    prod = tl.dot(vec.to(tl.bfloat16), s_tile.to(tl.bfloat16)).to(tl.float32)
+                else:
+                    prod = tl.dot(vec.to(tl.float32), s_tile.to(tl.float32))
+                acc += wm[:, None] * prod
+
+        tl.store(
+            Out_ptr + b * stride_ob + t_out[:, None] * stride_ot + h * stride_oh + offs_bv[None, :] * stride_od,
+            acc.to(Out_ptr.dtype.element_ty),
+            mask=mask_t[:, None],
+        )
+
+    @triton.jit
+    def _surprise_and_cumg_fwd_kernel(
+        V_ptr,
+        PredV_ptr,
+        SBias_ptr,
+        Slope_ptr,
+        Thresh_ptr,
+        WM_ptr,
+        TopIdx_ptr,
+        SteW_ptr,
+        PS_ptr,
+        Chan_ptr,
+        GRoot_ptr,
+        GPage_ptr,
+        CumG_ptr,
+        Act_ptr,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_pvb,
+        stride_pvt,
+        stride_pvh,
+        stride_pvd,
+        stride_sbb,
+        stride_sbt,
+        stride_sbh,
+        stride_wmb,
+        stride_wmt,
+        stride_ib,
+        stride_it,
+        stride_ik,
+        stride_swb,
+        stride_swt,
+        stride_swk,
+        stride_ch_b,
+        stride_ch_t,
+        stride_ch_h,
+        stride_ch_d,
+        stride_grb,
+        stride_grt,
+        stride_grh,
+        stride_gpb,
+        stride_gpt,
+        stride_gpm,
+        stride_gph,
+        stride_cg_bmh,
+        stride_cg_t,
+        stride_cg_d,
+        t0,
+        pv_t0,
+        c_len,
+        M: tl.constexpr,
+        H,
+        K_SEL: tl.constexpr,
+        D_K: tl.constexpr,
+        D_V: tl.constexpr,
+        HAS_WM: tl.constexpr,
+        USE_SURPRISE: tl.constexpr,
+    ):
+        bh = tl.program_id(0)
+        b = bh // H
+        h = bh % H
+        offs_64 = tl.arange(0, 64)
+        mask_t = offs_64 < c_len
+        t_glob = t0 + offs_64
+        t_pv = pv_t0 + offs_64
+
+        if USE_SURPRISE:
+            offs_dv = tl.arange(0, D_V)
+            v_f = tl.load(
+                V_ptr + b * stride_vb + t_glob[:, None] * stride_vt + h * stride_vh + offs_dv[None, :] * stride_vd,
+                mask=mask_t[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            pv_f = tl.load(
+                PredV_ptr
+                + b * stride_pvb
+                + t_pv[:, None] * stride_pvt
+                + h * stride_pvh
+                + offs_dv[None, :] * stride_pvd,
+                mask=mask_t[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            diff = v_f - pv_f
+            err_sq = tl.sum(diff * diff, axis=1)
+            v_sq = tl.sum(v_f * v_f, axis=1)
+            err_norm = tl.where(err_sq > 0.0, tl.sqrt(err_sq), 0.0)
+            v_norm = tl.where(v_sq > 0.0, tl.sqrt(v_sq), 0.0)
+            eps_err = err_norm / (v_norm + 1e-6)
+            slope_h = tl.load(Slope_ptr + h).to(tl.float32)
+            thresh_h = tl.load(Thresh_ptr + h).to(tl.float32)
+            sb = tl.load(SBias_ptr + b * stride_sbb + t_glob * stride_sbt + h * stride_sbh, mask=mask_t, other=0.0).to(
+                tl.float32
+            )
+            g_root = tl.where(mask_t, tl.sigmoid(slope_h * (eps_err - thresh_h) + sb), 0.0)
+        else:
+            g_root = tl.where(mask_t, 1.0, 0.0)
+
+        if HAS_WM:
+            wm = tl.load(WM_ptr + b * stride_wmb + t_glob * stride_wmt, mask=mask_t, other=0.0).to(tl.float32)
+            g_root = g_root * wm
+
+        tl.store(GRoot_ptr + b * stride_grb + t_glob * stride_grt + h * stride_grh, g_root, mask=mask_t)
+
+        offs_dk = tl.arange(0, D_K)
+        offs_half = offs_dk // 2
+        ch_val = tl.load(
+            Chan_ptr
+            + b * stride_ch_b
+            + t_glob[:, None] * stride_ch_t
+            + h * stride_ch_h
+            + offs_half[None, :] * stride_ch_d,
+            mask=mask_t[:, None],
+            other=0.0,
+        ).to(tl.float32)
+
+        for m in range(M):
+            wm_m = tl.zeros([64], dtype=tl.float32)
+            for r in tl.static_range(0, K_SEL):
+                idx_r = tl.load(TopIdx_ptr + b * stride_ib + t_glob * stride_it + r * stride_ik, mask=mask_t, other=-1)
+                sw_r = tl.load(
+                    SteW_ptr + b * stride_swb + t_glob * stride_swt + r * stride_swk, mask=mask_t, other=0.0
+                ).to(tl.float32)
+                wm_m += tl.where(idx_r == m, sw_r, 0.0)
+            g_vec = wm_m * g_root
+            tl.store(GPage_ptr + b * stride_gpb + offs_64 * stride_gpt + m * stride_gpm + h * stride_gph, g_vec)
+            bmh = (b * M + m) * H + h
+            if tl.max(tl.abs(g_vec)) == 0.0:
+                tl.store(Act_ptr + bmh, 0)
+            else:
+                tl.store(Act_ptr + bmh, 1)
+                ps_m = tl.load(PS_ptr + m).to(tl.float32)
+                log_a = tl.minimum(-(g_vec[:, None] * g_vec[:, None]) * (ps_m * ch_val), 0.0)
+                cum_g = tl.cumsum(log_a, axis=0)
+                tl.store(
+                    CumG_ptr + bmh * stride_cg_bmh + offs_64[:, None] * stride_cg_t + offs_dk[None, :] * stride_cg_d,
+                    cum_g,
+                )
+
+    @triton.jit
+    def _wy_L_blocks_off_fwd_kernel(
+        K_base_ptr,
+        G_page_ptr,
+        CumG_ptr,
+        Act_ptr,
+        L_work_ptr,
+        stride_kb_b,
+        stride_kb_t,
+        stride_kb_h,
+        stride_kb_d,
+        stride_gp_b,
+        stride_gp_t,
+        stride_gp_m,
+        stride_gp_h,
+        stride_cg_bmh,
+        stride_cg_t,
+        stride_cg_d,
+        stride_l_bmh,
+        stride_l_r,
+        stride_l_c,
+        t0,
+        c_len,
+        M,
+        H,
+        D_K: tl.constexpr,
+        USE_BF16_DOT: tl.constexpr,
+    ):
+        bmh = tl.program_id(0)
+        if tl.load(Act_ptr + bmh) == 0:
+            return
+        blk_id = tl.program_id(1)
+        h = bmh % H
+        bm = bmh // H
+        m = bm % M
+        b = bm // M
+        offs_16 = tl.arange(0, 16)
+        offs_dk = tl.arange(0, D_K)
+
+        if blk_id < 4:
+            br = blk_id
+            r_offs = br * 16 + offs_16
+            r_mask = r_offs < c_len
+            strict_lo = offs_16[:, None] > offs_16[None, :]
+            g_r = tl.load(
+                G_page_ptr + b * stride_gp_b + r_offs * stride_gp_t + m * stride_gp_m + h * stride_gp_h,
+                mask=r_mask,
+                other=0.0,
+            ).to(tl.float32)
+            cg_0 = tl.load(CumG_ptr + bmh * stride_cg_bmh + (br * 16) * stride_cg_t + offs_dk * stride_cg_d)
+            cg_15 = tl.load(CumG_ptr + bmh * stride_cg_bmh + (br * 16 + 15) * stride_cg_t + offs_dk * stride_cg_d)
+            if tl.max(cg_0 - cg_15) < 12.0:
+                kb_r = tl.load(
+                    K_base_ptr
+                    + b * stride_kb_b
+                    + (t0 + r_offs[:, None]) * stride_kb_t
+                    + h * stride_kb_h
+                    + offs_dk[None, :] * stride_kb_d,
+                    mask=r_mask[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                cg_r = tl.load(
+                    CumG_ptr + bmh * stride_cg_bmh + r_offs[:, None] * stride_cg_t + offs_dk[None, :] * stride_cg_d
+                )
+                ke_r = g_r[:, None] * kb_r
+                L_diag = tl.where(
+                    strict_lo,
+                    tl.dot(
+                        ke_r * tl.exp(cg_r - cg_0[None, :]),
+                        tl.trans(ke_r * tl.exp(cg_0[None, :] - cg_r)),
+                        input_precision="ieee",
+                    ),
+                    0.0,
+                )
+            else:
+                L_diag = tl.zeros([16, 16], dtype=tl.float32)
+                for d0 in range(0, D_K, 8):
+                    d_offs = d0 + tl.arange(0, 8)
+                    kb_s = tl.load(
+                        K_base_ptr
+                        + b * stride_kb_b
+                        + (t0 + r_offs[:, None]) * stride_kb_t
+                        + h * stride_kb_h
+                        + d_offs[None, :] * stride_kb_d,
+                        mask=r_mask[:, None],
+                        other=0.0,
+                    ).to(tl.float32)
+                    ke_s = g_r[:, None] * kb_s
+                    cg_s = tl.load(
+                        CumG_ptr + bmh * stride_cg_bmh + r_offs[:, None] * stride_cg_t + d_offs[None, :] * stride_cg_d
+                    )
+                    diff = tl.where(strict_lo[:, :, None], cg_s[:, None, :] - cg_s[None, :, :], 0.0)
+                    L_diag += tl.sum(ke_s[:, None, :] * ke_s[None, :, :] * tl.exp(diff), axis=2)
+                L_diag = tl.where(strict_lo, L_diag, 0.0)
+            inv_b = _invert_unit_lower_16x16_fast(L_diag)
+            tl.store(
+                L_work_ptr + bmh * stride_l_bmh + r_offs[:, None] * stride_l_r + r_offs[None, :] * stride_l_c, inv_b
+            )
+        else:
+            if blk_id == 4:
+                br, bc = 1, 0
+            elif blk_id == 5:
+                br, bc = 2, 0
+            elif blk_id == 6:
+                br, bc = 2, 1
+            elif blk_id == 7:
+                br, bc = 3, 0
+            elif blk_id == 8:
+                br, bc = 3, 1
+            else:
+                br, bc = 3, 2
+            r_offs = br * 16 + offs_16
+            c_offs = bc * 16 + offs_16
+            r_mask = r_offs < c_len
+            c_mask = c_offs < c_len
+            piv_row = bc * 16 + 15
+            g_r = tl.load(
+                G_page_ptr + b * stride_gp_b + r_offs * stride_gp_t + m * stride_gp_m + h * stride_gp_h,
+                mask=r_mask,
+                other=0.0,
+            ).to(tl.float32)
+            g_c = tl.load(
+                G_page_ptr + b * stride_gp_b + c_offs * stride_gp_t + m * stride_gp_m + h * stride_gp_h,
+                mask=c_mask,
+                other=0.0,
+            ).to(tl.float32)
+            kb_r = tl.load(
+                K_base_ptr
+                + b * stride_kb_b
+                + (t0 + r_offs[:, None]) * stride_kb_t
+                + h * stride_kb_h
+                + offs_dk[None, :] * stride_kb_d,
+                mask=r_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            kb_c = tl.load(
+                K_base_ptr
+                + b * stride_kb_b
+                + (t0 + c_offs[:, None]) * stride_kb_t
+                + h * stride_kb_h
+                + offs_dk[None, :] * stride_kb_d,
+                mask=c_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            cg_r = tl.load(
+                CumG_ptr + bmh * stride_cg_bmh + r_offs[:, None] * stride_cg_t + offs_dk[None, :] * stride_cg_d
+            )
+            cg_c = tl.load(
+                CumG_ptr + bmh * stride_cg_bmh + c_offs[:, None] * stride_cg_t + offs_dk[None, :] * stride_cg_d
+            )
+            cg_piv = tl.load(CumG_ptr + bmh * stride_cg_bmh + piv_row * stride_cg_t + offs_dk * stride_cg_d)
+            lhs = (g_r[:, None] * kb_r) * tl.exp(cg_r - cg_piv[None, :])
+            rhs = (g_c[:, None] * kb_c) * tl.exp(cg_piv[None, :] - cg_c)
+            blk = tl.dot(lhs, tl.trans(rhs), input_precision="ieee")
+            tl.store(L_work_ptr + bmh * stride_l_bmh + r_offs[:, None] * stride_l_r + c_offs[None, :] * stride_l_c, blk)
+
+    @triton.jit
+    def _wy_w2_off_fwd_kernel(
+        K_base_ptr,
+        V_base_ptr,
+        G_page_ptr,
+        A_inv_ptr,
+        CumG_ptr,
+        Act_ptr,
+        S_in_ptr,
+        S_out_ptr,
+        stride_kb_b,
+        stride_kb_t,
+        stride_kb_h,
+        stride_kb_d,
+        stride_vb_b,
+        stride_vb_t,
+        stride_vb_h,
+        stride_vb_d,
+        stride_gp_c,
+        stride_gp_b,
+        stride_gp_t,
+        stride_gp_m,
+        stride_gp_h,
+        stride_a_bmh,
+        stride_a_r,
+        stride_a_c,
+        stride_cg_bmh,
+        stride_cg_t,
+        stride_cg_d,
+        stride_s_c,
+        stride_s_bmh,
+        stride_s_k,
+        stride_s_v,
+        t0,
+        loc,
+        slot0,
+        s_in_idx,
+        s_out_idx,
+        c_len,
+        M,
+        H,
+        D_K: tl.constexpr,
+        B_V: tl.constexpr,
+        INPLACE_S: tl.constexpr,
+        USE_BF16_DOT: tl.constexpr,
+    ):
+        bmh = tl.program_id(0)
+        v_blk = tl.program_id(1)
+        slot = slot0 + bmh
+        act = tl.load(Act_ptr + slot)
+        offs_64 = tl.arange(0, 64)
+        offs_bv = v_blk * B_V + tl.arange(0, B_V)
+        s_in_base = S_in_ptr + s_in_idx * stride_s_c + bmh * stride_s_bmh
+        s_out_base = S_out_ptr + s_out_idx * stride_s_c + bmh * stride_s_bmh
+        if act == 0:
+            if not INPLACE_S:
+                for k0_off in range(0, D_K, 64):
+                    dk_sub = k0_off + offs_64
+                    tl.store(
+                        s_out_base + dk_sub[:, None] * stride_s_k + offs_bv[None, :] * stride_s_v,
+                        tl.load(s_in_base + dk_sub[:, None] * stride_s_k + offs_bv[None, :] * stride_s_v),
+                    )
+            return
+        h = bmh % H
+        bm = bmh // H
+        m = bm % M
+        b = bm // M
+        mask_64 = offs_64 < c_len
+        t_glob = t0 + offs_64
+        g_vec = tl.load(
+            G_page_ptr
+            + loc * stride_gp_c
+            + b * stride_gp_b
+            + offs_64 * stride_gp_t
+            + m * stride_gp_m
+            + h * stride_gp_h,
+            mask=mask_64,
+            other=0.0,
+        ).to(tl.float32)
+        v_base = tl.load(
+            V_base_ptr
+            + b * stride_vb_b
+            + t_glob[:, None] * stride_vb_t
+            + h * stride_vb_h
+            + offs_bv[None, :] * stride_vb_d,
+            mask=mask_64[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        rhs = g_vec[:, None] * v_base
+        for k_off in range(0, D_K, 64):
+            dk_sub = k_off + offs_64
+            kb_sub = tl.load(
+                K_base_ptr
+                + b * stride_kb_b
+                + t_glob[:, None] * stride_kb_t
+                + h * stride_kb_h
+                + dk_sub[None, :] * stride_kb_d,
+                mask=mask_64[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            cg_sub = tl.load(
+                CumG_ptr + slot * stride_cg_bmh + offs_64[:, None] * stride_cg_t + dk_sub[None, :] * stride_cg_d
+            )
+            k0_sub = tl.exp(cg_sub) * (g_vec[:, None] * kb_sub)
+            s_sub = tl.load(s_in_base + dk_sub[:, None] * stride_s_k + offs_bv[None, :] * stride_s_v).to(tl.float32)
+            if USE_BF16_DOT:
+                rhs -= tl.dot(k0_sub.to(tl.bfloat16), s_sub.to(tl.bfloat16)).to(tl.float32)
+            else:
+                rhs -= tl.dot(k0_sub, s_sub)
+        a_mat = tl.load(A_inv_ptr + slot * stride_a_bmh + offs_64[:, None] * stride_a_r + offs_64[None, :] * stride_a_c)
+        u_wy = tl.where(mask_64[:, None], tl.dot(a_mat, rhs, input_precision="ieee"), 0.0)
+        last_idx = c_len - 1
+        for k_off in range(0, D_K, 64):
+            dk_sub = k_off + offs_64
+            kb_sub = tl.load(
+                K_base_ptr
+                + b * stride_kb_b
+                + t_glob[:, None] * stride_kb_t
+                + h * stride_kb_h
+                + dk_sub[None, :] * stride_kb_d,
+                mask=mask_64[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            cg_sub = tl.load(
+                CumG_ptr + slot * stride_cg_bmh + offs_64[:, None] * stride_cg_t + dk_sub[None, :] * stride_cg_d
+            )
+            cg_end = tl.load(CumG_ptr + slot * stride_cg_bmh + last_idx * stride_cg_t + dk_sub * stride_cg_d)
+            kend_sub = tl.where(mask_64[:, None], tl.exp(cg_end[None, :] - cg_sub) * (g_vec[:, None] * kb_sub), 0.0)
+            s_sub = tl.load(s_in_base + dk_sub[:, None] * stride_s_k + offs_bv[None, :] * stride_s_v).to(tl.float32)
+            if USE_BF16_DOT:
+                upd = tl.dot(tl.trans(kend_sub.to(tl.bfloat16)), u_wy.to(tl.bfloat16)).to(tl.float32)
+            else:
+                upd = tl.dot(tl.trans(kend_sub), u_wy)
+            tl.store(
+                s_out_base + dk_sub[:, None] * stride_s_k + offs_bv[None, :] * stride_s_v,
+                tl.exp(cg_end)[:, None] * s_sub + upd,
+            )
+
+    @triton.jit
+    def _wy_cumg_from_routes_batched_kernel(
+        TWI_ptr,
+        SteW_ptr,
+        GRoot_ptr,
+        PS_ptr,
+        Chan_ptr,
+        G_page_ptr,
+        CumG_ptr,
+        Act_ptr,
+        stride_ib,
+        stride_it,
+        stride_ik,
+        stride_swb,
+        stride_swt,
+        stride_swk,
+        stride_grb,
+        stride_grt,
+        stride_grh,
+        stride_ch_b,
+        stride_ch_t,
+        stride_ch_h,
+        stride_ch_d,
+        stride_gp_c,
+        stride_gp_b,
+        stride_gp_t,
+        stride_gp_m,
+        stride_gp_h,
+        stride_cg_cbmh,
+        stride_cg_t,
+        stride_cg_d,
+        T_total,
+        c_start,
+        chunk_size: tl.constexpr,
+        M,
+        H,
+        K_SEL: tl.constexpr,
+        D_K: tl.constexpr,
+    ):
+        bmh = tl.program_id(0)
+        loc = tl.program_id(1)
+        n = c_start + loc
+        t0 = n * chunk_size
+        c_len = tl.minimum(chunk_size, T_total - t0)
+
+        h = bmh % H
+        bm = bmh // H
+        m = bm % M
+        b = bm // M
+        slot = loc * tl.num_programs(0) + bmh
+
+        offs_64 = tl.arange(0, 64)
+        mask_64 = offs_64 < c_len
+        t_glob = t0 + offs_64
+
+        wm = tl.zeros([64], dtype=tl.float32)
+        for r in tl.static_range(0, K_SEL):
+            idx_r = tl.load(TWI_ptr + b * stride_ib + t_glob * stride_it + r * stride_ik, mask=mask_64, other=-1)
+            sw_r = tl.load(
+                SteW_ptr + b * stride_swb + t_glob * stride_swt + r * stride_swk, mask=mask_64, other=0.0
+            ).to(tl.float32)
+            wm += tl.where(idx_r == m, sw_r, 0.0)
+        gr = tl.load(GRoot_ptr + b * stride_grb + t_glob * stride_grt + h * stride_grh, mask=mask_64, other=0.0).to(
+            tl.float32
+        )
+        g_vec = wm * gr
+        tl.store(
+            G_page_ptr
+            + loc * stride_gp_c
+            + b * stride_gp_b
+            + offs_64 * stride_gp_t
+            + m * stride_gp_m
+            + h * stride_gp_h,
+            g_vec,
+        )
+
+        if tl.max(tl.abs(g_vec)) == 0.0:
+            tl.store(Act_ptr + slot, 0)
+            return
+        tl.store(Act_ptr + slot, 1)
+        ps_m = tl.load(PS_ptr + m).to(tl.float32)
+        offs_dk = tl.arange(0, D_K)
+        offs_half = offs_dk // 2
+        ch_val = tl.load(
+            Chan_ptr
+            + b * stride_ch_b
+            + t_glob[:, None] * stride_ch_t
+            + h * stride_ch_h
+            + offs_half[None, :] * stride_ch_d,
+            mask=mask_64[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        log_a = tl.minimum(-(g_vec[:, None] * g_vec[:, None]) * (ps_m * ch_val), 0.0)
+        cum_g = tl.cumsum(log_a, axis=0)
+        tl.store(
+            CumG_ptr + slot * stride_cg_cbmh + offs_64[:, None] * stride_cg_t + offs_dk[None, :] * stride_cg_d, cum_g
+        )
+
+    @triton.jit
+    def _routed_readout_off_bwd_ds_kernel(
+        Vec_ptr,
+        TopIdx_ptr,
+        TopW_ptr,
+        DOut_ptr,
+        DBank_ptr,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_ib,
+        stride_it,
+        stride_ik,
+        stride_wb,
+        stride_wt,
+        stride_wk,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        stride_od,
+        stride_sb,
+        stride_sm,
+        stride_sh,
+        stride_sk,
+        stride_sv,
+        vec_t0,
+        dout_t0,
+        c_len,
+        M,
+        H,
+        K_SEL: tl.constexpr,
+        D_K: tl.constexpr,
+        B_V: tl.constexpr,
+        USE_BF16: tl.constexpr,
+    ):
+        bmh = tl.program_id(0)
+        v_blk = tl.program_id(1)
+        h = bmh % H
+        bm = bmh // H
+        m = bm % M
+        b = bm // M
+
+        offs_64 = tl.arange(0, 64)
+        offs_bv = v_blk * B_V + tl.arange(0, B_V)
+        t_mask = offs_64 < c_len
+        t_in = vec_t0 + offs_64
+        t_do = dout_t0 + offs_64
+
+        wm0 = tl.zeros([64], dtype=tl.float32)
+        for r in tl.static_range(0, K_SEL):
+            idx_r = tl.load(TopIdx_ptr + b * stride_ib + t_in * stride_it + r * stride_ik, mask=t_mask, other=-1)
+            w_r = tl.load(TopW_ptr + b * stride_wb + t_in * stride_wt + r * stride_wk, mask=t_mask, other=0.0).to(
+                tl.float32
+            )
+            wm0 += tl.where(idx_r == m, w_r, 0.0)
+        if tl.max(tl.abs(wm0)) == 0.0:
+            return
+        dout_sub = tl.load(
+            DOut_ptr + b * stride_ob + t_do[:, None] * stride_ot + h * stride_oh + offs_bv[None, :] * stride_od,
+            mask=t_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        for k_off in range(0, D_K, 64):
+            dk_sub = k_off + offs_64
+            vec_sub = tl.load(
+                Vec_ptr + b * stride_vb + t_in[:, None] * stride_vt + h * stride_vh + dk_sub[None, :] * stride_vd,
+                mask=t_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            w_vec = wm0[:, None] * vec_sub
+            if USE_BF16:
+                ds_acc = tl.dot(tl.trans(w_vec.to(tl.bfloat16)), dout_sub.to(tl.bfloat16)).to(tl.float32)
+            else:
+                ds_acc = tl.dot(tl.trans(w_vec), dout_sub)
+            ds_ptrs = (
+                DBank_ptr
+                + b * stride_sb
+                + m * stride_sm
+                + h * stride_sh
+                + dk_sub[:, None] * stride_sk
+                + offs_bv[None, :] * stride_sv
+            )
+            tl.store(ds_ptrs, tl.load(ds_ptrs) + ds_acc)
+
+    @triton.jit
+    def _wy_bwd_b1_off_kernel(
+        K_base_ptr,
+        V_base_ptr,
+        G_page_ptr,
+        A_inv_ptr,
+        CumG_ptr,
+        Act_ptr,
+        S_seg_ptr,
+        DS_cur_ptr,
+        DL_part_ptr,
+        DK0_part_ptr,
+        DKEnd_part_ptr,
+        DG63_part_ptr,
+        DGV_part_ptr,
+        DV_m_ptr,
+        stride_kb_b,
+        stride_kb_t,
+        stride_kb_h,
+        stride_kb_d,
+        stride_vb_b,
+        stride_vb_t,
+        stride_vb_h,
+        stride_vb_d,
+        stride_gp_c,
+        stride_gp_b,
+        stride_gp_t,
+        stride_gp_m,
+        stride_gp_h,
+        stride_a_bmh,
+        stride_a_r,
+        stride_a_c,
+        stride_cg_bmh,
+        stride_cg_t,
+        stride_cg_d,
+        stride_s_c,
+        stride_s_bmh,
+        stride_s_k,
+        stride_s_v,
+        stride_dl_bmh,
+        stride_dl_vb,
+        stride_dl_r,
+        stride_dl_c,
+        stride_dkp_bmh,
+        stride_dkp_vb,
+        stride_dkp_t,
+        stride_dkp_d,
+        stride_dg63_bmh,
+        stride_dg63_vb,
+        stride_dg63_d,
+        stride_dgv_bmh,
+        stride_dgv_vb,
+        stride_dgv_t,
+        stride_dvm_bmh,
+        stride_dvm_t,
+        stride_dvm_v,
+        t0,
+        loc,
+        slot0,
+        c_len,
+        M,
+        H,
+        D_K: tl.constexpr,
+        B_V: tl.constexpr,
+        USE_BF16_DOT: tl.constexpr,
+    ):
+        bmh = tl.program_id(0)
+        v_blk = tl.program_id(1)
+        slot = slot0 + bmh
+        act = tl.load(Act_ptr + slot)
+        offs_64 = tl.arange(0, 64)
+        offs_bv = v_blk * B_V + tl.arange(0, B_V)
+
+        if act == 0:
+            tl.store(
+                DV_m_ptr + slot * stride_dvm_bmh + offs_64[:, None] * stride_dvm_t + offs_bv[None, :] * stride_dvm_v,
+                0.0,
+            )
+            tl.store(DGV_part_ptr + slot * stride_dgv_bmh + v_blk * stride_dgv_vb + offs_64 * stride_dgv_t, 0.0)
+            return
+
+        h = bmh % H
+        bm = bmh // H
+        m = bm % M
+        b = bm // M
+        mask_64 = offs_64 < c_len
+        last_idx = c_len - 1
+        t_glob = t0 + offs_64
+
+        g_vec = tl.load(
+            G_page_ptr
+            + loc * stride_gp_c
+            + b * stride_gp_b
+            + offs_64 * stride_gp_t
+            + m * stride_gp_m
+            + h * stride_gp_h,
+            mask=mask_64,
+            other=0.0,
+        ).to(tl.float32)
+        v_base = tl.load(
+            V_base_ptr
+            + b * stride_vb_b
+            + t_glob[:, None] * stride_vb_t
+            + h * stride_vb_h
+            + offs_bv[None, :] * stride_vb_d,
+            mask=mask_64[:, None],
+            other=0.0,
+        ).to(tl.float32)
+
+        s_prev_base = S_seg_ptr + loc * stride_s_c + bmh * stride_s_bmh
+        ds_base = DS_cur_ptr + bmh * stride_s_bmh
+
+        rhs = g_vec[:, None] * v_base
+        du_wy = tl.zeros([64, B_V], dtype=tl.float32)
+        for k_off in range(0, D_K, 64):
+            dk_sub = k_off + offs_64
+            kb_sub = tl.load(
+                K_base_ptr
+                + b * stride_kb_b
+                + t_glob[:, None] * stride_kb_t
+                + h * stride_kb_h
+                + dk_sub[None, :] * stride_kb_d,
+                mask=mask_64[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            cg_sub = tl.load(
+                CumG_ptr + slot * stride_cg_bmh + offs_64[:, None] * stride_cg_t + dk_sub[None, :] * stride_cg_d
+            )
+            cg_end = tl.load(CumG_ptr + slot * stride_cg_bmh + last_idx * stride_cg_t + dk_sub * stride_cg_d)
+            ke_sub = g_vec[:, None] * kb_sub
+            k0_sub = tl.exp(cg_sub) * ke_sub
+            kend_sub = tl.where(mask_64[:, None], tl.exp(cg_end[None, :] - cg_sub) * ke_sub, 0.0)
+            s_prev_sub = tl.load(s_prev_base + dk_sub[:, None] * stride_s_k + offs_bv[None, :] * stride_s_v).to(
+                tl.float32
+            )
+            ds_in_sub = tl.load(ds_base + dk_sub[:, None] * stride_s_k + offs_bv[None, :] * stride_s_v).to(tl.float32)
+            if USE_BF16_DOT:
+                rhs -= tl.dot(k0_sub.to(tl.bfloat16), s_prev_sub.to(tl.bfloat16)).to(tl.float32)
+                du_wy += tl.dot(kend_sub.to(tl.bfloat16), ds_in_sub.to(tl.bfloat16)).to(tl.float32)
+            else:
+                rhs -= tl.dot(k0_sub, s_prev_sub)
+                du_wy += tl.dot(kend_sub, ds_in_sub)
+
+        a_mat = tl.load(A_inv_ptr + slot * stride_a_bmh + offs_64[:, None] * stride_a_r + offs_64[None, :] * stride_a_c)
+        u_wy = tl.where(mask_64[:, None], tl.dot(a_mat, rhs, input_precision="ieee"), 0.0)
+        du_wy = tl.where(mask_64[:, None], du_wy, 0.0)
+        dr = tl.where(mask_64[:, None], tl.dot(tl.trans(a_mat), du_wy, input_precision="ieee"), 0.0)
+
+        dl_part = -tl.dot(dr, tl.trans(u_wy), input_precision="ieee")
+        tl.store(
+            DL_part_ptr
+            + slot * stride_dl_bmh
+            + v_blk * stride_dl_vb
+            + offs_64[:, None] * stride_dl_r
+            + offs_64[None, :] * stride_dl_c,
+            dl_part,
+        )
+        tl.store(
+            DV_m_ptr + slot * stride_dvm_bmh + offs_64[:, None] * stride_dvm_t + offs_bv[None, :] * stride_dvm_v,
+            g_vec[:, None] * dr,
+            mask=mask_64[:, None],
+        )
+        tl.store(
+            DGV_part_ptr + slot * stride_dgv_bmh + v_blk * stride_dgv_vb + offs_64 * stride_dgv_t,
+            tl.sum(dr * v_base, axis=1),
+        )
+
+        for k_off in range(0, D_K, 64):
+            dk_sub = k_off + offs_64
+            kb_sub = tl.load(
+                K_base_ptr
+                + b * stride_kb_b
+                + t_glob[:, None] * stride_kb_t
+                + h * stride_kb_h
+                + dk_sub[None, :] * stride_kb_d,
+                mask=mask_64[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            cg_sub = tl.load(
+                CumG_ptr + slot * stride_cg_bmh + offs_64[:, None] * stride_cg_t + dk_sub[None, :] * stride_cg_d
+            )
+            cg_end = tl.load(CumG_ptr + slot * stride_cg_bmh + last_idx * stride_cg_t + dk_sub * stride_cg_d)
+            k0_sub = tl.exp(cg_sub) * (g_vec[:, None] * kb_sub)
+
+            s_prev_sub = tl.load(s_prev_base + dk_sub[:, None] * stride_s_k + offs_bv[None, :] * stride_s_v).to(
+                tl.float32
+            )
+            ds_in_sub = tl.load(ds_base + dk_sub[:, None] * stride_s_k + offs_bv[None, :] * stride_s_v).to(tl.float32)
+
+            if USE_BF16_DOT:
+                dk0_sub = -tl.dot(dr.to(tl.bfloat16), tl.trans(s_prev_sub.to(tl.bfloat16))).to(tl.float32)
+                dkend_sub = tl.dot(u_wy.to(tl.bfloat16), tl.trans(ds_in_sub.to(tl.bfloat16))).to(tl.float32)
+                ds_upd = tl.dot(tl.trans(k0_sub.to(tl.bfloat16)), dr.to(tl.bfloat16)).to(tl.float32)
+            else:
+                dk0_sub = -tl.dot(dr, tl.trans(s_prev_sub))
+                dkend_sub = tl.dot(u_wy, tl.trans(ds_in_sub))
+                ds_upd = tl.dot(tl.trans(k0_sub), dr)
+
+            dec_end = tl.exp(cg_end)
+            dg63_sub = tl.sum((dec_end[:, None] * s_prev_sub) * ds_in_sub, axis=1)
+            ds_prev_sub = dec_end[:, None] * ds_in_sub - ds_upd
+
+            tl.store(ds_base + dk_sub[:, None] * stride_s_k + offs_bv[None, :] * stride_s_v, ds_prev_sub)
+            tl.store(
+                DK0_part_ptr
+                + slot * stride_dkp_bmh
+                + v_blk * stride_dkp_vb
+                + offs_64[:, None] * stride_dkp_t
+                + dk_sub[None, :] * stride_dkp_d,
+                dk0_sub,
+            )
+            tl.store(
+                DKEnd_part_ptr
+                + slot * stride_dkp_bmh
+                + v_blk * stride_dkp_vb
+                + offs_64[:, None] * stride_dkp_t
+                + dk_sub[None, :] * stride_dkp_d,
+                dkend_sub,
+            )
+            tl.store(DG63_part_ptr + slot * stride_dg63_bmh + v_blk * stride_dg63_vb + dk_sub * stride_dg63_d, dg63_sub)
+
+    @triton.jit
+    def _wy_bwd_b2_off_kernel(
+        K_base_ptr,
+        G_page_ptr,
+        PS_ptr,
+        Chan_ptr,
+        CumG_ptr,
+        Act_ptr,
+        DL_part_ptr,
+        DK0_part_ptr,
+        DKEnd_part_ptr,
+        DG63_part_ptr,
+        DK_m_ptr,
+        DGam_m_ptr,
+        DGK_part_ptr,
+        stride_kb_b,
+        stride_kb_t,
+        stride_kb_h,
+        stride_kb_d,
+        stride_gp_c,
+        stride_gp_b,
+        stride_gp_t,
+        stride_gp_m,
+        stride_gp_h,
+        stride_ch_b,
+        stride_ch_t,
+        stride_ch_h,
+        stride_ch_d,
+        stride_cg_cbmh,
+        stride_cg_t,
+        stride_cg_d,
+        stride_dl_cbmh,
+        stride_dl_vb,
+        stride_dl_r,
+        stride_dl_c,
+        stride_dkp_cbmh,
+        stride_dkp_vb,
+        stride_dkp_t,
+        stride_dkp_d,
+        stride_dg63_cbmh,
+        stride_dg63_vb,
+        stride_dg63_d,
+        stride_dkm_cbmh,
+        stride_dkm_t,
+        stride_dkm_d,
+        stride_dgk_cbmh,
+        stride_dgk_kb,
+        stride_dgk_t,
+        t0,
+        loc,
+        slot0,
+        c_len,
+        M,
+        H,
+        N_VB: tl.constexpr,
+        B_K: tl.constexpr,
+    ):
+        bmh = tl.program_id(0)
+        k_blk = tl.program_id(1)
+        slot = slot0 + bmh
+        offs_64 = tl.arange(0, 64)
+        offs_bk = k_blk * B_K + tl.arange(0, B_K)
+        if tl.load(Act_ptr + slot) == 0:
+            tl.store(
+                DK_m_ptr + slot * stride_dkm_cbmh + offs_64[:, None] * stride_dkm_t + offs_bk[None, :] * stride_dkm_d,
+                0.0,
+            )
+            tl.store(
+                DGam_m_ptr + slot * stride_dkm_cbmh + offs_64[:, None] * stride_dkm_t + offs_bk[None, :] * stride_dkm_d,
+                0.0,
+            )
+            tl.store(DGK_part_ptr + slot * stride_dgk_cbmh + k_blk * stride_dgk_kb + offs_64 * stride_dgk_t, 0.0)
+            return
+
+        h = bmh % H
+        bm = bmh // H
+        m = bm % M
+        b = bm // M
+        offs_16 = tl.arange(0, 16)
+        offs_half = offs_bk // 2
+        mask_64 = offs_64 < c_len
+        last_idx = c_len - 1
+
+        dk0 = tl.zeros([64, B_K], dtype=tl.float32)
+        dkend = tl.zeros([64, B_K], dtype=tl.float32)
+        dg63_st = tl.zeros([B_K], dtype=tl.float32)
+        for vb in tl.static_range(0, N_VB):
+            dk0 += tl.load(
+                DK0_part_ptr
+                + slot * stride_dkp_cbmh
+                + vb * stride_dkp_vb
+                + offs_64[:, None] * stride_dkp_t
+                + offs_bk[None, :] * stride_dkp_d
+            )
+            dkend += tl.load(
+                DKEnd_part_ptr
+                + slot * stride_dkp_cbmh
+                + vb * stride_dkp_vb
+                + offs_64[:, None] * stride_dkp_t
+                + offs_bk[None, :] * stride_dkp_d
+            )
+            dg63_st += tl.load(DG63_part_ptr + slot * stride_dg63_cbmh + vb * stride_dg63_vb + offs_bk * stride_dg63_d)
+
+        strict_16 = offs_16[:, None] > offs_16[None, :]
+        gp_base = G_page_ptr + loc * stride_gp_c + b * stride_gp_b + m * stride_gp_m + h * stride_gp_h
+        kb_base = K_base_ptr + b * stride_kb_b + h * stride_kb_h
+        cg_base = CumG_ptr + slot * stride_cg_cbmh
+        dl_base = DL_part_ptr + slot * stride_dl_cbmh
+
+        for b_idx in range(0, 4):
+            idx_offs = b_idx * 16 + offs_16
+            idx_mask = idx_offs < c_len
+            acc_lo = tl.zeros([16, B_K], dtype=tl.float32)
+            acc_up = tl.zeros([16, B_K], dtype=tl.float32)
+
+            dl_diag = tl.zeros([16, 16], dtype=tl.float32)
+            for vb in tl.static_range(0, N_VB):
+                dl_diag += tl.load(
+                    dl_base + vb * stride_dl_vb + idx_offs[:, None] * stride_dl_r + idx_offs[None, :] * stride_dl_c
+                )
+            dl_diag = tl.where(strict_16 & idx_mask[:, None] & idx_mask[None, :], dl_diag, 0.0)
+
+            g_b = tl.load(gp_base + idx_offs * stride_gp_t, mask=idx_mask, other=0.0).to(tl.float32)
+            kb_b = tl.load(
+                kb_base + (t0 + idx_offs[:, None]) * stride_kb_t + offs_bk[None, :] * stride_kb_d,
+                mask=idx_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            ke_b = g_b[:, None] * kb_b
+            cg_b = tl.load(cg_base + idx_offs[:, None] * stride_cg_t + offs_bk[None, :] * stride_cg_d)
+            cg_0 = tl.load(cg_base + (b_idx * 16) * stride_cg_t + offs_bk * stride_cg_d)
+            cg_15 = tl.load(cg_base + (b_idx * 16 + 15) * stride_cg_t + offs_bk * stride_cg_d)
+
+            if tl.max(cg_0 - cg_15) < 12.0:
+                acc_lo += tl.exp(cg_b - cg_0[None, :]) * tl.dot(
+                    dl_diag, tl.exp(cg_0[None, :] - cg_b) * ke_b, input_precision="ieee"
+                )
+                acc_up += tl.exp(cg_0[None, :] - cg_b) * tl.dot(
+                    tl.trans(dl_diag), tl.exp(cg_b - cg_0[None, :]) * ke_b, input_precision="ieee"
+                )
+            else:
+                for j_loc in range(0, 16):
+                    j_glob = b_idx * 16 + j_loc
+                    cg_j = tl.load(cg_base + j_glob * stride_cg_t + offs_bk * stride_cg_d)
+                    kb_j = tl.load(
+                        kb_base + (t0 + j_glob) * stride_kb_t + offs_bk * stride_kb_d, mask=(j_glob < c_len), other=0.0
+                    ).to(tl.float32)
+                    g_j = tl.load(gp_base + j_glob * stride_gp_t, mask=(j_glob < c_len), other=0.0).to(tl.float32)
+                    ke_j = g_j * kb_j
+                    dl_col = tl.sum(tl.where((offs_16 == j_loc)[None, :], dl_diag, 0.0), axis=1)
+                    m_gt = offs_16 > j_loc
+                    ed = tl.where(m_gt[:, None], tl.exp(tl.where(m_gt[:, None], cg_b - cg_j[None, :], 0.0)), 0.0)
+                    acc_lo += dl_col[:, None] * ed * ke_j[None, :]
+                    dl_row = tl.sum(tl.where((offs_16 == j_loc)[:, None], dl_diag, 0.0), axis=0)
+                    m_lt = offs_16 < j_loc
+                    ed_u = tl.where(m_lt[:, None], tl.exp(tl.where(m_lt[:, None], cg_j[None, :] - cg_b, 0.0)), 0.0)
+                    acc_up += dl_row[:, None] * ed_u * ke_j[None, :]
+
+            for bc in range(0, b_idx):
+                c_offs = bc * 16 + offs_16
+                c_mask = c_offs < c_len
+                piv = bc * 16 + 15
+                dl_blk = tl.zeros([16, 16], dtype=tl.float32)
+                for vb in tl.static_range(0, N_VB):
+                    dl_blk += tl.load(
+                        dl_base + vb * stride_dl_vb + idx_offs[:, None] * stride_dl_r + c_offs[None, :] * stride_dl_c
+                    )
+                dl_blk = tl.where(idx_mask[:, None] & c_mask[None, :], dl_blk, 0.0)
+                g_c = tl.load(gp_base + c_offs * stride_gp_t, mask=c_mask, other=0.0).to(tl.float32)
+                kb_c = tl.load(
+                    kb_base + (t0 + c_offs[:, None]) * stride_kb_t + offs_bk[None, :] * stride_kb_d,
+                    mask=c_mask[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                cg_c = tl.load(cg_base + c_offs[:, None] * stride_cg_t + offs_bk[None, :] * stride_cg_d)
+                cg_piv = tl.load(cg_base + piv * stride_cg_t + offs_bk * stride_cg_d)
+                acc_lo += tl.exp(cg_b - cg_piv[None, :]) * tl.dot(
+                    dl_blk, (g_c[:, None] * kb_c) * tl.exp(cg_piv[None, :] - cg_c), input_precision="ieee"
+                )
+
+            piv_self = b_idx * 16 + 15
+            cg_piv_self = tl.load(cg_base + piv_self * stride_cg_t + offs_bk * stride_cg_d)
+            scale_self = tl.exp(cg_piv_self[None, :] - cg_b)
+            for br in range(b_idx + 1, 4):
+                r_offs = br * 16 + offs_16
+                r_mask = r_offs < c_len
+                dl_blk = tl.zeros([16, 16], dtype=tl.float32)
+                for vb in tl.static_range(0, N_VB):
+                    dl_blk += tl.load(
+                        dl_base + vb * stride_dl_vb + r_offs[:, None] * stride_dl_r + idx_offs[None, :] * stride_dl_c
+                    )
+                dl_blk = tl.where(r_mask[:, None] & idx_mask[None, :], dl_blk, 0.0)
+                g_r = tl.load(gp_base + r_offs * stride_gp_t, mask=r_mask, other=0.0).to(tl.float32)
+                kb_r = tl.load(
+                    kb_base + (t0 + r_offs[:, None]) * stride_kb_t + offs_bk[None, :] * stride_kb_d,
+                    mask=r_mask[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                cg_r = tl.load(cg_base + r_offs[:, None] * stride_cg_t + offs_bk[None, :] * stride_cg_d)
+                acc_up += scale_self * tl.dot(
+                    tl.trans(dl_blk),
+                    (g_r[:, None] * kb_r) * tl.exp(cg_r - cg_piv_self[None, :]),
+                    input_precision="ieee",
+                )
+
+            tl.store(
+                DK0_part_ptr
+                + slot * stride_dkp_cbmh
+                + 0 * stride_dkp_vb
+                + idx_offs[:, None] * stride_dkp_t
+                + offs_bk[None, :] * stride_dkp_d,
+                acc_lo,
+            )
+            tl.store(
+                DKEnd_part_ptr
+                + slot * stride_dkp_cbmh
+                + 0 * stride_dkp_vb
+                + idx_offs[:, None] * stride_dkp_t
+                + offs_bk[None, :] * stride_dkp_d,
+                acc_up,
+            )
+
+        dk_lo = tl.load(
+            DK0_part_ptr
+            + slot * stride_dkp_cbmh
+            + 0 * stride_dkp_vb
+            + offs_64[:, None] * stride_dkp_t
+            + offs_bk[None, :] * stride_dkp_d
+        )
+        dk_up = tl.load(
+            DKEnd_part_ptr
+            + slot * stride_dkp_cbmh
+            + 0 * stride_dkp_vb
+            + offs_64[:, None] * stride_dkp_t
+            + offs_bk[None, :] * stride_dkp_d
+        )
+        g_vec = tl.load(gp_base + offs_64 * stride_gp_t, mask=mask_64, other=0.0).to(tl.float32)
+        kb_full = tl.load(
+            kb_base + (t0 + offs_64[:, None]) * stride_kb_t + offs_bk[None, :] * stride_kb_d,
+            mask=mask_64[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        ke_full = g_vec[:, None] * kb_full
+        cg_full = tl.load(cg_base + offs_64[:, None] * stride_cg_t + offs_bk[None, :] * stride_cg_d)
+        cg_end = tl.load(cg_base + last_idx * stride_cg_t + offs_bk * stride_cg_d)
+
+        exp_cg = tl.exp(cg_full)
+        exp_to_end = tl.where(mask_64[:, None], tl.exp(cg_end[None, :] - cg_full), 0.0)
+        k0_full = exp_cg * ke_full
+        kend_full = exp_to_end * ke_full
+
+        dk_eff = tl.where(mask_64[:, None], dk_lo + dk_up + exp_cg * dk0 + exp_to_end * dkend, 0.0)
+        dG = ke_full * (dk_lo - dk_up) + k0_full * dk0 - kend_full * dkend
+        end_extra = dg63_st + tl.sum(kend_full * dkend, axis=0)
+        dG = tl.where(mask_64[:, None], dG + tl.where((offs_64 == last_idx)[:, None], end_extra[None, :], 0.0), 0.0)
+        tot_dG = tl.sum(dG, axis=0)
+        d_loga = tl.where(mask_64[:, None], tot_dG[None, :] - tl.cumsum(dG, axis=0) + dG, 0.0)
+
+        ps_m = tl.load(PS_ptr + m).to(tl.float32)
+        ch_val = tl.load(
+            Chan_ptr
+            + b * stride_ch_b
+            + (t0 + offs_64[:, None]) * stride_ch_t
+            + h * stride_ch_h
+            + offs_half[None, :] * stride_ch_d,
+            mask=mask_64[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        gam_full = ps_m * ch_val
+
+        tl.store(
+            DK_m_ptr + slot * stride_dkm_cbmh + offs_64[:, None] * stride_dkm_t + offs_bk[None, :] * stride_dkm_d,
+            tl.where(mask_64[:, None], g_vec[:, None] * dk_eff, 0.0),
+        )
+        tl.store(
+            DGam_m_ptr + slot * stride_dkm_cbmh + offs_64[:, None] * stride_dkm_t + offs_bk[None, :] * stride_dkm_d,
+            tl.where(mask_64[:, None], -(g_vec[:, None] * g_vec[:, None]) * d_loga, 0.0),
+        )
+        tl.store(
+            DGK_part_ptr + slot * stride_dgk_cbmh + k_blk * stride_dgk_kb + offs_64 * stride_dgk_t,
+            tl.where(mask_64, tl.sum(dk_eff * kb_full, axis=1) - 2.0 * g_vec * tl.sum(d_loga * gam_full, axis=1), 0.0),
+        )
+
+    @triton.jit
+    def _surprise_gate_off_bwd_kernel(
+        V_ptr,
+        PredV_ptr,
+        SBias_ptr,
+        Slope_ptr,
+        Thresh_ptr,
+        WM_ptr,
+        TopIdx_ptr,
+        SteW_ptr,
+        GRoot_ptr,
+        DGV_ptr,
+        DGK_ptr,
+        DGRootAux_ptr,
+        DPredV_ptr,
+        DVSurp_ptr,
+        DSBias_ptr,
+        DSlopePart_ptr,
+        DThreshPart_ptr,
+        DSteWPart_ptr,
+        DWM_ptr,
+        stride_vb,
+        stride_vt,
+        stride_vh,
+        stride_vd,
+        stride_pvb,
+        stride_pvt,
+        stride_pvh,
+        stride_pvd,
+        stride_sbb,
+        stride_sbt,
+        stride_sbh,
+        stride_wmb,
+        stride_wmt,
+        stride_ib,
+        stride_it,
+        stride_ik,
+        stride_swb,
+        stride_swt,
+        stride_swk,
+        stride_grb,
+        stride_grt,
+        stride_grh,
+        stride_dgv_bmh,
+        stride_dgv_vb,
+        stride_dgv_t,
+        stride_dgk_bmh,
+        stride_dgk_kb,
+        stride_dgk_t,
+        stride_dswp_bh,
+        stride_dswp_t,
+        stride_dswp_k,
+        t0,
+        l_off,
+        slot0,
+        c_len,
+        M: tl.constexpr,
+        H,
+        K_SEL: tl.constexpr,
+        D_V: tl.constexpr,
+        N_VB: tl.constexpr,
+        N_KB: tl.constexpr,
+        HAS_WM: tl.constexpr,
+        NEED_DWM: tl.constexpr,
+        USE_SURPRISE: tl.constexpr,
+    ):
+        bt = tl.program_id(0)
+        h = tl.program_id(1)
+        b = bt // c_len
+        t = bt % c_len
+        bh = b * H + h
+        t_glob = t0 + t
+        t_loc = l_off + t
+
+        g_root = tl.load(GRoot_ptr + b * stride_grb + t_glob * stride_grt + h * stride_grh).to(tl.float32)
+        dg_root = tl.load(DGRootAux_ptr + b * stride_grb + t_glob * stride_grt + h * stride_grh).to(tl.float32)
+
+        for r in tl.static_range(0, K_SEL):
+            idx_r = tl.load(TopIdx_ptr + b * stride_ib + t_glob * stride_it + r * stride_ik)
+            sw_r = tl.load(SteW_ptr + b * stride_swb + t_glob * stride_swt + r * stride_swk).to(tl.float32)
+            slot_r = slot0 + (b * M + idx_r) * H + h
+            dgp_r = 0.0
+            for vb in tl.static_range(0, N_VB):
+                dgp_r += tl.load(DGV_ptr + slot_r * stride_dgv_bmh + vb * stride_dgv_vb + t * stride_dgv_t).to(
+                    tl.float32
+                )
+            for kb in tl.static_range(0, N_KB):
+                dgp_r += tl.load(DGK_ptr + slot_r * stride_dgk_bmh + kb * stride_dgk_kb + t * stride_dgk_t).to(
+                    tl.float32
+                )
+            dg_root += sw_r * dgp_r
+            tl.store(DSteWPart_ptr + bh * stride_dswp_bh + t_loc * stride_dswp_t + r * stride_dswp_k, g_root * dgp_r)
+
+        if not USE_SURPRISE:
+            if HAS_WM and NEED_DWM:
+                tl.atomic_add(DWM_ptr + b * stride_wmb + t_glob * stride_wmt, dg_root)
+            return
+
+        if HAS_WM:
+            wm = tl.load(WM_ptr + b * stride_wmb + t_glob * stride_wmt).to(tl.float32)
+            dsig = dg_root * wm
+        else:
+            dsig = dg_root
+
+        offs_dv = tl.arange(0, D_V)
+        v_f = tl.load(V_ptr + b * stride_vb + t_glob * stride_vt + h * stride_vh + offs_dv * stride_vd).to(tl.float32)
+        pv_f = tl.load(PredV_ptr + b * stride_pvb + t_loc * stride_pvt + h * stride_pvh + offs_dv * stride_pvd).to(
+            tl.float32
+        )
+        diff = v_f - pv_f
+        err_sq = tl.sum(diff * diff, axis=0)
+        v_sq = tl.sum(v_f * v_f, axis=0)
+        err_norm = tl.where(err_sq > 0.0, tl.sqrt(err_sq), 0.0)
+        v_norm = tl.where(v_sq > 0.0, tl.sqrt(v_sq), 0.0)
+        denom = v_norm + 1e-6
+        eps_err = err_norm / denom
+
+        slope_h = tl.load(Slope_ptr + h).to(tl.float32)
+        thresh_h = tl.load(Thresh_ptr + h).to(tl.float32)
+        sb = tl.load(SBias_ptr + b * stride_sbb + t_glob * stride_sbt + h * stride_sbh).to(tl.float32)
+        sig = tl.sigmoid(slope_h * (eps_err - thresh_h) + sb)
+        if HAS_WM and NEED_DWM:
+            tl.atomic_add(DWM_ptr + b * stride_wmb + t_glob * stride_wmt, dg_root * sig)
+
+        dz = dsig * sig * (1.0 - sig)
+        tl.store(DSBias_ptr + b * stride_sbb + t_glob * stride_sbt + h * stride_sbh, dz)
+        out_idx = (b * stride_grb // H + t_glob) * H + h
+        tl.store(DSlopePart_ptr + out_idx, dz * (eps_err - thresh_h))
+        tl.store(DThreshPart_ptr + out_idx, -dz * slope_h)
+
+        deps = dz * slope_h
+        d_err_norm = deps / denom
+        d_diff = tl.where(err_sq > 0.0, (d_err_norm / tl.where(err_sq > 0.0, err_norm, 1.0)) * diff, 0.0)
+        d_v_norm = -deps * eps_err / denom
+        dv_denom = tl.where(v_sq > 0.0, (d_v_norm / tl.where(v_sq > 0.0, v_norm, 1.0)) * v_f, 0.0)
+
+        tl.store(DPredV_ptr + b * stride_pvb + t_loc * stride_pvt + h * stride_pvh + offs_dv * stride_pvd, -d_diff)
+        tl.store(
+            DVSurp_ptr + b * stride_vb + t_glob * stride_vt + h * stride_vh + offs_dv * stride_vd,
+            (d_diff + dv_denom).to(DVSurp_ptr.dtype.element_ty),
+        )
+
+    @triton.jit
+    def _wy_seg_reduce_noatomic_bwd_kernel(
+        DK_m_ptr,
+        DV_m_ptr,
+        DGam_m_ptr,
+        PS_ptr,
+        Chan_ptr,
+        DK_base_ptr,
+        DV_base_ptr,
+        DChan_ptr,
+        DPS_part_ptr,
+        stride_dkm_cbmh,
+        stride_dkm_t,
+        stride_dkm_d,
+        stride_dvm_cbmh,
+        stride_dvm_t,
+        stride_dvm_v,
+        stride_ch_b,
+        stride_ch_t,
+        stride_ch_h,
+        stride_ch_d,
+        stride_kb_b,
+        stride_kb_t,
+        stride_kb_h,
+        stride_kb_d,
+        stride_vb_b,
+        stride_vb_t,
+        stride_vb_h,
+        stride_vb_d,
+        seg_t0,
+        seg_len,
+        BMH,
+        chunk_size: tl.constexpr,
+        M: tl.constexpr,
+        H,
+        D_K: tl.constexpr,
+        D_V: tl.constexpr,
+    ):
+        t_blk = tl.program_id(0)
+        bh = tl.program_id(1)
+        b = bh // H
+        h = bh % H
+
+        offs_16 = tl.arange(0, 16)
+        l_offs = t_blk * 16 + offs_16
+        mask_t = l_offs < seg_len
+        loc = (t_blk * 16) // chunk_size
+        c_offs = (t_blk * 16) % chunk_size + offs_16
+        t_glob = seg_t0 + l_offs
+
+        offs_dk = tl.arange(0, D_K)
+        offs_dv = tl.arange(0, D_V)
+        offs_half = tl.arange(0, D_K // 2)
+
+        dk_acc = tl.zeros([16, D_K], dtype=tl.float32)
+        dv_acc = tl.zeros([16, D_V], dtype=tl.float32)
+        dch_acc = tl.zeros([16, D_K // 2], dtype=tl.float32)
+
+        ch_val = tl.load(
+            Chan_ptr
+            + b * stride_ch_b
+            + t_glob[:, None] * stride_ch_t
+            + h * stride_ch_h
+            + offs_half[None, :] * stride_ch_d,
+            mask=mask_t[:, None],
+            other=0.0,
+        ).to(tl.float32)
+
+        part_row = t_blk * (tl.num_programs(1)) + bh
+        for m in range(M):
+            slot = loc * BMH + (b * M + m) * H + h
+            dk_acc += tl.load(
+                DK_m_ptr + slot * stride_dkm_cbmh + c_offs[:, None] * stride_dkm_t + offs_dk[None, :] * stride_dkm_d,
+                mask=mask_t[:, None],
+                other=0.0,
+            )
+            dv_acc += tl.load(
+                DV_m_ptr + slot * stride_dvm_cbmh + c_offs[:, None] * stride_dvm_t + offs_dv[None, :] * stride_dvm_v,
+                mask=mask_t[:, None],
+                other=0.0,
+            )
+            dg0 = tl.load(
+                DGam_m_ptr
+                + slot * stride_dkm_cbmh
+                + c_offs[:, None] * stride_dkm_t
+                + (2 * offs_half[None, :]) * stride_dkm_d,
+                mask=mask_t[:, None],
+                other=0.0,
+            )
+            dg1 = tl.load(
+                DGam_m_ptr
+                + slot * stride_dkm_cbmh
+                + c_offs[:, None] * stride_dkm_t
+                + (2 * offs_half[None, :] + 1) * stride_dkm_d,
+                mask=mask_t[:, None],
+                other=0.0,
+            )
+            dg_pair = dg0 + dg1
+            ps_m = tl.load(PS_ptr + m).to(tl.float32)
+            dch_acc += dg_pair * ps_m
+            tl.store(DPS_part_ptr + part_row * M + m, tl.sum(dg_pair * ch_val))
+
+        tl.store(
+            DK_base_ptr
+            + b * stride_kb_b
+            + t_glob[:, None] * stride_kb_t
+            + h * stride_kb_h
+            + offs_dk[None, :] * stride_kb_d,
+            dk_acc.to(DK_base_ptr.dtype.element_ty),
+            mask=mask_t[:, None],
+        )
+        tl.store(
+            DV_base_ptr
+            + b * stride_vb_b
+            + t_glob[:, None] * stride_vb_t
+            + h * stride_vb_h
+            + offs_dv[None, :] * stride_vb_d,
+            dv_acc.to(DV_base_ptr.dtype.element_ty),
+            mask=mask_t[:, None],
+        )
+        tl.store(
+            DChan_ptr
+            + b * stride_ch_b
+            + t_glob[:, None] * stride_ch_t
+            + h * stride_ch_h
+            + offs_half[None, :] * stride_ch_d,
+            dch_acc,
+            mask=mask_t[:, None],
+        )
+
+    @triton.jit
+    def _reduce_head_weights_kernel(
+        Part_ptr,
+        Out_ptr,
+        stride_p_bh,
+        stride_p_t,
+        stride_p_k,
+        stride_o_b,
+        stride_o_t,
+        stride_o_k,
+        out_t0,
+        T_span,
+        H: tl.constexpr,
+        K_SEL: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        t_blk = tl.program_id(0)
+        b = tl.program_id(1)
+        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T)
+        mask_t = offs_t < T_span
+        for r in tl.static_range(0, K_SEL):
+            acc = tl.zeros([BLOCK_T], dtype=tl.float32)
+            for h in range(H):
+                acc += tl.load(
+                    Part_ptr + (b * H + h) * stride_p_bh + offs_t * stride_p_t + r * stride_p_k, mask=mask_t, other=0.0
+                )
+            tl.store(Out_ptr + b * stride_o_b + (out_t0 + offs_t) * stride_o_t + r * stride_o_k, acc, mask=mask_t)
+
+    class _TritonHSSDScanFn(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx,
+            q_hat,
+            k_hat,
+            v,
+            k_base,
+            v_base,
+            ps_gamma,
+            ch_gamma,
+            sbias,
+            slope,
+            thresh,
+            wm,
+            top_w_idx,
+            top_w_probs,
+            ste_w,
+            top_r_idx,
+            top_r_w,
+            s_init,
+            chunk_size: int,
+            window_chunks: int,
+            ckpt_every: int,
+            use_surprise: bool,
+            surprise_mode: str,
+            use_bf16_dot: bool,
+            need_boundaries=None,
+            boundary_sink=None,
+        ):
+            ctx.set_materialize_grads(False)
+            B, T, H, D_k = q_hat.shape
+            D_v = v.shape[-1]
+            M = int(ps_gamma.shape[0])
+            K_sel = int(top_w_idx.shape[-1])
+            BMH = B * M * H
+            BH = B * H
+            n_chunks = (T + chunk_size - 1) // chunk_size
+            n_segs = (n_chunks + ckpt_every - 1) // ckpt_every
+
+            qh_c = q_hat.contiguous()
+            kh_c = k_hat.contiguous()
+            v_c = v.contiguous()
+            kb_c = k_base.contiguous()
+            vb_c = v_base.contiguous()
+            ps_c = ps_gamma.float().contiguous()
+            ch_c = ch_gamma.float().contiguous()
+            sb_c = sbias.float().contiguous()
+            slp_c = slope.float().contiguous()
+            thr_c = thresh.float().contiguous()
+            has_wm = wm is not None
+            wm_c = wm.float().contiguous() if has_wm else sb_c.new_empty((1, 1))
+
+            twi_c = top_w_idx.to(torch.int32).contiguous()
+            twp_c = top_w_probs.float().contiguous()
+            stew_c = ste_w.float().contiguous()
+            tri_c = top_r_idx.to(torch.int32).contiguous()
+            trw_c = top_r_w.float().contiguous()
+
+            is_page0 = surprise_mode == "page0"
+            if is_page0:
+                surp_idx = torch.zeros((B, T, 1), device=q_hat.device, dtype=torch.int32)
+                surp_prob = torch.ones((B, T, 1), device=q_hat.device, dtype=torch.float32)
+                K_surp = 1
+            else:
+                surp_idx = twi_c
+                surp_prob = twp_c
+                K_surp = K_sel
+
+            need_bwd = any(ctx.needs_input_grad)
+            s_ckpts = (
+                torch.empty((n_segs, B, M, H, D_k, D_v), device=q_hat.device, dtype=torch.float32)
+                if need_bwd
+                else q_hat.new_empty(0, dtype=torch.float32)
+            )
+            # Slot 0 is rolling state when no future readout; slots 1..ckpt_every hold s_after_seg!
+            s_ring = torch.empty((ckpt_every + 1, B, M, H, D_k, D_v), device=q_hat.device, dtype=torch.float32)
+            s_ring[0].copy_(s_init)
+            s_ring_views = [s_ring[i] for i in range(ckpt_every + 1)]
+            cur_idx = 0
+
+            o_far = torch.empty((B, T, H, D_v), device=q_hat.device, dtype=torch.float32)
+            g_root = torch.empty((B, T, H), device=q_hat.device, dtype=torch.float32)
+
+            is_seg_surp = surprise_mode == "segment_start"
+            do_surp = use_surprise and surprise_mode != "none"
+            pv_len = ckpt_every * chunk_size if is_seg_surp else chunk_size
+            pred_v_buf = torch.empty((B, pv_len, H, D_v), device=q_hat.device, dtype=torch.float32)
+            g_page_buf = torch.zeros((1, B, 64, M, H), device=q_hat.device, dtype=torch.float32)
+            gp0_view = g_page_buf[0]
+            cg_buf = torch.empty((BMH, 64, D_k), device=q_hat.device, dtype=torch.float32)
+            act_buf = torch.empty((BMH,), device=q_hat.device, dtype=torch.int32)
+            l_work = torch.empty((BMH, 64, 64), device=q_hat.device, dtype=torch.float32)
+            a_buf = torch.empty((BMH, 64, 64), device=q_hat.device, dtype=torch.float32)
+
+            # Hoist ALL strides ONCE before the loops!
+            st_qh = qh_c.stride()
+            st_kh = kh_c.stride()
+            st_v = v_c.stride()
+            st_kb = kb_c.stride()
+            st_vb = vb_c.stride()
+            st_ch = ch_c.stride()
+            st_sb = sb_c.stride()
+            st_wm = wm_c.stride()
+            st_twi = twi_c.stride()
+            st_stew = stew_c.stride()
+            st_si = surp_idx.stride()
+            st_sp = surp_prob.stride()
+            st_tri = tri_c.stride()
+            st_trw = trw_c.stride()
+            st_of = o_far.stride()
+            st_gr = g_root.stride()
+            st_pv = pred_v_buf.stride()
+            st_gp5 = g_page_buf.stride()
+            st_gp4 = g_page_buf[0].stride()
+            st_cg = cg_buf.stride()
+            st_lw = l_work.stride()
+            st_a = a_buf.stride()
+            st_sr6 = s_ring.stride()
+            st_sr5 = s_ring[0].stride()
+            s_c_stride = BMH * D_k * D_v
+            s_bmh_stride = D_k * D_v
+            nv_32 = D_v // 32
+            nv_64 = D_v // 64
+
+            n_init_far = min(n_chunks, window_chunks + 1)
+            init_toks = min(T, n_init_far * chunk_size)
+            if init_toks > 0:
+                _routed_readout_off_fwd_kernel[((init_toks + 15) // 16, BH, nv_64)](
+                    qh_c,
+                    s_ring[0],
+                    tri_c,
+                    trw_c,
+                    o_far,
+                    *st_qh,
+                    *st_sr5,
+                    *st_tri,
+                    *st_trw,
+                    *st_of,
+                    0,
+                    0,
+                    init_toks,
+                    M,
+                    H,
+                    K_SEL=K_sel,
+                    BLOCK_T=16,
+                    D_K=D_k,
+                    B_V=64,
+                    USE_BF16=use_bf16_dot,
+                    num_warps=4,
+                    num_stages=1,
+                )
+
+            for seg_i in range(n_segs):
+                if need_bwd:
+                    s_ckpts[seg_i].copy_(s_ring[cur_idx])
+                c_start = seg_i * ckpt_every
+                c_end = min(n_chunks, c_start + ckpt_every)
+                s_cnt = c_end - c_start
+                s_seg_ref = s_ring[cur_idx].clone() if is_seg_surp else None
+
+                if do_surp and is_seg_surp:
+                    seg_t0 = c_start * chunk_size
+                    seg_len = min(T, c_end * chunk_size) - seg_t0
+                    _routed_readout_off_fwd_kernel[((seg_len + 15) // 16, BH, nv_64)](
+                        kh_c,
+                        s_seg_ref,
+                        surp_idx,
+                        surp_prob,
+                        pred_v_buf,
+                        *st_kh,
+                        *st_sr5,
+                        *st_si,
+                        *st_sp,
+                        *st_pv,
+                        seg_t0,
+                        0,
+                        seg_len,
+                        M,
+                        H,
+                        K_SEL=K_surp,
+                        BLOCK_T=16,
+                        D_K=D_k,
+                        B_V=64,
+                        USE_BF16=use_bf16_dot,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+
+                n_fut_valid = 0
+                for loc in range(s_cnt):
+                    n = c_start + loc
+                    t0 = n * chunk_size
+                    c_len = min(chunk_size, T - t0)
+
+                    if do_surp and not is_seg_surp:
+                        _routed_readout_off_fwd_kernel[((c_len + 15) // 16, BH, nv_64)](
+                            kh_c,
+                            s_ring_views[cur_idx],
+                            surp_idx,
+                            surp_prob,
+                            pred_v_buf,
+                            *st_kh,
+                            *st_sr5,
+                            *st_si,
+                            *st_sp,
+                            *st_pv,
+                            t0,
+                            0,
+                            c_len,
+                            M,
+                            H,
+                            K_SEL=K_surp,
+                            BLOCK_T=16,
+                            D_K=D_k,
+                            B_V=64,
+                            USE_BF16=use_bf16_dot,
+                            num_warps=4,
+                            num_stages=1,
+                        )
+
+                    pv_t0 = loc * chunk_size if is_seg_surp else 0
+                    _surprise_and_cumg_fwd_kernel[(BH,)](
+                        v_c,
+                        pred_v_buf,
+                        sb_c,
+                        slp_c,
+                        thr_c,
+                        wm_c,
+                        twi_c,
+                        stew_c,
+                        ps_c,
+                        ch_c,
+                        g_root,
+                        gp0_view,
+                        cg_buf,
+                        act_buf,
+                        *st_v,
+                        *st_pv,
+                        *st_sb,
+                        *st_wm,
+                        *st_twi,
+                        *st_stew,
+                        *st_ch,
+                        *st_gr,
+                        *st_gp4,
+                        *st_cg,
+                        t0,
+                        pv_t0,
+                        c_len,
+                        M=M,
+                        H=H,
+                        K_SEL=K_sel,
+                        D_K=D_k,
+                        D_V=D_v,
+                        HAS_WM=has_wm,
+                        USE_SURPRISE=do_surp,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                    _wy_L_blocks_off_fwd_kernel[(BMH, 10)](
+                        kb_c,
+                        gp0_view,
+                        cg_buf,
+                        act_buf,
+                        l_work,
+                        *st_kb,
+                        *st_gp4,
+                        *st_cg,
+                        *st_lw,
+                        t0,
+                        c_len,
+                        M,
+                        H,
+                        D_K=D_k,
+                        USE_BF16_DOT=use_bf16_dot,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                    _wy_merge_inv_fwd_kernel[(BMH,)](
+                        act_buf,
+                        l_work,
+                        a_buf,
+                        *st_lw,
+                        *st_a,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+
+                    has_fut = (n + window_chunks + 1 < n_chunks) and (c_len == chunk_size)
+                    nxt_idx = (loc + 1) if has_fut else 0
+                    _wy_w2_off_fwd_kernel[(BMH, nv_32)](
+                        kb_c,
+                        vb_c,
+                        g_page_buf,
+                        a_buf,
+                        cg_buf,
+                        act_buf,
+                        s_ring,
+                        s_ring,
+                        *st_kb,
+                        *st_vb,
+                        *st_gp5,
+                        *st_a,
+                        *st_cg,
+                        s_c_stride,
+                        s_bmh_stride,
+                        D_v,
+                        1,
+                        t0,
+                        0,
+                        0,
+                        cur_idx,
+                        nxt_idx,
+                        c_len,
+                        M,
+                        H,
+                        D_K=D_k,
+                        B_V=32,
+                        INPLACE_S=(cur_idx == nxt_idx),
+                        USE_BF16_DOT=use_bf16_dot,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                    cur_idx = nxt_idx
+                    if has_fut:
+                        n_fut_valid = loc + 1
+                    if (
+                        boundary_sink is not None
+                        and need_boundaries
+                        and c_len == chunk_size
+                        and (n + 1) in need_boundaries
+                    ):
+                        boundary_sink[n + 1] = s_ring_views[cur_idx].clone()
+
+                if n_fut_valid > 0:
+                    f0 = (c_start + window_chunks + 1) * chunk_size
+                    f1 = min(T, (c_start + n_fut_valid + window_chunks + 1) * chunk_size)
+                    f_span = f1 - f0
+                    _batched_chunk_readout_fwd_kernel[((f_span + 15) // 16, BH, nv_64)](
+                        qh_c[:, f0:f1],
+                        s_ring[1 : 1 + n_fut_valid],
+                        tri_c[:, f0:f1],
+                        trw_c[:, f0:f1],
+                        o_far[:, f0:f1],
+                        *st_qh,
+                        *st_sr6,
+                        *st_tri,
+                        *st_trw,
+                        *st_of,
+                        f_span,
+                        chunk_size=chunk_size,
+                        M=M,
+                        H=H,
+                        K_SEL=K_sel,
+                        BLOCK_T=16,
+                        D_K=D_k,
+                        B_V=64,
+                        USE_BF16=use_bf16_dot,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+
+            s_final = s_ring[cur_idx].clone()
+            if need_bwd:
+                ctx.save_for_backward(
+                    qh_c,
+                    kh_c,
+                    v_c,
+                    kb_c,
+                    vb_c,
+                    ps_c,
+                    ch_c,
+                    sb_c,
+                    slp_c,
+                    thr_c,
+                    wm_c,
+                    twi_c,
+                    twp_c,
+                    stew_c,
+                    tri_c,
+                    trw_c,
+                    g_root,
+                    s_ckpts,
+                )
+                wm_dt = wm.dtype if has_wm else None
+                ctx.meta = (
+                    chunk_size,
+                    window_chunks,
+                    ckpt_every,
+                    use_surprise,
+                    surprise_mode,
+                    use_bf16_dot,
+                    has_wm,
+                    wm_dt,
+                )
+            return o_far, g_root, s_final
+
+        @staticmethod
+        def backward(ctx, do_far, dg_root_aux, ds_final):
+            (
+                qh_c,
+                kh_c,
+                v_c,
+                kb_c,
+                vb_c,
+                ps_c,
+                ch_c,
+                sb_c,
+                slp_c,
+                thr_c,
+                wm_c,
+                twi_c,
+                twp_c,
+                stew_c,
+                tri_c,
+                trw_c,
+                g_root,
+                s_ckpts,
+            ) = ctx.saved_tensors
+            (
+                chunk_size,
+                window_chunks,
+                ckpt_every,
+                use_surprise,
+                surprise_mode,
+                use_bf16_dot,
+                has_wm,
+                wm_dt,
+            ) = ctx.meta
+
+            B, T, H, D_k = qh_c.shape
+            D_v = v_c.shape[-1]
+            M = int(ps_c.shape[0])
+            K_sel = int(twi_c.shape[-1])
+            BMH = B * M * H
+            BH = B * H
+            n_chunks = (T + chunk_size - 1) // chunk_size
+            n_segs = (n_chunks + ckpt_every - 1) // ckpt_every
+
+            is_page0 = surprise_mode == "page0"
+            is_seg_surp = surprise_mode == "segment_start"
+            do_surp = use_surprise and surprise_mode != "none"
+            if is_page0:
+                surp_idx = torch.zeros((B, T, 1), device=qh_c.device, dtype=torch.int32)
+                surp_prob = torch.ones((B, T, 1), device=qh_c.device, dtype=torch.float32)
+                K_surp = 1
+            else:
+                surp_idx = twi_c
+                surp_prob = twp_c
+                K_surp = K_sel
+
+            dof_c = (
+                do_far.float().contiguous()
+                if do_far is not None
+                else torch.zeros((B, T, H, D_v), device=qh_c.device, dtype=torch.float32)
+            )
+            dgr_c = (
+                dg_root_aux.float().contiguous()
+                if dg_root_aux is not None
+                else torch.zeros((B, T, H), device=qh_c.device, dtype=torch.float32)
+            )
+            ds_cur = (
+                ds_final.float().clone().contiguous()
+                if ds_final is not None
+                else torch.zeros((B, M, H, D_k, D_v), device=qh_c.device, dtype=torch.float32)
+            )
+
+            dq_hat = torch.zeros((B, T, H, D_k), device=qh_c.device, dtype=qh_c.dtype)
+            dk_hat = torch.zeros((B, T, H, D_k), device=qh_c.device, dtype=kh_c.dtype)
+            dv_surp = torch.zeros((B, T, H, D_v), device=qh_c.device, dtype=v_c.dtype)
+            dk_base = torch.empty((B, T, H, D_k), device=qh_c.device, dtype=kb_c.dtype)
+            dv_base = torch.empty((B, T, H, D_v), device=qh_c.device, dtype=vb_c.dtype)
+            dps_acc = torch.zeros((M,), device=qh_c.device, dtype=torch.float32)
+            dch_gamma = torch.empty((B, T, H, D_k // 2), device=qh_c.device, dtype=torch.float32)
+            dsbias = torch.zeros((B, T, H), device=qh_c.device, dtype=torch.float32)
+            dtw_probs = torch.zeros((B, T, K_sel), device=qh_c.device, dtype=torch.float32)
+            dste_w = torch.empty((B, T, K_sel), device=qh_c.device, dtype=torch.float32)
+            dtr_w = torch.zeros((B, T, K_sel), device=qh_c.device, dtype=torch.float32)
+
+            s_seg_states = torch.empty((ckpt_every + 1, B, M, H, D_k, D_v), device=qh_c.device, dtype=torch.float32)
+            gp_seg = torch.empty((ckpt_every, B, 64, M, H), device=qh_c.device, dtype=torch.float32)
+            cg_seg = torch.empty((ckpt_every * BMH, 64, D_k), device=qh_c.device, dtype=torch.float32)
+            act_seg = torch.empty((ckpt_every * BMH,), device=qh_c.device, dtype=torch.int32)
+            l_work_seg = torch.empty((ckpt_every * BMH, 64, 64), device=qh_c.device, dtype=torch.float32)
+            a_seg = torch.empty((ckpt_every * BMH, 64, 64), device=qh_c.device, dtype=torch.float32)
+
+            nv_64 = D_v // 64
+            nv_32 = D_v // 32
+            nk_32 = D_k // 32
+            dl_seg = torch.empty((ckpt_every * BMH, nv_64, 64, 64), device=qh_c.device, dtype=torch.float32)
+            dk0_seg = torch.empty((ckpt_every * BMH, nv_64, 64, D_k), device=qh_c.device, dtype=torch.float32)
+            dkend_seg = torch.empty((ckpt_every * BMH, nv_64, 64, D_k), device=qh_c.device, dtype=torch.float32)
+            dg63_seg = torch.empty((ckpt_every * BMH, nv_64, D_k), device=qh_c.device, dtype=torch.float32)
+            dgv_seg = torch.empty((ckpt_every * BMH, nv_64, 64), device=qh_c.device, dtype=torch.float32)
+            dgk_seg = torch.empty((ckpt_every * BMH, nk_32, 64), device=qh_c.device, dtype=torch.float32)
+            dv_m_seg = torch.empty((ckpt_every * BMH, 64, D_v), device=qh_c.device, dtype=torch.float32)
+            dk_m_seg = torch.empty((ckpt_every * BMH, 64, D_k), device=qh_c.device, dtype=torch.float32)
+            dgam_m_seg = torch.empty((ckpt_every * BMH, 64, D_k), device=qh_c.device, dtype=torch.float32)
+
+            max_seg_toks = max((window_chunks + 1) * chunk_size, ckpt_every * chunk_size)
+            pred_v_seg = torch.empty((B, ckpt_every * chunk_size, H, D_v), device=qh_c.device, dtype=torch.float32)
+            dpred_v_seg = torch.empty((B, ckpt_every * chunk_size, H, D_v), device=qh_c.device, dtype=torch.float32)
+            dslp_part = torch.zeros((B * T * H,), device=qh_c.device, dtype=torch.float32)
+            dthr_part = torch.zeros((B * T * H,), device=qh_c.device, dtype=torch.float32)
+            need_dwm = bool(has_wm and ctx.needs_input_grad[10])
+            dwm_acc = torch.zeros_like(wm_c) if need_dwm else wm_c.new_empty(1)
+            dsw_part = torch.empty((BH, ckpt_every * chunk_size, K_sel), device=qh_c.device, dtype=torch.float32)
+            dw_read_part = torch.empty((BH, max_seg_toks, max(K_sel, K_surp)), device=qh_c.device, dtype=torch.float32)
+            dps_part = torch.empty(
+                (((ckpt_every * chunk_size + 15) // 16) * BH, M), device=qh_c.device, dtype=torch.float32
+            )
+
+            # Hoist ALL strides ONCE!
+            st_qh = qh_c.stride()
+            st_kh = kh_c.stride()
+            st_v = v_c.stride()
+            st_kb = kb_c.stride()
+            st_vb = vb_c.stride()
+            st_ch = ch_c.stride()
+            st_sb = sb_c.stride()
+            st_wm = wm_c.stride()
+            st_twi = twi_c.stride()
+            st_stew = stew_c.stride()
+            st_si = surp_idx.stride()
+            st_sp = surp_prob.stride()
+            st_tri = tri_c.stride()
+            st_trw = trw_c.stride()
+            st_dof = dof_c.stride()
+            st_gr = g_root.stride()
+            st_ds = ds_cur.stride()
+            st_gp = gp_seg.stride()
+            st_cg = cg_seg.stride()
+            st_lw = l_work_seg.stride()
+            st_a = a_seg.stride()
+            st_ss6 = s_seg_states.stride()
+            st_ss5 = s_seg_states[0].stride()
+            st_dl = dl_seg.stride()
+            st_dkp = dk0_seg.stride()
+            st_dg63 = dg63_seg.stride()
+            st_dgv = dgv_seg.stride()
+            st_dgk = dgk_seg.stride()
+            st_dvm = dv_m_seg.stride()
+            st_dkm = dk_m_seg.stride()
+            st_pv = pred_v_seg.stride()
+            st_dpv = dpred_v_seg.stride()
+            st_dsw = dsw_part.stride()
+            st_dwr = dw_read_part.stride()
+            st_dtrw = dtr_w.stride()
+            st_dtwp = dtw_probs.stride()
+            st_dstew = dste_w.stride()
+            s_c_stride = BMH * D_k * D_v
+            s_bmh_stride = D_k * D_v
+
+            for seg_i in range(n_segs - 1, -1, -1):
+                c_start = seg_i * ckpt_every
+                c_end = min(n_chunks, c_start + ckpt_every)
+                s_cnt = c_end - c_start
+                seg_t0 = c_start * chunk_size
+                seg_t1 = min(T, c_end * chunk_size)
+                seg_len = seg_t1 - seg_t0
+                tot_slots = s_cnt * BMH
+
+                _wy_cumg_from_routes_batched_kernel[(BMH, s_cnt)](
+                    twi_c,
+                    stew_c,
+                    g_root,
+                    ps_c,
+                    ch_c,
+                    gp_seg,
+                    cg_seg,
+                    act_seg,
+                    *st_twi,
+                    *st_stew,
+                    *st_gr,
+                    *st_ch,
+                    *st_gp,
+                    *st_cg,
+                    T,
+                    c_start,
+                    chunk_size=chunk_size,
+                    M=M,
+                    H=H,
+                    K_SEL=K_sel,
+                    D_K=D_k,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                _wy_L_blocks_batched_kernel[(tot_slots, 10)](
+                    kb_c,
+                    gp_seg,
+                    cg_seg,
+                    act_seg,
+                    l_work_seg,
+                    *st_kb,
+                    *st_gp,
+                    *st_cg,
+                    *st_lw,
+                    T,
+                    c_start,
+                    BMH,
+                    chunk_size=chunk_size,
+                    M=M,
+                    H=H,
+                    D_K=D_k,
+                    USE_BF16_DOT=use_bf16_dot,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                _wy_merge_inv_fwd_kernel[(tot_slots,)](
+                    act_seg,
+                    l_work_seg,
+                    a_seg,
+                    *st_lw,
+                    *st_a,
+                    num_warps=4,
+                    num_stages=1,
+                )
+
+                s_seg_states[0].copy_(s_ckpts[seg_i])
+                n_fut_valid = 0
+                for loc in range(s_cnt):
+                    n = c_start + loc
+                    t0 = n * chunk_size
+                    c_len = min(chunk_size, T - t0)
+                    _wy_w2_off_fwd_kernel[(BMH, nv_32)](
+                        kb_c,
+                        vb_c,
+                        gp_seg,
+                        a_seg,
+                        cg_seg,
+                        act_seg,
+                        s_seg_states,
+                        s_seg_states,
+                        *st_kb,
+                        *st_vb,
+                        *st_gp,
+                        *st_a,
+                        *st_cg,
+                        s_c_stride,
+                        s_bmh_stride,
+                        D_v,
+                        1,
+                        t0,
+                        loc,
+                        loc * BMH,
+                        loc,
+                        loc + 1,
+                        c_len,
+                        M,
+                        H,
+                        D_K=D_k,
+                        B_V=32,
+                        INPLACE_S=False,
+                        USE_BF16_DOT=use_bf16_dot,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                    if n + window_chunks + 1 < n_chunks and c_len == chunk_size:
+                        n_fut_valid = loc + 1
+
+                if n_fut_valid > 0:
+                    f0 = (c_start + window_chunks + 1) * chunk_size
+                    f1 = min(T, (c_start + n_fut_valid + window_chunks + 1) * chunk_size)
+                    f_span = f1 - f0
+                    _batched_chunk_readout_bwd_vec_w_kernel[((f_span + 15) // 16, BH)](
+                        qh_c[:, f0:f1],
+                        s_seg_states[1 : 1 + n_fut_valid],
+                        tri_c[:, f0:f1],
+                        trw_c[:, f0:f1],
+                        dof_c[:, f0:f1],
+                        dq_hat[:, f0:f1],
+                        dw_read_part,
+                        *st_qh,
+                        *st_ss6,
+                        *st_tri,
+                        *st_trw,
+                        *st_dof,
+                        *st_dwr,
+                        f_span,
+                        chunk_size=chunk_size,
+                        M=M,
+                        H=H,
+                        K_SEL=K_sel,
+                        BLOCK_T=16,
+                        D_K=D_k,
+                        D_V=D_v,
+                        USE_BF16=use_bf16_dot,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                    _reduce_head_weights_kernel[((f_span + 63) // 64, B)](
+                        dw_read_part,
+                        dtr_w,
+                        *st_dwr,
+                        *st_dtrw,
+                        f0,
+                        f_span,
+                        H=H,
+                        K_SEL=K_sel,
+                        BLOCK_T=64,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+
+                if do_surp:
+                    if is_seg_surp:
+                        _routed_readout_off_fwd_kernel[((seg_len + 15) // 16, BH, nv_64)](
+                            kh_c,
+                            s_seg_states[0],
+                            surp_idx,
+                            surp_prob,
+                            pred_v_seg,
+                            *st_kh,
+                            *st_ss5,
+                            *st_si,
+                            *st_sp,
+                            *st_pv,
+                            seg_t0,
+                            0,
+                            seg_len,
+                            M,
+                            H,
+                            K_SEL=K_surp,
+                            BLOCK_T=16,
+                            D_K=D_k,
+                            B_V=64,
+                            USE_BF16=use_bf16_dot,
+                            num_warps=4,
+                            num_stages=1,
+                        )
+                    else:
+                        _batched_chunk_readout_fwd_kernel[((seg_len + 15) // 16, BH, nv_64)](
+                            kh_c[:, seg_t0:seg_t1],
+                            s_seg_states[:s_cnt],
+                            surp_idx[:, seg_t0:seg_t1],
+                            surp_prob[:, seg_t0:seg_t1],
+                            pred_v_seg,
+                            *st_kh,
+                            *st_ss6,
+                            *st_si,
+                            *st_sp,
+                            *st_pv,
+                            seg_len,
+                            chunk_size=chunk_size,
+                            M=M,
+                            H=H,
+                            K_SEL=K_surp,
+                            BLOCK_T=16,
+                            D_K=D_k,
+                            B_V=64,
+                            USE_BF16=use_bf16_dot,
+                            num_warps=4,
+                            num_stages=1,
+                        )
+
+                # Zero-slice per-chunk state backward!
+                ds_seg_start = torch.zeros_like(ds_cur) if is_seg_surp else None
+                ds_surp_target = ds_seg_start if is_seg_surp else ds_cur
+                for loc in range(s_cnt - 1, -1, -1):
+                    n = c_start + loc
+                    t0 = n * chunk_size
+                    c_len = min(chunk_size, T - t0)
+                    l_off = loc * chunk_size
+                    slot0 = loc * BMH
+
+                    if loc < n_fut_valid:
+                        f0 = (n + window_chunks + 1) * chunk_size
+                        f_len = min(chunk_size, T - f0)
+                        _routed_readout_off_bwd_ds_kernel[(BMH, nv_64)](
+                            qh_c,
+                            tri_c,
+                            trw_c,
+                            dof_c,
+                            ds_cur,
+                            *st_qh,
+                            *st_tri,
+                            *st_trw,
+                            *st_dof,
+                            *st_ds,
+                            f0,
+                            f0,
+                            f_len,
+                            M,
+                            H,
+                            K_SEL=K_sel,
+                            D_K=D_k,
+                            B_V=64,
+                            USE_BF16=use_bf16_dot,
+                            num_warps=4,
+                            num_stages=1,
+                        )
+
+                    _wy_bwd_b1_off_kernel[(BMH, nv_64)](
+                        kb_c,
+                        vb_c,
+                        gp_seg,
+                        a_seg,
+                        cg_seg,
+                        act_seg,
+                        s_seg_states,
+                        ds_cur,
+                        dl_seg,
+                        dk0_seg,
+                        dkend_seg,
+                        dg63_seg,
+                        dgv_seg,
+                        dv_m_seg,
+                        *st_kb,
+                        *st_vb,
+                        *st_gp,
+                        *st_a,
+                        *st_cg,
+                        s_c_stride,
+                        s_bmh_stride,
+                        D_v,
+                        1,
+                        *st_dl,
+                        *st_dkp,
+                        *st_dg63,
+                        *st_dgv,
+                        *st_dvm,
+                        t0,
+                        loc,
+                        slot0,
+                        c_len,
+                        M,
+                        H,
+                        D_K=D_k,
+                        B_V=64,
+                        USE_BF16_DOT=use_bf16_dot,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                    _wy_bwd_b2_off_kernel[(BMH, nk_32)](
+                        kb_c,
+                        gp_seg,
+                        ps_c,
+                        ch_c,
+                        cg_seg,
+                        act_seg,
+                        dl_seg,
+                        dk0_seg,
+                        dkend_seg,
+                        dg63_seg,
+                        dk_m_seg,
+                        dgam_m_seg,
+                        dgk_seg,
+                        *st_kb,
+                        *st_gp,
+                        *st_ch,
+                        *st_cg,
+                        *st_dl,
+                        *st_dkp,
+                        *st_dg63,
+                        *st_dkm,
+                        *st_dgk,
+                        t0,
+                        loc,
+                        slot0,
+                        c_len,
+                        M,
+                        H,
+                        N_VB=nv_64,
+                        B_K=32,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                    _surprise_gate_off_bwd_kernel[(B * c_len, H)](
+                        v_c,
+                        pred_v_seg,
+                        sb_c,
+                        slp_c,
+                        thr_c,
+                        wm_c,
+                        twi_c,
+                        stew_c,
+                        g_root,
+                        dgv_seg,
+                        dgk_seg,
+                        dgr_c,
+                        dpred_v_seg,
+                        dv_surp,
+                        dsbias,
+                        dslp_part,
+                        dthr_part,
+                        dsw_part,
+                        dwm_acc,
+                        *st_v,
+                        *st_pv,
+                        *st_sb,
+                        *st_wm,
+                        *st_twi,
+                        *st_stew,
+                        *st_gr,
+                        *st_dgv,
+                        *st_dgk,
+                        *st_dsw,
+                        t0,
+                        l_off,
+                        slot0,
+                        c_len,
+                        M=M,
+                        H=H,
+                        K_SEL=K_sel,
+                        D_V=D_v,
+                        N_VB=nv_64,
+                        N_KB=nk_32,
+                        HAS_WM=has_wm,
+                        NEED_DWM=need_dwm,
+                        USE_SURPRISE=do_surp,
+                        num_warps=4,
+                        num_stages=1,
+                    )
+                    if do_surp:
+                        _routed_readout_off_bwd_ds_kernel[(BMH, nv_64)](
+                            kh_c,
+                            surp_idx,
+                            surp_prob,
+                            dpred_v_seg,
+                            ds_surp_target,
+                            *st_kh,
+                            *st_si,
+                            *st_sp,
+                            *st_dpv,
+                            *st_ds,
+                            t0,
+                            l_off,
+                            c_len,
+                            M,
+                            H,
+                            K_SEL=K_surp,
+                            D_K=D_k,
+                            B_V=64,
+                            USE_BF16=use_bf16_dot,
+                            num_warps=4,
+                            num_stages=1,
+                        )
+
+                if is_seg_surp and ds_seg_start is not None:
+                    ds_cur.add_(ds_seg_start)
+
+                if do_surp:
+                    if is_seg_surp:
+                        _routed_readout_bwd_vec_w_kernel[((seg_len + 15) // 16, BH)](
+                            kh_c[:, seg_t0:seg_t1],
+                            s_seg_states[0],
+                            surp_idx[:, seg_t0:seg_t1],
+                            surp_prob[:, seg_t0:seg_t1],
+                            dpred_v_seg[:, :seg_len],
+                            dk_hat[:, seg_t0:seg_t1],
+                            dw_read_part,
+                            *st_kh,
+                            *st_ss5,
+                            *st_si,
+                            *st_sp,
+                            *st_dpv,
+                            *st_dwr,
+                            seg_len,
+                            M,
+                            H,
+                            K_SEL=K_surp,
+                            BLOCK_T=16,
+                            D_K=D_k,
+                            D_V=D_v,
+                            USE_BF16=use_bf16_dot,
+                            num_warps=4,
+                            num_stages=1,
+                        )
+                    else:
+                        _batched_chunk_readout_bwd_vec_w_kernel[((seg_len + 15) // 16, BH)](
+                            kh_c[:, seg_t0:seg_t1],
+                            s_seg_states[:s_cnt],
+                            surp_idx[:, seg_t0:seg_t1],
+                            surp_prob[:, seg_t0:seg_t1],
+                            dpred_v_seg[:, :seg_len],
+                            dk_hat[:, seg_t0:seg_t1],
+                            dw_read_part,
+                            *st_kh,
+                            *st_ss6,
+                            *st_si,
+                            *st_sp,
+                            *st_dpv,
+                            *st_dwr,
+                            seg_len,
+                            chunk_size=chunk_size,
+                            M=M,
+                            H=H,
+                            K_SEL=K_surp,
+                            BLOCK_T=16,
+                            D_K=D_k,
+                            D_V=D_v,
+                            USE_BF16=use_bf16_dot,
+                            num_warps=4,
+                            num_stages=1,
+                        )
+                    if not is_page0:
+                        _reduce_head_weights_kernel[((seg_len + 63) // 64, B)](
+                            dw_read_part,
+                            dtw_probs,
+                            *st_dwr,
+                            *st_dtwp,
+                            seg_t0,
+                            seg_len,
+                            H=H,
+                            K_SEL=K_sel,
+                            BLOCK_T=64,
+                            num_warps=4,
+                            num_stages=1,
+                        )
+
+                _reduce_head_weights_kernel[((seg_len + 63) // 64, B)](
+                    dsw_part,
+                    dste_w,
+                    *st_dsw,
+                    *st_dstew,
+                    seg_t0,
+                    seg_len,
+                    H=H,
+                    K_SEL=K_sel,
+                    BLOCK_T=64,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                n_t_blks = (seg_len + 15) // 16
+                _wy_seg_reduce_noatomic_bwd_kernel[(n_t_blks, BH)](
+                    dk_m_seg,
+                    dv_m_seg,
+                    dgam_m_seg,
+                    ps_c,
+                    ch_c,
+                    dk_base,
+                    dv_base,
+                    dch_gamma,
+                    dps_part,
+                    *st_dkm,
+                    *st_dvm,
+                    *st_ch,
+                    *st_kb,
+                    *st_vb,
+                    seg_t0,
+                    seg_len,
+                    BMH,
+                    chunk_size=chunk_size,
+                    M=M,
+                    H=H,
+                    D_K=D_k,
+                    D_V=D_v,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                dps_acc.add_(dps_part[: n_t_blks * BH].sum(dim=0))
+
+            dslope_acc = (
+                dslp_part.view(B * T, H).sum(dim=0)
+                if do_surp
+                else torch.zeros((H,), device=qh_c.device, dtype=torch.float32)
+            )
+            dthresh_acc = (
+                dthr_part.view(B * T, H).sum(dim=0)
+                if do_surp
+                else torch.zeros((H,), device=qh_c.device, dtype=torch.float32)
+            )
+
+            n_init_far = min(n_chunks, window_chunks + 1)
+            init_toks = min(T, n_init_far * chunk_size)
+            if init_toks > 0:
+                s0_bank = s_ckpts[0]
+                _routed_readout_bwd_vec_w_kernel[((init_toks + 15) // 16, BH)](
+                    qh_c[:, :init_toks],
+                    s0_bank,
+                    tri_c[:, :init_toks],
+                    trw_c[:, :init_toks],
+                    dof_c[:, :init_toks],
+                    dq_hat[:, :init_toks],
+                    dw_read_part,
+                    *st_qh,
+                    *st_ss5,
+                    *st_tri,
+                    *st_trw,
+                    *st_dof,
+                    *st_dwr,
+                    init_toks,
+                    M,
+                    H,
+                    K_SEL=K_sel,
+                    BLOCK_T=16,
+                    D_K=D_k,
+                    D_V=D_v,
+                    USE_BF16=use_bf16_dot,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                _reduce_head_weights_kernel[((init_toks + 63) // 64, B)](
+                    dw_read_part,
+                    dtr_w,
+                    *st_dwr,
+                    *st_dtrw,
+                    0,
+                    init_toks,
+                    H=H,
+                    K_SEL=K_sel,
+                    BLOCK_T=64,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                _routed_readout_bwd_ds_kernel[(BMH, nv_64)](
+                    qh_c[:, :init_toks],
+                    tri_c[:, :init_toks],
+                    trw_c[:, :init_toks],
+                    dof_c[:, :init_toks],
+                    ds_cur,
+                    *st_qh,
+                    *st_tri,
+                    *st_trw,
+                    *st_dof,
+                    *st_ds,
+                    init_toks,
+                    M,
+                    H,
+                    K_SEL=K_sel,
+                    D_K=D_k,
+                    B_V=64,
+                    USE_BF16=use_bf16_dot,
+                    num_warps=4,
+                    num_stages=1,
+                )
+
+            return (
+                dq_hat,
+                dk_hat,
+                dv_surp,
+                dk_base,
+                dv_base,
+                dps_acc,
+                dch_gamma,
+                dsbias,
+                dslope_acc,
+                dthresh_acc,
+                dwm_acc.to(wm_dt) if (need_dwm and wm_dt is not None) else None,
+                None,
+                dtw_probs,
+                dste_w,
+                None,
+                dtr_w,
+                ds_cur,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+    @triton.jit
+    def _invert_unit_lower_16x16_ieee(L_blk):
+        return _invert_unit_lower_16x16_fast(L_blk)
+
+    @triton.jit
+    def _invert_unit_lower_64_contig_kernel(L_ptr, AInv_ptr):
+        pid = tl.program_id(0)
+        offs_16 = tl.arange(0, 16)
+        l_base = L_ptr + pid * 4096
+
+        L00 = tl.load(l_base + (0 + offs_16[:, None]) * 64 + (0 + offs_16[None, :])).to(tl.float32)
+        L11 = tl.load(l_base + (16 + offs_16[:, None]) * 64 + (16 + offs_16[None, :])).to(tl.float32)
+        L22 = tl.load(l_base + (32 + offs_16[:, None]) * 64 + (32 + offs_16[None, :])).to(tl.float32)
+        L33 = tl.load(l_base + (48 + offs_16[:, None]) * 64 + (48 + offs_16[None, :])).to(tl.float32)
+        inv00 = _invert_unit_lower_16x16_ieee(L00)
+        inv11 = _invert_unit_lower_16x16_ieee(L11)
+        inv22 = _invert_unit_lower_16x16_ieee(L22)
+        inv33 = _invert_unit_lower_16x16_ieee(L33)
+
+        L10 = tl.load(l_base + (16 + offs_16[:, None]) * 64 + (0 + offs_16[None, :])).to(tl.float32)
+        L20 = tl.load(l_base + (32 + offs_16[:, None]) * 64 + (0 + offs_16[None, :])).to(tl.float32)
+        L21 = tl.load(l_base + (32 + offs_16[:, None]) * 64 + (16 + offs_16[None, :])).to(tl.float32)
+        L30 = tl.load(l_base + (48 + offs_16[:, None]) * 64 + (0 + offs_16[None, :])).to(tl.float32)
+        L31 = tl.load(l_base + (48 + offs_16[:, None]) * 64 + (16 + offs_16[None, :])).to(tl.float32)
+        L32 = tl.load(l_base + (48 + offs_16[:, None]) * 64 + (32 + offs_16[None, :])).to(tl.float32)
+
+        inv10 = -tl.dot(tl.dot(inv11, L10, input_precision="ieee"), inv00, input_precision="ieee")
+        inv32 = -tl.dot(tl.dot(inv33, L32, input_precision="ieee"), inv22, input_precision="ieee")
+        M20 = tl.dot(L20, inv00, input_precision="ieee") + tl.dot(L21, inv10, input_precision="ieee")
+        M21 = tl.dot(L21, inv11, input_precision="ieee")
+        M30 = tl.dot(L30, inv00, input_precision="ieee") + tl.dot(L31, inv10, input_precision="ieee")
+        M31 = tl.dot(L31, inv11, input_precision="ieee")
+        inv20 = -tl.dot(inv22, M20, input_precision="ieee")
+        inv21 = -tl.dot(inv22, M21, input_precision="ieee")
+        inv30 = -(tl.dot(inv32, M20, input_precision="ieee") + tl.dot(inv33, M30, input_precision="ieee"))
+        inv31 = -(tl.dot(inv32, M21, input_precision="ieee") + tl.dot(inv33, M31, input_precision="ieee"))
+
+        a_base = AInv_ptr + pid * 4096
+        z16 = tl.zeros([16, 16], dtype=tl.float32)
+        tl.store(a_base + (0 + offs_16[:, None]) * 64 + (0 + offs_16[None, :]), inv00)
+        tl.store(a_base + (0 + offs_16[:, None]) * 64 + (16 + offs_16[None, :]), z16)
+        tl.store(a_base + (0 + offs_16[:, None]) * 64 + (32 + offs_16[None, :]), z16)
+        tl.store(a_base + (0 + offs_16[:, None]) * 64 + (48 + offs_16[None, :]), z16)
+        tl.store(a_base + (16 + offs_16[:, None]) * 64 + (0 + offs_16[None, :]), inv10)
+        tl.store(a_base + (16 + offs_16[:, None]) * 64 + (16 + offs_16[None, :]), inv11)
+        tl.store(a_base + (16 + offs_16[:, None]) * 64 + (32 + offs_16[None, :]), z16)
+        tl.store(a_base + (16 + offs_16[:, None]) * 64 + (48 + offs_16[None, :]), z16)
+        tl.store(a_base + (32 + offs_16[:, None]) * 64 + (0 + offs_16[None, :]), inv20)
+        tl.store(a_base + (32 + offs_16[:, None]) * 64 + (16 + offs_16[None, :]), inv21)
+        tl.store(a_base + (32 + offs_16[:, None]) * 64 + (32 + offs_16[None, :]), inv22)
+        tl.store(a_base + (32 + offs_16[:, None]) * 64 + (48 + offs_16[None, :]), z16)
+        tl.store(a_base + (48 + offs_16[:, None]) * 64 + (0 + offs_16[None, :]), inv30)
+        tl.store(a_base + (48 + offs_16[:, None]) * 64 + (16 + offs_16[None, :]), inv31)
+        tl.store(a_base + (48 + offs_16[:, None]) * 64 + (32 + offs_16[None, :]), inv32)
+        tl.store(a_base + (48 + offs_16[:, None]) * 64 + (48 + offs_16[None, :]), inv33)
+
+    class _TritonSolveUnitLower64Fn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, l_mat: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+            ctx.set_materialize_grads(False)
+            lead_shape = l_mat.shape[:-2]
+            d_rhs = int(rhs.shape[-1])
+            n_batch = int(l_mat.numel() // 4096)
+            l_c = l_mat.contiguous().view(n_batch, 64, 64)
+            r_3d = rhs.reshape(n_batch, 64, d_rhs)
+            a_inv = torch.empty((n_batch, 64, 64), device=l_mat.device, dtype=torch.float32)
+            _invert_unit_lower_64_contig_kernel[(n_batch,)](l_c, a_inv, num_warps=4, num_stages=1)
+            if rhs.dtype == torch.float32:
+                prev_tf32 = bool(torch.backends.cuda.matmul.allow_tf32)
+                if prev_tf32:
+                    torch.backends.cuda.matmul.allow_tf32 = False
+                try:
+                    u_3d = torch.bmm(a_inv, r_3d)
+                finally:
+                    if prev_tf32:
+                        torch.backends.cuda.matmul.allow_tf32 = True
+            else:
+                u_3d = torch.bmm(a_inv.to(rhs.dtype), r_3d)
+            if any(ctx.needs_input_grad):
+                ctx.save_for_backward(a_inv, u_3d)
+                ctx.meta = (lead_shape, d_rhs, l_mat.dtype, rhs.dtype)
+            return u_3d.view(*lead_shape, 64, d_rhs)
+
+        @staticmethod
+        def backward(ctx, du: torch.Tensor | None):
+            a_inv, u_3d = ctx.saved_tensors
+            lead_shape, d_rhs, l_dt, r_dt = ctx.meta
+            if du is None:
+                return None, None
+            n_batch = int(a_inv.shape[0])
+            need_dl = bool(ctx.needs_input_grad[0])
+            need_dr = bool(ctx.needs_input_grad[1])
+            if all(s == 0 for s in du.stride()):
+                scale_c = du.reshape(-1)[:1].float().view(1, 1, 1)
+                dr_col = a_inv.sum(dim=-2, keepdim=True).transpose(-1, -2) * scale_c
+                dr_out = (
+                    (dr_col.to(r_dt) if r_dt != torch.float32 else dr_col)
+                    .view(*lead_shape, 64, 1)
+                    .expand(*lead_shape, 64, d_rhs)
+                )
+                if need_dl:
+                    u_row = u_3d.float().sum(dim=-1, keepdim=True).transpose(-1, -2)
+                    dl_f = (-dr_col * u_row).tril_(-1)
+                    dl_out = (dl_f.to(l_dt) if l_dt != torch.float32 else dl_f).view(*lead_shape, 64, 64)
+                else:
+                    dl_out = None
+                return dl_out, dr_out if need_dr else None
+
+            du_3d = du.reshape(n_batch, 64, d_rhs)
+            if r_dt == torch.float32:
+                prev_tf32 = bool(torch.backends.cuda.matmul.allow_tf32)
+                if prev_tf32:
+                    torch.backends.cuda.matmul.allow_tf32 = False
+                try:
+                    dr_3d = torch.bmm(a_inv.transpose(-1, -2), du_3d)
+                    dl_3d = (
+                        torch.bmm(dr_3d, u_3d.transpose(-1, -2)).neg_().tril_(-1)
+                        if need_dl
+                        else None
+                    )
+                finally:
+                    if prev_tf32:
+                        torch.backends.cuda.matmul.allow_tf32 = True
+            else:
+                dr_f = torch.bmm(a_inv.transpose(-1, -2), du_3d.float())
+                dr_3d = dr_f.to(r_dt) if need_dr else None
+                dl_3d = (
+                    torch.bmm(dr_f, u_3d.float().transpose(-1, -2)).neg_().tril_(-1).to(l_dt)
+                    if need_dl
+                    else None
+                )
+            return (
+                dl_3d.view(*lead_shape, 64, 64) if need_dl and dl_3d is not None else None,
+                dr_3d.view(*lead_shape, 64, d_rhs) if need_dr and dr_3d is not None else None,
+            )
+
+
+_ORIG_RUN_CHUNK_GROUP = _run_chunk_group
+_ORIG_CHECKPOINT = checkpoint
+
+
+def _chunk_hssd_triton_fast(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    ps_gamma: torch.Tensor,
+    ch_gamma: torch.Tensor,
+    b_gate: torch.Tensor,
+    w_gate: torch.Tensor,
+    theta: torch.Tensor,
+    surprise_bias: torch.Tensor,
+    surprise_slope: torch.Tensor,
+    surprise_thresh: torch.Tensor,
+    write_logits: torch.Tensor,
+    read_logits: torch.Tensor,
+    q_swa: torch.Tensor,
+    k_swa: torch.Tensor,
+    v_swa: torch.Tensor,
+    *,
+    st: HSSDCacheState,
+    boltzmann_gate: PeakBoltzmannGate | None,
+    swa_recency_slope: torch.Tensor | None,
+    chunk_size: int,
+    window_chunks: int,
+    num_pages: int,
+    top_k_pages: int,
+    segment_chunks: int,
+    output_final_state: bool,
+    write_mask: torch.Tensor | None,
+    use_qk_l2norm_in_kernel: bool,
+    scale: float | None,
+    state_dtype: str | torch.dtype,
+    use_swa: bool,
+    use_phase: bool,
+    use_surprise: bool,
+    surprise_mode: str,
+    write_mode: str,
+    compact_decode_cache: bool,
+) -> tuple[torch.Tensor, HSSDCacheState | None, torch.Tensor, torch.Tensor]:
+    init_dtype = query.dtype
+    bsz, seq_len, hv, dv = value.shape
+    dk = key.shape[-1]
+    acc_dt = torch.float32
+    use_bf16_dot = init_dtype in (torch.bfloat16, torch.float16)
+    tc_dt = torch.bfloat16 if use_bf16_dot else torch.float32
+
+    q_in = query
+    k_in = key
+    if q_in.shape[2] != hv:
+        require(hv % q_in.shape[2] == 0, "num_v_heads must be divisible by num_q_heads", q=q_in, v=value)
+        q_in = q_in.repeat_interleave(hv // q_in.shape[2], dim=2)
+    if k_in.shape[2] != hv:
+        require(hv % k_in.shape[2] == 0, "num_v_heads must be divisible by num_k_heads", k=k_in, v=value)
+        k_in = k_in.repeat_interleave(hv // k_in.shape[2], dim=2)
+
+    if write_mask is not None:
+        wm_f: torch.Tensor | None = (
+            write_mask.reshape(bsz, seq_len).to(device=query.device, dtype=acc_dt).clamp(0.0, 1.0)
+        )
+        valid_cur = wm_f > 0.5
+    else:
+        wm_f = None
+        valid_cur = (
+            torch.ones(bsz, seq_len, device=query.device, dtype=torch.bool)
+            if output_final_state
+            else torch.empty(0, device=query.device, dtype=torch.bool)
+        )
+
+    if use_phase:
+        cos_t, sin_t, term_theta = _TritonPhaseTrigFn.apply(theta, st.theta_cum, wm_f, tc_dt)
+    else:
+        cos_t = query.new_empty(0, dtype=tc_dt)
+        sin_t = query.new_empty(0, dtype=tc_dt)
+        term_theta = st.theta_cum.to(dtype=torch.float64).clone().contiguous()
+
+    sc = float(dk ** -0.5) if scale is None else float(scale)
+    q_hat, k_hat, v_tc, k_base, v_base = _TritonScanPrepFn.apply(
+        q_in, k_in, value, b_gate, w_gate, cos_t, sin_t, sc, use_phase, use_qk_l2norm_in_kernel, tc_dt
+    )
+
+    wl_f = write_logits.float()
+    rl_f = read_logits.float()
+    pi_w = F.softmax(wl_f, dim=-1)
+    tw_vals, tw_idx = torch.topk(pi_w, k=top_k_pages, dim=-1)
+    tw_probs = tw_vals / tw_vals.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+    if write_mode == "full":
+        ste_w = torch.ones_like(tw_vals) + (tw_vals - tw_vals.detach())
+        hard_sel = torch.zeros_like(pi_w).scatter(-1, tw_idx, 1.0)
+        pi_ste = hard_sel + float(top_k_pages) * (pi_w - pi_w.detach())
+    else:
+        ste_w = torch.sqrt(tw_probs.clamp_min(1e-30))
+        pi_act = torch.zeros_like(pi_w).scatter(-1, tw_idx, tw_probs)
+        pi_ste = pi_act + (pi_w - pi_w.detach())
+
+    pi_r = F.softmax(rl_f, dim=-1)
+    tr_vals, tr_idx = torch.topk(pi_r, k=top_k_pages, dim=-1)
+    tr_w = tr_vals / tr_vals.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+
+    seg_step = max(1, int(segment_chunks))
+    seg_tokens = seg_step * chunk_size
+    ckpt_every = seg_step if surprise_mode == "segment_start" else max(seg_step, 8)
+
+    end_step = seq_len
+    n_end = end_step // chunk_size
+    k_far_end = max(0, n_end - window_chunks)
+    can_build_compact = bool(output_final_state and compact_decode_cache)
+    need_global_boundaries: set[int] = set()
+    produced_boundaries: dict[int, torch.Tensor] = {}
+    if output_final_state:
+        if can_build_compact:
+            if k_far_end > 0:
+                need_global_boundaries.add(k_far_end)
+            if n_end > 0 and end_step % chunk_size != 0:
+                need_global_boundaries.add(n_end)
+            if surprise_mode == "segment_start":
+                seg_end_k = (end_step // seg_tokens) * seg_step
+                if seg_end_k > 0 and end_step % seg_tokens != 0:
+                    need_global_boundaries.add(seg_end_k)
+        else:
+            for k_b in range(max(1, n_end - window_chunks), n_end + 1):
+                need_global_boundaries.add(k_b)
+            if surprise_mode == "segment_start":
+                seg_end_k = (end_step // seg_tokens) * seg_step
+                if seg_end_k > 0 and end_step % seg_tokens != 0:
+                    need_global_boundaries.add(seg_end_k)
+
+    sb_in = (
+        surprise_bias.squeeze(-1)
+        if (surprise_bias.ndim == 4 and surprise_bias.shape[-1] == 1)
+        else surprise_bias
+    )
+    o_far, g_root, p_cur = _TritonHSSDScanFn.apply(
+        q_hat,
+        k_hat,
+        v_tc,
+        k_base,
+        v_base,
+        ps_gamma,
+        ch_gamma,
+        sb_in,
+        surprise_slope,
+        surprise_thresh,
+        wm_f,
+        tw_idx,
+        tw_probs,
+        ste_w,
+        tr_idx,
+        tr_w,
+        st.page_states,
+        chunk_size,
+        window_chunks,
+        ckpt_every,
+        use_surprise,
+        surprise_mode,
+        use_bf16_dot,
+        need_global_boundaries if output_final_state else None,
+        produced_boundaries if output_final_state else None,
+    )
+
+    if use_swa:
+        if boltzmann_gate is not None:
+            gate_log_kappa = upcast(boltzmann_gate.log_kappa).to(acc_dt)
+            gate_tau = upcast(boltzmann_gate.tau).to(acc_dt)
+        else:
+            gate_log_kappa = query.new_full((1,), math.log(2.0), dtype=acc_dt)
+            gate_tau = query.new_full((1,), 1.0, dtype=acc_dt)
+        qs_tc = q_swa if q_swa.dtype == tc_dt else q_swa.to(dtype=tc_dt)
+        ks_tc = k_swa if k_swa.dtype == tc_dt else k_swa.to(dtype=tc_dt)
+        vs_tc = v_swa if v_swa.dtype == tc_dt else v_swa.to(dtype=tc_dt)
+        o_loc, lse, max_sc, counts = _DisjointFlashSWAFn.apply(
+            qs_tc, ks_tc, vs_tc, valid_cur, swa_recency_slope, chunk_size, window_chunks, wm_f is not None
+        )
+        out = _TritonBoltzmannBlendFn.apply(
+            o_loc, o_far, lse, max_sc, counts, gate_log_kappa, gate_tau, init_dtype
+        )
+    else:
+        out = o_far.to(dtype=init_dtype)
+
+    g_sq_mean = (g_root * g_root).mean(dim=-1, keepdim=True)
+    u_total = (pi_ste * g_sq_mean).sum(dim=(0, 1))
+    tok_total = wm_f.sum() if wm_f is not None else g_root.new_full((), float(bsz * seq_len))
+
+    final_state: HSSDCacheState | None = None
+    if output_final_state:
+        max_win = st.max_swa_len
+        keep_from = max(0, end_step - max_win)
+        ring_slots = torch.arange(keep_from, end_step, device=query.device) % max_win
+        new_k_ring = _compact(
+            st.swa_k_ring.index_copy(1, ring_slots, k_swa[:, keep_from:].to(dtype=st.swa_k_ring.dtype))
+        )
+        new_v_ring = _compact(
+            st.swa_v_ring.index_copy(1, ring_slots, v_swa[:, keep_from:].to(dtype=st.swa_v_ring.dtype))
+        )
+        new_val_ring = _compact(st.swa_valid_ring.index_copy(1, ring_slots, valid_cur[:, keep_from:]))
+        p_comp = _compact(p_cur)
+        new_steps = st.step_count + seq_len
+
+        final_seg_bank: torch.Tensor | None = None
+        if surprise_mode == "segment_start":
+            if end_step % seg_tokens == 0:
+                final_seg_bank = p_comp
+            else:
+                seg_end_k = (end_step // seg_tokens) * seg_step
+                if seg_end_k in produced_boundaries:
+                    final_seg_bank = _compact(produced_boundaries[seg_end_k])
+                elif st.s_seg_start_bank is not None:
+                    final_seg_bank = _compact(st.s_seg_start_bank)
+                else:
+                    final_seg_bank = _compact(st.s_chunk_start_bank)
+
+        if can_build_compact:
+            s_far_final = _compact(st.s_far_bank) if k_far_end == 0 else _compact(produced_boundaries[k_far_end])
+            if end_step % chunk_size == 0:
+                s_cstart_final = p_comp
+            elif n_end > 0:
+                s_cstart_final = _compact(produced_boundaries[n_end])
+            else:
+                s_cstart_final = _compact(st.s_chunk_start_bank)
+
+            rep_d_g = int(ch_gamma.shape[-1])
+            new_rep_ke = query.new_zeros((bsz, hv, max_win, dk), dtype=acc_dt)
+            new_rep_ve = query.new_zeros((bsz, hv, max_win, dv), dtype=acc_dt)
+            new_rep_g = query.new_zeros((bsz, max_win, top_k_pages, hv), dtype=acc_dt)
+            new_rep_gam = query.new_zeros((bsz, max_win, top_k_pages, hv, rep_d_g), dtype=acc_dt)
+            new_rep_idx = torch.zeros((bsz, max_win, top_k_pages), device=query.device, dtype=torch.long)
+
+            c_from = max(0, k_far_end * chunk_size)
+            if c_from < end_step:
+                tail_len = end_step - c_from
+                r_slots = torch.arange(c_from, end_step, device=query.device) % max_win
+                k_tail = k_in[:, c_from:].float()
+                if use_qk_l2norm_in_kernel:
+                    k_tail = l2norm(k_tail, dim=-1, eps=1e-6)
+                if use_phase:
+                    k_tail = apply_2d_rotation_trig(k_tail, cos_t[:, c_from:].float(), sin_t[:, c_from:].float())
+                ke_tail = (_safe_sqrt(b_gate[:, c_from:].float()) * k_tail).transpose(1, 2)
+                ve_tail = (_safe_sqrt(w_gate[:, c_from:].float()) * value[:, c_from:].float()).transpose(1, 2)
+                g_tail = ste_w[:, c_from:].unsqueeze(-1) * g_root[:, c_from:].unsqueeze(2)
+                ps_sel = ps_gamma.index_select(0, tw_idx[:, c_from:].reshape(-1)).view(
+                    bsz, tail_len, top_k_pages, 1, 1
+                )
+                gam_tail = ps_sel * ch_gamma[:, c_from:].unsqueeze(2)
+                new_rep_ke = new_rep_ke.index_copy(2, r_slots, ke_tail)
+                new_rep_ve = new_rep_ve.index_copy(2, r_slots, ve_tail)
+                new_rep_g = new_rep_g.index_copy(1, r_slots, g_tail)
+                new_rep_gam = new_rep_gam.index_copy(1, r_slots, gam_tail)
+                new_rep_idx = new_rep_idx.index_copy(1, r_slots, tw_idx[:, c_from:])
+
+            final_state = _cast_state_dtype(
+                HSSDCacheState(
+                    step_count=new_steps,
+                    chunk_size=chunk_size,
+                    window_chunks=window_chunks,
+                    page_states=p_comp,
+                    theta_cum=term_theta,
+                    boundary_ring=None,
+                    swa_k_ring=new_k_ring,
+                    swa_v_ring=new_v_ring,
+                    swa_valid_ring=new_val_ring,
+                    s_far_bank=s_far_final,
+                    s_chunk_start_bank=s_cstart_final,
+                    s_seg_start_bank=final_seg_bank,
+                    replay_buf=(
+                        _compact(new_rep_ke),
+                        _compact(new_rep_ve),
+                        _compact(new_rep_g),
+                        _compact(new_rep_gam),
+                        _compact(new_rep_idx),
+                    ),
+                    _uniform_step=end_step,
+                ),
+                state_dtype,
+                acc_dt,
+            )
+        else:
+            ring_list: list[torch.Tensor] = []
+            for r_pos in range(window_chunks + 1):
+                k_want = n_end - window_chunks + r_pos
+                if k_want <= 0:
+                    ring_list.append(_compact(st.page_states))
+                elif k_want == n_end and end_step % chunk_size == 0:
+                    ring_list.append(p_comp)
+                else:
+                    ring_list.append(_compact(produced_boundaries[k_want]))
+            final_state = _cast_state_dtype(
+                HSSDCacheState(
+                    step_count=new_steps,
+                    chunk_size=chunk_size,
+                    window_chunks=window_chunks,
+                    page_states=p_comp,
+                    theta_cum=term_theta,
+                    boundary_ring=tuple(ring_list),
+                    swa_k_ring=new_k_ring,
+                    swa_v_ring=new_v_ring,
+                    swa_valid_ring=new_val_ring,
+                    s_seg_start_bank=final_seg_bank,
+                    _uniform_step=end_step,
+                ),
+                state_dtype,
+                acc_dt,
+            )
+
+    return out, final_state, u_total, tok_total
 
 
 def _chunk_hssd_raw(
@@ -4869,10 +10859,94 @@ def _chunk_hssd_raw(
         )
         return out_p, st_p, u_tot_p, cnt_tot_p
 
-    q, k, v = _prepare_qkv_unscaled(query, key, value, use_qk_l2norm_in_kernel)
+    step_offset_0 = st._uniform_step if st._uniform_step is not None else int(st.step_count[0].item())
     ps_gamma, ch_gamma = _normalize_gamma_spec(
-        gamma, num_pages=num_pages, dk=dk, acc_dt=acc_dt, device=q.device
+        gamma, num_pages=num_pages, dk=dk, acc_dt=acc_dt, device=query.device
     )
+    if (
+        _HAS_TRITON
+        and query.is_cuda
+        and not _is_compiling()
+        and not compile_chunks
+        and _run_chunk_group is _ORIG_RUN_CHUNK_GROUP
+        and checkpoint is _ORIG_CHECKPOINT
+        and init_dtype in (torch.bfloat16, torch.float16)
+        and step_offset_0 == 0
+        and chunk_size == 64
+        and dk in (64, 128)
+        and dv in (64, 128)
+        and g_override is None
+        and 1 <= top_k_pages <= num_pages
+        and window_chunks >= 0
+        and ps_gamma is not None
+        and ch_gamma.shape[-1] == dk // 2
+    ):
+        any_grad_in = torch.is_grad_enabled() and any(
+            isinstance(t, torch.Tensor) and t.requires_grad
+            for t in (
+                query,
+                key,
+                value,
+                ps_gamma,
+                ch_gamma,
+                b_gate,
+                w_gate,
+                theta,
+                surprise_bias,
+                surprise_slope,
+                surprise_thresh,
+                write_logits,
+                read_logits,
+                q_swa,
+                k_swa,
+                v_swa,
+                st.page_states,
+                write_mask,
+                swa_recency_slope,
+                None if boltzmann_gate is None else boltzmann_gate.log_kappa,
+                None if boltzmann_gate is None else boltzmann_gate.tau,
+            )
+        )
+        if not output_final_state or not any_grad_in:
+            return _chunk_hssd_triton_fast(
+                query,
+                key,
+                value,
+                ps_gamma,
+                ch_gamma,
+                b_gate,
+                w_gate,
+                theta,
+                surprise_bias,
+                surprise_slope,
+                surprise_thresh,
+                write_logits,
+                read_logits,
+                q_swa,
+                k_swa,
+                v_swa,
+                st=st,
+                boltzmann_gate=boltzmann_gate,
+                swa_recency_slope=swa_recency_slope,
+                chunk_size=chunk_size,
+                window_chunks=window_chunks,
+                num_pages=num_pages,
+                top_k_pages=top_k_pages,
+                segment_chunks=segment_chunks,
+                output_final_state=output_final_state,
+                write_mask=write_mask,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                scale=scale,
+                state_dtype=state_dtype,
+                use_swa=use_swa,
+                use_phase=use_phase,
+                use_surprise=use_surprise,
+                surprise_mode=surprise_mode,
+                write_mode=write_mode,
+                compact_decode_cache=compact_decode_cache,
+            )
+
+    q, k, v = _prepare_qkv_unscaled(query, key, value, use_qk_l2norm_in_kernel)
     bf = upcast(b_gate).to(acc_dt)
     wf = upcast(w_gate).to(acc_dt)
     sb = upcast(surprise_bias).to(acc_dt)
@@ -4880,9 +10954,10 @@ def _chunk_hssd_raw(
     thr = upcast(surprise_thresh).to(acc_dt)
     wl = upcast(write_logits).to(acc_dt)
     rl = upcast(read_logits).to(acc_dt)
-    qs = upcast(q_swa).to(acc_dt)
-    ks = upcast(k_swa).to(acc_dt)
-    vs = upcast(v_swa).to(acc_dt)
+    swa_dt = init_dtype if (q.is_cuda and init_dtype in (torch.bfloat16, torch.float16)) else acc_dt
+    qs = q_swa.to(swa_dt) if swa_dt != acc_dt else upcast(q_swa).to(acc_dt)
+    ks = k_swa.to(swa_dt) if swa_dt != acc_dt else upcast(k_swa).to(acc_dt)
+    vs = v_swa.to(swa_dt) if swa_dt != acc_dt else upcast(v_swa).to(acc_dt)
     go = None if g_override is None else upcast(g_override).to(acc_dt)
     swa_slp = None if swa_recency_slope is None else upcast(swa_recency_slope).to(device=q.device, dtype=acc_dt)
 
@@ -4919,8 +10994,8 @@ def _chunk_hssd_raw(
     _, _, swa_base_global = disjoint_horizon_bounds(step_offset + 1, chunk_size, window_chunks)
     if step_offset > swa_base_global:
         prior_idx = torch.arange(swa_base_global, step_offset, device=q.device) % max_win
-        all_ks = torch.cat([st.swa_k_ring.index_select(1, prior_idx), ks], dim=1)
-        all_vs = torch.cat([st.swa_v_ring.index_select(1, prior_idx), vs], dim=1)
+        all_ks = torch.cat([st.swa_k_ring.index_select(1, prior_idx).to(swa_dt), ks], dim=1)
+        all_vs = torch.cat([st.swa_v_ring.index_select(1, prior_idx).to(swa_dt), vs], dim=1)
         all_valid = torch.cat([st.swa_valid_ring.index_select(1, prior_idx), valid_cur], dim=1)
     else:
         all_ks = ks
@@ -4946,7 +11021,9 @@ def _chunk_hssd_raw(
         align_global_segments=(surprise_mode == "segment_start"),
     )
 
-    eff_compact_pages = bool(compact_active_pages and not compile_chunks)
+    eff_compact_pages = bool(
+        compact_active_pages and not compile_chunks and not (q.is_cuda and bsz * num_pages <= 32)
+    )
     group_runner = _get_compiled_chunk_group() if compile_chunks else _run_chunk_group
 
     # H4: Precompute o_far for initial chunks `m <= W` so `st.boundary_ring` NEVER enters segment checkpoints
@@ -5360,8 +11437,12 @@ def _chunk_hssd_raw(
         keep_from = max(swa_base_global, end_step - max_win)
         rel_from = keep_from - swa_base_global
         ring_slots = torch.arange(keep_from, end_step, device=q.device) % max_win
-        new_k_ring = _compact(st.swa_k_ring.index_copy(1, ring_slots, all_ks[:, rel_from:]))
-        new_v_ring = _compact(st.swa_v_ring.index_copy(1, ring_slots, all_vs[:, rel_from:]))
+        new_k_ring = _compact(
+            st.swa_k_ring.index_copy(1, ring_slots, all_ks[:, rel_from:].to(st.swa_k_ring.dtype))
+        )
+        new_v_ring = _compact(
+            st.swa_v_ring.index_copy(1, ring_slots, all_vs[:, rel_from:].to(st.swa_v_ring.dtype))
+        )
         new_val_ring = _compact(st.swa_valid_ring.index_copy(1, ring_slots, all_valid[:, rel_from:]))
         # Bug 3A: Explicitly clone & compact terminal theta_cum so [B, T, H_v, d_k // 2] is freed!
         term_theta = theta_cum_all[:, -1].clone().contiguous()
@@ -5759,6 +11840,94 @@ class HSSDAdapter(nn.Module):
         bsz, seq_len, _ = x_in.shape
         hv, dk, dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
         half_dk = self.half_k_dim
+
+        if (
+            _HAS_TRITON
+            and x_in.is_cuda
+            and not _is_compiling()
+            and query.dtype in (torch.bfloat16, torch.float16)
+            and key.dtype == query.dtype
+            and value.dtype == query.dtype
+            and seq_len >= 16
+            and dk in (64, 128)
+            and dv in (64, 128)
+            and hv % query.shape[2] == 0
+            and hv % key.shape[2] == 0
+        ):
+            xf = upcast(x_in)
+            h = F.silu(F.linear(xf, upcast(self.down.weight)))
+            cap_g = float(self.cfg.gate_logit_cap)
+            cap_d = float(self.cfg.decay_log_cap)
+            q_out, k_out, b_gate, w_gate, q_swa, k_swa, v_swa = _FusedAdapterProjFn.apply(
+                query,
+                key,
+                value,
+                h,
+                beta_base,
+                self.erase_up.weight,
+                self.write_up.weight,
+                self.swa_q_up.weight,
+                self.swa_k_up.weight,
+                self.swa_v_up.weight,
+                self.swa_q_norm,
+                self.swa_k_norm,
+                hv,
+                cap_g,
+                use_qk_l2norm,
+                bool(self.cfg.paired_b_gate),
+            )
+            d_decay_pair = (cap_d * torch.tanh(F.linear(h, upcast(self.decay_up.weight)))).view(
+                bsz, seq_len, hv, half_dk
+            )
+            if self.cfg.use_stock_decay_init:
+                rel_prior = upcast(self.page_gamma_prior) / float(self.cfg.decay_gamma_max)
+                gamma_page_scale = rel_prior * upcast(self.log_page_gamma).clamp(-3.0, 3.0).exp()
+                stock_gamma = (-upcast(g_base).clamp(max=0.0)).unsqueeze(-1)
+                stock_base = torch.where(
+                    stock_gamma > 0.0,
+                    stock_gamma.clamp(float(self.cfg.decay_gamma_min), float(self.cfg.decay_gamma_max)),
+                    torch.full_like(stock_gamma, float(self.cfg.decay_gamma_max)),
+                )
+                gamma_chan_pair = stock_base * d_decay_pair.exp()
+            else:
+                base_rate = 1.0 + 0.1 * (-upcast(g_base).clamp(max=0.0)).tanh().unsqueeze(-1)
+                gamma_chan_pair = base_rate * d_decay_pair.exp()
+                gamma_page_scale = (
+                    upcast(self.page_gamma_prior) * upcast(self.log_page_gamma).clamp(-3.0, 3.0).exp()
+                )
+            if not self.cfg.use_phase:
+                theta = xf.new_zeros(bsz, seq_len, hv, half_dk)
+            elif self.theta_down is not None and self.theta_up is not None:
+                theta_raw = F.linear(
+                    F.linear(xf, upcast(self.theta_down.weight)),
+                    upcast(self.theta_up.weight),
+                )
+                theta = math.pi * torch.tanh(theta_raw).view(bsz, seq_len, hv, half_dk)
+            else:
+                assert self.theta_proj is not None
+                theta = math.pi * torch.tanh(F.linear(xf, upcast(self.theta_proj.weight))).view(
+                    bsz, seq_len, hv, half_dk
+                )
+            surprise_bias = F.linear(xf, upcast(self.surprise_proj.weight), upcast(self.surprise_proj.bias))
+            write_logits = F.linear(xf, upcast(self.write_router.weight), upcast(self.write_router.bias))
+            q_flat = q_out.float().reshape(bsz, seq_len, hv * dk)
+            read_logits = F.linear(q_flat, upcast(self.read_router.weight), upcast(self.read_router.bias))
+            return {
+                "query": q_out,
+                "key": k_out,
+                "value": value,
+                "gamma_page_scale": gamma_page_scale,
+                "gamma_chan_pair": gamma_chan_pair,
+                "b_gate": b_gate,
+                "w_gate": w_gate,
+                "theta": theta,
+                "surprise_bias": surprise_bias,
+                "write_logits": write_logits,
+                "read_logits": read_logits,
+                "q_swa": q_swa,
+                "k_swa": k_swa,
+                "v_swa": v_swa,
+            }
 
         q_prep, k_prep, v_prep = _prepare_qkv_unscaled(query, key, value, use_qk_l2norm)
         xf = upcast(x_in)

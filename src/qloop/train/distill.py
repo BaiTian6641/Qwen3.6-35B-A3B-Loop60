@@ -985,7 +985,8 @@ def run_layerwise_warmup_microstep(
     with defer_micro_step(opt):
         if callable(set_blend):
             set_blend(1.0)
-        hssd.cfg.checkpoint_segments = False
+        if int(input_ids.numel()) <= int(getattr(hssd.cfg, "outer_checkpoint_max_tokens", 2048)):
+            hssd.cfg.checkpoint_segments = False
         try:
             with depth_cm, shared_teacher.activate(student_step_hook=_per_call_student_step), torch.no_grad():
                 _run_text_backbone(

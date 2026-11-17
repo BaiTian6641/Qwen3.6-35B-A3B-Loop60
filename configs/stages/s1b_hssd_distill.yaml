@@ -76,9 +76,9 @@ experts:
 
 train:
   init_from: runs/s1_loop_a6b
-  steps: 1500                           # 1500 x 4 x 16384 ≈ 98.3M tokens (micro_batch=2 x grad_accum=2 enabled by H4 + shared teacher)
-  micro_batch: 2
-  grad_accum: 2
+  steps: 1500                           # 1500 x 4 x 16384 ≈ 98.3M tokens (micro_batch=1 x grad_accum=4 fits < 80 GiB across Phase 1 & 2 on G4)
+  micro_batch: 1
+  grad_accum: 4
   ckpt_every: 25
   sha256_frozen_experts: true
   train_loop_adapters: true

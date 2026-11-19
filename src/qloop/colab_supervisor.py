@@ -6,9 +6,13 @@ Prevents two silent failure modes during long unattended Blackwell (`G4`) runs:
      zero open WebSockets once `colab exec` exits. Executing a lightweight (~1s) Python probe
      inside the remote Jupyter kernel every `--interval-sec` (default 300s = 5 min) both keeps
      the kernel active and refreshes `colab-cli`'s `runtimeProxyInfo` token.
-  2. **Zero-idle compute unit burn + automatic preemption recovery**:
-     - Immediately runs `colab stop -s <session>` when the remote pipeline finishes (`exit_code == 0`,
-       unless `--keep-on-complete`) or crashes (`exit_code != 0`), capturing the remote log tail locally.
+  2. **Zero-idle compute unit burn + automatic rollover & preemption recovery**:
+     - Immediately runs `colab stop -s <session>` when the remote pipeline finishes all requested
+       stages (`exit_code == 0`, unless `--keep-on-complete`) or crashes (`exit_code != 0`),
+       capturing the remote log tail locally.
+     - Automatically rolls over to a brand-new 24h VM (stopping the expiring VM FIRST and confirming
+       termination before provisioning, up to `--max-rollovers`) when `qloop sync pipeline` exits `0`
+       early due to `--time-budget-hours` while requested stages remain incomplete in `manifest.json`.
      - Automatically re-provisions, bootstraps, and resumes from the latest 25-step Hugging Face Hub
        checkpoint (up to `--max-respawns`) if Colab preempts the session while requested stages are
        still incomplete in `manifest.json`.
@@ -55,6 +59,7 @@ DEFAULT_INTERVAL_SEC = 300.0
 DEFAULT_EXEC_TIMEOUT_SEC = 180
 DEFAULT_BOOTSTRAP_TIMEOUT_SEC = 900
 DEFAULT_MAX_RESPAWNS = 3
+DEFAULT_MAX_ROLLOVERS = 10
 DEFAULT_RESPAWN_BACKOFF_SEC = 15.0
 DEFAULT_LOG_FILE = "runs/colab_supervisor.log"
 DEFAULT_TAIL_FILE = "runs/colab_last_tail.log"
@@ -62,6 +67,7 @@ DEFAULT_TAIL_FILE = "runs/colab_last_tail.log"
 BOOTSTRAP_SENTINEL = "__QLOOP_BOOTSTRAP_JSON__:"
 PROBE_SENTINEL = "__QLOOP_PROBE_JSON__:"
 TAIL_SENTINEL = "__QLOOP_TAIL_JSON__:"
+CLEAN_PAUSE_LOG_MARKER = "paused cleanly before completion"
 
 _SESSION_LINE_RE = re.compile(r"^\[([^\]]+)\]\s+\S+\s+\|\s+Hardware:")
 _HF_TOKEN_INLINE_RE = re.compile(r"\bhf_[A-Za-z0-9]{6,}\b")
@@ -218,6 +224,7 @@ class SupervisorConfig:
     exec_timeout_sec: int = DEFAULT_EXEC_TIMEOUT_SEC
     bootstrap_timeout_sec: int = DEFAULT_BOOTSTRAP_TIMEOUT_SEC
     max_respawns: int = DEFAULT_MAX_RESPAWNS
+    max_rollovers: int = DEFAULT_MAX_ROLLOVERS
     respawn_backoff_sec: float = DEFAULT_RESPAWN_BACKOFF_SEC
     log_file: str = DEFAULT_LOG_FILE
     tail_file: str = DEFAULT_TAIL_FILE
@@ -734,6 +741,21 @@ def fetch_hub_manifest_dict(
         ) from None
 
 
+def _tail_indicates_clean_pause(tail_text: str, last_log_lines: Sequence[str] = ()) -> bool:
+    """Return True when remote logs indicate `qloop sync pipeline` paused cleanly before completion."""
+    needle = CLEAN_PAUSE_LOG_MARKER.lower()
+    if needle in (tail_text or "").lower():
+        return True
+    return any(needle in str(line).lower() for line in last_log_lines)
+
+
+def _format_progress_summary(fingerprint: Sequence[tuple[str, str, int]]) -> str:
+    """Render a compact `stage=status@step` summary for rollover and guard logs."""
+    if not fingerprint:
+        return "hub=unavailable"
+    return ", ".join(f"{st}={status}@{step}" for st, status, step in fingerprint)
+
+
 class ColabSupervisor:
     """Local keepalive, auto-stop, and preemption auto-respawn supervisor for `colab` CLI."""
 
@@ -1028,6 +1050,137 @@ class ColabSupervisor:
                 tf.write(safe_tail + ("\n" if safe_tail and not safe_tail.endswith("\n") else ""))
         return safe_tail
 
+    def _fetch_hub_manifest_with_retries(
+        self,
+        retries: int = 3,
+        retry_sleep_sec: float = 2.0,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Fetch HF Hub `manifest.json` with bounded retries.
+
+        Returns `(manifest_dict_or_none, fetch_ok)`:
+          - `(dict, True)` when `manifest.json` was fetched cleanly.
+          - `(None, True)` when `manifest.json` does not exist yet (HTTP 404).
+          - `(None, False)` when Hub remained unreachable after all retries.
+        """
+        attempts = max(1, int(retries))
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                if self._manifest_fetcher is not None:
+                    manifest = self._manifest_fetcher(self.cfg.repo)
+                else:
+                    manifest = fetch_hub_manifest_dict(self.cfg.repo, hf_token=self.hf_token)
+                return manifest, True
+            except ColabSupervisorError as exc:
+                last_exc = exc
+                if attempt < attempts:
+                    self.log(
+                        f"[WARN] Hub manifest fetch failed (attempt {attempt}/{attempts}): "
+                        f"{self.redact(str(exc))}; retrying"
+                    )
+                    delay = min(float(retry_sleep_sec) * attempt, float(self.cfg.respawn_backoff_sec))
+                    self._sleep(delay)
+        self.log(
+            f"[WARN] Hub manifest unreachable after {attempts} attempt(s): "
+            f"{self.redact(str(last_exc) if last_exc is not None else 'unknown error')}"
+        )
+        return None, False
+
+    def _hub_stage_progress(
+        self,
+        retries: int = 3,
+    ) -> tuple[list[str], tuple[tuple[str, str, int], ...], bool]:
+        """Query Hub manifest and return `(incomplete_stages, progress_fingerprint, fetch_ok)`."""
+        manifest, fetch_ok = self._fetch_hub_manifest_with_retries(retries=retries)
+        if not fetch_ok:
+            return [], (), False
+
+        stages_map = manifest.get("stages") if isinstance(manifest, dict) else None
+        if not isinstance(stages_map, dict):
+            stages_map = {}
+
+        fingerprint_items: list[tuple[str, str, int]] = []
+        incomplete: list[str] = []
+        for st in self.cfg.stages:
+            raw_info = stages_map.get(st)
+            info = raw_info if isinstance(raw_info, dict) else {}
+            raw_status = info.get("status")
+            status = str(raw_status) if raw_status is not None else "pending"
+            raw_step = info.get("step")
+            try:
+                step = int(raw_step) if raw_step is not None else 0
+            except (TypeError, ValueError):
+                step = 0
+            fingerprint_items.append((st, status, step))
+            if status != "completed":
+                incomplete.append(st)
+        return incomplete, tuple(fingerprint_items), True
+
+    def _try_stop_session(self) -> bool:
+        try:
+            return self.stop_session()
+        except ColabSupervisorError as exc:
+            self.log(f"[WARN] colab stop -s {self.cfg.session} raised error: {exc}")
+            return False
+
+    def _stop_and_confirm_session_gone(self, *, max_retries: int = 2) -> bool:
+        """Stop the expiring VM and verify it is no longer listed in `colab sessions`."""
+        self._try_stop_session()
+        self._sleep(self.cfg.respawn_backoff_sec)
+        short_sleep = min(5.0, max(0.0, float(self.cfg.respawn_backoff_sec)))
+        retries = max(0, int(max_retries))
+        for retry_idx in range(retries + 1):
+            try:
+                active = self.list_active_sessions()
+            except ColabCommandError as exc:
+                self.log(
+                    f"[WARN] failed to verify session '{self.cfg.session}' termination "
+                    f"(check {retry_idx + 1}/{retries + 1}): {exc}"
+                )
+                active = {self.cfg.session}
+            if self.cfg.session not in active:
+                return True
+            if retry_idx < retries:
+                self.log(
+                    f"[WARN] session '{self.cfg.session}' still listed after stop "
+                    f"(retry {retry_idx + 1}/{retries}); retrying colab stop"
+                )
+                self._try_stop_session()
+                self._sleep(short_sleep)
+        return False
+
+    def _launch_fresh_rollover_session(self, rollover_count: int) -> bool:
+        """Provision and bootstrap a fresh 24h VM after old session termination, retrying transient errors."""
+        max_attempts = 1 + max(0, int(self.cfg.max_respawns))
+        last_exc: ColabSupervisorError | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self.ensure_session_and_launch()
+                return True
+            except ColabSupervisorError as exc:
+                last_exc = exc
+                self.log(
+                    f"[WARN] rollover {rollover_count}/{self.cfg.max_rollovers} "
+                    f"provision/bootstrap attempt {attempt}/{max_attempts} failed: {exc}"
+                )
+                if attempt < max_attempts:
+                    self._sleep(self.cfg.respawn_backoff_sec)
+        if isinstance(last_exc, ColabCommandError) and last_exc.returncode == 124:
+            self._try_stop_session()
+        self.log(
+            f"[ERROR] rollover {rollover_count}/{self.cfg.max_rollovers} failed to provision/bootstrap "
+            f"fresh session '{self.cfg.session}' after {max_attempts} attempt(s)"
+        )
+        return False
+
+    def _finish_completed_exit_zero(self) -> int:
+        if self.cfg.keep_on_complete:
+            self.log("[DONE] pipeline exited 0; keeping session (--keep-on-complete)")
+        else:
+            self.stop_session()
+            self.log("[DONE] pipeline exited 0; stopped session")
+        return 0
+
     def incomplete_hub_stages(self) -> list[str]:
         """Return requested stages whose HF Hub `manifest.json` status is not `'completed'`."""
         try:
@@ -1081,8 +1234,10 @@ class ColabSupervisor:
         return False, respawn_count, 1
 
     def run(self) -> int:
-        """Main supervisor loop: bootstrap -> periodic Jupyter probe -> auto-stop or auto-respawn."""
+        """Main supervisor loop: bootstrap -> periodic Jupyter probe -> auto-stop, rollover, or respawn."""
         respawn_count = 0
+        rollover_count = 0
+        last_rollover_progress: tuple[tuple[str, str, int], ...] | None = None
         consecutive_probe_errors = 0
 
         self.ensure_session_and_launch()
@@ -1121,14 +1276,70 @@ class ColabSupervisor:
             )
 
             if not probe.pid_alive and probe.exit_code is not None:
-                self.capture_last_tail(probe.last_log_lines)
+                tail_text = self.capture_last_tail(probe.last_log_lines)
                 if probe.exit_code == 0:
-                    if self.cfg.keep_on_complete:
-                        self.log("[DONE] pipeline exited 0; keeping session (--keep-on-complete)")
-                    else:
+                    if self.cfg.once or self.cfg.max_rollovers <= 0:
+                        return self._finish_completed_exit_zero()
+
+                    incomplete, progress_fp, fetch_ok = self._hub_stage_progress(retries=3)
+                    if not fetch_ok:
+                        if _tail_indicates_clean_pause(tail_text, probe.last_log_lines):
+                            incomplete = list(self.cfg.stages)
+                        else:
+                            self.log(
+                                "[WARN] Hub manifest unavailable on exit 0 and tail has no clean-pause marker; "
+                                "treating run as completed to avoid burning VMs"
+                            )
+                            incomplete = []
+
+                    if not incomplete:
+                        return self._finish_completed_exit_zero()
+
+                    prog_summary = (
+                        _format_progress_summary(progress_fp)
+                        if fetch_ok
+                        else "hub=unavailable (tail matched clean pause)"
+                    )
+
+                    if (
+                        fetch_ok
+                        and last_rollover_progress is not None
+                        and progress_fp == last_rollover_progress
+                    ):
                         self.stop_session()
-                        self.log("[DONE] pipeline exited 0; stopped session")
-                    return 0
+                        self.log(
+                            f"[ERROR] pipeline exited 0 with zero Hub progress since prior rollover "
+                            f"({prog_summary}); stopped session '{self.cfg.session}'"
+                        )
+                        return 1
+
+                    if rollover_count >= self.cfg.max_rollovers:
+                        self.stop_session()
+                        self.log(
+                            f"[ERROR] pipeline exited 0 with incomplete stages {incomplete} ({prog_summary}); "
+                            f"max_rollovers ({self.cfg.max_rollovers}) reached; stopped session '{self.cfg.session}'"
+                        )
+                        return 1
+
+                    rollover_count += 1
+                    if fetch_ok:
+                        last_rollover_progress = progress_fp
+                    self.log(
+                        f"[ROLLOVER] pipeline exited 0 with incomplete stages {incomplete} ({prog_summary}); "
+                        f"rollover {rollover_count}/{self.cfg.max_rollovers} — stopping expiring session "
+                        f"'{self.cfg.session}' before provisioning fresh VM"
+                    )
+                    if not self._stop_and_confirm_session_gone():
+                        self.log(
+                            f"[ERROR] rollover {rollover_count}/{self.cfg.max_rollovers} aborted: "
+                            f"old session '{self.cfg.session}' still active after stop retries; "
+                            "refusing to re-attach to expiring VM"
+                        )
+                        return 1
+                    if not self._launch_fresh_rollover_session(rollover_count):
+                        return 1
+                    consecutive_probe_errors = 0
+                    continue
 
                 self.stop_session()
                 self.log(f"[ERROR] pipeline exited {probe.exit_code}; stopped session")
@@ -1158,8 +1369,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="colab_supervisor",
         description=(
-            "Local anti-idle Jupyter keepalive, crash/completion auto-stop, and preemption "
-            "auto-respawn supervisor for Google Colab CLI (`colab`)."
+            "Local anti-idle Jupyter keepalive, crash/completion auto-stop, time-budget VM rollover, "
+            "and preemption auto-respawn supervisor for Google Colab CLI (`colab`)."
         ),
     )
     ap.add_argument("--colab-bin", default=DEFAULT_COLAB_BIN, help="Path to `colab` CLI binary")
@@ -1209,10 +1420,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum automatic VM respawns on Colab preemption (default: 3)",
     )
     ap.add_argument(
+        "--max-rollovers",
+        type=int,
+        default=DEFAULT_MAX_ROLLOVERS,
+        help=(
+            "Maximum automatic fresh-VM rollovers on clean exit_code=0 time-budget pauses "
+            "(default: 10; 0 disables rollover)"
+        ),
+    )
+    ap.add_argument(
         "--respawn-backoff-sec",
         type=float,
         default=DEFAULT_RESPAWN_BACKOFF_SEC,
-        help="Backoff seconds before respawning a preempted session (default: 15)",
+        help="Backoff seconds before respawning/rolling over a session (default: 15)",
     )
     ap.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="Local supervisor status log path")
     ap.add_argument("--tail-file", default=DEFAULT_TAIL_FILE, help="Local file written with remote stdout tail on exit")
@@ -1258,6 +1478,7 @@ def config_from_args(args: argparse.Namespace) -> SupervisorConfig:
         exec_timeout_sec=int(args.exec_timeout_sec),
         bootstrap_timeout_sec=int(args.bootstrap_timeout_sec),
         max_respawns=int(args.max_respawns),
+        max_rollovers=int(args.max_rollovers),
         respawn_backoff_sec=float(args.respawn_backoff_sec),
         log_file=str(args.log_file),
         tail_file=str(args.tail_file),

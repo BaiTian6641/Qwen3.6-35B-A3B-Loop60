@@ -686,6 +686,8 @@ def _run_sync_action(
         )
         lvl = args.debug if args.debug is not None else 1
         env = dict(os.environ, QLOOP_HF_REPO=repo_id, QLOOP_RUN_ROOT=run_root)
+        pipeline_t0 = time.monotonic()
+        stages_executed = 0
         for st_name in stages:
             manifest = hub.fetch_manifest()
             if manifest.is_completed(st_name) and not args.force:
@@ -694,6 +696,22 @@ def _run_sync_action(
                 if args.until == st_name:
                     break
                 continue
+            stage_budget_hours = args.time_budget_hours
+            if stage_budget_hours is not None and float(stage_budget_hours) > 0 and stages_executed > 0:
+                elapsed_hours = max(0.0, (time.monotonic() - pipeline_t0) / 3600.0)
+                remaining_hours = float(stage_budget_hours) - elapsed_hours
+                if remaining_hours <= 0.0:
+                    log.warning(
+                        "[pipeline] %s paused cleanly before completion "
+                        "(step=%d; session time budget %.2fh exhausted). "
+                        "Synced to hf://%s - re-run `qloop sync pipeline` in a fresh session to continue.",
+                        st_name,
+                        manifest.stage_step(st_name),
+                        float(stage_budget_hours),
+                        repo_id,
+                    )
+                    return 0
+                stage_budget_hours = round(remaining_hours, 4) if remaining_hours >= 1e-3 else remaining_hours
             reclaim_disk_space(run_root, keep_stages=(st_name,), clean_hf_staging=True)
             cmds = _pipeline_stage_cmds(
                 st_name,
@@ -702,7 +720,7 @@ def _run_sync_action(
                 repo_id=repo_id,
                 debug_level=lvl,
                 overrides=list(args.set or []),
-                time_budget_hours=args.time_budget_hours,
+                time_budget_hours=stage_budget_hours,
                 scan_batches=int(args.scan_batches),
                 scan_seq_len=int(args.scan_seq_len),
                 all_stages=stages,
@@ -714,6 +732,7 @@ def _run_sync_action(
                 if rc != 0:
                     log.error("[pipeline] stage %s failed with exit code %d", st_name, rc)
                     return rc
+            stages_executed += 1
             manifest = hub.fetch_manifest()
             if not manifest.is_completed(st_name):
                 log.warning(
@@ -805,7 +824,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clean", action="store_true", help="reclaim superseded local checkpoints & HF staging caches")
     p.add_argument("--keep", default=None, help="comma-separated stages to keep during `sync disk --clean`")
     p.add_argument("--pip", action="store_true", help="also purge ~/.cache/pip during `sync disk --clean`")
-    p.add_argument("--time-budget-hours", type=float, default=None, help="per-stage Colab session wall-clock budget")
+    p.add_argument(
+        "--time-budget-hours",
+        type=float,
+        default=None,
+        help="Colab session wall-clock budget in hours across pipeline stages",
+    )
     p.add_argument("--scan-batches", type=int, default=256, help="batches for ESFT router scans in pipeline")
     p.add_argument("--scan-seq-len", type=int, default=4096, help="seq_len for ESFT router scans in pipeline")
     p.add_argument("--config-root", default="configs", help="config directory root for pipeline")

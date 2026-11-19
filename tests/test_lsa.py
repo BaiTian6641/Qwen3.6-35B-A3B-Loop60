@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import copy
-from typing import ClassVar
+import warnings
+from types import SimpleNamespace
+from typing import Any, ClassVar
 
 import pytest
 import torch
@@ -168,6 +170,8 @@ def test_yarn_and_config_validation():
     cfg.max_position_embeddings = 262144
     rope = apply_yarn(cfg, 1_048_576)
     assert rope["factor"] == 4.0 and cfg.max_position_embeddings == 1_048_576
+    assert cfg.rope_scaling["rope_type"] == "yarn"
+    assert cfg.rope_scaling["original_max_position_embeddings"] == 262144
     with pytest.raises(ValueError):
         LSAConfig(block_size=10, pool=4).validate()
     with pytest.raises(ValueError, match="unknown"):
@@ -176,6 +180,127 @@ def test_yarn_and_config_validation():
         LSAConfig(mode=mode).validate()
     with pytest.raises(ValueError):
         LSAConfig(mode="invalid_mode").validate()
+
+
+def test_apply_yarn_transformers_v5_preserves_rope_parameters_and_avoids_clobbering_setter():
+    """Transformers >= 5.x `rope_scaling` setter overwrites `rope_parameters` (wiping `rope_theta` -> None)."""
+
+    class _MockTransformersV5Config:
+        def __init__(self, rope_parameters: dict[str, Any] | None, *, rope_theta: float | None = None) -> None:
+            self.max_position_embeddings = 262144
+            self.rope_parameters = rope_parameters
+            if rope_theta is not None:
+                self.rope_theta = rope_theta
+            self.rope_scaling_setter_calls = 0
+
+        @property
+        def rope_scaling(self) -> dict[str, Any] | None:
+            return self.rope_parameters
+
+        @rope_scaling.setter
+        def rope_scaling(self, value: dict[str, Any] | None) -> None:
+            self.rope_scaling_setter_calls += 1
+            warnings.warn(
+                "`rope_scaling` is deprecated and will be removed in a future version. "
+                "Set `rope_parameters` instead, with `rope_type` and `rope_theta` included.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            # Reproduces transformers 5.23.0 clobbering `rope_parameters` (wiping rope_theta / mrope_section).
+            self.rope_parameters = dict(value) if isinstance(value, dict) else value
+
+    # 1. Flat Qwen3_5MoeTextConfig-style rope_parameters
+    cfg_flat = _MockTransformersV5Config(
+        {
+            "rope_type": "default",
+            "rope_theta": 10_000_000.0,
+            "mrope_section": [11, 11, 10],
+            "mrope_interleaved": True,
+            "partial_rotary_factor": 0.25,
+        }
+    )
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        rope = apply_yarn(cfg_flat, 1_048_576)
+    assert [w for w in rec if issubclass(w.category, FutureWarning)] == []
+    assert cfg_flat.rope_scaling_setter_calls == 0
+    assert rope == {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144}
+    assert cfg_flat.max_position_embeddings == 1_048_576
+    assert cfg_flat.rope_parameters is not None
+    assert cfg_flat.rope_parameters["rope_type"] == "yarn"
+    assert cfg_flat.rope_parameters["factor"] == 4.0
+    assert cfg_flat.rope_parameters["original_max_position_embeddings"] == 262144
+    assert cfg_flat.rope_parameters["rope_theta"] == 10_000_000.0
+    assert cfg_flat.rope_parameters["mrope_section"] == [11, 11, 10]
+    assert cfg_flat.rope_parameters["mrope_interleaved"] is True
+    assert cfg_flat.rope_parameters["partial_rotary_factor"] == 0.25
+
+    # Idempotency: re-applying YaRN for 1M keeps factor=4.0 and original_max_position_embeddings=262144
+    rope_again = apply_yarn(cfg_flat, 1_048_576)
+    assert rope_again["factor"] == 4.0
+    assert cfg_flat.rope_parameters["factor"] == 4.0
+    assert cfg_flat.rope_parameters["original_max_position_embeddings"] == 262144
+    assert cfg_flat.rope_parameters["rope_theta"] == 10_000_000.0
+
+    # 2. Flat v5 config where `rope_theta` was only on `config.rope_theta`
+    cfg_top_theta = _MockTransformersV5Config({"rope_type": "default", "partial_rotary_factor": 0.25}, rope_theta=5e6)
+    apply_yarn(cfg_top_theta, 1_048_576)
+    assert cfg_top_theta.rope_scaling_setter_calls == 0
+    assert cfg_top_theta.rope_parameters is not None
+    assert cfg_top_theta.rope_parameters["rope_theta"] == 5e6
+    assert cfg_top_theta.rope_parameters["rope_type"] == "yarn"
+    assert cfg_top_theta.rope_parameters["factor"] == 4.0
+
+    # 3. Nested per-layer-type `rope_parameters` (e.g. full_attention + sliding_attention)
+    cfg_nested = _MockTransformersV5Config(
+        {
+            "full_attention": {
+                "rope_type": "default",
+                "rope_theta": 10_000_000.0,
+                "mrope_section": [11, 11, 10],
+                "partial_rotary_factor": 0.25,
+            },
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": 10_000.0,
+            },
+        }
+    )
+    apply_yarn(cfg_nested, 1_048_576)
+    assert cfg_nested.rope_scaling_setter_calls == 0
+    assert cfg_nested.rope_parameters is not None
+    full_rp = cfg_nested.rope_parameters["full_attention"]
+    assert full_rp["rope_type"] == "yarn"
+    assert full_rp["factor"] == 4.0
+    assert full_rp["original_max_position_embeddings"] == 262144
+    assert full_rp["rope_theta"] == 10_000_000.0
+    assert full_rp["mrope_section"] == [11, 11, 10]
+    assert full_rp["partial_rotary_factor"] == 0.25
+    assert cfg_nested.rope_parameters["sliding_attention"] == {"rope_type": "default", "rope_theta": 10_000.0}
+
+    # 4. v5 config with `rope_parameters = None` and property `rope_scaling`
+    cfg_none_rp = _MockTransformersV5Config(None, rope_theta=10_000_000.0)
+    with warnings.catch_warnings(record=True) as rec_none:
+        warnings.simplefilter("always")
+        apply_yarn(cfg_none_rp, 1_048_576)
+    assert [w for w in rec_none if issubclass(w.category, FutureWarning)] == []
+    assert cfg_none_rp.rope_scaling_setter_calls == 0
+    assert cfg_none_rp.rope_parameters is not None
+    assert cfg_none_rp.rope_parameters["rope_type"] == "yarn"
+    assert cfg_none_rp.rope_parameters["rope_theta"] == 10_000_000.0
+
+    # 5. Legacy transformers 4.x config without `rope_parameters` merges into existing `rope_scaling`
+    cfg_v4 = SimpleNamespace(
+        max_position_embeddings=262144,
+        rope_theta=10_000_000.0,
+        rope_scaling={"mrope_section": [11, 11, 10]},
+    )
+    apply_yarn(cfg_v4, 1_048_576)
+    assert cfg_v4.rope_scaling["rope_type"] == "yarn"
+    assert cfg_v4.rope_scaling["factor"] == 4.0
+    assert cfg_v4.rope_scaling["original_max_position_embeddings"] == 262144
+    assert cfg_v4.rope_scaling["mrope_section"] == [11, 11, 10]
+    assert cfg_v4.max_position_embeddings == 1_048_576
 
 
 def test_lsa_real_scale_shapes_smoke():
@@ -639,3 +764,157 @@ def test_zero_host_sync_ward_cluster_and_indexer_build():
     # Verify in-place mutation without `cache_key` did NOT return stale cached centroids!
     assert b_mut_2 is not None and c1_snap is not None
     assert not torch.allclose(b_mut_2.centroids, c1_snap)
+
+
+def test_detached_kl_surrogate_exact_grad_parity_and_checkpoint_isolation():
+    """Checkpoint-isolated `lsa_kl` surrogate matches naive `detach_inputs=False` grads bit-for-bit
+    on `(wq, q_proj_extra, wk)`, invalidates cache on `wk` in-place update, and never unpacks
+    `VirtualLayer` checkpoint frames prematurely."""
+    from qloop.model.loop import LoopSpec
+    from qloop.model.lsa import _dense_lower_right_causal_attention
+
+    # 1. Exact gradient equivalence on `wq` & `wk` against naive non-isolated graph
+    torch.manual_seed(123)
+    cfg_det = LSAConfig(
+        mode="distill",
+        index_dim=8,
+        rotary_dim=4,
+        block_size=8,
+        pool=2,
+        avg_bucket_keys=4,
+        max_bucket_keys=8,
+        window=8,
+        sinks=2,
+        num_select=2,
+        distill_weight=1.7,
+        distill_query_frac=1.0,
+        distill_chunk=5,
+        detach_inputs=True,
+    )
+    cfg_naive = copy.deepcopy(cfg_det)
+    cfg_naive.detach_inputs = False
+
+    ix_det = LSAIndexer(4, 2, 16, cfg_det, layer_id=0).double()
+    ix_naive = copy.deepcopy(ix_det)
+    ix_naive.cfg = cfg_naive
+
+    mod_det = torch.nn.Module()
+    mod_det.lsa_indexer = ix_det
+    mod_naive = torch.nn.Module()
+    mod_naive.lsa_indexer = ix_naive
+
+    q = torch.randn(1, 4, 32, 16, dtype=torch.float64)
+    k = torch.randn(1, 2, 32, 16, dtype=torch.float64)
+    v = torch.randn(1, 2, 32, 16, dtype=torch.float64)
+
+    saved = _DENSE_FN[0]
+    _DENSE_FN[0] = dense_causal_attention
+    try:
+        torch.manual_seed(999)
+        lsa_attention(mod_det, q, k, v)
+        loss_det = sum(ix_det.pop_losses())
+        assert isinstance(loss_det, torch.Tensor)
+        (0.5 * loss_det).backward()
+
+        torch.manual_seed(999)
+        lsa_attention(mod_naive, q, k, v)
+        loss_naive = sum(ix_naive.pop_losses())
+        assert isinstance(loss_naive, torch.Tensor)
+        (0.5 * loss_naive).backward()
+    finally:
+        _DENSE_FN[0] = saved
+
+    torch.testing.assert_close(loss_det.detach(), loss_naive.detach(), rtol=1e-12, atol=1e-12)
+    assert ix_det.wq.grad is not None and ix_naive.wq.grad is not None
+    assert ix_det.wk.grad is not None and ix_naive.wk.grad is not None
+    torch.testing.assert_close(ix_det.wq.grad, ix_naive.wq.grad, rtol=1e-10, atol=1e-10)
+    torch.testing.assert_close(ix_det.wk.grad, ix_naive.wk.grad, rtol=1e-10, atol=1e-10)
+
+    # Verify `wk_version` invalidates stale centroids after in-place `wk` step
+    b_before = ix_det.build(k)
+    assert b_before is not None
+    c_before = b_before.centroids.clone()
+    with torch.no_grad():
+        ix_det.wk.add_(0.25)
+    b_after = ix_det.build(k)
+    assert b_after is not None
+    assert not torch.allclose(b_after.centroids, c_before)
+
+    # 2. Checkpointed `VirtualLayer` + `LoopBridge` + multi-pass LSA: `lsa_kl.backward()` alone
+    # must NOT trigger any `VirtualLayer` recomputation, and `checkpoint=True` matches `checkpoint=False`!
+    base_a = build_toy(seed=17, num_hidden_layers=8).double()
+    base_b = copy.deepcopy(base_a)
+    lsa_kw = dict(SMALL, mode="hybrid", num_query_passes=2, distill_query_frac=1.0, recall_threshold=0.0)
+    spec_ckpt = LoopSpec(
+        prelude_end=2, core_end=6, num_passes=2, target_virtual_layers=12, bridge_rank=8, checkpoint=True
+    )
+    spec_nockpt = LoopSpec(
+        prelude_end=2, core_end=6, num_passes=2, target_virtual_layers=12, bridge_rank=8, checkpoint=False
+    )
+    torch.manual_seed(707)
+    mgr_a = install_lsa(base_a, lsa_kw)
+    ctl_a = apply_loop(base_a, spec_ckpt)
+    torch.manual_seed(707)
+    mgr_b = install_lsa(base_b, lsa_kw)
+    ctl_b = apply_loop(base_b, spec_nockpt)
+    with torch.no_grad():
+        ctl_a.adapters.gates.fill_(0.2)
+        ctl_b.adapters.gates.fill_(0.2)
+    base_a.train()
+    base_b.train()
+
+    recomp_hits = [0]
+    for vlyr in base_a.model.layers:
+        def _count_recomp(_m: Any, _inp: Any) -> None:
+            fn = getattr(torch._C, "_current_graph_task_id", None)
+            if fn is not None and fn() != -1:
+                recomp_hits[0] += 1
+
+        vlyr.inner.register_forward_pre_hook(_count_recomp)
+
+    ids = torch.randint(0, 64, (1, 32), generator=torch.Generator().manual_seed(5))
+    torch.manual_seed(321)
+    _ = base_a(ids).logits
+    kl_a = mgr_a.aux_loss()
+    assert kl_a is not None
+    # Backprop ONLY `lsa_kl`: MUST trigger 0 `VirtualLayer` checkpoint recomputations!
+    kl_a.backward()
+    assert recomp_hits[0] == 0, f"lsa_kl.backward() prematurely unpacked {recomp_hits[0]} checkpoint frames!"
+
+    # Full forward + backward (`lm + lsa_kl`) with `checkpoint=True` vs `checkpoint=False`
+    base_a.zero_grad(set_to_none=True)
+    base_b.zero_grad(set_to_none=True)
+    torch.manual_seed(654)
+    la = base_a(ids).logits.pow(2).mean() + (mgr_a.aux_loss() or 0.0)
+    la.backward()
+    torch.manual_seed(654)
+    lb = base_b(ids).logits.pow(2).mean() + (mgr_b.aux_loss() or 0.0)
+    lb.backward()
+    torch.testing.assert_close(la.detach(), lb.detach(), rtol=1e-10, atol=1e-10)
+    for (na, pa), (_nb, pb) in zip(ctl_a.adapters.named_parameters(), ctl_b.adapters.named_parameters()):
+        if pa.grad is not None or pb.grad is not None:
+            assert pa.grad is not None and pb.grad is not None, na
+            torch.testing.assert_close(pa.grad, pb.grad, rtol=1e-9, atol=1e-9)
+
+    # 3. Exact parity of `_dense_lower_right_causal_attention` (`Tq > 1, Tk > Tq`, GQA `H=8, G=2`)
+    torch.manual_seed(88)
+    q1 = torch.randn(1, 8, 12, 16, dtype=torch.float64, requires_grad=True)
+    k1 = torch.randn(1, 2, 30, 16, dtype=torch.float64, requires_grad=True)
+    v1 = torch.randn(1, 2, 30, 16, dtype=torch.float64, requires_grad=True)
+    q2, k2, v2 = [t.detach().clone().requires_grad_(True) for t in (q1, k1, v1)]
+    go = torch.randn(1, 12, 8, 16, dtype=torch.float64)
+    o_lr, _ = _dense_lower_right_causal_attention(q1, k1, v1, scaling=16 ** -0.5)
+    (o_lr * go).sum().backward()
+    qpos = torch.arange(18, 30)
+    kpos = torch.arange(30)
+    m_gt = kpos[None, :] <= qpos[:, None]
+    o_gt = F.scaled_dot_product_attention(
+        q2, k2.repeat_interleave(4, dim=1), v2.repeat_interleave(4, dim=1), attn_mask=m_gt, scale=16 ** -0.5
+    ).transpose(1, 2)
+    (o_gt * go).sum().backward()
+    torch.testing.assert_close(o_lr, o_gt, rtol=1e-11, atol=1e-11)
+    assert q1.grad is not None and k1.grad is not None and v1.grad is not None
+    assert q2.grad is not None and k2.grad is not None and v2.grad is not None
+    torch.testing.assert_close(q1.grad, q2.grad, rtol=1e-11, atol=1e-11)
+    torch.testing.assert_close(k1.grad, k2.grad, rtol=1e-11, atol=1e-11)
+    torch.testing.assert_close(v1.grad, v2.grad, rtol=1e-11, atol=1e-11)

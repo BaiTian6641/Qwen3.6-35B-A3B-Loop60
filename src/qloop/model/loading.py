@@ -773,7 +773,19 @@ def _reinit_rotary_and_meta_buffers(
                 sub.register_buffer("original_inv_freq", inv_dev.clone(), persistent=False)
             sub.attention_scaling = attn_scaling  # type: ignore[attr-defined]
         elif inferred_dim is not None and inferred_dim > 0:
-            theta = float(getattr(sub, "theta", getattr(rot_cfg, "rope_theta", 10000.0)))
+            raw_rp = getattr(rot_cfg, "rope_parameters", None)
+            rp_flat = (
+                raw_rp.get("full_attention")
+                if isinstance(raw_rp, dict) and isinstance(raw_rp.get("full_attention"), dict)
+                else (raw_rp if isinstance(raw_rp, dict) else {})
+            )
+            theta_val = (
+                getattr(sub, "theta", None)
+                or getattr(rot_cfg, "rope_theta", None)
+                or rp_flat.get("rope_theta")
+                or 10000.0
+            )
+            theta = float(theta_val)
             inv_dev = 1.0 / (
                 theta ** (torch.arange(0, inferred_dim, 2, dtype=torch.float32, device=mod_dev) / float(inferred_dim))
             )

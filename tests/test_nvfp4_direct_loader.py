@@ -24,6 +24,7 @@ import math
 import shutil
 import sys
 import types
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -282,7 +283,24 @@ def _install_qwen35_moe_transformers_shim(monkeypatch: pytest.MonkeyPatch) -> ty
                     "rope_type": "default",
                     "rope_theta": self.rope_theta,
                     "partial_rotary_factor": self.partial_rotary_factor,
+                    "mrope_section": [11, 11, 10],
+                    "mrope_interleaved": True,
                 }
+
+        @property
+        def rope_scaling(self) -> dict[str, Any] | None:
+            return getattr(self, "rope_parameters", None)
+
+        @rope_scaling.setter
+        def rope_scaling(self, value: dict[str, Any] | None) -> None:
+            warnings.warn(
+                "`rope_scaling` is deprecated and will be removed in a future version. "
+                "Set `rope_parameters` instead, with `rope_type` and `rope_theta` included.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            # Reproduces transformers 5.23.0 clobbering `rope_parameters` when `rope_scaling` is assigned.
+            self.rope_parameters = dict(value) if isinstance(value, dict) else value
 
     class Qwen3_5MoeConfig(PretrainedConfig):
         model_type = "qwen3_5_moe"
@@ -341,9 +359,10 @@ def _install_qwen35_moe_transformers_shim(monkeypatch: pytest.MonkeyPatch) -> ty
         def __init__(self, config: Qwen3_5MoeTextConfig, device: Any = None) -> None:
             super().__init__()
             self.config = config
-            rp = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
+            rp = getattr(config, "rope_parameters", None) or {}
             prf = float(rp.get("partial_rotary_factor", getattr(config, "partial_rotary_factor", 0.5)))
-            theta = float(rp.get("rope_theta", getattr(config, "rope_theta", 10000.0)))
+            # Matches transformers 5.23.0: raises TypeError on None ** Tensor if rope_theta was wiped!
+            theta = rp.get("rope_theta")
             rot_dim = int(config.head_dim * prf)
             inv_freq = 1.0 / (
                 theta ** (torch.arange(0, rot_dim, 2, dtype=torch.float32, device=device) / float(rot_dim))
@@ -1267,6 +1286,12 @@ def test_unsloth_nvfp4_standard_mixed_multishard_direct_load_and_grad_parity(
     assert not tm32.rotary_emb.inv_freq.is_meta
     assert not tm32.rotary_emb.original_inv_freq.is_meta
     assert int(tm32.config.max_position_embeddings) == 16384
+    assert tm32.config.rope_parameters["rope_type"] == "yarn"
+    assert tm32.config.rope_parameters["factor"] == 4.0
+    assert tm32.config.rope_parameters["rope_theta"] == 10000.0
+    assert tm32.config.rope_parameters["mrope_section"] == [11, 11, 10]
+    assert tm32.config.rope_parameters["mrope_interleaved"] is True
+    assert tm32.config.rope_parameters["partial_rotary_factor"] == 0.5
     assert tm32.config.rope_scaling["rope_type"] == "yarn"
 
     # Verify distinct gate vs up global_scale preserved losslessly in `[E, 2*I, 1]`
@@ -1758,6 +1783,57 @@ def test_mixed_nvfp4_e2e_loop_hssd_dlsa_hot_experts_step_and_pack_reload(
                 st_r = reloaded_standalone(eval_ids, use_cache=False).logits.float()
                 assert _cosine_sim(st_r, live_logits[r]) > 0.99999
                 assert (st_r - live_logits[r]).abs().max().item() < 1e-3
+
+    # Also verify explicit `qloop_v3_arch["yarn_target_len"]` under transformers 5.x clobbering `rope_scaling`
+    # setter (both when base_config is already YaRN-scaled and when base_config is native 4096 -> 16384).
+    for reset_base_native in (False, True):
+        yarn_pack_dir = tmp_path / f"yarn_arch_pack_{int(reset_base_native)}"
+        shutil.copytree(pack_dir, yarn_pack_dir)
+        cfg_p = yarn_pack_dir / "config.json"
+        cfg_data = json.loads(cfg_p.read_text(encoding="utf-8"))
+        cfg_data["qloop_v3_arch"]["yarn_target_len"] = 16384
+        if reset_base_native:
+            cfg_data["base_config"]["max_position_embeddings"] = 4096
+            cfg_data["base_config"]["rope_parameters"] = {
+                "rope_type": "default",
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 0.5,
+                "mrope_section": [11, 11, 10],
+                "mrope_interleaved": True,
+            }
+        cfg_p.write_text(json.dumps(cfg_data, indent=2), encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as rec_nat:
+            warnings.simplefilter("always")
+            nat_y = Qwen36LoopHSSDForCausalLM.from_pretrained(str(yarn_pack_dir), device_map="cpu", strict=True)
+        assert [w for w in rec_nat if issubclass(w.category, FutureWarning)] == []
+        nat_rp = find_text_model(nat_y).config.rope_parameters
+        assert nat_rp["rope_type"] == "yarn"
+        assert nat_rp["factor"] == 4.0
+        assert nat_rp["original_max_position_embeddings"] == 4096
+        assert nat_rp["rope_theta"] == 10000.0
+        assert nat_rp["mrope_section"] == [11, 11, 10]
+        assert nat_rp["mrope_interleaved"] is True
+        assert nat_rp["partial_rotary_factor"] == 0.5
+
+        st_y_mod = _load_emitted_standalone_without_qloop(yarn_pack_dir, monkeypatch)
+        with warnings.catch_warnings(record=True) as rec_st:
+            warnings.simplefilter("always")
+            st_y = st_y_mod.Qwen36LoopHSSDForCausalLM.from_pretrained(
+                str(yarn_pack_dir), device_map="cpu", strict=True
+            )
+        assert [w for w in rec_st if issubclass(w.category, FutureWarning)] == []
+        st_rp = find_text_model(st_y).config.rope_parameters
+        assert st_rp["rope_type"] == "yarn"
+        assert st_rp["factor"] == 4.0
+        assert st_rp["original_max_position_embeddings"] == 4096
+        assert st_rp["rope_theta"] == 10000.0
+        assert st_rp["mrope_section"] == [11, 11, 10]
+        assert st_rp["mrope_interleaved"] is True
+        assert st_rp["partial_rotary_factor"] == 0.5
+        assert torch.allclose(
+            find_text_model(st_y).rotary_emb.inv_freq, find_text_model(nat_y).rotary_emb.inv_freq
+        )
 
 
 # ============================================================================ 7. Adapter Grad + Tied + Strict Check

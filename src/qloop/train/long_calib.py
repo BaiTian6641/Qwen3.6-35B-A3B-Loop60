@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..model.introspect import find_lm_head, find_text_model
-from ..model.offload import FP8KVCacheQuantizer
+from ..model.offload import FP8KVCacheQuantizer, QuantizedFP8KV
 from .bptt import _detach_nested, _ReplayKVCacheProxy
 from .loss import lm_loss
 
@@ -96,8 +96,74 @@ class CalibrationStepResult:
 LongCalibStepResult = CalibrationStepResult
 
 
+def _quantize_fp8_tensor_lean(
+    x: torch.Tensor, quantizer: FP8KVCacheQuantizer, chunk_tokens: int = 65536
+) -> QuantizedFP8KV:
+    """Bit-exact chunked `FP8KVCacheQuantizer.quantize(x)` with zero full-length fp32 temporary."""
+    if not quantizer.supports_fp8(x.device) or quantizer.per_token or x.ndim < 3 or x.shape[-2] <= chunk_tokens:
+        return quantizer.quantize(x)
+    reduce_dims = tuple(range(2, x.ndim))
+    amax = x.abs().amax(dim=reduce_dims, keepdim=True).float()
+    scale = (amax / quantizer.FP8_MAX).clamp(min=1e-8)
+    q_fp8 = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
+    t_len = int(x.shape[-2])
+    for t0 in range(0, t_len, chunk_tokens):
+        t1 = min(t_len, t0 + chunk_tokens)
+        q_fp8[..., t0:t1, :] = (x[..., t0:t1, :].float() / scale).clamp(
+            -quantizer.FP8_MAX, quantizer.FP8_MAX
+        ).to(torch.float8_e4m3fn)
+    return QuantizedFP8KV(q_fp8, scale.to(torch.float32), x.dtype, is_fp8_native=True)
+
+
+def _extract_fp8_prefix_kv_(
+    cache: Any, quantizer: FP8KVCacheQuantizer
+) -> dict[int, tuple[QuantizedFP8KV, QuantizedFP8KV]]:
+    """Quantize populated full-attention prefix KV caches into true 1-byte FP8 E4M3 and release bf16 copies."""
+    out: dict[int, tuple[QuantizedFP8KV, QuantizedFP8KV]] = {}
+    kc = getattr(cache, "key_cache", None)
+    vc = getattr(cache, "value_cache", None)
+    if isinstance(kc, list) and isinstance(vc, list):
+        for i in range(min(len(kc), len(vc))):
+            k_t, v_t = kc[i], vc[i]
+            if (
+                isinstance(k_t, torch.Tensor)
+                and isinstance(v_t, torch.Tensor)
+                and k_t.numel() > 0
+                and quantizer.supports_fp8(k_t.device)
+            ):
+                out[i] = (
+                    _quantize_fp8_tensor_lean(k_t, quantizer),
+                    _quantize_fp8_tensor_lean(v_t, quantizer),
+                )
+                kc[i] = k_t.new_empty(0)
+                vc[i] = v_t.new_empty(0)
+        return out
+    layers = getattr(cache, "layers", None)
+    if isinstance(layers, list):
+        for i, lyr in enumerate(layers):
+            k_t = getattr(lyr, "keys", None)
+            v_t = getattr(lyr, "values", None)
+            if (
+                isinstance(k_t, torch.Tensor)
+                and isinstance(v_t, torch.Tensor)
+                and k_t.numel() > 0
+                and quantizer.supports_fp8(k_t.device)
+            ):
+                out[i] = (
+                    _quantize_fp8_tensor_lean(k_t, quantizer),
+                    _quantize_fp8_tensor_lean(v_t, quantizer),
+                )
+                lyr.keys = k_t.new_empty(0)
+                lyr.values = v_t.new_empty(0)
+    return out
+
+
 def _quantize_prefix_cache_fp8_(cache: Any, quantizer: FP8KVCacheQuantizer) -> None:
-    """Simulate/apply Tier-1 `FP8 E4M3` precision on populated prefix full-attention KV caches."""
+    """Simulate/apply Tier-1 `FP8 E4M3` precision on populated prefix full-attention KV caches.
+
+    Supports both legacy `key_cache`/`value_cache` lists (`HSSDHybridCache`, `ToyHybridCache`,
+    HF 4.x `DynamicCache`) and `transformers >= 5.x` `cache.layers[i].keys`/`values` layers.
+    """
     kc = getattr(cache, "key_cache", None)
     vc = getattr(cache, "value_cache", None)
     if isinstance(kc, list) and isinstance(vc, list):
@@ -106,6 +172,16 @@ def _quantize_prefix_cache_fp8_(cache: Any, quantizer: FP8KVCacheQuantizer) -> N
                 kc[i] = quantizer.dequantize(quantizer.quantize(kc[i]), dtype=kc[i].dtype)
             if isinstance(vc[i], torch.Tensor) and vc[i].numel() > 0:
                 vc[i] = quantizer.dequantize(quantizer.quantize(vc[i]), dtype=vc[i].dtype)
+        return
+    layers = getattr(cache, "layers", None)
+    if isinstance(layers, list):
+        for lyr in layers:
+            k_t = getattr(lyr, "keys", None)
+            v_t = getattr(lyr, "values", None)
+            if isinstance(k_t, torch.Tensor) and k_t.numel() > 0:
+                lyr.keys = quantizer.dequantize(quantizer.quantize(k_t), dtype=k_t.dtype)
+            if isinstance(v_t, torch.Tensor) and v_t.numel() > 0:
+                lyr.values = quantizer.dequantize(quantizer.quantize(v_t), dtype=v_t.dtype)
 
 
 def _invoke_calib_loss(
@@ -172,6 +248,18 @@ def _resolve_backbone_and_head(root: nn.Module) -> tuple[nn.Module | None, nn.Mo
     vocab_sz = getattr(getattr(tm, "config", None), "vocab_size", None) if tm is not None else None
     head = direct_head if isinstance(direct_head, nn.Module) else find_lm_head(root, vocab_sz)
     return tm, head
+
+
+def _can_bypass_hf_causal_mask(tm: nn.Module | None, lsa_manager: Any | None) -> bool:
+    """True when `tm` accepts a prebuilt dict `attention_mask` and `qloop_lsa` handles lower-right causal."""
+    if tm is None:
+        return False
+    cfg = getattr(tm, "config", None)
+    if cfg is None or str(getattr(cfg, "model_type", "")).startswith("toy"):
+        return False
+    if getattr(cfg, "layer_types", None) is None:
+        return False
+    return lsa_manager is not None or str(getattr(cfg, "_attn_implementation", "")) == "qloop_lsa"
 
 
 @contextlib.contextmanager
@@ -243,12 +331,15 @@ def prefix_suffix_calibration_step(
 
     tm, lm_head = _resolve_backbone_and_head(root)
 
-    # Clear stale LSA losses prior to streaming
+    # Clear stale LSA / HSSD aux buffers prior to streaming
     scan_root = tm if tm is not None else root
     for mod in scan_root.modules():
         lsa_ix = getattr(mod, "lsa_indexer", None)
         if lsa_ix is not None:
             lsa_ix.pop_losses()
+        hssd_ad = getattr(mod, "hssd_adapter", None)
+        if hssd_ad is not None and callable(getattr(hssd_ad, "clear_aux", None)):
+            hssd_ad.clear_aux()
 
     eff_prefix_mode = (
         prefix_lsa_mode
@@ -266,6 +357,8 @@ def prefix_suffix_calibration_step(
     prefix_mode_used: str | None = None
 
     # Phase 1: Stream `[0 : prefix_len]` in `chunk_size` chunks under `torch.no_grad()`
+    bypass_mask = _can_bypass_hf_causal_mask(tm, lsa_manager)
+    no_mask_dict: dict[str, None] = {"full_attention": None, "linear_attention": None}
     cache: Any = None
     n_prefix_chunks = 0
     if prefix_len > 0:
@@ -277,30 +370,49 @@ def prefix_suffix_calibration_step(
                     s1 = min(prefix_len, s0 + chunk_size)
                     p_chunk = input_ids[:, s0:s1]
                     if tm is not None and tm is not root:
-                        p_out = tm(input_ids=p_chunk, past_key_values=cache, use_cache=True)
+                        tm_kw: dict[str, Any] = {
+                            "input_ids": p_chunk,
+                            "past_key_values": cache,
+                            "use_cache": True,
+                        }
+                        if bypass_mask and cache is not None:
+                            tm_kw["attention_mask"] = no_mask_dict
+                        p_out = tm(**tm_kw)
                     else:
                         p_out = root(p_chunk, past_key_values=cache, use_cache=True)
                     cache = p_out.past_key_values
                     n_prefix_chunks += 1
+        fp8_prefix_kv: dict[int, tuple[QuantizedFP8KV, QuantizedFP8KV]] = {}
         if cache is not None:
             _detach_nested(cache)
             if fp8_quantizer is not None:
                 with torch.no_grad():
-                    _quantize_prefix_cache_fp8_(cache, fp8_quantizer)
+                    if hasattr(cache, "update"):
+                        fp8_prefix_kv = _extract_fp8_prefix_kv_(cache, fp8_quantizer)
+                    if not fp8_prefix_kv:
+                        _quantize_prefix_cache_fp8_(cache, fp8_quantizer)
+    else:
+        fp8_prefix_kv = {}
 
-    # Clear any non-differentiable LSA bookkeeping before differentiable suffix
+    # Clear any non-differentiable LSA / HSSD bookkeeping before differentiable suffix
     for mod in scan_root.modules():
         lsa_ix = getattr(mod, "lsa_indexer", None)
         if lsa_ix is not None:
             lsa_ix.pop_losses()
+        hssd_ad = getattr(mod, "hssd_adapter", None)
+        if hssd_ad is not None and callable(getattr(hssd_ad, "clear_aux", None)):
+            hssd_ad.clear_aux()
 
     # Phase 2: Run `[prefix_len : total_len]` WITH gradients enabled to pre-head hidden states (`D2`)
     suffix_ids = input_ids[:, prefix_len:]
     suffix_labels = labels[:, prefix_len:] if labels is not None else None
     suffix_targets = suffix_labels if suffix_labels is not None else suffix_ids
     suffix_cache = (
-        _ReplayKVCacheProxy(cache) if (cache is not None and hasattr(cache, "update")) else cache
+        _ReplayKVCacheProxy(cache, readonly_base=True, fp8_prefix_kv=fp8_prefix_kv)
+        if (cache is not None and hasattr(cache, "update"))
+        else cache
     )
+    fp8_prefix_kv.clear()
 
     can_pre_head = (
         tm is not None
@@ -310,85 +422,142 @@ def prefix_suffix_calibration_step(
     )
 
     suffix_logits_out: torch.Tensor | None = None
-    if can_pre_head:
-        assert tm is not None and lm_head is not None
-        tm_out = tm(input_ids=suffix_ids, past_key_values=suffix_cache, use_cache=True)
-        suffix_hidden = tm_out.last_hidden_state if hasattr(tm_out, "last_hidden_state") else tm_out[0]
-        if loss_fn is None:
-            if suffix_hidden.shape[1] < 2:
-                raise ValueError("default next-token CE requires suffix_len >= 2 when loss_fn is None")
-            if getattr(lm_head, "bias", None) is None:
-                task_loss, _ = lm_loss(
-                    suffix_hidden,
-                    lm_head.weight,
-                    suffix_targets,
-                    impl="chunked",
-                    chunk_size=ce_chunk_size,
-                    shift=True,
-                    ignore_index=-100,
+    try:
+        if can_pre_head:
+            assert tm is not None and lm_head is not None
+            suf_kw: dict[str, Any] = {
+                "input_ids": suffix_ids,
+                "past_key_values": suffix_cache,
+                "use_cache": True,
+            }
+            if bypass_mask and suffix_cache is not None:
+                suf_kw["attention_mask"] = no_mask_dict
+            tm_out = tm(**suf_kw)
+            suffix_hidden = tm_out.last_hidden_state if hasattr(tm_out, "last_hidden_state") else tm_out[0]
+            if loss_fn is None:
+                if suffix_hidden.shape[1] < 2:
+                    raise ValueError("default next-token CE requires suffix_len >= 2 when loss_fn is None")
+                if getattr(lm_head, "bias", None) is None:
+                    task_loss, _ = lm_loss(
+                        suffix_hidden,
+                        lm_head.weight,
+                        suffix_targets,
+                        impl="chunked",
+                        chunk_size=ce_chunk_size,
+                        shift=True,
+                        ignore_index=-100,
+                    )
+                else:
+                    task_loss = _chunked_linear_ce_with_bias(
+                        suffix_hidden,
+                        lm_head,
+                        suffix_targets,
+                        chunk_size=ce_chunk_size,
+                        ignore_index=-100,
+                    )
+                want_logits = (
+                    bool(return_logits)
+                    if return_logits is not None
+                    else (bool(cfg.return_logits) if cfg is not None else False)
                 )
+                if want_logits:
+                    with torch.no_grad():
+                        suffix_logits_out = lm_head(suffix_hidden.detach())
             else:
-                task_loss = _chunked_linear_ce_with_bias(
-                    suffix_hidden,
-                    lm_head,
-                    suffix_targets,
-                    chunk_size=ce_chunk_size,
-                    ignore_index=-100,
+                raw_logits = lm_head(suffix_hidden)
+                task_loss = _invoke_calib_loss(loss_fn, raw_logits, suffix_ids, suffix_labels)
+                want_logits = (
+                    bool(return_logits)
+                    if return_logits is not None
+                    else (bool(cfg.return_logits) if cfg is not None else True)
                 )
-            want_logits = (
-                bool(return_logits)
-                if return_logits is not None
-                else (bool(cfg.return_logits) if cfg is not None else False)
-            )
-            if want_logits:
-                with torch.no_grad():
-                    suffix_logits_out = lm_head(suffix_hidden.detach())
+                if want_logits:
+                    suffix_logits_out = raw_logits.detach()
         else:
-            raw_logits = lm_head(suffix_hidden)
+            suffix_out = root(suffix_ids, past_key_values=suffix_cache, use_cache=True)
+            raw_logits = suffix_out.logits if hasattr(suffix_out, "logits") else suffix_out
             task_loss = _invoke_calib_loss(loss_fn, raw_logits, suffix_ids, suffix_labels)
             want_logits = (
                 bool(return_logits)
                 if return_logits is not None
-                else (bool(cfg.return_logits) if cfg is not None else True)
+                else (bool(cfg.return_logits) if cfg is not None else (loss_fn is not None))
             )
             if want_logits:
                 suffix_logits_out = raw_logits.detach()
-    else:
-        suffix_out = root(suffix_ids, past_key_values=suffix_cache, use_cache=True)
-        raw_logits = suffix_out.logits if hasattr(suffix_out, "logits") else suffix_out
-        task_loss = _invoke_calib_loss(loss_fn, raw_logits, suffix_ids, suffix_labels)
-        want_logits = (
-            bool(return_logits)
-            if return_logits is not None
-            else (bool(cfg.return_logits) if cfg is not None else (loss_fn is not None))
-        )
-        if want_logits:
-            suffix_logits_out = raw_logits.detach()
 
-    total_loss = task_loss
+        total_loss = task_loss
 
-    lsa_losses = [
-        loss_t
-        for mod in scan_root.modules()
-        if getattr(mod, "lsa_indexer", None) is not None
-        for loss_t in mod.lsa_indexer.pop_losses()
-    ]
-    lsa_val = 0.0
-    if lsa_losses and lsa_aux_weight > 0:
-        lsa_sum = torch.stack([t.to(total_loss.dtype) for t in lsa_losses]).sum()
-        lsa_val = float(lsa_sum.detach())
-        total_loss = total_loss + float(lsa_aux_weight) * lsa_sum
+        lsa_losses = [
+            loss_t
+            for mod in scan_root.modules()
+            if getattr(mod, "lsa_indexer", None) is not None
+            for loss_t in mod.lsa_indexer.pop_losses()
+        ]
+        lsa_val = 0.0
+        if lsa_losses and lsa_aux_weight > 0:
+            lsa_sum = torch.stack([t.to(total_loss.dtype) for t in lsa_losses]).sum()
+            lsa_val = float(lsa_sum.detach())
+            total_loss = total_loss + float(lsa_aux_weight) * lsa_sum
+        lsa_losses.clear()
 
-    if tm is not None and loop_aux_weight > 0:
-        layers = getattr(tm, "layers", None)
-        ctl = getattr(layers[0], "_ctl", None) if (layers is not None and len(layers) > 0) else None
-        if ctl is not None:
-            l_aux = ctl.aux_loss()
-            if l_aux is not None:
-                total_loss = total_loss + float(loop_aux_weight) * l_aux.to(total_loss.dtype)
+        if tm is not None:
+            layers = getattr(tm, "layers", None)
+            ctl = getattr(layers[0], "_ctl", None) if (layers is not None and len(layers) > 0) else None
+            if ctl is not None:
+                l_aux = ctl.aux_loss()
+                if l_aux is not None and loop_aux_weight > 0:
+                    total_loss = total_loss + float(loop_aux_weight) * l_aux.to(total_loss.dtype)
+                del l_aux
 
-    if backward and total_loss.requires_grad:
-        total_loss.backward()
+        # Drop unconsumed HSSD write-budget aux terms BEFORE backward: retaining live `bud_loss`
+        # tensors on `adapter._pending_aux` across `total_loss.backward()` pins every linear layer's
+        # checkpointed HSSD segment frames (~4.8 GiB/layer at 32K suffix) until backward finishes!
+        for mod in scan_root.modules():
+            hssd_ad = getattr(mod, "hssd_adapter", None)
+            if hssd_ad is not None and callable(getattr(hssd_ad, "clear_aux", None)):
+                hssd_ad.clear_aux()
+
+        if backward and total_loss.requires_grad:
+            total_loss.backward()
+    finally:
+        # Release long-prefix caches, loop stashes, and LSA bucket caches so 512K-1M calibration
+        # leaves 0 GiB pinned in GPU HBM across subsequent 64K training steps!
+        if isinstance(suffix_cache, _ReplayKVCacheProxy):
+            suffix_cache.reset_segment()
+        for mod in scan_root.modules():
+            lsa_ix = getattr(mod, "lsa_indexer", None)
+            if lsa_ix is not None:
+                lsa_ix.pop_losses()
+                lsa_cache = getattr(lsa_ix, "_cache", None)
+                if isinstance(lsa_cache, dict):
+                    lsa_cache.clear()
+            hssd_ad = getattr(mod, "hssd_adapter", None)
+            if hssd_ad is not None and callable(getattr(hssd_ad, "clear_aux", None)):
+                hssd_ad.clear_aux()
+        if tm is not None:
+            layers_cl = getattr(tm, "layers", None)
+            ctl_cl = (
+                getattr(layers_cl[0], "_ctl", None)
+                if (layers_cl is not None and len(layers_cl) > 0)
+                else None
+            )
+            if ctl_cl is not None and hasattr(ctl_cl, "ctx"):
+                ctx_cl = ctl_cl.ctx
+                ctx_cl.anchor = None
+                for _attr in (
+                    "start",
+                    "kv_stash",
+                    "pkv_stash",
+                    "keep",
+                    "coef",
+                    "aux",
+                    "div_terms",
+                    "routing",
+                    "router_probs",
+                ):
+                    _box = getattr(ctx_cl, _attr, None)
+                    if isinstance(_box, (dict, list)):
+                        _box.clear()
 
     grad_norms: dict[str, float] = {}
     for name, p in root.named_parameters():

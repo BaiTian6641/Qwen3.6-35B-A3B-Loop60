@@ -288,12 +288,21 @@ class SharedKVView:
         stash = object.__getattribute__(self, "_stash")
         record = object.__getattribute__(self, "_record")
         lidx = int(layer_idx)
+        readonly_cache = bool(getattr(cache, "_readonly_base", False))
         if record:
             res = cache.update(key_states, value_states, layer_idx, *args, **kwargs)
             if stash is not None and isinstance(res, tuple) and len(res) >= 2:
-                stash[lidx] = (res[0], res[1])
+                if readonly_cache:
+                    # Stash only the compact current-suffix `(k, v)` (`~64 MiB/layer` at 32K) rather than
+                    # pinning the entire concatenated `[prefix + suffix]` tensor (`~2 GiB/layer` at 1M)!
+                    stash[lidx] = (key_states, value_states)
+                else:
+                    stash[lidx] = (res[0], res[1])
             return res
         if stash is not None and lidx in stash:
+            if readonly_cache:
+                k_suf, v_suf = stash[lidx]
+                return cache.update(k_suf, v_suf, layer_idx, *args, **kwargs)
             return stash[lidx]
         if type(cache).__name__ in ("QuantizedHybridCache", "_QuantizedKV"):
             return cache.update(key_states[..., :0, :], value_states[..., :0, :], layer_idx, *args, **kwargs)
@@ -558,7 +567,16 @@ class VirtualLayer(nn.Module):
                     ctl._route(ctx, x)
             else:
                 ctx.start[s.r] = x
-                x = ctl.adapters.bridge(x, ctx.anchor, s.r - 2)
+                if ctl.spec.checkpoint and self.training and torch.is_grad_enabled() and ctx.anchor is not None:
+                    pass_idx = s.r - 2
+                    x = checkpoint(
+                        lambda h_in, anc_in, p_i=pass_idx: ctl.adapters.bridge(h_in, anc_in, p_i),
+                        x,
+                        ctx.anchor,
+                        use_reentrant=False,
+                    )
+                else:
+                    x = ctl.adapters.bridge(x, ctx.anchor, s.r - 2)
         pkv_key = next((k for k in ("past_key_values", "past_key_value", "cache") if k in kwargs), None)
         pkv = kwargs.get(pkv_key) if pkv_key is not None else None
         if s.vidx == 0 and pkv is not None:

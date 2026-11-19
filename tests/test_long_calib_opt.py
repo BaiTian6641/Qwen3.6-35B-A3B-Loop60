@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from typing import Any
 
 import pytest
 import torch
@@ -332,3 +333,323 @@ def test_d3_prefix_switches_lsa_to_sparse_and_restores_training_mode_on_suffix()
         assert mgr.cfg.mode == "hybrid"
     finally:
         hook.remove()
+
+
+def test_transformers_v5_dynamic_cache_fp8_quantize_and_checkpoint_safe_proxy():
+    """Verify `_quantize_prefix_cache_fp8_` and `_ReplayKVCacheProxy` on `transformers 5.x` `DynamicCache`
+    (`cache.layers[i].keys`/`values` + in-place `.copy_()` `LinearAttentionLayer` conv/recurrent states)."""
+    from torch.utils.checkpoint import checkpoint
+
+    from qloop.model.offload import FP8KVCacheQuantizer
+    from qloop.train.bptt import _ReplayKVCacheProxy
+    from qloop.train.long_calib import _quantize_prefix_cache_fp8_
+
+    class _MockV5LinearLayer:
+        def __init__(self) -> None:
+            self.conv_states: list[torch.Tensor | None] = [None]
+            self.recurrent_states: list[torch.Tensor | None] = [None]
+            self.has_previous_state = [False]
+
+        def get_conv_state(self, state_idx: int = 0) -> torch.Tensor | None:
+            return self.conv_states[state_idx] if self.has_previous_state[state_idx] else None
+
+        def update_conv_state(
+            self, conv_states: torch.Tensor, state_idx: int = 0, conv_kernel_size: int = 4
+        ) -> torch.Tensor:
+            if not self.has_previous_state[state_idx]:
+                self.conv_states[state_idx] = torch.zeros(
+                    (*conv_states.shape[:-1], conv_kernel_size), dtype=conv_states.dtype
+                )
+                self.has_previous_state[state_idx] = True
+                full = conv_states
+            else:
+                prev = self.conv_states[state_idx]
+                assert prev is not None
+                full = torch.cat([prev, conv_states], dim=-1)
+            assert self.conv_states[state_idx] is not None
+            # In-place `.copy_()` exactly matching `transformers 5.23.0` `LinearAttentionLayer`!
+            self.conv_states[state_idx].copy_(full[..., -conv_kernel_size:])
+            return full
+
+        def get_recurrent_state(self, state_idx: int = 0) -> torch.Tensor | None:
+            return self.recurrent_states[state_idx] if self.has_previous_state[state_idx] else None
+
+        def update_recurrent_state(self, rec_state: torch.Tensor, state_idx: int = 0) -> torch.Tensor:
+            if self.recurrent_states[state_idx] is None:
+                self.recurrent_states[state_idx] = torch.zeros_like(rec_state)
+            self.recurrent_states[state_idx].copy_(rec_state)
+            return self.recurrent_states[state_idx]
+
+    class _MockV5FullLayer:
+        def __init__(self, k: torch.Tensor, v: torch.Tensor) -> None:
+            self.keys = k
+            self.values = v
+
+        def update(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            self.keys = torch.cat([self.keys, k], dim=-2)
+            self.values = torch.cat([self.values, v], dim=-2)
+            return self.keys, self.values
+
+    class _MockV5DynamicCache:
+        def __init__(self, k: torch.Tensor, v: torch.Tensor) -> None:
+            self.layers: list[Any] = [_MockV5LinearLayer(), _MockV5FullLayer(k, v)]
+
+        def get_conv_state(self, layer_idx: int, state_idx: int = 0) -> torch.Tensor | None:
+            return self.layers[layer_idx].get_conv_state(state_idx)
+
+        def update_conv_state(
+            self, conv_states: torch.Tensor, layer_idx: int, state_idx: int = 0, conv_kernel_size: int = 4
+        ) -> torch.Tensor:
+            return self.layers[layer_idx].update_conv_state(conv_states, state_idx, conv_kernel_size)
+
+        def get_recurrent_state(self, layer_idx: int, state_idx: int = 0) -> torch.Tensor | None:
+            return self.layers[layer_idx].get_recurrent_state(state_idx)
+
+        def update_recurrent_state(
+            self, rec_state: torch.Tensor, layer_idx: int, state_idx: int = 0
+        ) -> torch.Tensor:
+            return self.layers[layer_idx].update_recurrent_state(rec_state, state_idx)
+
+        def update(
+            self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return self.layers[layer_idx].update(key_states, value_states)
+
+    torch.manual_seed(11)
+    k0 = torch.randn(1, 2, 16, 8)
+    v0 = torch.randn(1, 2, 16, 8)
+    cache = _MockV5DynamicCache(k0.clone(), v0.clone())
+    cache.update_conv_state(torch.randn(1, 4, 6), layer_idx=0, conv_kernel_size=4)
+    rec0 = torch.randn(1, 4, 4)
+    cache.update_recurrent_state(rec0.clone(), layer_idx=0)
+    conv_before = cache.get_conv_state(0).clone()  # type: ignore[union-attr]
+
+    # 1. `_quantize_prefix_cache_fp8_` operates on `cache.layers[i].keys/values` (not a no-op!)
+    quant = FP8KVCacheQuantizer()
+    _quantize_prefix_cache_fp8_(cache, quant)
+    expected_k = quant.dequantize(quant.quantize(k0), dtype=k0.dtype)
+    torch.testing.assert_close(cache.layers[1].keys, expected_k)
+    assert not torch.equal(cache.layers[1].keys, k0)
+
+    # 2. `_ReplayKVCacheProxy(cache, readonly_base=True)` stays checkpoint-safe across `use_reentrant=False`
+    # even when `LinearAttentionLayer.update_*` mutates in-place via `.copy_()`, AND never mutates KV `base_cache`!
+    proxy = _ReplayKVCacheProxy(cache, readonly_base=True)
+    x = torch.randn(1, 4, 6, requires_grad=True)
+    k_new = torch.randn(1, 2, 4, 8, requires_grad=True)
+    v_new = torch.randn(1, 2, 4, 8, requires_grad=True)
+    seen_rec_during_recomp: list[torch.Tensor] = []
+
+    def _ckpt_block(x_in: torch.Tensor, kn: torch.Tensor, vn: torch.Tensor) -> torch.Tensor:
+        r_prev = proxy.get_recurrent_state(0)
+        assert r_prev is not None
+        seen_rec_during_recomp.append(r_prev.detach().clone())
+        full_conv = proxy.update_conv_state(x_in, 0, conv_kernel_size=4)
+        proxy.update_recurrent_state(r_prev + 5.0, 0)
+        kf, vf = proxy.update(kn, vn, 1)
+        return full_conv.sum() + (kf * vf).sum()
+
+    out = checkpoint(_ckpt_block, x, k_new, v_new, use_reentrant=False)
+    out.backward()
+    assert len(seen_rec_during_recomp) == 2
+    # Both forward AND backward recomputation saw the exact pre-segment snapshot `rec0` (NOT mutated `rec0 + 5.0`)!
+    torch.testing.assert_close(seen_rec_during_recomp[0], rec0)
+    torch.testing.assert_close(seen_rec_during_recomp[1], rec0)
+    # Gradients flow through live `x`, `k_new`, `v_new`, and `readonly_base=True` did NOT grow `cache.layers[1].keys`!
+    assert x.grad is not None and torch.isfinite(x.grad).all() and x.grad.abs().sum() > 0
+    assert k_new.grad is not None and v_new.grad is not None
+    assert cache.layers[1].keys.shape[-2] == 16
+    assert conv_before.shape == (1, 4, 4)
+
+
+def test_long_calib_clears_hssd_pending_aux_before_backward():
+    """Unconsumed `hssd_adapter._pending_aux` must be cleared BEFORE `total_loss.backward()`
+    so live `bud_loss` tensors cannot pin linear-layer checkpoint frames across backward."""
+    from qloop.model.hssd import HSSDConfig, apply_hssd
+
+    torch.manual_seed(29)
+    t_cfg = ToyConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        full_attention_interval=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        partial_rotary_factor=0.5,
+    )
+    model = ToyForCausalLM(t_cfg).train()
+    hssd_handle = apply_hssd(
+        model,
+        HSSDConfig(
+            chunk_size=4,
+            window_chunks=2,
+            num_pages=4,
+            k_pages=2,
+            segment_chunks=2,
+            checkpoint_segments=True,
+            checkpoint_segments_min_len=4,
+        ),
+    )
+    # Freeze HSSD adapters (mirrors `s3_long_1m_lsa` with `train_hssd: false`) while leaving other params live
+    for ad in hssd_handle.adapters.values():
+        for p in ad.parameters():
+            p.requires_grad_(False)
+
+    observed_pending_during_bwd: list[int] = []
+
+    def _bwd_hook(_grad: torch.Tensor) -> None:
+        observed_pending_during_bwd.append(sum(len(ad._pending_aux) for ad in hssd_handle.adapters.values()))
+
+    hook_handle = model.lm_head.weight.register_hook(_bwd_hook)
+    try:
+        ids = torch.randint(0, 64, (1, 24), generator=torch.Generator().manual_seed(7))
+        res = prefix_suffix_calibration_step(
+            model,
+            ids,
+            prefix_len=8,
+            chunk_size=4,
+            backward=True,
+        )
+    finally:
+        hook_handle.remove()
+
+    assert observed_pending_during_bwd, "expected backward hook to fire on lm_head.weight"
+    assert all(cnt == 0 for cnt in observed_pending_during_bwd), (
+        f"expected 0 pending HSSD aux tensors during backward, saw {observed_pending_during_bwd}"
+    )
+    assert all(len(ad._pending_aux) == 0 for ad in hssd_handle.adapters.values())
+    assert res.task_loss > 0.0
+
+
+def test_bptt_chunked_replay_indexer_kl_exact_grad_parity():
+    """Verify `_chunked_replay_indexer_kl` matches dense KL and `(dKL/dqz, dKL/dkz)` to 1e-10."""
+    from qloop.train.bptt import _chunked_replay_indexer_kl
+
+    torch.manual_seed(41)
+    bsz, g, hg, t_seg, k_sel, d_nope, d_idx = 2, 2, 4, 17, 9, 12, 8
+    tau = 0.25
+    scale = 1.0 / (d_nope ** 0.5)
+    qn_t = torch.randn(bsz, g, hg, t_seg, d_nope, dtype=torch.float64)
+    kn_t = torch.randn(bsz, g, k_sel, d_nope, dtype=torch.float64)
+
+    for per_head in (False, True):
+        qz_shape = (bsz, g * hg, t_seg, d_idx) if per_head else (bsz, g, t_seg, d_idx)
+        qz0 = torch.randn(qz_shape, dtype=torch.float64)
+        kz0 = torch.randn(bsz, g, k_sel, d_idx, dtype=torch.float64)
+
+        qz_ref = qz0.clone().requires_grad_(True)
+        kz_ref = kz0.clone().requires_grad_(True)
+        raw_sc = torch.einsum("bghcd,bgkd->bghck", qn_t, kn_t) * scale
+        if per_head:
+            tgt_p = torch.softmax(raw_sc, dim=-1)
+            pred = torch.einsum("bghcd,bgkd->bghck", qz_ref.view(bsz, g, hg, t_seg, d_idx), kz_ref) / tau
+        else:
+            tgt_p = torch.softmax(raw_sc, dim=-1).mean(dim=2)
+            pred = torch.einsum("bgcd,bgkd->bgck", qz_ref, kz_ref) / tau
+        log_pred = torch.log_softmax(pred, dim=-1)
+        kl_ref = (tgt_p * (torch.log(tgt_p.clamp_min(1e-30)) - log_pred)).sum(-1).mean()
+        kl_ref.backward()
+
+        qz_c = qz0.clone().requires_grad_(True)
+        kz_c = kz0.clone().requires_grad_(True)
+        kl_c = _chunked_replay_indexer_kl(
+            qn_t,
+            kn_t,
+            qz_c,
+            kz_c,
+            scale_nope=scale,
+            temperature=tau,
+            per_head_q=per_head,
+            chunk_size=5,
+        )
+        kl_c.backward()
+
+        torch.testing.assert_close(kl_c, kl_ref, rtol=1e-10, atol=1e-10)
+        assert qz_c.grad is not None and qz_ref.grad is not None
+        assert kz_c.grad is not None and kz_ref.grad is not None
+        torch.testing.assert_close(qz_c.grad, qz_ref.grad, rtol=1e-10, atol=1e-10)
+        torch.testing.assert_close(kz_c.grad, kz_ref.grad, rtol=1e-10, atol=1e-10)
+
+
+def test_long_calib_fp8_prefix_extraction_lean_parity_and_ctx_cleanup():
+    """Verify chunked FP8 prefix KV extraction, `_ReplayKVCacheProxy.get_seq_length`,
+    compact `SharedKVView` suffix-only stash, and post-calibration cleanup of loop/LSA caches."""
+    from qloop.model.loop import LoopSpec, apply_loop
+    from qloop.model.offload import FP8KVCacheQuantizer
+    from qloop.train.bptt import _dequantize_fp8_kv_lean, _ReplayKVCacheProxy
+    from qloop.train.long_calib import _extract_fp8_prefix_kv_, _quantize_fp8_tensor_lean
+
+    # 1. Chunked `_quantize_fp8_tensor_lean` & `_dequantize_fp8_kv_lean` parity vs FP8KVCacheQuantizer
+    torch.manual_seed(53)
+    quant = FP8KVCacheQuantizer()
+    x = torch.randn(1, 2, 100, 16, dtype=torch.float32) * 3.0
+    q_ref = quant.quantize(x)
+    q_lean = _quantize_fp8_tensor_lean(x, quant, chunk_tokens=32)
+    assert q_lean.is_fp8_native == q_ref.is_fp8_native
+    torch.testing.assert_close(q_lean.scale, q_ref.scale)
+    torch.testing.assert_close(
+        _dequantize_fp8_kv_lean(q_lean, torch.float32, chunk_tokens=32),
+        quant.dequantize(q_ref, dtype=torch.float32),
+    )
+
+    # 2. `_extract_fp8_prefix_kv_` + `_ReplayKVCacheProxy.get_seq_length` & on-the-fly dequant
+    class _V5Layer:
+        def __init__(self, k: torch.Tensor, v: torch.Tensor) -> None:
+            self.keys = k
+            self.values = v
+
+    class _V5Cache:
+        def __init__(self, k: torch.Tensor, v: torch.Tensor) -> None:
+            self.layers = [_V5Layer(k, v)]
+
+        def update(self, k: torch.Tensor, v: torch.Tensor, idx: int):
+            self.layers[idx].keys = torch.cat([self.layers[idx].keys, k], dim=-2)
+            self.layers[idx].values = torch.cat([self.layers[idx].values, v], dim=-2)
+            return self.layers[idx].keys, self.layers[idx].values
+
+        def get_seq_length(self, layer_idx: int = 0) -> int:
+            return int(self.layers[layer_idx].keys.shape[-2])
+
+    k0 = torch.randn(1, 2, 40, 16, dtype=torch.float32)
+    v0 = torch.randn(1, 2, 40, 16, dtype=torch.float32)
+    c = _V5Cache(k0.clone(), v0.clone())
+    extracted = _extract_fp8_prefix_kv_(c, quant)
+    if quant.supports_fp8(k0.device):
+        assert 0 in extracted and c.layers[0].keys.numel() == 0
+        proxy = _ReplayKVCacheProxy(c, readonly_base=True, fp8_prefix_kv=extracted)
+        assert proxy.get_seq_length() == 40
+        assert proxy.get_seq_length(0) == 40
+        ks, vs = torch.randn(1, 2, 8, 16), torch.randn(1, 2, 8, 16)
+        k_out, v_out = proxy.update(ks, vs, 0)
+        assert k_out.shape == (1, 2, 48, 16) and v_out.shape == (1, 2, 48, 16)
+        torch.testing.assert_close(k_out[:, :, :40], quant.dequantize(quant.quantize(k0), dtype=torch.float32))
+        torch.testing.assert_close(k_out[:, :, 40:], ks)
+
+    # 3. End-to-end looped + LSA `prefix_suffix_calibration_step` clears `ctl.ctx.pkv_stash` and `lsa_ix._cache`!
+    t_cfg = ToyConfig(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=4,
+        full_attention_interval=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        partial_rotary_factor=0.5,
+    )
+    model = ToyForCausalLM(t_cfg).train()
+    mgr = install_lsa(model, LSAConfig(**SMALL_LSA, mode="hybrid", num_query_passes=2))
+    ctl = apply_loop(
+        model,
+        LoopSpec(prelude_end=1, core_end=3, num_passes=2, target_virtual_layers=6, kv_share=True, checkpoint=True),
+    )
+    ids = torch.randint(0, 64, (1, 24), generator=torch.Generator().manual_seed(9))
+    res = prefix_suffix_calibration_step(
+        model, ids, prefix_len=12, chunk_size=6, fp8_kv_cache=True, lsa_manager=mgr, backward=True
+    )
+    assert res.task_loss > 0.0
+    assert len(ctl.ctx.pkv_stash) == 0
+    assert ctl.ctx.anchor is None
+    assert all(len(ix._cache) == 0 for ix in mgr.indexers.values())
+
+
+

@@ -7599,16 +7599,76 @@ else:
                 except Exception:
                     pass
             if arch.get("yarn_target_len"):
-                orig_l = getattr(hf_cfg, "max_position_embeddings", None) or 262144
-                fac = max(1.0, float(arch["yarn_target_len"]) / float(orig_l))
-                rope = {"rope_type": "yarn", "factor": fac, "original_max_position_embeddings": int(orig_l)}
+                t_len = int(arch["yarn_target_len"])
                 rp = getattr(hf_cfg, "rope_parameters", None)
+                has_v5_rp = isinstance(rp, dict) or (
+                    hasattr(hf_cfg, "rope_parameters")
+                    and rp is None
+                    and isinstance(getattr(type(hf_cfg), "rope_scaling", None), property)
+                )
+                ex_orig = None
                 if isinstance(rp, dict):
-                    rp = dict(rp)
-                    rp.update(rope)
-                    hf_cfg.rope_parameters = rp
-                hf_cfg.rope_scaling = dict(rope)
-                hf_cfg.max_position_embeddings = int(max(int(arch["yarn_target_len"]), int(orig_l)))
+                    probes = (
+                        [v for v in rp.values() if isinstance(v, dict)]
+                        if (rp and all(isinstance(v, dict) for v in rp.values()))
+                        else [rp]
+                    )
+                elif not has_v5_rp:
+                    rs_old = getattr(hf_cfg, "rope_scaling", None)
+                    probes = [rs_old] if isinstance(rs_old, dict) else []
+                else:
+                    probes = []
+                for pd in probes:
+                    ro = pd.get("original_max_position_embeddings")
+                    if (
+                        str(pd.get("rope_type", pd.get("type", ""))) == "yarn"
+                        and isinstance(ro, (int, float))
+                        and int(ro) > 0
+                    ):
+                        ex_orig = int(ro)
+                        break
+                orig_l = int(ex_orig or getattr(hf_cfg, "max_position_embeddings", None) or 262144)
+                fac = max(1.0, float(t_len) / float(orig_l))
+                rope = {"rope_type": "yarn", "factor": fac, "original_max_position_embeddings": orig_l}
+                if has_v5_rp:
+                    base_rp = dict(rp) if isinstance(rp, dict) else {}
+                    is_nested_rp = bool(base_rp) and all(isinstance(v, dict) for v in base_rp.values())
+
+                    def _merge_st_rp(ent: dict[str, Any]) -> dict[str, Any]:
+                        mg = dict(ent)
+                        mg.pop("type", None)
+                        mg.update(rope)
+                        if mg.get("rope_theta") is None:
+                            ct = getattr(hf_cfg, "rope_theta", None)
+                            if ct is not None:
+                                mg["rope_theta"] = float(ct)
+                        if mg.get("partial_rotary_factor") is None:
+                            cp = getattr(hf_cfg, "partial_rotary_factor", None)
+                            if cp is not None:
+                                mg["partial_rotary_factor"] = float(cp)
+                        return mg
+
+                    if is_nested_rp:
+                        t_keys = [
+                            k
+                            for k in base_rp
+                            if "sliding" not in str(k).lower() and "linear" not in str(k).lower()
+                        ]
+                        if not t_keys:
+                            t_keys = list(base_rp.keys())
+                        t_set = set(t_keys)
+                        hf_cfg.rope_parameters = {
+                            k: (_merge_st_rp(sub) if k in t_set else dict(sub))
+                            for k, sub in base_rp.items()
+                        }
+                    else:
+                        hf_cfg.rope_parameters = _merge_st_rp(base_rp)
+                else:
+                    ex_rs = getattr(hf_cfg, "rope_scaling", None)
+                    mg_rs = dict(ex_rs) if isinstance(ex_rs, dict) else {}
+                    mg_rs.update(rope)
+                    hf_cfg.rope_scaling = mg_rs
+                hf_cfg.max_position_embeddings = int(max(t_len, orig_l))
             if _meta_moe_only:
                 with torch.device("meta"):
                     built_bb: nn.Module | None = None
@@ -8082,8 +8142,14 @@ else:
             lcfg = dict(arch.get("lsa") or {})
             if lcfg.get("enabled"):
                 hd = getattr(hf_cfg, "head_dim", None) or (hf_cfg.hidden_size // hf_cfg.num_attention_heads)
-                rope_p = getattr(hf_cfg, "rope_parameters", None) or {}
-                prf = getattr(hf_cfg, "partial_rotary_factor", None) or rope_p.get("partial_rotary_factor", 1.0)
+                raw_rope_p = getattr(hf_cfg, "rope_parameters", None) or {}
+                rope_p = (
+                    raw_rope_p.get("full_attention")
+                    if isinstance(raw_rope_p, dict) and isinstance(raw_rope_p.get("full_attention"), dict)
+                    else raw_rope_p
+                )
+                rope_pd = rope_p if isinstance(rope_p, dict) else {}
+                prf = getattr(hf_cfg, "partial_rotary_factor", None) or rope_pd.get("partial_rotary_factor", 1.0)
                 rot = int(lcfg.get("rotary_dim") if lcfg.get("rotary_dim") is not None else int(hd * prf))
                 lsa_mgr_state: dict[str, Any] = {
                     "step": 0,

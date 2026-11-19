@@ -19,6 +19,7 @@ retrieval gradients.
 """
 from __future__ import annotations
 
+import copy
 import inspect
 import math
 from dataclasses import dataclass, field, fields
@@ -31,6 +32,7 @@ from torch import nn
 from ..model._dtype import upcast
 from ..model.experts import physical_layers
 from ..model.introspect import FULL, find_text_model
+from .loss import lm_loss
 
 
 @dataclass
@@ -152,6 +154,29 @@ def _extract_cached_keys(cache: Any, layer_idx: int) -> torch.Tensor | None:
     return None
 
 
+def _extract_cached_kv(cache: Any, layer_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Extract cached `(key, value)` tensors `[B, G, Tk, D]` for `layer_idx` across Toy and HF caches."""
+    kc = getattr(cache, "key_cache", None)
+    vc = getattr(cache, "value_cache", None)
+    if (
+        isinstance(kc, list)
+        and isinstance(vc, list)
+        and layer_idx < len(kc)
+        and layer_idx < len(vc)
+        and isinstance(kc[layer_idx], torch.Tensor)
+        and isinstance(vc[layer_idx], torch.Tensor)
+    ):
+        return kc[layer_idx], vc[layer_idx]
+    layers = getattr(cache, "layers", None)
+    if isinstance(layers, list) and layer_idx < len(layers):
+        lyr = layers[layer_idx]
+        keys = getattr(lyr, "keys", None)
+        vals = getattr(lyr, "values", None)
+        if isinstance(keys, torch.Tensor) and isinstance(vals, torch.Tensor):
+            return keys, vals
+    return None, None
+
+
 class _SlotStateListProxy:
     """Checkpoint-recomputation-safe list view over `conv_states` / `recurrent_states`."""
 
@@ -173,6 +198,109 @@ class _SlotStateListProxy:
         self._backing[idx] = val.detach() if isinstance(val, torch.Tensor) else val
 
 
+def _clone_detached_state(obj: Any) -> Any:
+    """Return an independent detached clone of a conv/recurrent state (safe against in-place `.copy_`)."""
+    if obj is None:
+        return None
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().clone()
+    clone_fn = getattr(obj, "clone", None)
+    if callable(clone_fn):
+        return _detach_nested(clone_fn())
+    try:
+        return _detach_nested(copy.deepcopy(obj))
+    except Exception:
+        return _detach_nested(obj)
+
+
+def _resolve_bptt_backbone_and_head(model: nn.Module) -> tuple[nn.Module, nn.Module | None]:
+    tm = find_text_model(model)
+    head = getattr(model, "lm_head", None)
+    if head is None and callable(getattr(model, "get_output_embeddings", None)):
+        head = model.get_output_embeddings()
+    if not isinstance(head, nn.Module):
+        head = None
+    return tm, head
+
+
+def _can_bypass_bptt_causal_mask(tm: nn.Module) -> bool:
+    """Return True when `qloop_lsa` handles lower-right causal masking without HF's O(T_q*T_k) 4D mask."""
+    cfg = getattr(tm, "config", None)
+    if cfg is None or str(getattr(cfg, "model_type", "")).startswith("toy"):
+        return False
+    if str(getattr(cfg, "_attn_implementation", "")) != "qloop_lsa":
+        return False
+    return any(getattr(m, "lsa_indexer", None) is not None for m in tm.modules())
+
+
+def _chunked_replay_indexer_kl(
+    qn_t: torch.Tensor,
+    kn_t: torch.Tensor,
+    qz_live: torch.Tensor,
+    kz_live: torch.Tensor,
+    *,
+    scale_nope: float,
+    temperature: float,
+    per_head_q: bool,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Memory-lean chunked KL(softmax(q_nope k_nope^T / sqrt(d)) || softmax(qz kz^T / tau)).
+
+    Computes exact scalar KL and exact first-order analytical gradients `(dKL/dqz, dKL/dkz)` in
+    `chunk_size`-token slices (`O(chunk * K_sel)` instead of `O(T_seg * K_sel)`, cutting `17 GiB`
+    to `< 32 MiB` at `T_seg=32K, K_sel=2048`) while preserving bit-exact gradients through `qz_live`
+    and `kz_live` with zero large tensors saved in checkpoint frames.
+    """
+    bsz, num_kv_heads, hg, t_seg, _ = qn_t.shape
+    inv_temp = 1.0 / float(temperature)
+    chunk = max(1, int(chunk_size))
+    qz_view = (
+        qz_live.view(bsz, num_kv_heads, hg, t_seg, qz_live.shape[-1])
+        if per_head_q
+        else qz_live
+    )
+    denom = float(bsz * num_kv_heads * (hg if per_head_q else 1) * max(1, t_seg))
+
+    with torch.no_grad():
+        qz_d = upcast(qz_view.detach())
+        kz_d = upcast(kz_live.detach())
+        g_qz = torch.zeros_like(qz_d)
+        g_kz = torch.zeros_like(kz_d)
+        kl_sum = qz_d.new_zeros(())
+        for c0 in range(0, t_seg, chunk):
+            c1 = min(t_seg, c0 + chunk)
+            raw_sc = torch.einsum("bghcd,bgkd->bghck", qn_t[:, :, :, c0:c1], kn_t) * scale_nope
+            if per_head_q:
+                tgt_p = torch.softmax(raw_sc, dim=-1)  # [B, G, Hg, C, K]
+                qz_c = qz_d[:, :, :, c0:c1]
+                pred_logits = torch.einsum("bghcd,bgkd->bghck", qz_c, kz_d) * inv_temp
+                log_pred = torch.log_softmax(pred_logits, dim=-1)
+                kl_sum = kl_sum + (tgt_p * (torch.log(tgt_p.clamp_min(1e-30)) - log_pred)).sum()
+                d_logits = (log_pred.exp() - tgt_p) * (inv_temp / denom)
+                g_qz[:, :, :, c0:c1] = torch.einsum("bghck,bgkd->bghcd", d_logits, kz_d)
+                g_kz.add_(torch.einsum("bghck,bghcd->bgkd", d_logits, qz_c))
+            else:
+                tgt_p = torch.softmax(raw_sc, dim=-1).mean(dim=2)  # [B, G, C, K]
+                qz_c = qz_d[:, :, c0:c1]
+                pred_logits = torch.einsum("bgcd,bgkd->bgck", qz_c, kz_d) * inv_temp
+                log_pred = torch.log_softmax(pred_logits, dim=-1)
+                kl_sum = kl_sum + (tgt_p * (torch.log(tgt_p.clamp_min(1e-30)) - log_pred)).sum()
+                d_logits = (log_pred.exp() - tgt_p) * (inv_temp / denom)
+                g_qz[:, :, c0:c1] = torch.einsum("bgck,bgkd->bgcd", d_logits, kz_d)
+                g_kz.add_(torch.einsum("bgck,bgcd->bgkd", d_logits, qz_c))
+
+    kl_val = (kl_sum / denom).to(qz_live.dtype)
+    g_qz_cast = g_qz.to(qz_live.dtype).reshape_as(qz_live)
+    g_kz_cast = g_kz.to(kz_live.dtype)
+    return (
+        kl_val
+        + (qz_live * g_qz_cast).sum()
+        - (qz_live.detach() * g_qz_cast).sum()
+        + (kz_live * g_kz_cast).sum()
+        - (kz_live.detach() * g_kz_cast).sum()
+    )
+
+
 def _maybe_create_initial_cache(tm: nn.Module) -> Any:
     """Create an empty hybrid KV/recurrent cache when possible so Segment 0 is checkpoint-safe."""
     cfg = getattr(tm, "config", None)
@@ -187,17 +315,53 @@ def _maybe_create_initial_cache(tm: nn.Module) -> Any:
             return Qwen3_5DynamicCache(cfg)
     except Exception:
         pass
+    try:
+        from transformers.cache_utils import DynamicCache
+
+        if cfg is not None:
+            return DynamicCache(config=cfg)
+    except Exception:
+        pass
     return None
 
 
-class _ReplayKVCacheProxy:
-    """Wraps `past_key_values` so `update` injects live re-projected `(k_live, v_live)` out-of-place."""
+def _dequantize_fp8_kv_lean(qkv: Any, dtype: torch.dtype, chunk_tokens: int = 65536) -> torch.Tensor:
+    """Chunked dequantization of `QuantizedFP8KV` -> `dtype` without allocating a full fp32 copy."""
+    if not getattr(qkv, "is_fp8_native", False):
+        return qkv.data.to(dtype)
+    q_data: torch.Tensor = qkv.data
+    scale: torch.Tensor = qkv.scale.to(device=q_data.device, dtype=torch.float32)
+    t_len = int(q_data.shape[-2])
+    if t_len <= chunk_tokens or dtype == torch.float64:
+        acc_dt = torch.float64 if dtype == torch.float64 else torch.float32
+        return (q_data.to(acc_dt) * scale.to(acc_dt)).to(dtype)
+    out = torch.empty(q_data.shape, device=q_data.device, dtype=dtype)
+    for t0 in range(0, t_len, chunk_tokens):
+        t1 = min(t_len, t0 + chunk_tokens)
+        out[..., t0:t1, :] = (q_data[..., t0:t1, :].float() * scale).to(dtype)
+    return out
 
-    def __init__(self, base_cache: Any) -> None:
+
+class _ReplayKVCacheProxy:
+    """Wraps `past_key_values` so `update` injects live re-projected `(k_live, v_live)` out-of-place
+    and linear-attention conv/recurrent states are checkpoint-recomputation safe across HF 4.x & 5.x."""
+
+    def __init__(
+        self,
+        base_cache: Any,
+        *,
+        readonly_base: bool = False,
+        fp8_prefix_kv: dict[int, tuple[Any, Any]] | None = None,
+    ) -> None:
         object.__setattr__(self, "_base_cache", base_cache)
+        object.__setattr__(self, "_readonly_base", bool(readonly_base))
+        object.__setattr__(self, "_detach_recurrent_state", True)
+        object.__setattr__(self, "_fp8_prefix_kv", dict(fp8_prefix_kv) if fp8_prefix_kv else {})
         object.__setattr__(self, "_pending_replay", {})
         object.__setattr__(self, "_live_kv_for_seg", {})
         object.__setattr__(self, "_raw_prefix_kv", {})
+        object.__setattr__(self, "_conv_snap", {})
+        object.__setattr__(self, "_rec_snap", {})
         conv = getattr(base_cache, "conv_states", None)
         rec = getattr(base_cache, "recurrent_states", None)
         object.__setattr__(
@@ -211,10 +375,117 @@ class _ReplayKVCacheProxy:
     def base_cache(self) -> Any:
         return object.__getattribute__(self, "_base_cache")
 
+    def get_seq_length(self, layer_idx: int | None = None) -> int:
+        fp8_pref: dict[int, tuple[Any, Any]] = object.__getattribute__(self, "_fp8_prefix_kv")
+        if fp8_pref:
+            if layer_idx is not None and int(layer_idx) in fp8_pref:
+                return int(fp8_pref[int(layer_idx)][0].data.shape[-2])
+            first_pair = next(iter(fp8_pref.values()))
+            return int(first_pair[0].data.shape[-2])
+        base = object.__getattribute__(self, "_base_cache")
+        fn = getattr(base, "get_seq_length", None)
+        if callable(fn):
+            if layer_idx is None:
+                return int(fn())
+            try:
+                return int(fn(layer_idx))
+            except TypeError:
+                return int(fn())
+        return 0
+
     def reset_segment(self) -> None:
         object.__getattribute__(self, "_pending_replay").clear()
         object.__getattribute__(self, "_live_kv_for_seg").clear()
         object.__getattribute__(self, "_raw_prefix_kv").clear()
+        object.__getattribute__(self, "_fp8_prefix_kv").clear()
+        object.__getattribute__(self, "_conv_snap").clear()
+        object.__getattribute__(self, "_rec_snap").clear()
+
+    def get_conv_state(self, layer_idx: int, state_idx: int = 0, **kwargs: Any) -> torch.Tensor | None:
+        base = object.__getattribute__(self, "_base_cache")
+        conv_snap: dict[tuple[int, int], tuple[bool, torch.Tensor | None]] = object.__getattribute__(
+            self, "_conv_snap"
+        )
+        key = (int(layer_idx), int(state_idx))
+        if _in_backward() and key in conv_snap:
+            return conv_snap[key][1]
+        if not _in_backward() and key not in conv_snap:
+            val = base.get_conv_state(layer_idx, state_idx=state_idx, **kwargs)
+            conv_snap[key] = (val is not None, _clone_detached_state(val))
+        if key in conv_snap:
+            return conv_snap[key][1]
+        return base.get_conv_state(layer_idx, state_idx=state_idx, **kwargs)
+
+    def update_conv_state(
+        self,
+        conv_states: torch.Tensor,
+        layer_idx: int,
+        state_idx: int = 0,
+        conv_kernel_size: int | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        base = object.__getattribute__(self, "_base_cache")
+        conv_snap: dict[tuple[int, int], tuple[bool, torch.Tensor | None]] = object.__getattribute__(
+            self, "_conv_snap"
+        )
+        key = (int(layer_idx), int(state_idx))
+        if not _in_backward():
+            if key not in conv_snap:
+                prev = (
+                    base.get_conv_state(layer_idx, state_idx=state_idx)
+                    if hasattr(base, "get_conv_state")
+                    else None
+                )
+                conv_snap[key] = (prev is not None, _clone_detached_state(prev))
+            base.update_conv_state(
+                conv_states.detach(),
+                layer_idx,
+                state_idx=state_idx,
+                conv_kernel_size=conv_kernel_size,
+                **kwargs,
+            )
+        had_prev, prev_snap = conv_snap.get(key, (False, None))
+        if had_prev and isinstance(prev_snap, torch.Tensor):
+            return torch.cat([prev_snap.to(device=conv_states.device, dtype=conv_states.dtype), conv_states], dim=-1)
+        full_conv = conv_states
+        if conv_kernel_size is not None and full_conv.shape[-1] < int(conv_kernel_size):
+            full_conv = F.pad(full_conv, (int(conv_kernel_size) - full_conv.shape[-1], 0), value=0)
+        return full_conv
+
+    def get_recurrent_state(self, layer_idx: int, state_idx: int = 0, **kwargs: Any) -> Any:
+        base = object.__getattribute__(self, "_base_cache")
+        rec_snap: dict[tuple[int, int], Any] = object.__getattribute__(self, "_rec_snap")
+        key = (int(layer_idx), int(state_idx))
+        if _in_backward() and key in rec_snap:
+            return rec_snap[key]
+        if not _in_backward() and key not in rec_snap:
+            val = base.get_recurrent_state(layer_idx, state_idx=state_idx, **kwargs)
+            rec_snap[key] = _clone_detached_state(val)
+        if key in rec_snap:
+            return rec_snap[key]
+        return base.get_recurrent_state(layer_idx, state_idx=state_idx, **kwargs)
+
+    def update_recurrent_state(
+        self,
+        recurrent_states: Any,
+        layer_idx: int,
+        state_idx: int = 0,
+        **kwargs: Any,
+    ) -> Any:
+        if _in_backward():
+            return recurrent_states
+        base = object.__getattribute__(self, "_base_cache")
+        rec_snap: dict[tuple[int, int], Any] = object.__getattribute__(self, "_rec_snap")
+        key = (int(layer_idx), int(state_idx))
+        if key not in rec_snap and hasattr(base, "get_recurrent_state"):
+            prev = base.get_recurrent_state(layer_idx, state_idx=state_idx)
+            rec_snap[key] = _clone_detached_state(prev)
+        return base.update_recurrent_state(
+            _clone_detached_state(recurrent_states),
+            layer_idx,
+            state_idx=state_idx,
+            **kwargs,
+        )
 
     def set_pending(
         self,
@@ -234,6 +505,8 @@ class _ReplayKVCacheProxy:
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         base = object.__getattribute__(self, "_base_cache")
+        readonly_base: bool = object.__getattribute__(self, "_readonly_base")
+        fp8_pref: dict[int, tuple[Any, Any]] = object.__getattribute__(self, "_fp8_prefix_kv")
         live_map: dict[int, tuple[torch.Tensor, torch.Tensor]] = object.__getattribute__(self, "_live_kv_for_seg")
         pending: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = object.__getattribute__(
             self, "_pending_replay"
@@ -245,7 +518,28 @@ class _ReplayKVCacheProxy:
             return live_map[slot]
 
         t_cur = key_states.shape[-2]
-        if not _in_backward():
+        if readonly_base:
+            # Read-only prefix mode (e.g. `long_calib` suffix where `base_cache` is discarded afterward):
+            # avoid mutating `base_cache` (saves a full 10-20 GiB duplicate prefix KV copy!) and when
+            # `fp8_prefix_kv` holds true 1-byte FP8 E4M3 tensors, dequantize ONLY the active layer on the fly!
+            if slot in fp8_pref:
+                qk, qv = fp8_pref[slot]
+                k_prefix = _dequantize_fp8_kv_lean(qk, key_states.dtype)
+                v_prefix = _dequantize_fp8_kv_lean(qv, value_states.dtype)
+                if t_cur == 0:
+                    return k_prefix, v_prefix
+                k_ret = torch.cat([k_prefix, key_states], dim=-2)
+                v_ret = torch.cat([v_prefix, value_states], dim=-2)
+                return k_ret, v_ret
+            if slot not in raw_pref:
+                kp, vp = _extract_cached_kv(base, slot)
+                if kp is not None and vp is not None:
+                    raw_pref[slot] = (kp.detach(), vp.detach())
+            if t_cur == 0:
+                if slot in raw_pref:
+                    return raw_pref[slot]
+                return key_states, value_states
+        elif not _in_backward():
             k_full, v_full = base.update(key_states.detach(), value_states.detach(), slot, *args, **kwargs)
             if t_cur > 0:
                 raw_pref[slot] = (k_full[:, :, :-t_cur, :], v_full[:, :, :-t_cur, :])
@@ -266,7 +560,8 @@ class _ReplayKVCacheProxy:
         else:
             k_ret, v_ret = key_states, value_states
 
-        live_map[slot] = (k_ret, v_ret)
+        if not readonly_base:
+            live_map[slot] = (k_ret, v_ret)
         return k_ret, v_ret
 
     def __getattr__(self, name: str) -> Any:
@@ -448,6 +743,10 @@ class SegmentedKVBPTTRunner:
         loss_fn: Callable[..., torch.Tensor | None] | None = None,
         *,
         backward: bool = True,
+        hssd_aux_weight: float = 0.0,
+        lsa_aux_weight: float = 1.0,
+        loop_aux_weight: float = 1.0,
+        ce_chunk_size: int = 2048,
     ) -> BPTTStepResult:
         """Execute segmented forward (+ per-segment backward with K/V replay) over `input_ids` `[B, T]`."""
         if input_ids.ndim != 2:
@@ -581,33 +880,20 @@ class SegmentedKVBPTTRunner:
                                 q_live_for_idx, _, _, _ = self._extract_query_heads(attn_mod, x_cur.detach())
                                 qz_live = lsa_ix.query_latent(q_live_for_idx)  # [B, G | H, T_seg, d_idx]
                                 per_head_q = qz_live.shape[1] != num_kv_heads
-                                with torch.no_grad():
-                                    lo = lsa_ix.lo
-                                    hg = q_det.shape[1] // num_kv_heads
-                                    qn_t = upcast(q_det[..., lo:]).view(bsz, num_kv_heads, hg, -1, head_dim - lo)
-                                    kn_t = upcast(k_live.detach()[..., lo:])
-                                    raw_sc = torch.einsum("bghcd,bgkd->bghck", qn_t, kn_t) / math.sqrt(
-                                        max(1, head_dim - lo)
-                                    )
-                                    if per_head_q:
-                                        tgt_p = torch.softmax(raw_sc, dim=-1)  # [B, G, Hg, T_seg, K_sel]
-                                    else:
-                                        tgt_p = torch.softmax(raw_sc, dim=-1).mean(dim=2)  # [B, G, T_seg, K_sel]
-                                if per_head_q:
-                                    hg_q = qz_live.shape[1] // num_kv_heads
-                                    qz_ph = qz_live.view(bsz, num_kv_heads, hg_q, -1, qz_live.shape[-1])
-                                    pred_logits = (
-                                        torch.einsum("bghcd,bgkd->bghck", qz_ph, kz_live.to(qz_live.dtype))
-                                        / lsa_ix.cfg.temperature
-                                    )
-                                else:
-                                    pred_logits = (
-                                        torch.einsum("bgcd,bgkd->bgck", qz_live, kz_live.to(qz_live.dtype))
-                                        / lsa_ix.cfg.temperature
-                                    )
-                                log_pred = torch.log_softmax(pred_logits, dim=-1)
-                                tgt_p_m = tgt_p.to(log_pred.dtype)
-                                kl_idx = (tgt_p_m * (torch.log(tgt_p_m.clamp_min(1e-30)) - log_pred)).sum(-1).mean()
+                                lo = lsa_ix.lo
+                                hg = q_det.shape[1] // num_kv_heads
+                                qn_t = upcast(q_det[..., lo:]).view(bsz, num_kv_heads, hg, -1, head_dim - lo)
+                                kn_t = upcast(k_live.detach()[..., lo:])
+                                kl_idx = _chunked_replay_indexer_kl(
+                                    qn_t,
+                                    kn_t,
+                                    qz_live,
+                                    kz_live,
+                                    scale_nope=1.0 / math.sqrt(max(1, head_dim - lo)),
+                                    temperature=float(lsa_ix.cfg.temperature),
+                                    per_head_q=per_head_q,
+                                    chunk_size=self.cfg.query_sim_chunk,
+                                )
                                 if not _in_backward():
                                     seg_replay_aux.append(float(self.cfg.replay_indexer_weight) * kl_idx)
 
@@ -627,12 +913,26 @@ class SegmentedKVBPTTRunner:
         for phys_idx, attn_mod in full_layers:
             hooks.append(attn_mod.register_forward_pre_hook(make_attn_pre_hook(phys_idx), with_kwargs=True))
 
-        # Clear any stale LSA pending losses before starting
-        tm = find_text_model(self.model)
+        # Clear any stale LSA / HSSD pending losses before starting
+        tm, lm_head = _resolve_bptt_backbone_and_head(self.model)
         for mod in tm.modules():
             lsa_ix = getattr(mod, "lsa_indexer", None)
             if lsa_ix is not None:
                 lsa_ix.pop_losses()
+            hssd_ad = getattr(mod, "hssd_adapter", None)
+            if hssd_ad is not None and callable(getattr(hssd_ad, "clear_aux", None)):
+                hssd_ad.clear_aux()
+
+        can_pre_head = (
+            loss_fn is None
+            and tm is not self.model
+            and lm_head is not None
+            and isinstance(getattr(lm_head, "weight", None), torch.Tensor)
+            and getattr(lm_head, "bias", None) is None
+            and lm_head.weight.dtype != torch.float64
+        )
+        bypass_mask = _can_bypass_bptt_causal_mask(tm)
+        no_mask_dict: dict[str, None] = {"full_attention": None, "linear_attention": None}
 
         try:
             base_cache: Any = None
@@ -658,33 +958,95 @@ class SegmentedKVBPTTRunner:
                 if base_cache is not None:
                     proxy = _ReplayKVCacheProxy(base_cache)
                     proxy_holder[0] = proxy
-                    out = self.model(seg_ids, past_key_values=proxy, use_cache=True)
-                    base_cache = proxy.base_cache
+                    pkv_arg: Any = proxy
                 else:
                     proxy_holder[0] = None
-                    out = self.model(seg_ids, past_key_values=None, use_cache=True)
-                    base_cache = out.past_key_values
+                    pkv_arg = None
 
-                logits = out.logits
-                logits_for_loss = logits if (s1 < t_total or loss_fn is not None) else logits[:, :-1]
-                seg_loss = self._invoke_segment_loss(loss_fn, s_idx, logits_for_loss, seg_ids, seg_targets)
+                if can_pre_head:
+                    assert lm_head is not None
+                    tm_kw: dict[str, Any] = {
+                        "input_ids": seg_ids,
+                        "past_key_values": pkv_arg,
+                        "use_cache": True,
+                    }
+                    if bypass_mask and s_idx > 0:
+                        tm_kw["attention_mask"] = no_mask_dict
+                    tm_out = tm(**tm_kw)
+                    base_cache = (
+                        proxy_holder[0].base_cache
+                        if proxy_holder[0] is not None
+                        else getattr(tm_out, "past_key_values", None)
+                    )
+                    seg_hidden = tm_out.last_hidden_state if hasattr(tm_out, "last_hidden_state") else tm_out[0]
+                    hidden_for_loss = seg_hidden if s1 < t_total else seg_hidden[:, :-1]
+                    if (
+                        seg_targets is not None
+                        and seg_targets.numel() > 0
+                        and hidden_for_loss.shape[1] == seg_targets.shape[1]
+                        and bool((seg_targets != -100).any())
+                    ):
+                        seg_loss, _ = lm_loss(
+                            hidden_for_loss,
+                            lm_head.weight,
+                            seg_targets,
+                            impl="chunked",
+                            chunk_size=int(ce_chunk_size),
+                            shift=False,
+                            ignore_index=-100,
+                        )
+                    else:
+                        seg_loss = None
+                else:
+                    fwd_kw: dict[str, Any] = {"past_key_values": pkv_arg, "use_cache": True}
+                    if bypass_mask and s_idx > 0:
+                        fwd_kw["attention_mask"] = no_mask_dict
+                    out = self.model(seg_ids, **fwd_kw)
+                    base_cache = (
+                        proxy_holder[0].base_cache
+                        if proxy_holder[0] is not None
+                        else getattr(out, "past_key_values", None)
+                    )
+                    logits = out.logits
+                    logits_for_loss = logits if (s1 < t_total or loss_fn is not None) else logits[:, :-1]
+                    seg_loss = self._invoke_segment_loss(loss_fn, s_idx, logits_for_loss, seg_ids, seg_targets)
 
-                # Collect per-segment LSA & replay indexer auxiliary losses
+                # Collect per-segment LSA, HSSD, loop & replay indexer auxiliary losses and drop unconsumed
+                # HSSD aux terms BEFORE backward so live `bud_loss` tensors never pin checkpoint frames!
                 lsa_terms = [
                     loss_t
                     for mod in tm.modules()
                     if getattr(mod, "lsa_indexer", None) is not None
                     for loss_t in mod.lsa_indexer.pop_losses()
                 ]
+                hssd_terms: list[torch.Tensor] = []
+                for mod in tm.modules():
+                    hssd_ad = getattr(mod, "hssd_adapter", None)
+                    if hssd_ad is not None:
+                        pending_h = getattr(hssd_ad, "_pending_aux", None)
+                        if pending_h:
+                            hssd_terms.extend(pending_h)
+                        if callable(getattr(hssd_ad, "clear_aux", None)):
+                            hssd_ad.clear_aux()
                 loop_aux = loop_ctl.aux_loss() if loop_ctl is not None else None
 
                 total_seg_loss: torch.Tensor | None = seg_loss
-                extra_terms = [*lsa_terms, *seg_replay_aux]
-                if loop_aux is not None:
-                    extra_terms.append(loop_aux)
+                extra_terms: list[torch.Tensor] = list(seg_replay_aux)
+                if lsa_terms and lsa_aux_weight > 0:
+                    extra_terms.extend(float(lsa_aux_weight) * t for t in lsa_terms)
+                if hssd_terms and hssd_aux_weight > 0:
+                    extra_terms.append(float(hssd_aux_weight) * torch.stack([t.float() for t in hssd_terms]).mean())
+                if loop_aux is not None and loop_aux_weight > 0:
+                    extra_terms.append(float(loop_aux_weight) * loop_aux)
+                lsa_terms.clear()
+                hssd_terms.clear()
+                seg_replay_aux.clear()
+                del loop_aux
+
                 if total_seg_loss is not None and extra_terms:
                     aux_sum = torch.stack([t.to(total_seg_loss.dtype) for t in extra_terms]).sum()
                     total_seg_loss = total_seg_loss + aux_sum
+                extra_terms.clear()
 
                 if total_seg_loss is not None:
                     seg_losses.append(float(total_seg_loss.detach()))

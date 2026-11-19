@@ -1775,11 +1775,10 @@ def _moe_routed_forward_impl(
         return out, None
 
     tok_valid_dev = tok_valid.to(device=flat_hidden.device)
-    x_sorted = flat_hidden.index_select(0, tok_valid_dev)
     w_sorted = top_k_weights[tok_valid, slot_valid].to(device=flat_hidden.device)
     c_step = max(1, int(_MOE_CHUNK_EXPERTS if chunk_experts is None else chunk_experts))
 
-    total_routed = int(x_sorted.shape[0])
+    total_routed = int(tok_valid_dev.shape[0])
     h_dim = int(flat_hidden.shape[1])
     gu_all: torch.Tensor | None = None
     y_all: torch.Tensor | None = (
@@ -1801,7 +1800,8 @@ def _moe_routed_forward_impl(
         )
 
         if is_std_silu:
-            x_sub = x_sorted[c_start:c_end]
+            tok_sub = tok_valid_dev[c_start:c_end]
+            x_sub = flat_hidden.index_select(0, tok_sub)
             w_sub = w_sorted[c_start:c_end]
             gu_sub, y_sub = _moe_chunk_forward_silu(
                 x_sub,
@@ -1811,6 +1811,7 @@ def _moe_routed_forward_impl(
                 c_start,
                 need_y=True,
             )
+            del x_sub
             assert y_sub is not None
             if do_cache:
                 if gu_all is None:
@@ -1823,24 +1824,25 @@ def _moe_routed_forward_impl(
                 assert y_all is not None
                 y_all[c_start:c_end] = y_sub
             contrib = (y_sub * w_sub.unsqueeze(-1).to(y_sub.dtype)).contiguous()
-            out.index_add_(0, tok_valid_dev[c_start:c_end], contrib)
+            out.index_add_(0, tok_sub, contrib)
             del gu_sub, y_sub, contrib
         else:
             for local_i, (_eid, off, cnt) in enumerate(chunk_spans):
-                x_e = x_sorted[off : off + cnt]
+                tok_e = tok_valid_dev[off : off + cnt]
+                x_e = flat_hidden.index_select(0, tok_e)
                 w_e = w_sorted[off : off + cnt]
                 gu_e = gu_chunk[local_i].to(device=x_e.device, dtype=x_e.dtype)
                 dn_e = dn_chunk[local_i].to(device=x_e.device, dtype=x_e.dtype)
                 gate, up = F.linear(x_e, gu_e).chunk(2, dim=-1)
                 y_e = F.linear(act_fn(gate) * up, dn_e)
                 contrib = y_e * w_e.unsqueeze(-1).to(y_e.dtype)
-                out.index_add_(0, tok_valid_dev[off : off + cnt], contrib)
-                del gate, up, y_e, contrib
+                out.index_add_(0, tok_e, contrib)
+                del x_e, gate, up, y_e, contrib
         del gu_chunk, dn_chunk
 
     if do_cache and gu_all is not None and y_all is not None:
         cache = (
-            x_sorted.detach(),
+            None,
             gu_all.detach(),
             y_all.detach(),
             perm_valid.detach(),
@@ -1952,27 +1954,35 @@ class _QuantMoERoutedAutogradFn(torch.autograd.Function):
                 del gu_all, y_all
                 return grad_h, None, grad_w, None
 
-            go_sorted = grad_out.index_select(0, tok_valid_dev)
-            if grad_w is not None:
-                grad_w_sorted = (go_sorted.to(acc_dt) * y_all.to(acc_dt)).sum(dim=-1).to(
-                    device=top_k_weights.device,
-                    dtype=top_k_weights.dtype,
-                )
-                grad_w.view(-1).index_copy_(0, perm_valid.to(device=top_k_weights.device), grad_w_sorted)
-                del grad_w_sorted
-            del y_all
-
-            if need_h and grad_h is not None:
-                grad_y_all = go_sorted.to(dtype=flat_hidden.dtype) * w_sorted.unsqueeze(-1).to(dtype=flat_hidden.dtype)
-                for c0 in range(0, len(active_spans), c_step):
-                    chunk_spans = active_spans[c0 : c0 + c_step]
-                    c_start = chunk_spans[0][1]
-                    c_end = chunk_spans[-1][1] + chunk_spans[-1][2]
+            flat_grad_w = grad_w.view(-1) if grad_w is not None else None
+            perm_valid_w = perm_valid.to(device=top_k_weights.device) if flat_grad_w is not None else None
+            w_dot_step = 16384
+            for c0 in range(0, len(active_spans), c_step):
+                chunk_spans = active_spans[c0 : c0 + c_step]
+                c_start = chunk_spans[0][1]
+                c_end = chunk_spans[-1][1] + chunk_spans[-1][2]
+                tok_sub = tok_valid_dev[c_start:c_end]
+                go_sub = grad_out.index_select(0, tok_sub)
+                if flat_grad_w is not None and perm_valid_w is not None:
+                    n_sub = c_end - c_start
+                    for r0 in range(0, n_sub, w_dot_step):
+                        r1 = min(n_sub, r0 + w_dot_step)
+                        gw_r = (
+                            (go_sub[r0:r1].to(acc_dt) * y_all[c_start + r0 : c_start + r1].to(acc_dt))
+                            .sum(dim=-1)
+                            .to(device=top_k_weights.device, dtype=top_k_weights.dtype)
+                        )
+                        flat_grad_w.index_copy_(0, perm_valid_w[c_start + r0 : c_start + r1], gw_r)
+                        del gw_r
+                if need_h and grad_h is not None:
+                    grad_y_sub = go_sub.to(dtype=flat_hidden.dtype) * w_sorted[c_start:c_end].unsqueeze(-1).to(
+                        dtype=flat_hidden.dtype
+                    )
                     chunk_eids = [eid for eid, _, _ in chunk_spans]
                     gu_chunk, dn_chunk = _dequant_experts_chunk(experts_mod, chunk_eids, dtype=flat_hidden.dtype)
                     grad_x_sub = _moe_chunk_backward_dx(
                         gu_all[c_start:c_end],
-                        grad_y_all[c_start:c_end],
+                        grad_y_sub,
                         gu_chunk,
                         dn_chunk,
                         chunk_spans,
@@ -1980,12 +1990,12 @@ class _QuantMoERoutedAutogradFn(torch.autograd.Function):
                     )
                     grad_h.index_add_(
                         0,
-                        tok_valid_dev[c_start:c_end],
+                        tok_sub,
                         grad_x_sub.contiguous().to(dtype=flat_hidden.dtype),
                     )
-                    del gu_chunk, dn_chunk, grad_x_sub
-                del grad_y_all
-            del gu_all, go_sorted
+                    del gu_chunk, dn_chunk, grad_x_sub, grad_y_sub
+                del go_sub
+            del gu_all, y_all
             return grad_h, None, grad_w, None
 
         # Fast path B: uncheckpointed backward (0 extra forward activation memory saved across layers)
@@ -1996,46 +2006,51 @@ class _QuantMoERoutedAutogradFn(torch.autograd.Function):
 
         act_fn = getattr(experts_mod, "act_fn", None) or F.silu
         tok_valid_dev = tok_valid.to(device=flat_hidden.device)
-        x_sorted = flat_hidden.index_select(0, tok_valid_dev)
         w_sorted = top_k_weights[tok_valid, slot_valid].to(device=flat_hidden.device)
-        go_sorted = grad_out.index_select(0, tok_valid_dev)
         flat_grad_w = grad_w.view(-1) if grad_w is not None else None
         perm_valid_w = perm_valid.to(device=top_k_weights.device) if flat_grad_w is not None else None
 
         if _is_standard_silu(act_fn):
-            grad_y_all = (
-                go_sorted.to(dtype=flat_hidden.dtype) * w_sorted.unsqueeze(-1).to(dtype=flat_hidden.dtype)
-                if need_h
-                else None
-            )
+            w_dot_step = 16384
             for c0 in range(0, len(active_spans), c_step):
                 chunk_spans = active_spans[c0 : c0 + c_step]
                 c_start = chunk_spans[0][1]
                 c_end = chunk_spans[-1][1] + chunk_spans[-1][2]
+                tok_sub = tok_valid_dev[c_start:c_end]
+                x_sub = flat_hidden.index_select(0, tok_sub)
+                go_sub = grad_out.index_select(0, tok_sub)
                 chunk_eids = [eid for eid, _, _ in chunk_spans]
                 gu_chunk, dn_chunk = _dequant_experts_chunk(experts_mod, chunk_eids, dtype=flat_hidden.dtype)
                 gu_sub, y_sub = _moe_chunk_forward_silu(
-                    x_sorted[c_start:c_end],
+                    x_sub,
                     gu_chunk,
                     dn_chunk,
                     chunk_spans,
                     c_start,
                     need_y=(flat_grad_w is not None),
                 )
+                del x_sub
                 if flat_grad_w is not None and perm_valid_w is not None:
                     assert y_sub is not None
-                    grad_w_sub = (go_sorted[c_start:c_end].to(acc_dt) * y_sub.to(acc_dt)).sum(dim=-1).to(
-                        device=top_k_weights.device,
-                        dtype=top_k_weights.dtype,
-                    )
-                    flat_grad_w.index_copy_(0, perm_valid_w[c_start:c_end], grad_w_sub)
-                    del grad_w_sub
+                    n_sub = c_end - c_start
+                    for r0 in range(0, n_sub, w_dot_step):
+                        r1 = min(n_sub, r0 + w_dot_step)
+                        gw_r = (
+                            (go_sub[r0:r1].to(acc_dt) * y_sub[r0:r1].to(acc_dt))
+                            .sum(dim=-1)
+                            .to(device=top_k_weights.device, dtype=top_k_weights.dtype)
+                        )
+                        flat_grad_w.index_copy_(0, perm_valid_w[c_start + r0 : c_start + r1], gw_r)
+                        del gw_r
                 del y_sub
 
-                if need_h and grad_h is not None and grad_y_all is not None:
+                if need_h and grad_h is not None:
+                    grad_y_sub = go_sub.to(dtype=flat_hidden.dtype) * w_sorted[c_start:c_end].unsqueeze(-1).to(
+                        dtype=flat_hidden.dtype
+                    )
                     grad_x_sub = _moe_chunk_backward_dx(
                         gu_sub,
-                        grad_y_all[c_start:c_end],
+                        grad_y_sub,
                         gu_chunk,
                         dn_chunk,
                         chunk_spans,
@@ -2043,12 +2058,11 @@ class _QuantMoERoutedAutogradFn(torch.autograd.Function):
                     )
                     grad_h.index_add_(
                         0,
-                        tok_valid_dev[c_start:c_end],
+                        tok_sub,
                         grad_x_sub.contiguous().to(dtype=flat_hidden.dtype),
                     )
-                    del grad_x_sub
-                del gu_chunk, dn_chunk, gu_sub
-            del grad_y_all
+                    del grad_x_sub, grad_y_sub
+                del gu_chunk, dn_chunk, gu_sub, go_sub
             return grad_h, None, grad_w, None
 
         # Exotic custom `act_fn` fallback
@@ -2057,9 +2071,10 @@ class _QuantMoERoutedAutogradFn(torch.autograd.Function):
             chunk_eids = [eid for eid, _, _ in chunk_spans]
             gu_chunk, dn_chunk = _dequant_experts_chunk(experts_mod, chunk_eids, dtype=flat_hidden.dtype)
             for local_i, (_eid, off, cnt) in enumerate(chunk_spans):
-                x_saved = x_sorted[off : off + cnt]
+                tok_e = tok_valid_dev[off : off + cnt]
+                x_saved = flat_hidden.index_select(0, tok_e)
                 w_saved = w_sorted[off : off + cnt]
-                go_e = go_sorted[off : off + cnt]
+                go_e = grad_out.index_select(0, tok_e)
                 gu_e = gu_chunk[local_i].to(device=x_saved.device, dtype=x_saved.dtype)
                 dn_e = dn_chunk[local_i].to(device=x_saved.device, dtype=x_saved.dtype)
 
@@ -2071,7 +2086,7 @@ class _QuantMoERoutedAutogradFn(torch.autograd.Function):
                         grad_y = go_e.to(y_e.dtype) * w_saved.unsqueeze(-1).to(y_e.dtype)
                         grad_xe = torch.autograd.grad(y_e, xe, grad_y, retain_graph=False)[0].to(flat_hidden.dtype)
                         y_det = y_e.detach()
-                    grad_h.index_add_(0, tok_valid_dev[off : off + cnt], grad_xe)
+                    grad_h.index_add_(0, tok_e, grad_xe)
                 else:
                     gate, up = F.linear(x_saved, gu_e).chunk(2, dim=-1)
                     y_det = F.linear(act_fn(gate) * up, dn_e)
@@ -2082,7 +2097,7 @@ class _QuantMoERoutedAutogradFn(torch.autograd.Function):
                         dtype=top_k_weights.dtype,
                     )
                     flat_grad_w.index_copy_(0, perm_valid_w[off : off + cnt], grad_we)
-                del gate, up, y_det
+                del x_saved, go_e, gate, up, y_det
             del gu_chunk, dn_chunk
 
         return grad_h, None, grad_w, None

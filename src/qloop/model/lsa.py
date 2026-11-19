@@ -29,7 +29,7 @@ import math
 import weakref
 from collections import OrderedDict
 from collections.abc import Hashable, Iterator
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Any, Callable
 
 import torch
@@ -312,6 +312,8 @@ class BucketIndex:
     counts: torch.Tensor | None = None    # [B,G,S] key counts per slot (`0` if inactive)
     block_id: torch.Tensor | None = None  # [S] block index `0..nb-1` of each slot
     slots_per_block: int = 0              # compacted (`~64`) or full (`128`) slots per block
+    slot_labels: torch.Tensor | None = None  # [B,G,nb,n] local slot id in 0..spb-1 per unit
+    slot_counts: torch.Tensor | None = None  # [B,G,nb,spb] unit counts per slot
 
 
 @dataclass
@@ -326,6 +328,7 @@ class _CacheEntry:
     slot_counts: torch.Tensor             # [B,G,nb,spb] unit counts per slot
     unit_members: torch.Tensor            # [B,G,nb,spb,max_units]
     centroids: torch.Tensor | None        # [B,G,nb,spb,d] kept for no-grad incremental reuse
+    wk_version: int = -1                  # self.wk._version for safe centroid reuse across opt steps
 
 
 class _PassQueryProj(nn.Module):
@@ -557,10 +560,12 @@ class LSAIndexer(nn.Module):
         loop_ctx, _ = self._current_loop_ctx()
         loop_ref = _weakref_or_none(loop_ctx)
 
+        wk_ver = int(self.wk._version)
+
         if cache_key is not None:
             lkey: tuple[Any, ...] = ("explicit", cache_key, b, g, dev_s)
             ent = self._cache.get(lkey)
-            reuse = ent.n_blocks if (ent is not None and ent.n_blocks <= nb) else 0
+            reuse = ent.n_blocks if (ent is not None and ent.n_blocks <= nb and ent.wk_version == wk_ver) else 0
             return lkey, ent, reuse, None, loop_ref
 
         pkv_ref, pkv_id, pkv_ok = self._active_pkv
@@ -569,7 +574,7 @@ class LSAIndexer(nn.Module):
             lkey = ("pkv", pkv_id, self.layer_id, b, g, dev_s)
             ent = self._cache.get(lkey)
             reuse = 0
-            if ent is not None and ent.n_blocks <= nb:
+            if ent is not None and ent.n_blocks <= nb and ent.wk_version == wk_ver:
                 owner_alive = (ent.owner_ref is None) or (ent.owner_ref() is pkv_obj)
                 same_loop = (
                     loop_ctx is not None
@@ -591,6 +596,7 @@ class LSAIndexer(nn.Module):
                 if (
                     ent is not None
                     and ent.n_blocks == nb
+                    and ent.wk_version == wk_ver
                     and ent.owner_ref is not None
                     and ent.owner_ref() is loop_ctx
                 )
@@ -607,6 +613,7 @@ class LSAIndexer(nn.Module):
                 if (
                     ent is not None
                     and ent.n_blocks == nb
+                    and ent.wk_version == wk_ver
                     and ent.k_ident == k_ident
                     and ent.owner_ref is not None
                     and ent.owner_ref() is k
@@ -685,6 +692,7 @@ class LSAIndexer(nn.Module):
                 slot_counts=slot_counts,
                 unit_members=umem,
                 centroids=None if grad_mode else cent.detach(),
+                wk_version=int(self.wk._version),
             )
             self._cache.move_to_end(lkey)
             while len(self._cache) > cfg.cache_entries:
@@ -732,6 +740,8 @@ class LSAIndexer(nn.Module):
             counts=counts_keys,
             block_id=block_id,
             slots_per_block=spb,
+            slot_labels=slot_labels,
+            slot_counts=slot_counts,
         )
 
     # --------------------------------------------------------------- selection
@@ -1274,6 +1284,230 @@ def _resolve_hybrid_sparse(
     return (step % cfg.hybrid_sparse_every) == 0
 
 
+class _RingLowerRightCausalFlashAttn(torch.autograd.Function):
+    """Exact Ring-FlashAttention for unpadded lower-right causal attention (`Tk = past_len + Tq`, `past_len > 0`).
+
+    Avoids materializing a `[B, 1, Tq, Tk]` dense causal mask (`17-64 GiB` at `512K-1M` context)
+    and avoids GQA `repeat_kv` copies by iterating over KV groups with zero-copy `.expand` and
+    prefix blocks of `prefix_chunk` keys, using ATen's native FlashAttention forward + exact
+    merged-LSE backward.
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx: Any,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        past_len: int,
+        scale: float,
+        prefix_chunk: int = 65536,
+    ) -> torch.Tensor:
+        b, h, tq, dh = q.shape
+        g = k.shape[1]
+        hg = h // g
+        fwd = torch.ops.aten._scaled_dot_product_flash_attention
+        p_step = max(1, int(prefix_chunk))
+        outs: list[torch.Tensor] = []
+        lses: list[torch.Tensor] = []
+        philox_seed: Any = None
+        philox_offset: Any = None
+
+        for gi in range(g):
+            qg = q[:, gi * hg : (gi + 1) * hg].contiguous()
+            o_acc: torch.Tensor | None = None
+            lse_acc: torch.Tensor | None = None
+
+            for p0 in range(0, past_len, p_step):
+                p1 = min(past_len, p0 + p_step)
+                kp = k[:, gi : gi + 1, p0:p1].expand(b, hg, p1 - p0, dh)
+                vp = v[:, gi : gi + 1, p0:p1].expand(b, hg, p1 - p0, dh)
+                r_p = fwd(qg, kp, vp, 0.0, False, False, scale=scale)
+                o_p, lse_p = r_p[0], r_p[1]
+                if philox_seed is None:
+                    philox_seed, philox_offset = r_p[6], r_p[7]
+                if o_acc is None or lse_acc is None:
+                    o_acc = o_p.float()
+                    lse_acc = lse_p
+                else:
+                    m = torch.maximum(lse_acc, lse_p)
+                    w_old = torch.exp(lse_acc - m)
+                    w_new = torch.exp(lse_p - m)
+                    denom = w_old + w_new
+                    o_acc = (o_acc * w_old.unsqueeze(-1) + o_p.float() * w_new.unsqueeze(-1)) / denom.unsqueeze(-1)
+                    lse_acc = m + torch.log(denom)
+
+            ks = k[:, gi : gi + 1, past_len:].expand(b, hg, tq, dh)
+            vs = v[:, gi : gi + 1, past_len:].expand(b, hg, tq, dh)
+            r_s = fwd(qg, ks, vs, 0.0, True, False, scale=scale)
+            o_s, lse_s = r_s[0], r_s[1]
+            if philox_seed is None:
+                philox_seed, philox_offset = r_s[6], r_s[7]
+            if o_acc is None or lse_acc is None:
+                o_final = o_s
+                lse_final = lse_s
+            else:
+                m = torch.maximum(lse_acc, lse_s)
+                w_old = torch.exp(lse_acc - m)
+                w_new = torch.exp(lse_s - m)
+                denom = w_old + w_new
+                o_final = ((o_acc * w_old.unsqueeze(-1) + o_s.float() * w_new.unsqueeze(-1)) / denom.unsqueeze(-1)).to(
+                    q.dtype
+                )
+                lse_final = m + torch.log(denom)
+
+            outs.append(o_final)
+            lses.append(lse_final)
+
+        out = torch.cat(outs, dim=1)
+        lse_all = torch.cat(lses, dim=1)
+        ctx.save_for_backward(q, k, v, out, lse_all)
+        ctx.past_len = past_len
+        ctx.scale = scale
+        ctx.prefix_chunk = p_step
+        ctx.philox_seed = philox_seed
+        ctx.philox_offset = philox_offset
+        return out
+
+    @staticmethod
+    def backward(ctx: Any, grad_out: torch.Tensor) -> tuple[torch.Tensor | None, ...]:  # type: ignore[override]
+        q, k, v, out, lse_all = ctx.saved_tensors
+        past_len: int = ctx.past_len
+        scale: float = ctx.scale
+        p_step: int = ctx.prefix_chunk
+        b, h, tq, dh = q.shape
+        g = k.shape[1]
+        hg = h // g
+        bwd = torch.ops.aten._scaled_dot_product_flash_attention_backward
+        grad_out = grad_out.contiguous()
+
+        need_q = bool(ctx.needs_input_grad[0])
+        need_k = bool(ctx.needs_input_grad[1])
+        need_v = bool(ctx.needs_input_grad[2])
+        dq = torch.empty_like(q) if need_q else None
+        dk = torch.empty_like(k) if need_k else None
+        dv = torch.empty_like(v) if need_v else None
+
+        for gi in range(g):
+            sl_h = slice(gi * hg, (gi + 1) * hg)
+            qg = q[:, sl_h].contiguous()
+            og = out[:, sl_h].contiguous()
+            gog = grad_out[:, sl_h].contiguous()
+            lseg = lse_all[:, sl_h].contiguous()
+
+            dq_acc: torch.Tensor | None = None
+            for p0 in range(0, past_len, p_step):
+                p1 = min(past_len, p0 + p_step)
+                kp = k[:, gi : gi + 1, p0:p1].expand(b, hg, p1 - p0, dh)
+                vp = v[:, gi : gi + 1, p0:p1].expand(b, hg, p1 - p0, dh)
+                dq_p, dk_p, dv_p = bwd(
+                    gog,
+                    qg,
+                    kp,
+                    vp,
+                    og,
+                    lseg,
+                    None,
+                    None,
+                    tq,
+                    p1 - p0,
+                    0.0,
+                    False,
+                    ctx.philox_seed,
+                    ctx.philox_offset,
+                    scale=scale,
+                )
+                if need_q:
+                    dq_acc = dq_p if dq_acc is None else (dq_acc + dq_p)
+                if dk is not None:
+                    dk[:, gi, p0:p1] = dk_p.sum(dim=1)
+                if dv is not None:
+                    dv[:, gi, p0:p1] = dv_p.sum(dim=1)
+                del dq_p, dk_p, dv_p
+
+            ks = k[:, gi : gi + 1, past_len:].expand(b, hg, tq, dh)
+            vs = v[:, gi : gi + 1, past_len:].expand(b, hg, tq, dh)
+            dq_s, dk_s, dv_s = bwd(
+                gog,
+                qg,
+                ks,
+                vs,
+                og,
+                lseg,
+                None,
+                None,
+                tq,
+                tq,
+                0.0,
+                True,
+                ctx.philox_seed,
+                ctx.philox_offset,
+                scale=scale,
+            )
+            if dq is not None:
+                dq[:, sl_h] = dq_s if dq_acc is None else (dq_acc + dq_s)
+            if dk is not None:
+                dk[:, gi, past_len:] = dk_s.sum(dim=1)
+            if dv is not None:
+                dv[:, gi, past_len:] = dv_s.sum(dim=1)
+            del dq_s, dk_s, dv_s, dq_acc
+
+        return dq, dk, dv, None, None, None
+
+
+def _dense_lower_right_causal_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    scaling: float,
+    dropout: float = 0.0,
+) -> tuple[torch.Tensor, None]:
+    """Exact unpadded lower-right causal attention for `Tq > 1, Tk > Tq` with zero full-matrix mask allocation."""
+    _b, h, tq, dh = query.shape
+    g, tk = key.shape[1], key.shape[2]
+    past_len = tk - tq
+    if (
+        query.is_cuda
+        and query.dtype in (torch.bfloat16, torch.float16)
+        and key.dtype == query.dtype
+        and value.dtype == query.dtype
+        and dropout == 0.0
+        and past_len > 0
+        and dh <= 256
+        and dh % 8 == 0
+        and h % g == 0
+        and hasattr(torch.ops.aten, "_scaled_dot_product_flash_attention")
+        and hasattr(torch.ops.aten, "_scaled_dot_product_flash_attention_backward")
+    ):
+        out = _RingLowerRightCausalFlashAttn.apply(query, key, value, past_len, float(scaling), 65536)
+        return out.transpose(1, 2).contiguous(), None
+
+    # Exact fallback (CPU / fp32 / fp64 / dropout > 0): query-chunked masked SDPA
+    k_rep = key.repeat_interleave(h // g, dim=1) if g != h else key
+    v_rep = value.repeat_interleave(h // g, dim=1) if g != h else value
+    kpos = torch.arange(tk, device=query.device)
+    q_step = 512
+    parts: list[torch.Tensor] = []
+    for q0 in range(0, tq, q_step):
+        q1 = min(tq, q0 + q_step)
+        qpos_c = torch.arange(past_len + q0, past_len + q1, device=query.device)
+        m_c = kpos[None, :] <= qpos_c[:, None]
+        parts.append(
+            F.scaled_dot_product_attention(
+                query[:, :, q0:q1],
+                k_rep,
+                v_rep,
+                attn_mask=m_c,
+                dropout_p=dropout,
+                scale=scaling,
+                is_causal=False,
+            )
+        )
+    out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=2)
+    return out.transpose(1, 2).contiguous(), None
+
+
 def lsa_attention(
     module: nn.Module,
     query: torch.Tensor,
@@ -1292,6 +1526,9 @@ def lsa_attention(
     key = _ensure_attn_kv_dtype(module, key, query.dtype, is_key=True)
     value = _ensure_attn_kv_dtype(module, value, query.dtype, is_key=False)
     if idx is None or idx.cfg.mode in ("off", "dense"):
+        if attention_mask is None and query.shape[2] > 1 and key.shape[2] > query.shape[2]:
+            sc = query.shape[-1] ** -0.5 if scaling is None else scaling
+            return _dense_lower_right_causal_attention(query, key, value, scaling=sc, dropout=dropout)
         return dense(module, query, key, value, attention_mask, scaling=scaling, dropout=dropout, **kwargs)
 
     cfg = idx.cfg
@@ -1318,9 +1555,16 @@ def lsa_attention(
     need_index = (
         (cfg.mode == "sparse" and tk > cfg.resolved_window())
         or (cfg.mode == "hybrid" and tk > cfg.resolved_window())
-        or want_kl
+        or (want_kl and (not cfg.detach_inputs or not _in_backward()))
     )
-    index = idx.build(key, cache_key=cache_key) if need_index else None
+    if need_index:
+        if cfg.detach_inputs:
+            with torch.no_grad():
+                index = idx.build(key, cache_key=cache_key)
+        else:
+            index = idx.build(key, cache_key=cache_key)
+    else:
+        index = None
 
     if cfg.mode == "sparse":
         sparse = tk > cfg.resolved_window()
@@ -1336,26 +1580,128 @@ def lsa_attention(
         )
 
     if want_kl and index is not None:
-        cand = torch.nonzero((qpos_all // cfg.block_size) > 0).flatten()
-        if cand.numel():
-            nq = max(1, int(cand.numel() * cfg.distill_query_frac))
-            pick = cand[torch.randperm(cand.numel(), device=cand.device)[:nq]].sort().values
-            qg_kl = qin.view(b, g, h // g, tq, dh)
-            kls = []
-            for s0 in range(0, pick.numel(), cfg.distill_chunk):
-                sel = pick[s0 : s0 + cfg.distill_chunk]
-                qz = idx.query_latent(qin[:, :, sel], pass_idx=cur_pass)
-                kl = _distill_kl(qg_kl[:, :, :, sel], qz, qpos_all[sel], key.detach(), index, idx, scaling)
-                if kl is not None:
-                    kls.append(kl)
-            if kls and not _in_backward():
-                loss = torch.stack(kls).mean()
-                idx.pending.append(cfg.distill_weight * loss)
-                idx.last_stats["distill_kl"] = float(loss.detach())
+        if cfg.detach_inputs:
+            # Exact zero-checkpoint-unpack, O(distill_chunk * S) memory KL distillation:
+            # isolates `lsa_kl` from any outer `VirtualLayer` `checkpoint(use_reentrant=False)` frame
+            # via identity `saved_tensors_hooks`, computes exact `(dKL/dwq, dKL/dwk)` chunk-by-chunk,
+            # and appends an exact first-order surrogate scalar to `idx.pending`.
+            if not _in_backward():
+                with torch.autograd.graph.saved_tensors_hooks(lambda x: x, lambda x: x):
+                    cand = torch.nonzero((qpos_all // cfg.block_size) > 0).flatten()
+                    if cand.numel():
+                        nq = max(1, int(cand.numel() * cfg.distill_query_frac))
+                        pick = cand[torch.randperm(cand.numel(), device=cand.device)[:nq]].sort().values
+                        qg_kl = qin.view(b, g, h // g, tq, dh)
+                        need_wq = bool(active_wq.requires_grad)
+                        need_wk = bool(idx.wk.requires_grad)
+                        cent_leaf = index.centroids.detach().requires_grad_(need_wk)
+                        kl_index = replace(index, centroids=cent_leaf)
+                        g_wq_sum: torch.Tensor | None = None
+                        g_cent_sum: torch.Tensor | None = None
+                        loss_sum = 0.0
+                        n_chunks_ok = 0
+                        for s0 in range(0, pick.numel(), cfg.distill_chunk):
+                            sel = pick[s0 : s0 + cfg.distill_chunk]
+                            qz = idx.query_latent(qin[:, :, sel], pass_idx=cur_pass)
+                            kl = _distill_kl(
+                                qg_kl[:, :, :, sel], qz, qpos_all[sel], key.detach(), kl_index, idx, scaling
+                            )
+                            if kl is None:
+                                del qz
+                                continue
+                            loss_sum += float(kl.detach())
+                            n_chunks_ok += 1
+                            grad_targets: list[torch.Tensor] = []
+                            if need_wq:
+                                grad_targets.append(active_wq)
+                            if need_wk:
+                                grad_targets.append(cent_leaf)
+                            if grad_targets and kl.requires_grad:
+                                grads = torch.autograd.grad(kl, grad_targets, allow_unused=True)
+                                gi_t = 0
+                                if need_wq:
+                                    gwq_c = grads[gi_t]
+                                    gi_t += 1
+                                    if gwq_c is not None:
+                                        g_wq_sum = gwq_c.detach() if g_wq_sum is None else (g_wq_sum + gwq_c.detach())
+                                if need_wk:
+                                    gct_c = grads[gi_t]
+                                    if gct_c is not None:
+                                        g_cent_sum = (
+                                            gct_c.detach() if g_cent_sum is None else (g_cent_sum + gct_c.detach())
+                                        )
+                            del qz, kl
+                        if n_chunks_ok > 0:
+                            inv_n = 1.0 / float(n_chunks_ok)
+                            loss_val = loss_sum * inv_n
+                            g_wq_avg = (g_wq_sum * inv_n) if g_wq_sum is not None else None
+                            g_wk_avg: torch.Tensor | None = None
+                            if (
+                                need_wk
+                                and g_cent_sum is not None
+                                and index.slot_labels is not None
+                                and index.slot_counts is not None
+                            ):
+                                g_cent_avg = g_cent_sum * inv_n
+                                bs = cfg.block_size
+                                pool = cfg.pool
+                                n_units = bs // pool
+                                spb = index.slots_per_block or (index.centroids.shape[2] // max(1, index.n_blocks))
+                                kin_det = key.detach()
+                                g_wk_acc = torch.zeros_like(idx.wk)
+                                for b0 in range(0, index.n_blocks, 64):
+                                    b1 = min(index.n_blocks, b0 + 64)
+                                    nb_c = b1 - b0
+                                    z_b = (
+                                        idx.key_latent(kin_det[:, :, b0 * bs : b1 * bs])
+                                        .view(b, g, nb_c, n_units, pool, -1)
+                                        .sum(4)
+                                    )
+                                    c_b = idx._centroids(
+                                        z_b,
+                                        index.slot_labels[:, :, b0:b1],
+                                        index.slot_counts[:, :, b0:b1],
+                                        spb,
+                                    ).reshape(b, g, nb_c * spb, -1)
+                                    go_b = g_cent_avg[:, :, b0 * spb : b1 * spb].to(c_b.dtype)
+                                    (gw_b,) = torch.autograd.grad(c_b, idx.wk, grad_outputs=go_b, allow_unused=True)
+                                    if gw_b is not None:
+                                        g_wk_acc = g_wk_acc + gw_b.detach()
+                                    del z_b, c_b, go_b, gw_b
+                                g_wk_avg = g_wk_acc
+                                del g_cent_avg
+                            surrogate = active_wq.new_tensor(loss_val)
+                            if need_wq and g_wq_avg is not None:
+                                term_q = (active_wq * g_wq_avg.to(active_wq.dtype)).sum()
+                                surrogate = surrogate + (term_q - term_q.detach())
+                            if need_wk and g_wk_avg is not None:
+                                term_k = (idx.wk * g_wk_avg.to(idx.wk.dtype)).sum()
+                                surrogate = surrogate + (term_k - term_k.detach())
+                            idx.pending.append(cfg.distill_weight * surrogate)
+                            idx.last_stats["distill_kl"] = loss_val
+        else:
+            cand = torch.nonzero((qpos_all // cfg.block_size) > 0).flatten()
+            if cand.numel():
+                nq = max(1, int(cand.numel() * cfg.distill_query_frac))
+                pick = cand[torch.randperm(cand.numel(), device=cand.device)[:nq]].sort().values
+                qg_kl = qin.view(b, g, h // g, tq, dh)
+                kls = []
+                for s0 in range(0, pick.numel(), cfg.distill_chunk):
+                    sel = pick[s0 : s0 + cfg.distill_chunk]
+                    qz = idx.query_latent(qin[:, :, sel], pass_idx=cur_pass)
+                    kl = _distill_kl(qg_kl[:, :, :, sel], qz, qpos_all[sel], key.detach(), index, idx, scaling)
+                    if kl is not None:
+                        kls.append(kl)
+                if kls and not _in_backward():
+                    loss = torch.stack(kls).mean()
+                    idx.pending.append(cfg.distill_weight * loss)
+                    idx.last_stats["distill_kl"] = float(loss.detach())
 
     if not sparse:
         if not _in_backward():
             idx.last_stats["forward_sparse"] = 0.0
+        if attention_mask is None and tq > 1 and tk > tq:
+            return _dense_lower_right_causal_attention(query, key, value, scaling=scaling, dropout=dropout)
         return dense(module, query, key, value, attention_mask, scaling=scaling, dropout=dropout, **kwargs)
 
     if not _in_backward() and not _is_sync_restricted():
@@ -1395,17 +1741,90 @@ _DENSE_FN: list[Callable[..., Any] | None] = [None]
 
 def apply_yarn(config: Any, target_len: int, original_len: int | None = None) -> dict[str, Any]:
     """Set YaRN RoPE scaling on a (text) config for `target_len` tokens. Call BEFORE model init."""
-    orig = original_len or getattr(config, "max_position_embeddings", None) or 262144
-    factor = max(1.0, float(target_len) / float(orig))
-    rope = {"rope_type": "yarn", "factor": factor, "original_max_position_embeddings": int(orig)}
     params = getattr(config, "rope_parameters", None)
-    if isinstance(params, dict):
-        params = dict(params)
-        params.update(rope)
-        config.rope_parameters = params
-    config.rope_scaling = dict(rope)
-    config.max_position_embeddings = int(max(target_len, orig))
-    log.info("YaRN: %d -> %d tokens (factor %.2f)", orig, target_len, factor)
+    has_v5_params = isinstance(params, dict) or (
+        hasattr(config, "rope_parameters")
+        and params is None
+        and isinstance(getattr(type(config), "rope_scaling", None), property)
+    )
+
+    # Resolve original context length; remain idempotent if YaRN was already applied on `config`.
+    existing_orig: int | None = None
+    if original_len is None:
+        if isinstance(params, dict):
+            probe_dicts = (
+                [v for v in params.values() if isinstance(v, dict)]
+                if (params and all(isinstance(v, dict) for v in params.values()))
+                else [params]
+            )
+        elif not has_v5_params:
+            rs = getattr(config, "rope_scaling", None)
+            probe_dicts = [rs] if isinstance(rs, dict) else []
+        else:
+            probe_dicts = []
+        for d in probe_dicts:
+            raw_orig = d.get("original_max_position_embeddings")
+            if (
+                str(d.get("rope_type", d.get("type", ""))) == "yarn"
+                and isinstance(raw_orig, (int, float))
+                and int(raw_orig) > 0
+            ):
+                existing_orig = int(raw_orig)
+                break
+
+    orig = int(original_len or existing_orig or getattr(config, "max_position_embeddings", None) or 262144)
+    factor = max(1.0, float(target_len) / float(orig))
+    rope: dict[str, Any] = {
+        "rope_type": "yarn",
+        "factor": factor,
+        "original_max_position_embeddings": orig,
+    }
+
+    if has_v5_params:
+        # Transformers >= 5.x: update `rope_parameters` cleanly while preserving `rope_theta`,
+        # `mrope_section`, `mrope_interleaved`, `partial_rotary_factor`, etc. NEVER assign the
+        # deprecated `rope_scaling` setter, which overwrites `rope_parameters` and wipes
+        # `rope_theta` to `None` in `transformers >= 5.x`.
+        base_params = dict(params) if isinstance(params, dict) else {}
+        is_nested = bool(base_params) and all(isinstance(v, dict) for v in base_params.values())
+
+        def _merge_v5_entry(entry: dict[str, Any]) -> dict[str, Any]:
+            merged = dict(entry)
+            merged.pop("type", None)
+            merged.update(rope)
+            if merged.get("rope_theta") is None:
+                cfg_theta = getattr(config, "rope_theta", None)
+                if cfg_theta is not None:
+                    merged["rope_theta"] = float(cfg_theta)
+            if merged.get("partial_rotary_factor") is None:
+                cfg_prf = getattr(config, "partial_rotary_factor", None)
+                if cfg_prf is not None:
+                    merged["partial_rotary_factor"] = float(cfg_prf)
+            return merged
+
+        if is_nested:
+            target_keys = [
+                k for k in base_params if "sliding" not in str(k).lower() and "linear" not in str(k).lower()
+            ]
+            if not target_keys:
+                target_keys = list(base_params.keys())
+            target_set = set(target_keys)
+            config.rope_parameters = {
+                k: (_merge_v5_entry(sub) if k in target_set else dict(sub))
+                for k, sub in base_params.items()
+            }
+        else:
+            config.rope_parameters = _merge_v5_entry(base_params)
+    else:
+        # Legacy Transformers 4.x or ToyConfig without v5 `rope_parameters`:
+        # merge into any existing `rope_scaling` dict rather than clobbering sibling fields.
+        existing_rs = getattr(config, "rope_scaling", None)
+        merged_rs = dict(existing_rs) if isinstance(existing_rs, dict) else {}
+        merged_rs.update(rope)
+        config.rope_scaling = merged_rs
+
+    config.max_position_embeddings = int(max(int(target_len), orig))
+    log.info("YaRN: %d -> %d tokens (factor %.2f)", orig, int(target_len), factor)
     return rope
 
 
@@ -1652,8 +2071,14 @@ def install_lsa(model: nn.Module, cfg: LSAConfig | dict[str, Any]) -> LSAManager
     tc = parts.text_config
     if cfg.rotary_dim is None:
         hd = getattr(tc, "head_dim", None) or tc.hidden_size // tc.num_attention_heads
-        rope = getattr(tc, "rope_parameters", None) or {}
-        prf = getattr(tc, "partial_rotary_factor", None) or rope.get("partial_rotary_factor", 1.0)
+        raw_rope = getattr(tc, "rope_parameters", None) or {}
+        rope = (
+            raw_rope.get("full_attention")
+            if isinstance(raw_rope, dict) and isinstance(raw_rope.get("full_attention"), dict)
+            else raw_rope
+        )
+        rope_d = rope if isinstance(rope, dict) else {}
+        prf = getattr(tc, "partial_rotary_factor", None) or rope_d.get("partial_rotary_factor", 1.0)
         cfg.rotary_dim = int(hd * prf)
     full = parts.full_attention_indices()
     layers = full if cfg.layers is None else list(cfg.layers)

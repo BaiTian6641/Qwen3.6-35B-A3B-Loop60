@@ -26,7 +26,6 @@ import time
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 from ..debug import cuda_mem_brief, require, stage
 from ..utils.tf32 import configure_tf32
@@ -419,15 +418,6 @@ class LMTrainer:
     ) -> dict[str, float]:
         st = self.stack
 
-        def _seg_loss_fn(_s_idx: int, seg_logits: torch.Tensor, seg_targets: torch.Tensor | None) -> torch.Tensor:
-            require(seg_targets is not None, "BPTT segment targets must not be None")
-            assert seg_targets is not None
-            lg = seg_logits[:, : seg_targets.shape[1]]
-            ce = F.cross_entropy(lg.reshape(-1, lg.shape[-1]).float(), seg_targets.reshape(-1), ignore_index=-100)
-            if st.hssd is not None:
-                ce = ce + float(aux_w.get("hssd_budget", 1.0)) * st.hssd.aux_loss().to(ce.dtype)
-            return ce
-
         scale_hooks: list[Any] = []
         if accum > 1:
             inv_acc = 1.0 / float(accum)
@@ -440,8 +430,11 @@ class LMTrainer:
                 res = bptt_runner.run_step(
                     batch["input_ids"],
                     labels=batch["labels"],
-                    loss_fn=_seg_loss_fn,
+                    loss_fn=None,
                     backward=True,
+                    hssd_aux_weight=float(aux_w.get("hssd_budget", 1.0)) if st.hssd is not None else 0.0,
+                    lsa_aux_weight=float(aux_w.get("lsa_kl", 1.0)),
+                    loop_aux_weight=float(aux_w.get("loop_aux", 1.0)),
                 )
         finally:
             for h in scale_hooks:
@@ -623,7 +616,7 @@ class LMTrainer:
                     self.metrics.log(self.step, ev)
                     if tok_log == 0:
                         t_log = time.time()
-                if self.step % ckpt_every == 0:
+                if ckpt_every and self.step % ckpt_every == 0:
                     self.save(metrics=last)
                     if tok_log == 0:
                         t_log = time.time()

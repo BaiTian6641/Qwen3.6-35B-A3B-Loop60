@@ -424,6 +424,8 @@ class GRPOTrainer:
         if epochs > 1:
             with torch.no_grad():
                 old = [self._logprobs(self._batch(c)[0]).detach() for c in chunks]
+        # Drop any stale no-grad aux terms left behind by `rollout()` or `old` logprob evaluation
+        self.stack.aux_losses()
         stats = {"loss/pg": 0.0, "loss/kl": 0.0, "loss/teacher_nll": 0.0, "clip_frac": 0.0}
         clip_n = tok_n = 0.0
         for _ep in range(epochs):
@@ -433,6 +435,7 @@ class GRPOTrainer:
                 ids, mask, adv = self._batch(chunk)
                 m = mask[:, 1:]
                 lp = self._logprobs(ids)
+                aux_now = self.stack.aux_losses()
                 if chunk[0].kind == "teacher":
                     loss = -(lp * m).sum() / n_te_tok * sft_w
                     stats["loss/teacher_nll"] += float(loss.detach())
@@ -447,11 +450,12 @@ class GRPOTrainer:
                     stats["loss/pg"] += float(loss.detach())
                     if kl_coef > 0 and self.ref is not None:
                         rlp = self._ref_logprobs(ids)
+                        self.stack.aux_losses()
                         d = rlp - lp
                         kl = ((torch.exp(d) - d - 1) * m).sum() / n_pg_tok
                         loss = loss + kl_coef * kl
                         stats["loss/kl"] += float(kl.detach())
-                for a_name, a_loss in self.stack.aux_losses().items():
+                for a_name, a_loss in aux_now.items():
                     loss = loss + float(aux_w.get(a_name, 1.0)) * a_loss
                     stats[f"loss/{a_name}"] = stats.get(f"loss/{a_name}", 0.0) + float(a_loss.detach())
                 loss.backward()
@@ -464,6 +468,7 @@ class GRPOTrainer:
                 h = self.stack.hidden(ids)
                 ent = token_entropy(h[:, :-1], self.stack.lm_head_weight, temperature=self.temperature)
                 stats["entropy"] = float((ent * mask[:, 1:]).sum() / mask[:, 1:].sum().clamp_min(1))
+                self.stack.aux_losses()
             self._adapt_temperature(stats["entropy"])
         stats["temperature"] = self.temperature
         return stats

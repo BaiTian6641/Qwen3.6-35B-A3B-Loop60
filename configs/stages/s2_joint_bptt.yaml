@@ -133,5 +133,5 @@ data:
   decontaminate: {enabled: true, ngram: 13, groups: [aime_2026, gpqa, hle, arc_agi_2, kernelbench], on_missing: warn}
 
 eval_quick:
-  n_batches: 8
+  n_batches: 2                          # 2 x 131,072 = 262,144 tokens/depth (matches s3_long_1m_lsa's 4 x 65,536 budget)
   depths: [1, 2, 3]

@@ -1082,6 +1082,8 @@ def _sparse_chunk(
     idx: LSAIndexer,
     scaling: float,
     cur_pass: int = 1,
+    q_bounds: tuple[int, int] | None = None,
+    record_stats: bool = True,
 ) -> torch.Tensor:
     """`q [B,G,Hg,C,D]`, `qz [B,G_or_Hq,C,d]`, `qpos [C]` -> `out [B,G,Hg,C,D]`."""
     cfg = idx.cfg
@@ -1091,7 +1093,12 @@ def _sparse_chunk(
     tk = k.shape[2]
     sync_free = _is_sync_restricted()
 
-    lo, hi = max(0, int(qpos[0]) - w + 1) if not sync_free else 0, int(qpos[-1]) + 1 if not sync_free else tk
+    if q_bounds is not None:
+        q0_pos, q1_pos = q_bounds
+        lo, hi = max(0, q0_pos - w + 1), q1_pos + 1
+    else:
+        lo = max(0, int(qpos[0]) - w + 1) if not sync_free else 0
+        hi = int(qpos[-1]) + 1 if not sync_free else tk
     kw, vw = k[:, :, lo:hi], v[:, :, lo:hi]
     kpos = torch.arange(lo, hi, device=dev)
     win_lo = qpos - w + 1
@@ -1108,7 +1115,10 @@ def _sparse_chunk(
     kb = vb = None
     per_head = cfg.per_head_select or (qz.shape[1] == g * hg and hg > 1)
     n_sel = 0
-    if index is not None:
+    n_hist_bound = max(0, (q_bounds[1] - w + 1) - ns) if q_bounds is not None else tk
+    need_buckets = index is not None and (n_hist_bound > 0 or record_stats)
+    if need_buckets:
+        assert index is not None
         with torch.no_grad():
             scores = idx.slot_scores(qz.detach(), index, qpos)
             s_slots = scores.shape[-1]
@@ -1116,26 +1126,31 @@ def _sparse_chunk(
             top = scores.topk(kk, dim=-1)
             finite_top = torch.isfinite(top.values)
             sel_slots = torch.where(finite_top, top.indices, torch.full_like(top.indices, -1))
-            if not _in_backward():
+            if record_stats and not _in_backward():
                 idx.last_selected_buckets[cur_pass] = sel_slots
-            mk = index.members.shape[-1]
-            kb_n = kk * mk
-            eff_cap = _effective_member_cap(cfg, s_slots, kk, kb_n, tk)
+            packed = None
+            if n_hist_bound > 0:
+                mk = index.members.shape[-1]
+                kb_n = kk * mk
+                eff_cap = min(_effective_member_cap(cfg, s_slots, kk, kb_n, tk), n_hist_bound)
 
-            if per_head:
-                top_idx_g = top.indices.view(b, g, hg, c, kk)
-                fin_g = finite_top.view(b, g, hg, c, kk)
-                flat_sel = top_idx_g.reshape(b, g, hg * c * kk, 1).expand(b, g, hg * c * kk, mk)
-                mem = index.members.gather(2, flat_sel).view(b, g, hg, c, kk, mk)
-                mem = torch.where(fin_g.unsqueeze(-1), mem, torch.full_like(mem, -1)).flatten(-2)
-                m_b = (mem >= ns) & (mem < win_lo[None, None, None, :, None])
-            else:
-                flat_sel = top.indices.reshape(b, g, c * kk, 1).expand(b, g, c * kk, mk)
-                mem = index.members.gather(2, flat_sel).view(b, g, c, kk, mk)
-                mem = torch.where(finite_top.unsqueeze(-1), mem, torch.full_like(mem, -1)).flatten(-2)
-                m_b = (mem >= ns) & (mem < win_lo[None, None, :, None])
+                if per_head:
+                    top_idx_g = top.indices.view(b, g, hg, c, kk)
+                    fin_g = finite_top.view(b, g, hg, c, kk)
+                    flat_sel = top_idx_g.reshape(b, g, hg * c * kk, 1).expand(b, g, hg * c * kk, mk)
+                    mem = index.members.gather(2, flat_sel).view(b, g, hg, c, kk, mk)
+                    mem = torch.where(fin_g.unsqueeze(-1), mem, torch.full_like(mem, -1)).flatten(-2)
+                    m_b = (mem >= ns) & (mem < win_lo[None, None, None, :, None])
+                else:
+                    flat_sel = top.indices.reshape(b, g, c * kk, 1).expand(b, g, c * kk, mk)
+                    mem = index.members.gather(2, flat_sel).view(b, g, c, kk, mk)
+                    mem = torch.where(finite_top.unsqueeze(-1), mem, torch.full_like(mem, -1)).flatten(-2)
+                    m_b = (mem >= ns) & (mem < win_lo[None, None, :, None])
 
-            packed = _pack_valid_members(mem, m_b, tk=tk, eff_cap=eff_cap, sync_free=sync_free)
+                # Skip GPU->CPU host syncs (`valid_per_q.max()` / `m_final.sum()`) on intermediate chunks
+                # when `record_stats=False` — padded entries stay masked (`-inf`), keeping attention exact!
+                pack_sync_free = sync_free or (not record_stats)
+                packed = _pack_valid_members(mem, m_b, tk=tk, eff_cap=eff_cap, sync_free=pack_sync_free)
 
         if packed is not None:
             mem_final, m_final, n_sel = packed
@@ -1172,7 +1187,7 @@ def _sparse_chunk(
         else:
             out = out + torch.einsum("bghck,bgckd->bghcd", parts[pi], vb)
 
-    if not sync_free and not _in_backward():
+    if record_stats and not sync_free and not _in_backward():
         denom_q = b * (g * hg if per_head else g) * max(1, c)
         per_q_bucket = n_sel / max(1, denom_q)
         kpq = float(m_win.sum() + m_sink.sum()) / max(1, c) + per_q_bucket
@@ -1711,8 +1726,12 @@ def lsa_attention(
     with torch.no_grad():
         qz_all = idx.query_latent(qin.detach(), pass_idx=cur_pass)
     outs = []
+    q_base_pos = tk - tq
     for c0 in range(0, tq, cfg.query_chunk):
-        sl = slice(c0, min(tq, c0 + cfg.query_chunk))
+        c1 = min(tq, c0 + cfg.query_chunk)
+        sl = slice(c0, c1)
+        qb = (q_base_pos + c0, q_base_pos + c1 - 1)
+        is_last = c1 >= tq
 
         def run(
             qc: torch.Tensor,
@@ -1721,8 +1740,22 @@ def lsa_attention(
             qzc: torch.Tensor,
             sl: slice = sl,
             p: int = cur_pass,
+            q_bounds: tuple[int, int] = qb,
+            rec_stats: bool = is_last,
         ) -> torch.Tensor:
-            return _sparse_chunk(qc, qzc, qpos_all[sl], kc, vc, index, idx, scaling, cur_pass=p)
+            return _sparse_chunk(
+                qc,
+                qzc,
+                qpos_all[sl],
+                kc,
+                vc,
+                index,
+                idx,
+                scaling,
+                cur_pass=p,
+                q_bounds=q_bounds,
+                record_stats=rec_stats,
+            )
 
         args = (qg[:, :, :, sl], key, value, qz_all[:, :, sl])
         if cfg.checkpoint_chunks and torch.is_grad_enabled() and (query.requires_grad or key.requires_grad):

@@ -4588,15 +4588,15 @@ if _HAS_TRITON:
         D_HALF: tl.constexpr,
         HAS_WM: tl.constexpr,
     ):
-        c_id = tl.program_id(0)
-        bh = tl.program_id(1)
+        c_id = tl.program_id(0).to(tl.int64)
+        bh = tl.program_id(1).to(tl.int64)
         b = bh // H
         h = bh % H
 
         t0 = c_id * CHUNK_C
-        offs_t = t0 + tl.arange(0, CHUNK_C)
+        offs_t = t0 + tl.arange(0, CHUNK_C).to(tl.int64)
         mask_t = offs_t < T_len
-        offs_d = tl.arange(0, D_HALF)
+        offs_d = tl.arange(0, D_HALF).to(tl.int64)
 
         th = tl.load(
             Theta_ptr + b * stride_tb + offs_t[:, None] * stride_tt + h * stride_th + offs_d[None, :] * stride_td,
@@ -4626,10 +4626,10 @@ if _HAS_TRITON:
         H,
         D_HALF: tl.constexpr,
     ):
-        bh = tl.program_id(0)
+        bh = tl.program_id(0).to(tl.int64)
         b = bh // H
         h = bh % H
-        offs_d = tl.arange(0, D_HALF)
+        offs_d = tl.arange(0, D_HALF).to(tl.int64)
         two_pi = tl.full([D_HALF], 6.283185307179586476925286766559, dtype=tl.float64)
 
         acc = tl.load(InitTheta_ptr + b * stride_ib + h * stride_ih + offs_d * stride_id).to(tl.float64)
@@ -4670,15 +4670,15 @@ if _HAS_TRITON:
         HAS_WM: tl.constexpr,
         SAVE_MOD: tl.constexpr,
     ):
-        c_id = tl.program_id(0)
-        bh = tl.program_id(1)
+        c_id = tl.program_id(0).to(tl.int64)
+        bh = tl.program_id(1).to(tl.int64)
         b = bh // H
         h = bh % H
 
         t0 = c_id * CHUNK_C
-        offs_t = t0 + tl.arange(0, CHUNK_C)
+        offs_t = t0 + tl.arange(0, CHUNK_C).to(tl.int64)
         mask_t = offs_t < T_len
-        offs_d = tl.arange(0, D_HALF)
+        offs_d = tl.arange(0, D_HALF).to(tl.int64)
         two_pi = tl.full([1, D_HALF], 6.283185307179586476925286766559, dtype=tl.float64)
 
         th = tl.load(
@@ -4731,15 +4731,15 @@ if _HAS_TRITON:
         D_HALF: tl.constexpr,
         HAS_DTERM: tl.constexpr,
     ):
-        c_id = tl.program_id(0)
-        bh = tl.program_id(1)
+        c_id = tl.program_id(0).to(tl.int64)
+        bh = tl.program_id(1).to(tl.int64)
         b = bh // H
         h = bh % H
 
         t0 = c_id * CHUNK_C
-        offs_t = t0 + tl.arange(0, CHUNK_C)
+        offs_t = t0 + tl.arange(0, CHUNK_C).to(tl.int64)
         mask_t = offs_t < T_len
-        offs_d = tl.arange(0, D_HALF)
+        offs_d = tl.arange(0, D_HALF).to(tl.int64)
 
         o_ptrs = b * stride_ob + offs_t[:, None] * stride_ot + h * stride_oh + offs_d[None, :] * stride_od
         dcos = tl.load(DCos_ptr + o_ptrs, mask=mask_t[:, None], other=0.0).to(tl.float32)
@@ -4773,10 +4773,10 @@ if _HAS_TRITON:
         H,
         D_HALF: tl.constexpr,
     ):
-        bh = tl.program_id(0)
+        bh = tl.program_id(0).to(tl.int64)
         b = bh // H
         h = bh % H
-        offs_d = tl.arange(0, D_HALF)
+        offs_d = tl.arange(0, D_HALF).to(tl.int64)
         acc = tl.zeros([D_HALF], dtype=tl.float32)
         for c_rev in range(N_chunks):
             c = N_chunks - 1 - c_rev
@@ -4813,15 +4813,15 @@ if _HAS_TRITON:
         HAS_WM: tl.constexpr,
         NEED_DWM: tl.constexpr,
     ):
-        c_id = tl.program_id(0)
-        bh = tl.program_id(1)
+        c_id = tl.program_id(0).to(tl.int64)
+        bh = tl.program_id(1).to(tl.int64)
         b = bh // H
         h = bh % H
 
         t0 = c_id * CHUNK_C
-        offs_t = t0 + tl.arange(0, CHUNK_C)
+        offs_t = t0 + tl.arange(0, CHUNK_C).to(tl.int64)
         mask_t = offs_t < T_len
-        offs_d = tl.arange(0, D_HALF)
+        offs_d = tl.arange(0, D_HALF).to(tl.int64)
 
         o_ptrs = b * stride_ob + offs_t[:, None] * stride_ot + h * stride_oh + offs_d[None, :] * stride_od
         dloc = tl.load(DLocal_ptr + o_ptrs, mask=mask_t[:, None], other=0.0)
@@ -5068,12 +5068,12 @@ if _HAS_TRITON:
         USE_PHASE: tl.constexpr,
         USE_L2: tl.constexpr,
     ):
-        bt = tl.program_id(0)
-        h = tl.program_id(1)
+        bt = tl.program_id(0).to(tl.int64)
+        h = tl.program_id(1).to(tl.int64)
         b = bt // T_len
         t = bt % T_len
 
-        offs_p = tl.arange(0, D_HALF)
+        offs_p = tl.arange(0, D_HALF).to(tl.int64)
         d0 = 2 * offs_p
         d1 = d0 + 1
 
@@ -5190,12 +5190,12 @@ if _HAS_TRITON:
         USE_PHASE: tl.constexpr,
         USE_L2: tl.constexpr,
     ):
-        bt = tl.program_id(0)
-        h = tl.program_id(1)
+        bt = tl.program_id(0).to(tl.int64)
+        h = tl.program_id(1).to(tl.int64)
         b = bt // T_len
         t = bt % T_len
 
-        offs_p = tl.arange(0, D_HALF)
+        offs_p = tl.arange(0, D_HALF).to(tl.int64)
         d0 = 2 * offs_p
         d1 = d0 + 1
 
@@ -5500,8 +5500,8 @@ if _HAS_TRITON:
         SCALAR_GATE: tl.constexpr,
         D_V: tl.constexpr,
     ):
-        bt = tl.program_id(0)
-        h = tl.program_id(1)
+        bt = tl.program_id(0).to(tl.int64)
+        h = tl.program_id(1).to(tl.int64)
         b = bt // T_len
         t = bt % T_len
 
@@ -5570,8 +5570,8 @@ if _HAS_TRITON:
         SCALAR_GATE: tl.constexpr,
         D_V: tl.constexpr,
     ):
-        bt = tl.program_id(0)
-        h = tl.program_id(1)
+        bt = tl.program_id(0).to(tl.int64)
+        h = tl.program_id(1).to(tl.int64)
         b = bt // T_len
         t = bt % T_len
 
@@ -5771,15 +5771,15 @@ if _HAS_TRITON:
         USE_L2: tl.constexpr,
         PAIRED_B: tl.constexpr,
     ):
-        bt = tl.program_id(0)
-        h = tl.program_id(1)
+        bt = tl.program_id(0).to(tl.int64)
+        h = tl.program_id(1).to(tl.int64)
         b = bt // T_len
         t = bt % T_len
         hq = h // gqa_q
         hk = h // gqa_k
 
-        offs_dk = tl.arange(0, D_K)
-        offs_dv = tl.arange(0, D_V)
+        offs_dk = tl.arange(0, D_K).to(tl.int64)
+        offs_dv = tl.arange(0, D_V).to(tl.int64)
 
         qf = tl.load(Q_ptr + b * stride_qb + t * stride_qt + hq * stride_qh + offs_dk * stride_qd).to(tl.float32)
         kf = tl.load(K_ptr + b * stride_kb + t * stride_kt + hk * stride_kh + offs_dk * stride_kd).to(tl.float32)
@@ -5900,15 +5900,15 @@ if _HAS_TRITON:
         USE_L2: tl.constexpr,
         PAIRED_B: tl.constexpr,
     ):
-        bt = tl.program_id(0)
-        h = tl.program_id(1)
+        bt = tl.program_id(0).to(tl.int64)
+        h = tl.program_id(1).to(tl.int64)
         b = bt // T_len
         t = bt % T_len
         hq = h // gqa_q
         hk = h // gqa_k
 
-        offs_dk = tl.arange(0, D_K)
-        offs_dv = tl.arange(0, D_V)
+        offs_dk = tl.arange(0, D_K).to(tl.int64)
+        offs_dv = tl.arange(0, D_V).to(tl.int64)
 
         qf_raw = tl.load(Q_ptr + b * stride_qb + t * stride_qt + hq * stride_qh + offs_dk * stride_qd).to(tl.float32)
         kf_raw = tl.load(K_ptr + b * stride_kb + t * stride_kt + hk * stride_kh + offs_dk * stride_kd).to(tl.float32)
@@ -6047,7 +6047,6 @@ if _HAS_TRITON:
             out_dt = q_raw.dtype
 
             cat_w = torch.cat([w_er.float(), w_wr.float(), w_sq.float(), w_sk.float(), w_sv.float()], dim=0)
-            all_up = F.linear(h_f, cat_w).contiguous()
 
             qc = q_raw.contiguous()
             kc = k_raw.contiguous()
@@ -6064,41 +6063,61 @@ if _HAS_TRITON:
             k_swa = torch.empty((B, T, hv, D_k), device=qc.device, dtype=out_dt)
             v_swa = torch.empty((B, T, hv, D_v), device=qc.device, dtype=out_dt)
 
-            _proj_gates_swa_fwd_kernel[(B * T, hv)](
-                qc,
-                kc,
-                vc,
-                bc,
-                all_up,
-                qnw_c,
-                knw_c,
-                q_out,
-                k_out,
-                b_gate,
-                w_gate,
-                q_swa,
-                k_swa,
-                v_swa,
-                *qc.stride(),
-                *kc.stride(),
-                *vc.stride(),
-                *bc.stride(),
-                *all_up.stride(),
-                *q_out.stride(),
-                *w_gate.stride(),
-                T,
-                hv,
-                hv // H_q,
-                hv // H_k,
-                float(cap_g),
-                float(math.sqrt(D_k)),
-                D_K=D_k,
-                D_V=D_v,
-                USE_L2=use_l2,
-                PAIRED_B=paired_b,
-                num_warps=4,
-                num_stages=1,
-            )
+            # Chunk `all_up` along T (`B * t_chunk <= 8192` -> <= 671 MiB instead of 10.74 GiB at T=131K)
+            # so peak VRAM stays bounded and `t * stride_aut` never approaches int32 overflow.
+            t_chunk = max(1, min(T, 8192 // max(1, B)))
+            for t0 in range(0, T, t_chunk):
+                t1 = min(T, t0 + t_chunk)
+                tc_len = t1 - t0
+                all_up_c = F.linear(h_f[:, t0:t1], cat_w).contiguous()
+                qc_s = qc[:, t0:t1]
+                kc_s = kc[:, t0:t1]
+                vc_s = vc[:, t0:t1]
+                bc_s = bc[:, t0:t1]
+                qo_s = q_out[:, t0:t1]
+                ko_s = k_out[:, t0:t1]
+                bg_s = b_gate[:, t0:t1]
+                wg_s = w_gate[:, t0:t1]
+                qs_s = q_swa[:, t0:t1]
+                ks_s = k_swa[:, t0:t1]
+                vs_s = v_swa[:, t0:t1]
+
+                _proj_gates_swa_fwd_kernel[(B * tc_len, hv)](
+                    qc_s,
+                    kc_s,
+                    vc_s,
+                    bc_s,
+                    all_up_c,
+                    qnw_c,
+                    knw_c,
+                    qo_s,
+                    ko_s,
+                    bg_s,
+                    wg_s,
+                    qs_s,
+                    ks_s,
+                    vs_s,
+                    *qc_s.stride(),
+                    *kc_s.stride(),
+                    *vc_s.stride(),
+                    *bc_s.stride(),
+                    *all_up_c.stride(),
+                    *qo_s.stride(),
+                    *wg_s.stride(),
+                    tc_len,
+                    hv,
+                    hv // H_q,
+                    hv // H_k,
+                    float(cap_g),
+                    float(math.sqrt(D_k)),
+                    D_K=D_k,
+                    D_V=D_v,
+                    USE_L2=use_l2,
+                    PAIRED_B=paired_b,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                del all_up_c
             if any(ctx.needs_input_grad):
                 ctx.save_for_backward(qc, kc, h_f, bc, w_er, w_wr, w_sq, w_sk, w_sv, qnw_c, knw_c)
                 ctx.meta = (hv, cap_g, use_l2, paired_b, v_raw.dtype, q_norm_w.dtype, k_norm_w.dtype)
@@ -6114,7 +6133,6 @@ if _HAS_TRITON:
             out_dt = qc.dtype
 
             cat_w = torch.cat([w_er.float(), w_wr.float(), w_sq.float(), w_sk.float(), w_sv.float()], dim=0)
-            all_up = F.linear(h_f, cat_w).contiguous()
 
             def _z_k() -> torch.Tensor:
                 return torch.zeros((B, T, hv, D_k), device=qc.device, dtype=out_dt)
@@ -6142,50 +6160,91 @@ if _HAS_TRITON:
             dk_full = torch.empty((B, T, hv, D_k), device=qc.device, dtype=torch.float32)
             dv_sub = torch.empty((B, T, hv, D_v), device=qc.device, dtype=torch.float32)
             dbeta = torch.empty_like(bc)
-            d_all_up = torch.empty_like(all_up)
-            dqn_part = torch.empty((B * T * hv, D_k), device=qc.device, dtype=torch.float32)
-            dkn_part = torch.empty((B * T * hv, D_k), device=qc.device, dtype=torch.float32)
+            need_dh = bool(ctx.needs_input_grad[3])
+            need_w = any(ctx.needs_input_grad[5:10])
+            need_qnw = bool(ctx.needs_input_grad[10])
+            need_knw = bool(ctx.needs_input_grad[11])
+            dh = torch.empty_like(h_f) if need_dh else None
+            dcat_w = torch.zeros_like(cat_w) if need_w else None
+            dqnw_acc = torch.zeros((D_k,), device=qc.device, dtype=torch.float32) if need_qnw else None
+            dknw_acc = torch.zeros((D_k,), device=qc.device, dtype=torch.float32) if need_knw else None
 
-            _proj_gates_swa_bwd_kernel[(B * T, hv)](
-                qc,
-                kc,
-                bc,
-                all_up,
-                qnw_c,
-                knw_c,
-                dqo_c,
-                dko_c,
-                dbg_c,
-                dwg_c,
-                dqs_c,
-                dks_c,
-                dvs_c,
-                dq_full,
-                dk_full,
-                dv_sub,
-                dbeta,
-                d_all_up,
-                dqn_part,
-                dkn_part,
-                *qc.stride(),
-                *kc.stride(),
-                *bc.stride(),
-                *all_up.stride(),
-                *dqo_c.stride(),
-                *dwg_c.stride(),
-                T,
-                hv,
-                hv // H_q,
-                hv // H_k,
-                float(cap_g),
-                float(math.sqrt(D_k)),
-                D_K=D_k,
-                D_V=D_v,
-                USE_L2=use_l2,
-                PAIRED_B=paired_b,
-                num_warps=4,
-                num_stages=1,
-            )
+            t_chunk = max(1, min(T, 8192 // max(1, B)))
+            for t0 in range(0, T, t_chunk):
+                t1 = min(T, t0 + t_chunk)
+                tc_len = t1 - t0
+                hf_s = h_f[:, t0:t1]
+                all_up_c = F.linear(hf_s, cat_w).contiguous()
+                d_all_up_c = torch.empty_like(all_up_c)
+                dqn_part_c = torch.empty((B * tc_len * hv, D_k), device=qc.device, dtype=torch.float32)
+                dkn_part_c = torch.empty((B * tc_len * hv, D_k), device=qc.device, dtype=torch.float32)
+                qc_s = qc[:, t0:t1]
+                kc_s = kc[:, t0:t1]
+                bc_s = bc[:, t0:t1]
+                dqo_s = dqo_c[:, t0:t1]
+                dko_s = dko_c[:, t0:t1]
+                dbg_s = dbg_c[:, t0:t1]
+                dwg_s = dwg_c[:, t0:t1]
+                dqs_s = dqs_c[:, t0:t1]
+                dks_s = dks_c[:, t0:t1]
+                dvs_s = dvs_c[:, t0:t1]
+                dqf_s = dq_full[:, t0:t1]
+                dkf_s = dk_full[:, t0:t1]
+                dvsb_s = dv_sub[:, t0:t1]
+                db_s = dbeta[:, t0:t1]
+
+                _proj_gates_swa_bwd_kernel[(B * tc_len, hv)](
+                    qc_s,
+                    kc_s,
+                    bc_s,
+                    all_up_c,
+                    qnw_c,
+                    knw_c,
+                    dqo_s,
+                    dko_s,
+                    dbg_s,
+                    dwg_s,
+                    dqs_s,
+                    dks_s,
+                    dvs_s,
+                    dqf_s,
+                    dkf_s,
+                    dvsb_s,
+                    db_s,
+                    d_all_up_c,
+                    dqn_part_c,
+                    dkn_part_c,
+                    *qc_s.stride(),
+                    *kc_s.stride(),
+                    *bc_s.stride(),
+                    *all_up_c.stride(),
+                    *dqo_s.stride(),
+                    *dwg_s.stride(),
+                    tc_len,
+                    hv,
+                    hv // H_q,
+                    hv // H_k,
+                    float(cap_g),
+                    float(math.sqrt(D_k)),
+                    D_K=D_k,
+                    D_V=D_v,
+                    USE_L2=use_l2,
+                    PAIRED_B=paired_b,
+                    num_warps=4,
+                    num_stages=1,
+                )
+
+                dau_2d = d_all_up_c.view(B * tc_len, -1)
+                if dh is not None:
+                    dh[:, t0:t1] = (dau_2d @ cat_w).view(B, tc_len, -1)
+                if dcat_w is not None:
+                    hf_2d = hf_s.reshape(B * tc_len, -1)
+                    dcat_w.add_(dau_2d.t() @ hf_2d)
+                if dqnw_acc is not None:
+                    dqnw_acc.add_(dqn_part_c.sum(dim=0))
+                if dknw_acc is not None:
+                    dknw_acc.add_(dkn_part_c.sum(dim=0))
+                del all_up_c, d_all_up_c, dqn_part_c, dkn_part_c
 
             gqa_q = hv // H_q
             gqa_k = hv // H_k
@@ -6193,13 +6252,14 @@ if _HAS_TRITON:
             dk_raw = dk_full.view(B, T, H_k, gqa_k, D_k).sum(dim=3).to(out_dt) if gqa_k > 1 else dk_full.to(out_dt)
             dv_raw = dv_sub.to(v_dt)
 
-            dau_2d = d_all_up.view(B * T, -1)
-            hf_2d = h_f.reshape(B * T, -1)
-            dh = (dau_2d @ cat_w).view_as(h_f) if ctx.needs_input_grad[3] else None
-            dcat_w = dau_2d.t() @ hf_2d
-            dw_er, dw_wr, dw_sq, dw_sk, dw_sv = dcat_w.split([hv * D_k, hv * D_v, hv * D_k, hv * D_k, hv * D_v], dim=0)
-            dqnw = dqn_part.sum(dim=0).to(qnw_dt) if ctx.needs_input_grad[10] else None
-            dknw = dkn_part.sum(dim=0).to(knw_dt) if ctx.needs_input_grad[11] else None
+            if dcat_w is not None:
+                dw_er, dw_wr, dw_sq, dw_sk, dw_sv = dcat_w.split(
+                    [hv * D_k, hv * D_v, hv * D_k, hv * D_k, hv * D_v], dim=0
+                )
+            else:
+                dw_er = dw_wr = dw_sq = dw_sk = dw_sv = None
+            dqnw = dqnw_acc.to(qnw_dt) if dqnw_acc is not None else None
+            dknw = dknw_acc.to(knw_dt) if dknw_acc is not None else None
 
             return (
                 dq_raw if ctx.needs_input_grad[0] else None,
@@ -6207,11 +6267,11 @@ if _HAS_TRITON:
                 dv_raw if ctx.needs_input_grad[2] else None,
                 dh,
                 dbeta if ctx.needs_input_grad[4] else None,
-                dw_er.to(w_er.dtype) if ctx.needs_input_grad[5] else None,
-                dw_wr.to(w_wr.dtype) if ctx.needs_input_grad[6] else None,
-                dw_sq.to(w_sq.dtype) if ctx.needs_input_grad[7] else None,
-                dw_sk.to(w_sk.dtype) if ctx.needs_input_grad[8] else None,
-                dw_sv.to(w_sv.dtype) if ctx.needs_input_grad[9] else None,
+                dw_er.to(w_er.dtype) if (dw_er is not None and ctx.needs_input_grad[5]) else None,
+                dw_wr.to(w_wr.dtype) if (dw_wr is not None and ctx.needs_input_grad[6]) else None,
+                dw_sq.to(w_sq.dtype) if (dw_sq is not None and ctx.needs_input_grad[7]) else None,
+                dw_sk.to(w_sk.dtype) if (dw_sk is not None and ctx.needs_input_grad[8]) else None,
+                dw_sv.to(w_sv.dtype) if (dw_sv is not None and ctx.needs_input_grad[9]) else None,
                 dqnw,
                 dknw,
                 None,
@@ -6265,18 +6325,19 @@ if _HAS_TRITON:
         HAS_VALID: tl.constexpr,
     ):
         chunk_n = tl.program_id(0)
-        bh = tl.program_id(1)
+        bh = tl.program_id(1).to(tl.int64)
         b = bh // H
         h = bh % H
 
         q_start = chunk_n * CHUNK_C
         offs_m = q_start + tl.arange(0, CHUNK_C)
-        offs_dk = tl.arange(0, D_K)
-        offs_dv = tl.arange(0, D_V)
+        om64 = offs_m.to(tl.int64)
+        offs_dk = tl.arange(0, D_K).to(tl.int64)
+        offs_dv = tl.arange(0, D_V).to(tl.int64)
         mask_m = offs_m < T_q
 
         q = tl.load(
-            Q_ptr + b * stride_qb + offs_m[:, None] * stride_qt + h * stride_qh + offs_dk[None, :] * stride_qd,
+            Q_ptr + b * stride_qb + om64[:, None] * stride_qt + h * stride_qh + offs_dk[None, :] * stride_qd,
             mask=mask_m[:, None],
             other=0.0,
         )
@@ -6292,15 +6353,16 @@ if _HAS_TRITON:
         for c_k in range(k_far, chunk_n + 1):
             k_start = c_k * CHUNK_C
             offs_n = k_start + tl.arange(0, CHUNK_C)
+            on64 = offs_n.to(tl.int64)
             mask_n = offs_n < T_q
             if HAS_VALID:
-                val_n = tl.load(Valid_ptr + b * stride_val_b + offs_n * stride_val_t, mask=mask_n, other=False).to(
+                val_n = tl.load(Valid_ptr + b * stride_val_b + on64 * stride_val_t, mask=mask_n, other=False).to(
                     tl.int1
                 )
                 mask_n = mask_n & val_n
 
             k_blk = tl.load(
-                K_ptr + b * stride_kb + offs_n[None, :] * stride_kt + h * stride_kh + offs_dk[:, None] * stride_kd,
+                K_ptr + b * stride_kb + on64[None, :] * stride_kt + h * stride_kh + offs_dk[:, None] * stride_kd,
                 mask=mask_n[None, :],
                 other=0.0,
             )
@@ -6326,7 +6388,7 @@ if _HAS_TRITON:
             l_i = l_i * alpha + tl.sum(p, axis=1)
 
             v_blk = tl.load(
-                V_ptr + b * stride_vb + offs_n[:, None] * stride_vt + h * stride_vh + offs_dv[None, :] * stride_vd,
+                V_ptr + b * stride_vb + on64[:, None] * stride_vt + h * stride_vh + offs_dv[None, :] * stride_vd,
                 mask=mask_n[:, None],
                 other=0.0,
             )
@@ -6340,11 +6402,11 @@ if _HAS_TRITON:
         lse = tl.where(has_v, safe_m + tl.log(safe_l), 0.0)
 
         tl.store(
-            Out_ptr + b * stride_ob + offs_m[:, None] * stride_ot + h * stride_oh + offs_dv[None, :] * stride_od,
+            Out_ptr + b * stride_ob + om64[:, None] * stride_ot + h * stride_oh + offs_dv[None, :] * stride_od,
             out.to(Out_ptr.dtype.element_ty),
             mask=mask_m[:, None],
         )
-        l_base = b * stride_lb + offs_m * stride_lt + h * stride_lh
+        l_base = b * stride_lb + om64 * stride_lt + h * stride_lh
         tl.store(LSE_ptr + l_base, lse, mask=mask_m)
         tl.store(Max_ptr + l_base, safe_m, mask=mask_m)
         tl.store(Argmax_ptr + l_base, tl.where(has_v, argmax_i, -1), mask=mask_m)
@@ -6399,27 +6461,28 @@ if _HAS_TRITON:
         HAS_VALID: tl.constexpr,
     ):
         chunk_n = tl.program_id(0)
-        bh = tl.program_id(1)
+        bh = tl.program_id(1).to(tl.int64)
         b = bh // H
         h = bh % H
 
         q_start = chunk_n * CHUNK_C
         offs_m = q_start + tl.arange(0, CHUNK_C)
-        offs_dk = tl.arange(0, D_K)
-        offs_dv = tl.arange(0, D_V)
+        om64 = offs_m.to(tl.int64)
+        offs_dk = tl.arange(0, D_K).to(tl.int64)
+        offs_dv = tl.arange(0, D_V).to(tl.int64)
         mask_m = offs_m < T_q
 
-        l_base = b * stride_lb + offs_m * stride_lt + h * stride_lh
+        l_base = b * stride_lb + om64 * stride_lt + h * stride_lh
         cnt_i = tl.load(Counts_ptr + l_base, mask=mask_m, other=0)
         active_m = mask_m & (cnt_i > 0)
 
         q = tl.load(
-            Q_ptr + b * stride_qb + offs_m[:, None] * stride_qt + h * stride_qh + offs_dk[None, :] * stride_qd,
+            Q_ptr + b * stride_qb + om64[:, None] * stride_qt + h * stride_qh + offs_dk[None, :] * stride_qd,
             mask=active_m[:, None],
             other=0.0,
         )
         do = tl.load(
-            DO_ptr + b * stride_ob + offs_m[:, None] * stride_ot + h * stride_oh + offs_dv[None, :] * stride_od,
+            DO_ptr + b * stride_ob + om64[:, None] * stride_ot + h * stride_oh + offs_dv[None, :] * stride_od,
             mask=active_m[:, None],
             other=0.0,
         )
@@ -6437,20 +6500,21 @@ if _HAS_TRITON:
         for c_k in range(k_far, chunk_n + 1):
             k_start = c_k * CHUNK_C
             offs_n = k_start + tl.arange(0, CHUNK_C)
+            on64 = offs_n.to(tl.int64)
             mask_n = offs_n < T_q
             if HAS_VALID:
-                val_n = tl.load(Valid_ptr + b * stride_val_b + offs_n * stride_val_t, mask=mask_n, other=False).to(
+                val_n = tl.load(Valid_ptr + b * stride_val_b + on64 * stride_val_t, mask=mask_n, other=False).to(
                     tl.int1
                 )
                 mask_n = mask_n & val_n
 
             k_blk = tl.load(
-                K_ptr + b * stride_kb + offs_n[:, None] * stride_kt + h * stride_kh + offs_dk[None, :] * stride_kd,
+                K_ptr + b * stride_kb + on64[:, None] * stride_kt + h * stride_kh + offs_dk[None, :] * stride_kd,
                 mask=mask_n[:, None],
                 other=0.0,
             )
             v_blk = tl.load(
-                V_ptr + b * stride_vb + offs_n[:, None] * stride_vt + h * stride_vh + offs_dv[None, :] * stride_vd,
+                V_ptr + b * stride_vb + on64[:, None] * stride_vt + h * stride_vh + offs_dv[None, :] * stride_vd,
                 mask=mask_n[:, None],
                 other=0.0,
             )
@@ -6471,12 +6535,12 @@ if _HAS_TRITON:
 
         dq_acc = dq_acc * scale
         tl.store(
-            DQ_ptr + b * stride_qb + offs_m[:, None] * stride_qt + h * stride_qh + offs_dk[None, :] * stride_qd,
+            DQ_ptr + b * stride_qb + om64[:, None] * stride_qt + h * stride_qh + offs_dk[None, :] * stride_qd,
             dq_acc.to(DQ_ptr.dtype.element_ty),
             mask=mask_m[:, None],
         )
         if HAS_SLOPE:
-            tl.store(DSlope_part_ptr + chunk_n * tl.num_programs(1) + bh, dslope_acc)
+            tl.store(DSlope_part_ptr + chunk_n.to(tl.int64) * tl.num_programs(1) + bh, dslope_acc)
 
     @triton.jit
     def _disjoint_swa_bwd_dkv_kernel(
@@ -6528,29 +6592,30 @@ if _HAS_TRITON:
         HAS_VALID: tl.constexpr,
     ):
         chunk_k = tl.program_id(0)
-        bh = tl.program_id(1)
+        bh = tl.program_id(1).to(tl.int64)
         b = bh // H
         h = bh % H
 
         k_start = chunk_k * CHUNK_C
         offs_n = k_start + tl.arange(0, CHUNK_C)
-        offs_dk = tl.arange(0, D_K)
-        offs_dv = tl.arange(0, D_V)
+        on64 = offs_n.to(tl.int64)
+        offs_dk = tl.arange(0, D_K).to(tl.int64)
+        offs_dv = tl.arange(0, D_V).to(tl.int64)
         mask_n_raw = offs_n < T_q
         mask_n = mask_n_raw
         if HAS_VALID:
-            val_n = tl.load(Valid_ptr + b * stride_val_b + offs_n * stride_val_t, mask=mask_n_raw, other=False).to(
+            val_n = tl.load(Valid_ptr + b * stride_val_b + on64 * stride_val_t, mask=mask_n_raw, other=False).to(
                 tl.int1
             )
             mask_n = mask_n_raw & val_n
 
         k_blk = tl.load(
-            K_ptr + b * stride_kb + offs_n[:, None] * stride_kt + h * stride_kh + offs_dk[None, :] * stride_kd,
+            K_ptr + b * stride_kb + on64[:, None] * stride_kt + h * stride_kh + offs_dk[None, :] * stride_kd,
             mask=mask_n[:, None],
             other=0.0,
         )
         v_blk = tl.load(
-            V_ptr + b * stride_vb + offs_n[:, None] * stride_vt + h * stride_vh + offs_dv[None, :] * stride_vd,
+            V_ptr + b * stride_vb + on64[:, None] * stride_vt + h * stride_vh + offs_dv[None, :] * stride_vd,
             mask=mask_n[:, None],
             other=0.0,
         )
@@ -6563,18 +6628,19 @@ if _HAS_TRITON:
         for c_q in range(chunk_k, q_end):
             q_start = c_q * CHUNK_C
             offs_m = q_start + tl.arange(0, CHUNK_C)
+            om64 = offs_m.to(tl.int64)
             mask_m = offs_m < T_q
-            l_base = b * stride_lb + offs_m * stride_lt + h * stride_lh
+            l_base = b * stride_lb + om64 * stride_lt + h * stride_lh
             cnt_i = tl.load(Counts_ptr + l_base, mask=mask_m, other=0)
             active_m = mask_m & (cnt_i > 0)
 
             q = tl.load(
-                Q_ptr + b * stride_qb + offs_m[:, None] * stride_qt + h * stride_qh + offs_dk[None, :] * stride_qd,
+                Q_ptr + b * stride_qb + om64[:, None] * stride_qt + h * stride_qh + offs_dk[None, :] * stride_qd,
                 mask=active_m[:, None],
                 other=0.0,
             )
             do = tl.load(
-                DO_ptr + b * stride_ob + offs_m[:, None] * stride_ot + h * stride_oh + offs_dv[None, :] * stride_od,
+                DO_ptr + b * stride_ob + om64[:, None] * stride_ot + h * stride_oh + offs_dv[None, :] * stride_od,
                 mask=active_m[:, None],
                 other=0.0,
             )
@@ -6599,12 +6665,12 @@ if _HAS_TRITON:
 
         dk_acc = dk_acc * scale
         tl.store(
-            DK_ptr + b * stride_kb + offs_n[:, None] * stride_kt + h * stride_kh + offs_dk[None, :] * stride_kd,
+            DK_ptr + b * stride_kb + on64[:, None] * stride_kt + h * stride_kh + offs_dk[None, :] * stride_kd,
             dk_acc.to(DK_ptr.dtype.element_ty),
             mask=mask_n_raw[:, None],
         )
         tl.store(
-            DV_ptr + b * stride_vb + offs_n[:, None] * stride_vt + h * stride_vh + offs_dv[None, :] * stride_vd,
+            DV_ptr + b * stride_vb + on64[:, None] * stride_vt + h * stride_vh + offs_dv[None, :] * stride_vd,
             dv_acc.to(DV_ptr.dtype.element_ty),
             mask=mask_n_raw[:, None],
         )
@@ -6804,15 +6870,15 @@ if _HAS_TRITON:
         D_V: tl.constexpr,
         USE_BF16: tl.constexpr,
     ):
-        t_blk = tl.program_id(0)
-        bh = tl.program_id(1)
+        t_blk = tl.program_id(0).to(tl.int64)
+        bh = tl.program_id(1).to(tl.int64)
         b = bh // H
         h = bh % H
 
-        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T)
+        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
         mask_t = offs_t < T_len
-        offs_dk = tl.arange(0, D_K)
-        offs_64 = tl.arange(0, 64)
+        offs_dk = tl.arange(0, D_K).to(tl.int64)
+        offs_64 = tl.arange(0, 64).to(tl.int64)
 
         vec = tl.load(
             Vec_ptr + b * stride_vb + offs_t[:, None] * stride_vt + h * stride_vh + offs_dk[None, :] * stride_vd,
@@ -6923,15 +6989,15 @@ if _HAS_TRITON:
         B_V: tl.constexpr,
         USE_BF16: tl.constexpr,
     ):
-        bmh = tl.program_id(0)
-        v_blk = tl.program_id(1)
+        bmh = tl.program_id(0).to(tl.int64)
+        v_blk = tl.program_id(1).to(tl.int64)
         h = bmh % H
         bm = bmh // H
         m = bm % M
         b = bm // M
 
-        offs_64 = tl.arange(0, 64)
-        offs_bv = v_blk * B_V + tl.arange(0, B_V)
+        offs_64 = tl.arange(0, 64).to(tl.int64)
+        offs_bv = v_blk * B_V + tl.arange(0, B_V).to(tl.int64)
 
         # Fast early-exit for single-chunk T_len <= 64 if page m is untouched!
         if T_len <= 64:
@@ -7058,10 +7124,10 @@ if _HAS_TRITON:
         stride_a_r,
         stride_a_c,
     ):
-        bmh = tl.program_id(0)
+        bmh = tl.program_id(0).to(tl.int64)
         if tl.load(Act_ptr + bmh) == 0:
             return
-        offs_16 = tl.arange(0, 16)
+        offs_16 = tl.arange(0, 16).to(tl.int64)
         l_base = L_work_ptr + bmh * stride_l_bmh
         a_base = A_inv_ptr + bmh * stride_a_bmh
 
@@ -7136,7 +7202,7 @@ if _HAS_TRITON:
         D_K: tl.constexpr,
         USE_BF16_DOT: tl.constexpr,
     ):
-        slot = tl.program_id(0)
+        slot = tl.program_id(0).to(tl.int64)
         if tl.load(Act_ptr + slot) == 0:
             return
         blk_id = tl.program_id(1)
@@ -7150,8 +7216,8 @@ if _HAS_TRITON:
         bm = bmh // H
         m = bm % M
         b = bm // M
-        offs_16 = tl.arange(0, 16)
-        offs_dk = tl.arange(0, D_K)
+        offs_16 = tl.arange(0, 16).to(tl.int64)
+        offs_dk = tl.arange(0, D_K).to(tl.int64)
 
         gp_base = G_page_ptr + loc * stride_gp_c + b * stride_gp_b + m * stride_gp_m + h * stride_gp_h
         kb_base = K_base_ptr + b * stride_kb_b + h * stride_kb_h
@@ -7271,17 +7337,17 @@ if _HAS_TRITON:
         B_V: tl.constexpr,
         USE_BF16: tl.constexpr,
     ):
-        t_blk = tl.program_id(0)
-        bh = tl.program_id(1)
-        v_blk = tl.program_id(2)
+        t_blk = tl.program_id(0).to(tl.int64)
+        bh = tl.program_id(1).to(tl.int64)
+        v_blk = tl.program_id(2).to(tl.int64)
         b = bh // H
         h = bh % H
 
-        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T)
+        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
         mask_t = offs_t < T_span
         c_loc = (t_blk * BLOCK_T) // chunk_size
-        offs_dk = tl.arange(0, D_K)
-        offs_bv = v_blk * B_V + tl.arange(0, B_V)
+        offs_dk = tl.arange(0, D_K).to(tl.int64)
+        offs_bv = v_blk * B_V + tl.arange(0, B_V).to(tl.int64)
 
         vec = tl.load(
             Vec_ptr + b * stride_vb + offs_t[:, None] * stride_vt + h * stride_vh + offs_dk[None, :] * stride_vd,
@@ -7355,16 +7421,16 @@ if _HAS_TRITON:
         D_V: tl.constexpr,
         USE_BF16: tl.constexpr,
     ):
-        t_blk = tl.program_id(0)
-        bh = tl.program_id(1)
+        t_blk = tl.program_id(0).to(tl.int64)
+        bh = tl.program_id(1).to(tl.int64)
         b = bh // H
         h = bh % H
 
-        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T)
+        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
         mask_t = offs_t < T_span
         c_loc = (t_blk * BLOCK_T) // chunk_size
-        offs_dk = tl.arange(0, D_K)
-        offs_64 = tl.arange(0, 64)
+        offs_dk = tl.arange(0, D_K).to(tl.int64)
+        offs_64 = tl.arange(0, 64).to(tl.int64)
 
         vec = tl.load(
             Vec_ptr + b * stride_vb + offs_t[:, None] * stride_vt + h * stride_vh + offs_dk[None, :] * stride_vd,
@@ -7471,18 +7537,18 @@ if _HAS_TRITON:
         B_V: tl.constexpr,
         USE_BF16: tl.constexpr,
     ):
-        t_blk = tl.program_id(0)
-        bh = tl.program_id(1)
-        v_blk = tl.program_id(2)
+        t_blk = tl.program_id(0).to(tl.int64)
+        bh = tl.program_id(1).to(tl.int64)
+        v_blk = tl.program_id(2).to(tl.int64)
         b = bh // H
         h = bh % H
 
-        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T)
+        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
         mask_t = offs_t < c_len
         t_in = vec_t0 + offs_t
         t_out = out_t0 + offs_t
-        offs_dk = tl.arange(0, D_K)
-        offs_bv = v_blk * B_V + tl.arange(0, B_V)
+        offs_dk = tl.arange(0, D_K).to(tl.int64)
+        offs_bv = v_blk * B_V + tl.arange(0, B_V).to(tl.int64)
 
         vec = tl.load(
             Vec_ptr + b * stride_vb + t_in[:, None] * stride_vt + h * stride_vh + offs_dk[None, :] * stride_vd,
@@ -7580,10 +7646,10 @@ if _HAS_TRITON:
         HAS_WM: tl.constexpr,
         USE_SURPRISE: tl.constexpr,
     ):
-        bh = tl.program_id(0)
+        bh = tl.program_id(0).to(tl.int64)
         b = bh // H
         h = bh % H
-        offs_64 = tl.arange(0, 64)
+        offs_64 = tl.arange(0, 64).to(tl.int64)
         mask_t = offs_64 < c_len
         t_glob = t0 + offs_64
         t_pv = pv_t0 + offs_64
@@ -7688,7 +7754,7 @@ if _HAS_TRITON:
         D_K: tl.constexpr,
         USE_BF16_DOT: tl.constexpr,
     ):
-        bmh = tl.program_id(0)
+        bmh = tl.program_id(0).to(tl.int64)
         if tl.load(Act_ptr + bmh) == 0:
             return
         blk_id = tl.program_id(1)
@@ -7696,8 +7762,8 @@ if _HAS_TRITON:
         bm = bmh // H
         m = bm % M
         b = bm // M
-        offs_16 = tl.arange(0, 16)
-        offs_dk = tl.arange(0, D_K)
+        offs_16 = tl.arange(0, 16).to(tl.int64)
+        offs_dk = tl.arange(0, D_K).to(tl.int64)
 
         if blk_id < 4:
             br = blk_id
@@ -7862,12 +7928,12 @@ if _HAS_TRITON:
         INPLACE_S: tl.constexpr,
         USE_BF16_DOT: tl.constexpr,
     ):
-        bmh = tl.program_id(0)
-        v_blk = tl.program_id(1)
+        bmh = tl.program_id(0).to(tl.int64)
+        v_blk = tl.program_id(1).to(tl.int64)
         slot = slot0 + bmh
         act = tl.load(Act_ptr + slot)
-        offs_64 = tl.arange(0, 64)
-        offs_bv = v_blk * B_V + tl.arange(0, B_V)
+        offs_64 = tl.arange(0, 64).to(tl.int64)
+        offs_bv = v_blk * B_V + tl.arange(0, B_V).to(tl.int64)
         s_in_base = S_in_ptr + s_in_idx * stride_s_c + bmh * stride_s_bmh
         s_out_base = S_out_ptr + s_out_idx * stride_s_c + bmh * stride_s_bmh
         if act == 0:
@@ -7993,8 +8059,8 @@ if _HAS_TRITON:
         K_SEL: tl.constexpr,
         D_K: tl.constexpr,
     ):
-        bmh = tl.program_id(0)
-        loc = tl.program_id(1)
+        bmh = tl.program_id(0).to(tl.int64)
+        loc = tl.program_id(1).to(tl.int64)
         n = c_start + loc
         t0 = n * chunk_size
         c_len = tl.minimum(chunk_size, T_total - t0)
@@ -8005,7 +8071,7 @@ if _HAS_TRITON:
         b = bm // M
         slot = loc * tl.num_programs(0) + bmh
 
-        offs_64 = tl.arange(0, 64)
+        offs_64 = tl.arange(0, 64).to(tl.int64)
         mask_64 = offs_64 < c_len
         t_glob = t0 + offs_64
 
@@ -8088,15 +8154,15 @@ if _HAS_TRITON:
         B_V: tl.constexpr,
         USE_BF16: tl.constexpr,
     ):
-        bmh = tl.program_id(0)
-        v_blk = tl.program_id(1)
+        bmh = tl.program_id(0).to(tl.int64)
+        v_blk = tl.program_id(1).to(tl.int64)
         h = bmh % H
         bm = bmh // H
         m = bm % M
         b = bm // M
 
-        offs_64 = tl.arange(0, 64)
-        offs_bv = v_blk * B_V + tl.arange(0, B_V)
+        offs_64 = tl.arange(0, 64).to(tl.int64)
+        offs_bv = v_blk * B_V + tl.arange(0, B_V).to(tl.int64)
         t_mask = offs_64 < c_len
         t_in = vec_t0 + offs_64
         t_do = dout_t0 + offs_64
@@ -8203,12 +8269,12 @@ if _HAS_TRITON:
         B_V: tl.constexpr,
         USE_BF16_DOT: tl.constexpr,
     ):
-        bmh = tl.program_id(0)
-        v_blk = tl.program_id(1)
+        bmh = tl.program_id(0).to(tl.int64)
+        v_blk = tl.program_id(1).to(tl.int64)
         slot = slot0 + bmh
         act = tl.load(Act_ptr + slot)
-        offs_64 = tl.arange(0, 64)
-        offs_bv = v_blk * B_V + tl.arange(0, B_V)
+        offs_64 = tl.arange(0, 64).to(tl.int64)
+        offs_bv = v_blk * B_V + tl.arange(0, B_V).to(tl.int64)
 
         if act == 0:
             tl.store(
@@ -8415,11 +8481,11 @@ if _HAS_TRITON:
         N_VB: tl.constexpr,
         B_K: tl.constexpr,
     ):
-        bmh = tl.program_id(0)
-        k_blk = tl.program_id(1)
+        bmh = tl.program_id(0).to(tl.int64)
+        k_blk = tl.program_id(1).to(tl.int64)
         slot = slot0 + bmh
-        offs_64 = tl.arange(0, 64)
-        offs_bk = k_blk * B_K + tl.arange(0, B_K)
+        offs_64 = tl.arange(0, 64).to(tl.int64)
+        offs_bk = k_blk * B_K + tl.arange(0, B_K).to(tl.int64)
         if tl.load(Act_ptr + slot) == 0:
             tl.store(
                 DK_m_ptr + slot * stride_dkm_cbmh + offs_64[:, None] * stride_dkm_t + offs_bk[None, :] * stride_dkm_d,
@@ -8436,7 +8502,7 @@ if _HAS_TRITON:
         bm = bmh // H
         m = bm % M
         b = bm // M
-        offs_16 = tl.arange(0, 16)
+        offs_16 = tl.arange(0, 16).to(tl.int64)
         offs_half = offs_bk // 2
         mask_64 = offs_64 < c_len
         last_idx = c_len - 1
@@ -8707,8 +8773,8 @@ if _HAS_TRITON:
         NEED_DWM: tl.constexpr,
         USE_SURPRISE: tl.constexpr,
     ):
-        bt = tl.program_id(0)
-        h = tl.program_id(1)
+        bt = tl.program_id(0).to(tl.int64)
+        h = tl.program_id(1).to(tl.int64)
         b = bt // c_len
         t = bt % c_len
         bh = b * H + h
@@ -8821,12 +8887,12 @@ if _HAS_TRITON:
         D_K: tl.constexpr,
         D_V: tl.constexpr,
     ):
-        t_blk = tl.program_id(0)
-        bh = tl.program_id(1)
+        t_blk = tl.program_id(0).to(tl.int64)
+        bh = tl.program_id(1).to(tl.int64)
         b = bh // H
         h = bh % H
 
-        offs_16 = tl.arange(0, 16)
+        offs_16 = tl.arange(0, 16).to(tl.int64)
         l_offs = t_blk * 16 + offs_16
         mask_t = l_offs < seg_len
         loc = (t_blk * 16) // chunk_size
@@ -8929,9 +8995,9 @@ if _HAS_TRITON:
         K_SEL: tl.constexpr,
         BLOCK_T: tl.constexpr,
     ):
-        t_blk = tl.program_id(0)
-        b = tl.program_id(1)
-        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T)
+        t_blk = tl.program_id(0).to(tl.int64)
+        b = tl.program_id(1).to(tl.int64)
+        offs_t = t_blk * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
         mask_t = offs_t < T_span
         for r in tl.static_range(0, K_SEL):
             acc = tl.zeros([BLOCK_T], dtype=tl.float32)
@@ -10196,8 +10262,8 @@ if _HAS_TRITON:
 
     @triton.jit
     def _invert_unit_lower_64_contig_kernel(L_ptr, AInv_ptr):
-        pid = tl.program_id(0)
-        offs_16 = tl.arange(0, 16)
+        pid = tl.program_id(0).to(tl.int64)
+        offs_16 = tl.arange(0, 16).to(tl.int64)
         l_base = L_ptr + pid * 4096
 
         L00 = tl.load(l_base + (0 + offs_16[:, None]) * 64 + (0 + offs_16[None, :])).to(tl.float32)

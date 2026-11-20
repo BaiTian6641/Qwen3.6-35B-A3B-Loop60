@@ -589,6 +589,24 @@ class _PriorSegRecord:
     sin: torch.Tensor  # [B, T_seg, rot_dim] detached
 
 
+def _gather_prior_field(tensors: list[torch.Tensor], idx: torch.Tensor) -> torch.Tensor:
+    """Gather `[B, M, D]` along dim=1 from per-segment `[B, T_i, D]` tensors without concatenating them."""
+    ref = tensors[0]
+    idx_d = idx.to(ref.device)
+    if len(tensors) == 1:
+        return ref.gather(1, idx_d.unsqueeze(-1).expand(-1, -1, ref.shape[-1]))
+    out = ref.new_empty((ref.shape[0], idx_d.shape[1], ref.shape[-1]))
+    offset = 0
+    for t in tensors:
+        t_len = int(t.shape[1])
+        local = (idx_d - offset).clamp(0, t_len - 1)
+        gathered = t.gather(1, local.unsqueeze(-1).expand(-1, -1, t.shape[-1]))
+        mask = (idx_d >= offset) & (idx_d < offset + t_len)
+        out = torch.where(mask.unsqueeze(-1), gathered, out)
+        offset += t_len
+    return out
+
+
 class SegmentedKVBPTTRunner:
     """Runs `n_segments x seg_len` Truncated BPTT with Differentiable Sparse K/V Gradient Replay."""
 
@@ -767,6 +785,7 @@ class SegmentedKVBPTTRunner:
         cur_seg_records: dict[int, _PriorSegRecord] = {}
         seg_replay_aux: list[torch.Tensor] = []
         recorded_indices: dict[tuple[int, int], torch.Tensor] = {}
+        replay_meta: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, int, int]] = {}
         replayed_counts: list[int] = []
         seg_losses: list[float] = []
         active_seg_state = {"seg_idx": 0}
@@ -794,6 +813,7 @@ class SegmentedKVBPTTRunner:
                 s_idx = active_seg_state["seg_idx"]
                 cache_slot = int(getattr(attn_mod, "layer_idx", phys_idx))
                 proxy = proxy_holder[0]
+                in_bwd = _in_backward()
 
                 if (
                     s_idx > 0
@@ -814,44 +834,52 @@ class SegmentedKVBPTTRunner:
                         if loop_ctl is not None:
                             loop_ctl._cur = None
                         try:
-                            with torch.no_grad():
-                                q_det, _nh, num_kv_heads, head_dim = self._extract_query_heads(
-                                    attn_mod, x_cur.detach()
-                                )
-                            top_idx = self._select_replay_indices(
-                                attn_mod, q_det, k_prior, rot_dim=rot_dim, k_sel=k_sel
-                            )
-                            if not _in_backward():
-                                recorded_indices[(s_idx, phys_idx)] = top_idx.detach().cpu()
-
                             dev, dt = x_cur.device, x_cur.dtype
-                            u_all = torch.cat([r.u for r in prior_records[phys_idx]], dim=1)
-                            cos_all = torch.cat([r.cos for r in prior_records[phys_idx]], dim=1)
-                            sin_all = torch.cat([r.sin for r in prior_records[phys_idx]], dim=1)
+                            cached_meta = replay_meta.get((s_idx, phys_idx)) if in_bwd else None
+                            if cached_meta is not None:
+                                top_idx_cpu, uniq_pad_cpu, num_kv_heads, head_dim = cached_meta
+                                top_idx = top_idx_cpu.to(device=dev)
+                                uniq_pad = uniq_pad_cpu.to(device=dev)
+                                max_u = int(uniq_pad.shape[1])
+                                q_det: torch.Tensor | None = None
+                            else:
+                                with torch.no_grad():
+                                    q_det, _nh, num_kv_heads, head_dim = self._extract_query_heads(
+                                        attn_mod, x_cur.detach()
+                                    )
+                                top_idx = self._select_replay_indices(
+                                    attn_mod, q_det, k_prior, rot_dim=rot_dim, k_sel=k_sel
+                                )
+                                # Build per-batch union of selected indices across KV heads for single k/v_proj call
+                                union_rows: list[torch.Tensor] = []
+                                max_u = 0
+                                for b_i in range(bsz):
+                                    u_b = torch.unique(top_idx[b_i].reshape(-1), sorted=True)
+                                    union_rows.append(u_b)
+                                    max_u = max(max_u, int(u_b.numel()))
+                                uniq_pad = top_idx.new_zeros((bsz, max_u))
+                                for b_i, u_b in enumerate(union_rows):
+                                    uniq_pad[b_i, : u_b.numel()] = u_b
+                                    if u_b.numel() < max_u:
+                                        uniq_pad[b_i, u_b.numel() :] = u_b[-1]
+                                if not in_bwd:
+                                    top_cpu = top_idx.detach().cpu()
+                                    recorded_indices[(s_idx, phys_idx)] = top_cpu
+                                    replay_meta[(s_idx, phys_idx)] = (
+                                        top_cpu,
+                                        uniq_pad.detach().cpu(),
+                                        num_kv_heads,
+                                        head_dim,
+                                    )
 
-                            # Build per-batch union of selected indices across KV heads for single k/v_proj call
-                            union_rows: list[torch.Tensor] = []
-                            max_u = 0
-                            for b_i in range(bsz):
-                                u_b = torch.unique(top_idx[b_i].reshape(-1), sorted=True)
-                                union_rows.append(u_b)
-                                max_u = max(max_u, int(u_b.numel()))
-                            uniq_pad = top_idx.new_zeros((bsz, max_u))
-                            for b_i, u_b in enumerate(union_rows):
-                                uniq_pad[b_i, : u_b.numel()] = u_b
-                                if u_b.numel() < max_u:
-                                    uniq_pad[b_i, u_b.numel() :] = u_b[-1]
-
-                            idx_cpu_or_dev = uniq_pad.to(u_all.device)
-                            u_sel = u_all.gather(
-                                1, idx_cpu_or_dev.unsqueeze(-1).expand(-1, -1, u_all.shape[-1])
-                            ).to(device=dev, dtype=dt)
-                            cos_sel = cos_all.gather(
-                                1, idx_cpu_or_dev.unsqueeze(-1).expand(-1, -1, rot_dim)
-                            ).to(device=dev, dtype=cos_cur.dtype)
-                            sin_sel = sin_all.gather(
-                                1, idx_cpu_or_dev.unsqueeze(-1).expand(-1, -1, rot_dim)
-                            ).to(device=dev, dtype=sin_cur.dtype)
+                            recs = prior_records[phys_idx]
+                            u_sel = _gather_prior_field([r.u for r in recs], uniq_pad).to(device=dev, dtype=dt)
+                            cos_sel = _gather_prior_field([r.cos for r in recs], uniq_pad).to(
+                                device=dev, dtype=cos_cur.dtype
+                            )
+                            sin_sel = _gather_prior_field([r.sin for r in recs], uniq_pad).to(
+                                device=dev, dtype=sin_cur.dtype
+                            )
 
                             # Live differentiable re-projection through k_proj, k_norm, and v_proj!
                             k_proj_sel = attn_mod.k_proj(u_sel).view(bsz, max_u, num_kv_heads, head_dim)
@@ -870,31 +898,35 @@ class SegmentedKVBPTTRunner:
                             v_live = v_union.gather(2, gather_idx)
 
                             # Also re-project selected keys through `lsa_indexer.k_proj` (`W_k_idx`) if present
+                            # (isolate saved tensors from any enclosing checkpoint frame so backward recompute
+                            # never re-runs `_chunked_replay_indexer_kl` only to discard it!)
                             lsa_ix = getattr(attn_mod, "lsa_indexer", None)
                             if (
-                                lsa_ix is not None
+                                not in_bwd
+                                and q_det is not None
+                                and lsa_ix is not None
                                 and self.cfg.replay_indexer_weight > 0
                                 and (lsa_ix.wk.requires_grad or lsa_ix.wq.requires_grad or k_live.requires_grad)
                             ):
-                                kz_live = lsa_ix.k_proj(k_live)  # [B, G, K_sel, d_idx]
-                                q_live_for_idx, _, _, _ = self._extract_query_heads(attn_mod, x_cur.detach())
-                                qz_live = lsa_ix.query_latent(q_live_for_idx)  # [B, G | H, T_seg, d_idx]
-                                per_head_q = qz_live.shape[1] != num_kv_heads
-                                lo = lsa_ix.lo
-                                hg = q_det.shape[1] // num_kv_heads
-                                qn_t = upcast(q_det[..., lo:]).view(bsz, num_kv_heads, hg, -1, head_dim - lo)
-                                kn_t = upcast(k_live.detach()[..., lo:])
-                                kl_idx = _chunked_replay_indexer_kl(
-                                    qn_t,
-                                    kn_t,
-                                    qz_live,
-                                    kz_live,
-                                    scale_nope=1.0 / math.sqrt(max(1, head_dim - lo)),
-                                    temperature=float(lsa_ix.cfg.temperature),
-                                    per_head_q=per_head_q,
-                                    chunk_size=self.cfg.query_sim_chunk,
-                                )
-                                if not _in_backward():
+                                with torch.autograd.graph.saved_tensors_hooks(lambda x: x, lambda x: x):
+                                    kz_live = lsa_ix.k_proj(k_live)  # [B, G, K_sel, d_idx]
+                                    q_live_for_idx, _, _, _ = self._extract_query_heads(attn_mod, x_cur.detach())
+                                    qz_live = lsa_ix.query_latent(q_live_for_idx)  # [B, G | H, T_seg, d_idx]
+                                    per_head_q = qz_live.shape[1] != num_kv_heads
+                                    lo = lsa_ix.lo
+                                    hg = q_det.shape[1] // num_kv_heads
+                                    qn_t = upcast(q_det[..., lo:]).view(bsz, num_kv_heads, hg, -1, head_dim - lo)
+                                    kn_t = upcast(k_live.detach()[..., lo:])
+                                    kl_idx = _chunked_replay_indexer_kl(
+                                        qn_t,
+                                        kn_t,
+                                        qz_live,
+                                        kz_live,
+                                        scale_nope=1.0 / math.sqrt(max(1, head_dim - lo)),
+                                        temperature=float(lsa_ix.cfg.temperature),
+                                        per_head_q=per_head_q,
+                                        chunk_size=self.cfg.query_sim_chunk,
+                                    )
                                     seg_replay_aux.append(float(self.cfg.replay_indexer_weight) * kl_idx)
 
                             proxy.set_pending(cache_slot, top_idx, k_live, v_live)
@@ -902,7 +934,7 @@ class SegmentedKVBPTTRunner:
                             if loop_ctl is not None:
                                 loop_ctl._cur = saved_cur
 
-                if not _in_backward():
+                if not in_bwd:
                     u_store = x_cur.detach().to("cpu") if self.cfg.offload_u_to_cpu else x_cur.detach()
                     c_store = cos_cur.detach().to("cpu") if self.cfg.offload_u_to_cpu else cos_cur.detach()
                     s_store = sin_cur.detach().to("cpu") if self.cfg.offload_u_to_cpu else sin_cur.detach()
@@ -1064,6 +1096,7 @@ class SegmentedKVBPTTRunner:
                 # Commit pre-attention `u_seg` records and detach carried recurrent/KV states!
                 for p_id, rec in cur_seg_records.items():
                     prior_records[p_id].append(rec)
+                replay_meta.clear()
                 if proxy_holder[0] is not None:
                     proxy_holder[0].reset_segment()
                 if base_cache is not None:
@@ -1092,6 +1125,7 @@ class SegmentedKVBPTTRunner:
                 h.remove()
             prior_records.clear()
             cur_seg_records.clear()
+            replay_meta.clear()
 
     run = run_step
     __call__ = run_step

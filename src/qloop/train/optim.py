@@ -1019,7 +1019,8 @@ class FusedStepOptimizer:
                         grad_buckets.setdefault((g_t.device, g_t.dtype), []).append(g_t)
                     has_fmul = hasattr(torch, "_foreach_mul_")
                     for (g_dev, g_dt), g_list in grad_buckets.items():
-                        coef_d = clip_coef.to(device=g_dev, dtype=g_dt)
+                        coef_dt = torch.float64 if g_dt == torch.float64 else torch.float32
+                        coef_d = clip_coef.to(device=g_dev, dtype=coef_dt)
                         if has_fmul and len(g_list) > 1 and not any(g.is_sparse for g in g_list):
                             torch._foreach_mul_(g_list, coef_d)
                         else:

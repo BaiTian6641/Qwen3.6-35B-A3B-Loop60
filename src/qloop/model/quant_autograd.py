@@ -529,7 +529,11 @@ if _HAS_TRITON:
         hi = (u8 >> 4) & 0x0F
 
         g_idx = offs_b // BYTES_PER_GROUP
-        sc = tl.load(Scale_ptr + row * stride_s_r + g_idx, mask=mask_b, other=0.0).to(tl.float32)
+        sc = tl.where(
+            mask_b,
+            tl.load(Scale_ptr + row * stride_s_r + g_idx, mask=mask_b).to(tl.float32),
+            0.0,
+        )
 
         v_lo = _e2m1_decode_nibble(lo) * sc
         v_hi = _e2m1_decode_nibble(hi) * sc
@@ -550,6 +554,39 @@ if _HAS_TRITON:
         out_ty = Out_ptr.dtype.element_ty
         tl.store(out_base + (2 * offs_b), v_lo.to(out_ty), mask=mask_b)
         tl.store(out_base + (2 * offs_b + 1), v_hi.to(out_ty), mask=mask_b)
+
+
+def _resolve_triton_nvfp4_gs(
+    u8_shape: tuple[int, ...],
+    weight_global_scale: torch.Tensor | float | None,
+    device: torch.device,
+) -> tuple[bool, torch.Tensor, bool, int] | None:
+    """Resolve `(has_gs, gs_1d_fp32, gs_is_scalar, gs_div)` for 2D/3D NVFP4 Triton dequant, or `None`."""
+    if weight_global_scale is None:
+        return False, torch.empty((1,), device=device, dtype=torch.float32), True, 1
+    if not isinstance(weight_global_scale, torch.Tensor):
+        return True, torch.tensor([float(weight_global_scale)], device=device, dtype=torch.float32), True, 1
+
+    raw_gs = weight_global_scale.to(device=device, dtype=torch.float32)
+    if raw_gs.ndim == 0 or raw_gs.numel() == 1:
+        return True, raw_gs.reshape(1).contiguous(), True, 1
+
+    if len(u8_shape) == 2:
+        n_rows = int(u8_shape[0])
+        if tuple(raw_gs.shape) in ((n_rows,), (n_rows, 1)):
+            return True, raw_gs.reshape(n_rows).contiguous(), False, 1
+        return None
+
+    if len(u8_shape) == 3:
+        e_cnt, m_dim = int(u8_shape[0]), int(u8_shape[1])
+        n_rows = e_cnt * m_dim
+        if tuple(raw_gs.shape) in ((e_cnt,), (e_cnt, 1), (e_cnt, 1, 1)):
+            return True, raw_gs.reshape(e_cnt).contiguous(), False, m_dim
+        if tuple(raw_gs.shape) in ((e_cnt, m_dim), (e_cnt, m_dim, 1)):
+            return True, raw_gs.reshape(n_rows).contiguous(), False, 1
+        return None
+
+    return None
 
 
 def _maybe_triton_dequant_nvfp4(
@@ -587,42 +624,10 @@ def _maybe_triton_dequant_nvfp4(
     if n_rows == 0:
         return torch.empty((*u8_c.shape[:-1], k_unpacked), device=u8_c.device, dtype=dtype)
 
-    has_gs = weight_global_scale is not None
-    gs_is_scalar = True
-    gs_div = 1
-    if not has_gs:
-        gs_t = torch.empty((1,), device=u8_c.device, dtype=torch.float32)
-    elif isinstance(weight_global_scale, torch.Tensor):
-        raw_gs = weight_global_scale.to(device=u8_c.device, dtype=torch.float32)
-        if raw_gs.ndim == 0 or raw_gs.numel() == 1:
-            gs_t = raw_gs.reshape(1).contiguous()
-            gs_is_scalar = True
-        elif u8_c.ndim == 2 and (
-            (raw_gs.ndim == 1 and int(raw_gs.shape[0]) == int(u8_c.shape[0]))
-            or (raw_gs.ndim == 2 and int(raw_gs.shape[0]) == int(u8_c.shape[0]) and int(raw_gs.shape[1]) == 1)
-        ):
-            gs_t = raw_gs.reshape(n_rows).contiguous()
-            gs_is_scalar = False
-            gs_div = 1
-        elif u8_c.ndim == 3:
-            e_cnt, m_dim = int(u8_c.shape[0]), int(u8_c.shape[1])
-            if (raw_gs.ndim == 1 and int(raw_gs.shape[0]) == e_cnt) or (
-                raw_gs.ndim == 2 and int(raw_gs.shape[0]) == e_cnt and int(raw_gs.shape[1]) == 1
-            ):
-                gs_t = raw_gs.reshape(e_cnt).contiguous()
-                gs_is_scalar = False
-                gs_div = m_dim
-            elif raw_gs.ndim == 2 and int(raw_gs.shape[0]) == e_cnt and int(raw_gs.shape[1]) == m_dim:
-                gs_t = raw_gs.reshape(n_rows).contiguous()
-                gs_is_scalar = False
-                gs_div = 1
-            else:
-                return None
-        else:
-            return None
-    else:
-        gs_t = torch.tensor([float(weight_global_scale)], device=u8_c.device, dtype=torch.float32)
-        gs_is_scalar = True
+    resolved = _resolve_triton_nvfp4_gs(tuple(int(d) for d in u8_c.shape), weight_global_scale, u8_c.device)
+    if resolved is None:
+        return None
+    has_gs, gs_t, gs_is_scalar, gs_div = resolved
 
     out = torch.empty((*u8_c.shape[:-1], k_unpacked), device=u8_c.device, dtype=dtype)
     block_bytes = 256 if k_bytes >= 256 else (128 if k_bytes >= 128 else 64)
@@ -1123,7 +1128,7 @@ def _contiguous_id_slice(expert_ids: list[int]) -> slice | None:
     if n == 0:
         return slice(0, 0)
     e0 = int(expert_ids[0])
-    if int(expert_ids[-1]) - e0 + 1 != n:
+    if e0 < 0 or int(expert_ids[-1]) - e0 + 1 != n:
         return None
     for i in range(1, n):
         if int(expert_ids[i]) != e0 + i:

@@ -16,6 +16,7 @@ from qloop.model.hssd import (
     _replay_chunk_on_bank,
     chunk_hssd,
     install_hssd,
+    recurrent_hssd_step,
 )
 from qloop.model.lsa import (
     LSAConfig,
@@ -30,18 +31,20 @@ from qloop.model.lsa import (
 from qloop.model.quant_autograd import (
     _contiguous_id_slice,
     _maybe_triton_dequant_nvfp4,
+    _resolve_triton_nvfp4_gs,
     _slice_expert_scale_batch,
     dequantize_nvfp4_tensor,
 )
 from qloop.model.toy import ToyConfig, ToyForCausalLM
 from qloop.train import bptt as bptt_mod
+from qloop.train import optim as optim_mod
 from qloop.train.bptt import (
     BPTTConfig,
     SegmentedKVBPTTRunner,
     _gather_prior_field,
     _offload_prior_record,
 )
-from qloop.train.optim import FusedStepOptimizer
+from qloop.train.optim import AdamWLite, ApolloAdamWFallback, FusedStepOptimizer
 from qloop.train.trainer import _AsyncBatchPrefetcher, _to_device
 
 
@@ -60,6 +63,7 @@ def _make_mixed_opt_params(seed: int = 17) -> list[tuple[str, nn.Parameter]]:
 
 def test_optim_batched_nonfused_parity_and_atomic_nonfinite_guard(monkeypatch):
     """Batched `_foreach_norm` + `_step_batched_adamw_lite` matches unbatched reference & keeps atomic guard."""
+    monkeypatch.setattr(optim_mod, "apollo_torch_available", lambda: False)
     p_fast = _make_mixed_opt_params(seed=101)
     p_ref = [(n, nn.Parameter(p.detach().clone())) for n, p in p_fast]
 
@@ -70,14 +74,18 @@ def test_optim_batched_nonfused_parity_and_atomic_nonfinite_guard(monkeypatch):
         "total_steps": 10,
         "fused": False,
         "max_grad_norm": 0.5,
-        "adamw_lite_bf16_master": True,
-        "apollo_min_params": 4096,
-        "apollo_rank": 8,
-        "apollo_backend": "fallback",
+        "impl": "auto",
+        "apollo": {"enabled": True, "rank": 8, "min_dim": 64},
         "seed": 42,
     }
     opt_fast = FusedStepOptimizer.from_config(p_fast, dict(ocfg), grad_accum=1)
     opt_ref = FusedStepOptimizer.from_config(p_ref, dict(ocfg), grad_accum=1)
+
+    # Confirm all 3 optimizer backends are genuinely active (AdamW, batched AdamWLite, ApolloAdamWFallback)
+    assert isinstance(opt_fast.entries["layers.0.self_attn.q_norm.weight"].opt, torch.optim.AdamW)
+    assert isinstance(opt_fast.entries["layers.0.self_attn.k_proj.weight"].opt, AdamWLite)
+    assert isinstance(opt_fast.entries["layers.1.self_attn.v_proj.weight"].opt, AdamWLite)
+    assert isinstance(opt_fast.entries["layers.0.mlp.gate_proj.weight"].opt, ApolloAdamWFallback)
 
     # Force reference optimizer to take per-param unbatched path by hiding `_step_batched_adamw_lite`
     # and `_foreach_norm` during reference steps.
@@ -176,6 +184,26 @@ def test_nvfp4_contiguous_slicing_and_dequant_cpu():
     assert _contiguous_id_slice(torch.tensor([64, 65, 66, 67])) == slice(64, 68)
     assert _contiguous_id_slice(torch.tensor([0, 2, 4])) is None
     assert _contiguous_id_slice(torch.tensor([5])) == slice(5, 6)
+    assert _contiguous_id_slice(torch.tensor([-1, 0])) is None
+
+    # Verify `_resolve_triton_nvfp4_gs` accepts all live 2D and 3D MoE NVFP4 global-scale shapes
+    cpu = torch.device("cpu")
+    r_sc = _resolve_triton_nvfp4_gs((8, 32, 64), torch.tensor(2.0), cpu)
+    assert r_sc is not None and r_sc[0] is True and r_sc[2] is True
+    for shp, exp_len, exp_div in [
+        ((8,), 8, 32),
+        ((8, 1), 8, 32),
+        ((8, 1, 1), 8, 32),
+        ((8, 32), 256, 1),
+        ((8, 32, 1), 256, 1),
+    ]:
+        r_3d = _resolve_triton_nvfp4_gs((8, 32, 64), torch.ones(shp), cpu)
+        assert r_3d is not None, f"expected 3D gs shape {shp} to be accepted"
+        assert r_3d[0] is True and r_3d[2] is False and int(r_3d[1].numel()) == exp_len and r_3d[3] == exp_div
+    assert _resolve_triton_nvfp4_gs((8, 32, 64), torch.ones(8, 32, 2), cpu) is None
+    for shp in ((64,), (64, 1)):
+        r_2d = _resolve_triton_nvfp4_gs((64, 64), torch.ones(shp), cpu)
+        assert r_2d is not None and r_2d[0] is True and r_2d[2] is False and int(r_2d[1].numel()) == 64 and r_2d[3] == 1
 
     scale_3d = torch.randn(16, 4, 8)
     eids = torch.arange(4, 12, dtype=torch.long)
@@ -199,28 +227,38 @@ def test_nvfp4_contiguous_slicing_and_dequant_cpu():
     torch.testing.assert_close(y_div, y_mul, rtol=1e-5, atol=1e-6)
 
 
+_NVFP4_SCALE_DTYPES = [torch.bfloat16] + (
+    [torch.float8_e4m3fn] if hasattr(torch, "float8_e4m3fn") else []
+)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton NVFP4 dequant parity")
 @pytest.mark.parametrize("mode", ["divisor", "multiplier"])
-@pytest.mark.parametrize("shape_3d", [False, True])
-def test_cuda_triton_nvfp4_dequant_parity(mode: str, shape_3d: bool):
+@pytest.mark.parametrize("gs_kind", ["2d_scalar", "3d_per_expert", "3d_per_row"])
+@pytest.mark.parametrize("scale_dtype", _NVFP4_SCALE_DTYPES)
+def test_cuda_triton_nvfp4_dequant_parity(mode: str, gs_kind: str, scale_dtype: torch.dtype):
     g = torch.Generator().manual_seed(33)
-    if shape_3d:
-        lo = torch.randint(0, 16, (8, 32, 64), generator=g)
-        hi = torch.randint(0, 16, (8, 32, 64), generator=g)
-        ws = (torch.rand(8, 32, 8, generator=g) + 0.1).to(dtype=torch.bfloat16, device="cuda")
-        gs = (torch.rand(8, 1, 1, generator=g) + 0.5).to(dtype=torch.float32, device="cuda")
-    else:
+    if gs_kind == "2d_scalar":
         lo = torch.randint(0, 16, (64, 64), generator=g)
         hi = torch.randint(0, 16, (64, 64), generator=g)
-        ws = (torch.rand(64, 8, generator=g) + 0.1).to(dtype=torch.bfloat16, device="cuda")
+        ws = (torch.rand(64, 8, generator=g) + 0.25).to(dtype=scale_dtype, device="cuda")
         gs = torch.tensor(2.25, dtype=torch.float32, device="cuda")
+    elif gs_kind == "3d_per_expert":
+        lo = torch.randint(0, 16, (8, 32, 64), generator=g)
+        hi = torch.randint(0, 16, (8, 32, 64), generator=g)
+        ws = (torch.rand(8, 32, 8, generator=g) + 0.25).to(dtype=scale_dtype, device="cuda")
+        gs = (torch.rand(8, 1, 1, generator=g) + 0.5).to(dtype=torch.float32, device="cuda")
+    else:
+        lo = torch.randint(0, 16, (8, 32, 64), generator=g)
+        hi = torch.randint(0, 16, (8, 32, 64), generator=g)
+        ws = (torch.rand(8, 32, 8, generator=g) + 0.25).to(dtype=scale_dtype, device="cuda")
+        gs = (torch.rand(8, 32, 1, generator=g) + 0.5).to(dtype=torch.float32, device="cuda")
     packed = _pack_e2m1_nibbles(lo, hi).to("cuda")
 
     tri = _maybe_triton_dequant_nvfp4(
         packed, ws, gs, dtype=torch.bfloat16, group_size=16, global_scale_mode=mode
     )
     assert tri is not None
-    # Force eager PyTorch path by computing on CPU then casting
     ref = dequantize_nvfp4_tensor(
         packed.cpu(), ws.cpu(), gs.cpu(), dtype=torch.bfloat16, group_size=16, global_scale_mode=mode
     ).to("cuda")
@@ -305,7 +343,7 @@ def test_hssd_cache_state_all_swa_valid_and_replay_bank_parity():
         num_pages=4, chunk_size=4, window_chunks=2, top_k_pages=2, segment_chunks=2, checkpoint_segments=False,
         output_final_state=True,
     )
-    o2, _ = chunk_hssd(
+    o2, s2 = chunk_hssd(
         q[:, 8:], k[:, 8:], v[:, 8:], (gamma[0], gamma[1][:, 8:]), bg[:, 8:], wg[:, 8:],
         th[:, 8:], sb[:, 8:], ss, st_th, wl[:, 8:], rl[:, 8:],
         q_swa=q[:, 8:], k_swa=k[:, 8:], v_swa=v[:, 8:],
@@ -313,6 +351,34 @@ def test_hssd_cache_state_all_swa_valid_and_replay_bank_parity():
         initial_state=s1, output_final_state=True,
     )
     torch.testing.assert_close(torch.cat([o1, o2], dim=1), full_o, rtol=1e-5, atol=1e-5)
+
+    # Regression: in-place masked decode step MUST invalidate `_all_swa_valid` from True -> None
+    assert s2 is not None
+    s2._all_swa_valid = True
+    with torch.no_grad():
+        _, s_after = recurrent_hssd_step(
+            q[:, :1],
+            k[:, :1],
+            v[:, :1],
+            (gamma[0], gamma[1][:, :1]),
+            bg[:, :1],
+            wg[:, :1],
+            th[:, :1],
+            sb[:, :1],
+            ss,
+            st_th,
+            wl[:, :1],
+            rl[:, :1],
+            q[:, :1],
+            k[:, :1],
+            v[:, :1],
+            s2,
+            top_k_pages=2,
+            segment_chunks=2,
+            write_mask=torch.zeros(1, 1),
+            inplace_state=True,
+        )
+    assert s_after is s2 and s2._all_swa_valid is None
 
 
 # ==============================================================================

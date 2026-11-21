@@ -3249,6 +3249,8 @@ def recurrent_hssd_step(
             st.swa_k_ring[:, slot : slot + 1] = ks_ring
             st.swa_v_ring[:, slot : slot + 1] = vs_ring
             st.swa_valid_ring[:, slot : slot + 1] = valid_tok.unsqueeze(1)
+            if wm is not None:
+                st._all_swa_valid = None
             swa_k_ring = st.swa_k_ring
             swa_v_ring = st.swa_v_ring
             swa_valid_ring = st.swa_valid_ring
@@ -3290,6 +3292,8 @@ def recurrent_hssd_step(
             st.swa_k_ring[:, slot : slot + 1] = ks_ring
             st.swa_v_ring[:, slot : slot + 1] = vs_ring
             st.swa_valid_ring[:, slot : slot + 1] = valid_tok.unsqueeze(1)
+            if wm is not None:
+                st._all_swa_valid = None
             swa_k_ring = st.swa_k_ring
             swa_v_ring = st.swa_v_ring
             swa_valid_ring = st.swa_valid_ring

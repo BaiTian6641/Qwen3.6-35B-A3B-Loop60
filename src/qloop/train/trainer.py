@@ -15,13 +15,16 @@ data stream + RNG).
 from __future__ import annotations
 
 import contextlib
+import copy
 import inspect
 import json
 import logging
 import math
 import os
+import queue
 import random
 import signal
+import threading
 import time
 from typing import Any
 
@@ -72,12 +75,116 @@ class MetricsLogger:
             self.wandb.log(metrics, step=step)
 
 
+_PREFETCH_STOP = object()
+_PREFETCH_ERR = object()
+
+
+class _AsyncBatchPrefetcher:
+    """Single-thread deterministic background prefetcher with pinned-memory H2D prep and exact state tracking.
+
+    Overlaps CPU data streaming, 13-gram decontamination, tokenization, and sequence packing with GPU
+    compute while preserving 100% bit-exact `stream.state_dict()` checkpoint/resume determinism:
+    `state_dict()` always returns the snapshot captured immediately after the last *consumed* item,
+    never the prefetched-ahead cursor.
+    """
+
+    def __init__(self, stream: Any, *, maxsize: int = 2, pin_memory: bool = False) -> None:
+        self._stream = stream
+        self._pin_memory = bool(pin_memory and torch.cuda.is_available())
+        self._has_state = callable(getattr(stream, "state_dict", None))
+        self._last_state: Any = copy.deepcopy(stream.state_dict()) if self._has_state else None
+        self._q: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(maxsize)))
+        self._stop_ev = threading.Event()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._worker,
+            name="qloop-data-prefetch",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _put_or_stop(self, payload: Any) -> bool:
+        while not self._stop_ev.is_set():
+            try:
+                self._q.put(payload, timeout=0.05)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _worker(self) -> None:
+        try:
+            while not self._stop_ev.is_set():
+                try:
+                    item = next(self._stream)
+                except StopIteration:
+                    self._put_or_stop((_PREFETCH_STOP, None))
+                    return
+                sd = copy.deepcopy(self._stream.state_dict()) if self._has_state else None
+                if self._pin_memory and isinstance(item, dict):
+                    pinned: dict[str, Any] = {}
+                    for k, v in item.items():
+                        if isinstance(v, torch.Tensor) and v.device.type == "cpu" and not v.is_pinned():
+                            pinned[k] = v.pin_memory()
+                        else:
+                            pinned[k] = v
+                    item = pinned
+                if not self._put_or_stop((item, sd)):
+                    return
+        except BaseException as exc:
+            self._put_or_stop((_PREFETCH_ERR, exc))
+
+    def next_item(self) -> Any:
+        item, sd = self._q.get()
+        if item is _PREFETCH_STOP:
+            raise StopIteration
+        if item is _PREFETCH_ERR:
+            raise sd
+        self._last_state = sd
+        return item
+
+    def state_dict(self) -> Any:
+        return copy.deepcopy(self._last_state) if self._last_state is not None else None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop_ev.set()
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
+        if self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+
+
 def _to_device(batch: list[dict[str, Any]], device: torch.device, pass_pos: bool) -> dict[str, torch.Tensor]:
-    ids = torch.stack([b["input_ids"] for b in batch]).to(device)
-    labels = torch.stack([b["labels"] for b in batch]).to(device)
+    is_cuda = device.type == "cuda"
+    if len(batch) == 1:
+        ids_cpu = batch[0]["input_ids"].unsqueeze(0)
+        lbl_cpu = batch[0]["labels"].unsqueeze(0)
+    else:
+        ids_cpu = torch.stack([b["input_ids"] for b in batch])
+        lbl_cpu = torch.stack([b["labels"] for b in batch])
+    if is_cuda:
+        if ids_cpu.device.type == "cpu" and not ids_cpu.is_pinned():
+            ids_cpu = ids_cpu.pin_memory()
+        if lbl_cpu.device.type == "cpu" and not lbl_cpu.is_pinned():
+            lbl_cpu = lbl_cpu.pin_memory()
+    ids = ids_cpu.to(device, non_blocking=is_cuda)
+    labels = lbl_cpu.to(device, non_blocking=is_cuda)
     out = {"input_ids": ids, "labels": labels}
     if pass_pos and "position_ids" in batch[0]:
-        out["position_ids"] = torch.stack([b["position_ids"] for b in batch]).to(device)
+        pos_cpu = (
+            batch[0]["position_ids"].unsqueeze(0)
+            if len(batch) == 1
+            else torch.stack([b["position_ids"] for b in batch])
+        )
+        if is_cuda and pos_cpu.device.type == "cpu" and not pos_cpu.is_pinned():
+            pos_cpu = pos_cpu.pin_memory()
+        out["position_ids"] = pos_cpu.to(device, non_blocking=is_cuda)
     return out
 
 
@@ -120,8 +227,24 @@ class LMTrainer:
         self.tokens_seen = 0
         self._stop = False
         self.stream: Any = None
+        self._prefetcher: _AsyncBatchPrefetcher | None = None
         self.eval_batches: list[dict[str, Any]] = []
         self.shared_teacher: SharedBackboneTeacher | None = None
+
+    def _next_stream_item(self) -> Any:
+        if self._prefetcher is not None:
+            return self._prefetcher.next_item()
+        return next(self.stream)
+
+    def _start_prefetcher(self) -> None:
+        prefetch_n = int(self.tcfg.get("prefetch_batches", 2))
+        if prefetch_n > 0 and self.stream is not None and self._prefetcher is None:
+            pin_mem = bool(self.stack.device.type == "cuda")
+            self._prefetcher = _AsyncBatchPrefetcher(self.stream, maxsize=prefetch_n, pin_memory=pin_mem)
+
+    def _stop_prefetcher(self) -> None:
+        if self._prefetcher is not None:
+            self._prefetcher.close()
 
     # ------------------------------------------------------------------ data
     def _build_stream(self):
@@ -148,14 +271,22 @@ class LMTrainer:
         lbl_parts: list[torch.Tensor] = []
         cur_len = 0
         while cur_len < total_len:
-            item = next(self.stream)
+            item = self._next_stream_item()
             ids_1d = item["input_ids"]
             lbl_1d = item["labels"]
             id_parts.append(ids_1d)
             lbl_parts.append(lbl_1d)
             cur_len += int(ids_1d.numel())
-        full_ids = torch.cat(id_parts, dim=-1)[:total_len].unsqueeze(0).to(self.stack.device)
-        full_lbl = torch.cat(lbl_parts, dim=-1)[:total_len].unsqueeze(0).to(self.stack.device)
+        is_cuda = self.stack.device.type == "cuda"
+        full_ids_cpu = torch.cat(id_parts, dim=-1)[:total_len].unsqueeze(0)
+        full_lbl_cpu = torch.cat(lbl_parts, dim=-1)[:total_len].unsqueeze(0)
+        if is_cuda:
+            if full_ids_cpu.device.type == "cpu" and not full_ids_cpu.is_pinned():
+                full_ids_cpu = full_ids_cpu.pin_memory()
+            if full_lbl_cpu.device.type == "cpu" and not full_lbl_cpu.is_pinned():
+                full_lbl_cpu = full_lbl_cpu.pin_memory()
+        full_ids = full_ids_cpu.to(self.stack.device, non_blocking=is_cuda)
+        full_lbl = full_lbl_cpu.to(self.stack.device, non_blocking=is_cuda)
         out = {"input_ids": full_ids, "labels": full_lbl}
         if pass_pos:
             out["position_ids"] = torch.arange(total_len, device=self.stack.device, dtype=torch.long).unsqueeze(0)
@@ -163,11 +294,17 @@ class LMTrainer:
 
     # ------------------------------------------------------------------ resume / save
     def _state(self) -> dict[str, Any]:
+        if self._prefetcher is not None:
+            data_state = self._prefetcher.state_dict()
+        elif self.stream is not None and callable(getattr(self.stream, "state_dict", None)):
+            data_state = self.stream.state_dict()
+        else:
+            data_state = None
         return {
             "stage": self.cfg.get("stage"),
             "tokens_seen": self.tokens_seen,
             "stack": self.stack.describe(),
-            "data": self.stream.state_dict() if self.stream is not None else None,
+            "data": data_state,
             "config": self.cfg.get("_meta_", {}),
         }
 
@@ -269,7 +406,7 @@ class LMTrainer:
 
         if self.step < distill_cfg.layerwise_warmup_steps:
             for k in range(accum):
-                batch = _to_device([next(self.stream) for _ in range(mb)], st.device, pass_pos)
+                batch = _to_device([self._next_stream_item() for _ in range(mb)], st.device, pass_pos)
                 self.opt.set_boundary(k == accum - 1)
                 w_stats = run_layerwise_warmup_microstep(
                     st,
@@ -297,7 +434,7 @@ class LMTrainer:
             losses["hssd_blend"] = float(st.hssd.step_blend(blend_step))
 
         for k in range(accum):
-            batch = _to_device([next(self.stream) for _ in range(mb)], st.device, pass_pos)
+            batch = _to_device([self._next_stream_item() for _ in range(mb)], st.device, pass_pos)
             self.opt.set_boundary(k == accum - 1)
             dout = compute_shared_distill_loss(
                 st,
@@ -417,9 +554,14 @@ class LMTrainer:
         aux_w: dict[str, Any],
     ) -> dict[str, float]:
         st = self.stack
+        sig = inspect.signature(bptt_runner.run_step)
+        supports_loss_scale = "loss_scale" in sig.parameters
 
         scale_hooks: list[Any] = []
-        if accum > 1:
+        extra_kw: dict[str, Any] = {}
+        if supports_loss_scale:
+            extra_kw["loss_scale"] = 1.0 / float(max(1, accum))
+        elif accum > 1:
             inv_acc = 1.0 / float(accum)
             for p in st.named_trainable.values():
                 if p.requires_grad:
@@ -435,6 +577,7 @@ class LMTrainer:
                     hssd_aux_weight=float(aux_w.get("hssd_budget", 1.0)) if st.hssd is not None else 0.0,
                     lsa_aux_weight=float(aux_w.get("lsa_kl", 1.0)),
                     loop_aux_weight=float(aux_w.get("loop_aux", 1.0)),
+                    **extra_kw,
                 )
         finally:
             for h in scale_hooks:
@@ -447,6 +590,7 @@ class LMTrainer:
             "lm": float(res.total_loss),
             "bptt_segments": float(res.num_segments),
             "bptt_replayed_tokens": float(res.stats.get("bptt/mean_replayed_tokens", 0.0)),
+            "bptt_offload_to_cpu": float(res.stats.get("bptt/offload_to_cpu", 0.0)),
         }
 
     # ------------------------------------------------------------------ loop
@@ -534,6 +678,7 @@ class LMTrainer:
         t_log, tok_log = time.time(), 0
         last: dict[str, Any] = {}
         self.opt.zero_grad(set_to_none=True)
+        self._start_prefetcher()
         try:
             while self.step < steps and not self._stop:
                 if st.lsa is not None and callable(getattr(st.lsa, "set_step", None)):
@@ -558,7 +703,7 @@ class LMTrainer:
                     tok_log += step_toks
                 else:
                     for k in range(accum):
-                        batch = _to_device([next(self.stream) for _ in range(mb)], st.device, pass_pos)
+                        batch = _to_device([self._next_stream_item() for _ in range(mb)], st.device, pass_pos)
                         self.opt.set_boundary(k == accum - 1)
                         seq_len_cur = int(batch["input_ids"].shape[1])
                         if bptt_runner is not None and seq_len_cur >= bptt_min_seq_len:
@@ -625,8 +770,11 @@ class LMTrainer:
                     break
         except KeyboardInterrupt:
             log.warning("interrupted: saving checkpoint before exit")
+            self._stop_prefetcher()
             self.save(metrics=last)
             raise
+        finally:
+            self._stop_prefetcher()
         if hasattr(self.stream, "log_stats"):
             self.stream.log_stats()
         if st.frozen_experts_sha256 is not None:
@@ -635,4 +783,5 @@ class LMTrainer:
         if final:
             self.metrics.log(self.step, final)
         path = self.save(completed=(self.step >= steps), metrics={**last, **final})
+        self._prefetcher = None
         return {"step": self.step, "checkpoint": path, "last": last, "eval": final}

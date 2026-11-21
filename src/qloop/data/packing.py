@@ -20,6 +20,7 @@ import logging
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from qloop.debug import require
 
@@ -129,31 +130,50 @@ class Packer:
             ids = ids + [self.pad_id] * n_pad
             labels = labels + [IGNORE] * n_pad
             docs = docs + [-1] * n_pad
-        pos: list[int] = []
-        prev, p = None, 0
-        for d in docs:
-            if d == -1:
-                pos.append(0)
-                continue
-            p = p + 1 if d == prev else 0
-            pos.append(p)
-            prev = d
         lab = torch.tensor(labels, dtype=torch.long)
         n_loss = int((lab[1:] != IGNORE).sum())  # position 0 is never a target after the causal shift
         if n_loss == 0 and self.drop_no_loss:
             self.n_dropped_no_loss += 1
             return
+        docs_t = torch.tensor(docs, dtype=torch.long)
+        n_valid = T - n_pad
+        if n_valid == 0:
+            pos_t = torch.zeros(T, dtype=torch.long)
+            n_docs = 0
+        elif bool((docs_t[:n_valid] == -1).any()):
+            pos_list: list[int] = []
+            prev: int | None = None
+            p = 0
+            for d in docs:
+                if d == -1:
+                    pos_list.append(0)
+                    continue
+                p = p + 1 if d == prev else 0
+                pos_list.append(p)
+                prev = d
+            pos_t = torch.tensor(pos_list, dtype=torch.long)
+            n_docs = len({d for d in docs if d != -1})
+        else:
+            v_docs = docs_t[:n_valid]
+            change = torch.ones(n_valid, dtype=torch.bool)
+            if n_valid > 1:
+                change[1:] = v_docs[1:] != v_docs[:-1]
+            idx = torch.arange(n_valid, dtype=torch.long)
+            run_starts = torch.where(change, idx, torch.zeros_like(idx)).cummax(dim=0).values
+            pos_valid = idx - run_starts
+            pos_t = F.pad(pos_valid, (0, n_pad), value=0) if n_pad else pos_valid
+            n_docs = int(torch.unique(v_docs).numel())
         self.n_rows += 1
         self.n_pad_tokens += n_pad
         self.n_tokens += T
         out.append({
             "input_ids": torch.tensor(ids, dtype=torch.long),
             "labels": lab,
-            "doc_ids": torch.tensor(docs, dtype=torch.long),
-            "position_ids": torch.tensor(pos, dtype=torch.long),
+            "doc_ids": docs_t,
+            "position_ids": pos_t,
             "n_loss_tokens": n_loss,
             "n_pad": n_pad,
-            "n_docs": len({d for d in docs if d != -1}),
+            "n_docs": n_docs,
         })
 
     def state_dict(self) -> dict[str, Any]:

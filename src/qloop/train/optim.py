@@ -199,6 +199,13 @@ class ApolloAdamWFallback(Optimizer):
         gen = torch.Generator(device="cpu").manual_seed(int(seed) % (2 ** 63 - 1))
         shape_p = (r, n) if right else (m, r)
         proj = torch.randn(shape_p, generator=gen, dtype=torch.float64) / math.sqrt(r)
+        if device.type == "cuda":
+            proj_cast = proj.to(dtype=dtype)
+            try:
+                proj_cast = proj_cast.pin_memory()
+                return proj_cast.to(device=device, non_blocking=True), right
+            except Exception:
+                return proj_cast.to(device=device), right
         return proj.to(device=device, dtype=dtype), right
 
     @torch.no_grad()
@@ -221,9 +228,12 @@ class ApolloAdamWFallback(Optimizer):
                 st = self.state[p]
                 sd = _state_dtype(p)
                 w = _work_tensor(p, st, group["master_weights"])
-                g = p.grad.to(sd)
-                had_sgn = "scaling_grad_norm" in st
-                old_sgn = st["scaling_grad_norm"].clone() if had_sgn else None
+                g = p.grad if p.grad.dtype == sd else p.grad.to(sd)
+                old_sgn = (
+                    st["scaling_grad_norm"].clone()
+                    if (finite_mask is not None and "scaling_grad_norm" in st)
+                    else None
+                )
                 if finite_mask is not None:
                     fmask = finite_mask.to(device=p.device, dtype=torch.bool)
                     old_w = w.clone()
@@ -277,14 +287,18 @@ class ApolloAdamWFallback(Optimizer):
                     if "scaling_grad_norm" in st:  # Fira norm-growth limiter
                         gamma = group["limiter_gamma"]
                         limiter = torch.clamp(sg_norm / (st["scaling_grad_norm"] + 1e-8), min=gamma) / gamma
-                        scaling_grad = scaling_grad / limiter
+                        scaling_grad.div_(limiter)
                         st["scaling_grad_norm"] = sg_norm / limiter
                     else:
                         st["scaling_grad_norm"] = sg_norm
-                    update = scaling_grad * math.sqrt(float(group.get("scale", 1.0)))
+                    scale_mul = math.sqrt(float(group.get("scale", 1.0)))
+                    if scale_mul != 1.0:
+                        scaling_grad.mul_(scale_mul)
+                    update = scaling_grad
                 else:
                     update = norm_grad
-                w.add_(update.to(w.dtype), alpha=-step_size)
+                upd_w = update if update.dtype == w.dtype else update.to(w.dtype)
+                w.add_(upd_w, alpha=-step_size)
                 if wd > 0:
                     w.add_(w, alpha=-lr * wd)
                 if finite_mask is not None:
@@ -439,6 +453,58 @@ class _Entry:
 
 def _copy_state(st: dict[str, Any]) -> dict[str, Any]:
     return {k: (v.detach().clone() if isinstance(v, torch.Tensor) else copy.deepcopy(v)) for k, v in st.items()}
+
+
+def _move_state_value(val: Any, dev: torch.device, _seen: dict[int, Any] | None = None) -> Any:
+    """Recursively copy & move tensors inside optimizer state values (e.g. APOLLO `GradientProjector`)."""
+    if isinstance(val, torch.Tensor):
+        return val.detach().clone().to(dev)
+    if val is None or isinstance(val, (bool, int, float, str, bytes, torch.dtype, torch.device)):
+        return val
+    if _seen is None:
+        _seen = {}
+    oid = id(val)
+    if oid in _seen:
+        return _seen[oid]
+    if isinstance(val, dict):
+        out_d: dict[Any, Any] = {}
+        _seen[oid] = out_d
+        for k, v in val.items():
+            out_d[k] = _move_state_value(v, dev, _seen)
+        return out_d
+    if isinstance(val, list):
+        out_l: list[Any] = []
+        _seen[oid] = out_l
+        for v in val:
+            out_l.append(_move_state_value(v, dev, _seen))
+        return out_l
+    if isinstance(val, tuple):
+        out_t = tuple(_move_state_value(v, dev, _seen) for v in val)
+        _seen[oid] = out_t
+        return out_t
+    copied = copy.deepcopy(val)
+    _seen[oid] = copied
+    if hasattr(copied, "__dict__"):
+        for attr, attr_val in list(vars(copied).items()):
+            moved = _move_state_value(attr_val, dev, _seen)
+            if moved is not attr_val:
+                try:
+                    setattr(copied, attr, moved)
+                except Exception:
+                    pass
+    slots = getattr(type(copied), "__slots__", ())
+    if isinstance(slots, str):
+        slots = (slots,)
+    for slot_name in slots:
+        if hasattr(copied, slot_name):
+            attr_val = getattr(copied, slot_name)
+            moved = _move_state_value(attr_val, dev, _seen)
+            if moved is not attr_val:
+                try:
+                    setattr(copied, slot_name, moved)
+                except Exception:
+                    pass
+    return copied
 
 
 @contextlib.contextmanager
@@ -824,49 +890,201 @@ class FusedStepOptimizer:
         self._clamp_projected_param(p, ent.opt)
         return True
 
+    @staticmethod
+    def _batched_grad_norms(
+        active: list[_Entry],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]:
+        """Compute per-param L2 norms and total finite squared norm in fp64 via fused `_foreach_norm`."""
+        gnorms: dict[str, torch.Tensor] = {}
+        finites: dict[str, torch.Tensor] = {}
+        buckets: dict[tuple[torch.device, torch.dtype], list[_Entry]] = {}
+        for ent in active:
+            grad = ent.param.grad
+            assert grad is not None
+            buckets.setdefault((grad.device, grad.dtype), []).append(ent)
+
+        ref_dev = active[0].param.device
+        step_gnorm_sq: torch.Tensor | None = None
+        has_foreach = hasattr(torch, "_foreach_norm")
+        for (_dev, dt), ents in buckets.items():
+            acc = torch.float64 if dt == torch.float64 else torch.float32
+            grads = [e.param.grad.detach() for e in ents if e.param.grad is not None]
+            norms_list: list[torch.Tensor] | None = None
+            if has_foreach and len(grads) > 1 and not any(g.is_sparse for g in grads):
+                try:
+                    norms_list = list(torch._foreach_norm(grads, 2.0, dtype=acc))
+                except (TypeError, RuntimeError):
+                    if dt == acc:
+                        try:
+                            norms_list = list(torch._foreach_norm(grads, 2.0))
+                        except (TypeError, RuntimeError):
+                            norms_list = None
+            if norms_list is None:
+                norms_list = [torch.linalg.vector_norm(g, dtype=acc) for g in grads]
+
+            norm_vec = torch.stack(norms_list)
+            fin_vec = torch.isfinite(norm_vec)
+            g64 = norm_vec.to(dtype=torch.float64)
+            bucket_sq = torch.where(fin_vec, g64 * g64, torch.zeros_like(g64)).sum()
+            if step_gnorm_sq is None:
+                step_gnorm_sq = bucket_sq.to(device=ref_dev)
+            else:
+                step_gnorm_sq = step_gnorm_sq + bucket_sq.to(device=ref_dev)
+            for e, gn, fn in zip(ents, norms_list, fin_vec.unbind(0)):
+                gnorms[e.name] = gn
+                finites[e.name] = fn
+
+        assert step_gnorm_sq is not None
+        return gnorms, finites, step_gnorm_sq
+
+    @staticmethod
+    def _step_batched_adamw_lite(entries: list[_Entry], lrf: float) -> None:
+        """Execute multi-tensor `_foreach_*` AdamW updates across `AdamWLite` params (bit-exact `state_dict`)."""
+        buckets: dict[tuple[Any, ...], list[tuple[_Entry, torch.Tensor, dict[str, Any]]]] = {}
+        fallback: list[_Entry] = []
+        has_foreach = all(
+            hasattr(torch, fn)
+            for fn in (
+                "_foreach_mul_",
+                "_foreach_add_",
+                "_foreach_addcmul_",
+                "_foreach_sqrt",
+                "_foreach_div_",
+                "_foreach_addcdiv_",
+                "_foreach_copy_",
+            )
+        )
+        for ent in entries:
+            p = ent.param
+            grad = p.grad
+            if grad is None:
+                continue
+            if not has_foreach or grad.is_sparse or len(ent.opt.param_groups) != 1:
+                fallback.append(ent)
+                continue
+            pg = ent.opt.param_groups[0]
+            lr = ent.base_lr * lrf
+            pg["lr"] = lr
+            st = ent.opt.state[p]
+            sd = _state_dtype(p)
+            w = _work_tensor(p, st, pg["master_weights"])
+            if "exp_avg" not in st:
+                st["step"] = 0
+                st["exp_avg"] = torch.zeros(p.shape, dtype=sd, device=p.device)
+                st["exp_avg_sq"] = torch.zeros(p.shape, dtype=sd, device=p.device)
+            b1, b2 = pg["betas"]
+            key = (
+                p.device,
+                p.dtype,
+                sd,
+                w.dtype,
+                bool(pg["master_weights"]),
+                float(lr),
+                float(b1),
+                float(b2),
+                float(pg["eps"]),
+                float(pg["weight_decay"]),
+                int(st["step"]),
+            )
+            buckets.setdefault(key, []).append((ent, w, st))
+
+        with torch.no_grad():
+            for key, items in buckets.items():
+                if len(items) == 1:
+                    ent, _w, _st = items[0]
+                    ent.opt.step()
+                    continue
+                _dev, _p_dt, sd, w_dt, _mw, lr, b1, b2, eps, wd, prev_step = key
+                t = prev_step + 1
+                ps = [ent.param for ent, _w, _st in items]
+                ws = [w for _ent, w, _st in items]
+                gs = [
+                    ent.param.grad if ent.param.grad.dtype == sd else ent.param.grad.to(sd)  # type: ignore[union-attr]
+                    for ent, _w, _st in items
+                ]
+                eas = [st["exp_avg"] for _ent, _w, st in items]
+                easqs = [st["exp_avg_sq"] for _ent, _w, st in items]
+                for _ent, _w, st in items:
+                    st["step"] = t
+                if wd:
+                    torch._foreach_mul_(ws, 1.0 - lr * wd)
+                torch._foreach_mul_(eas, b1)
+                torch._foreach_add_(eas, gs, alpha=1.0 - b1)
+                torch._foreach_mul_(easqs, b2)
+                torch._foreach_addcmul_(easqs, gs, gs, value=1.0 - b2)
+                bc1, bc2 = 1.0 - b1 ** t, 1.0 - b2 ** t
+                denoms = list(torch._foreach_sqrt(easqs))
+                torch._foreach_div_(denoms, math.sqrt(bc2))
+                torch._foreach_add_(denoms, eps)
+                ea_w = eas if sd == w_dt else [e.to(w_dt) for e in eas]
+                den_w = denoms if sd == w_dt else [d.to(w_dt) for d in denoms]
+                torch._foreach_addcdiv_(ws, ea_w, den_w, value=-lr / bc1)
+                if ws[0] is not ps[0]:
+                    torch._foreach_copy_(ps, ws)
+
+        for ent in fallback:
+            lr = ent.base_lr * lrf
+            for g in ent.opt.param_groups:
+                g["lr"] = lr
+            ent.opt.step()
+
     def _step_nonfused(self) -> None:
         """Classic post-backward update with atomic whole-step non-finite guard, true global
-        `clip_grad_norm_(max_grad_norm)`, and fused CUDA `torch.optim.AdamW` + master-weight / APOLLO support."""
+        `clip_grad_norm_(max_grad_norm)`, and fused CUDA `torch.optim.AdamW` + batched master-weight / APOLLO."""
         active = [ent for ent in self.entries.values() if ent.param.grad is not None]
         if not active:
             return
 
-        gnorms: dict[str, torch.Tensor] = {}
-        finites: dict[str, torch.Tensor] = {}
         with torch.no_grad():
-            for ent in active:
-                grad = ent.param.grad
-                assert grad is not None
-                acc = torch.float64 if grad.dtype == torch.float64 else torch.float32
-                gnorm = torch.linalg.vector_norm(grad.detach(), dtype=acc)
-                finite = torch.isfinite(gnorm)
-                gnorms[ent.name] = gnorm
-                finites[ent.name] = finite
-                self._accumulate_device_norm(ent.name, gnorm, finite)
+            gnorms, finites, step_gnorm_sq = self._batched_grad_norms(active)
+            for name, fin in finites.items():
+                self._param_finite[name] = fin
+            if self._step_gnorm_sq is None:
+                self._step_gnorm_sq = step_gnorm_sq
+            else:
+                self._step_gnorm_sq = self._step_gnorm_sq + step_gnorm_sq.to(device=self._step_gnorm_sq.device)
 
-            if self.skip_nonfinite:
-                ref_dev = self._step_gnorm_sq.device if self._step_gnorm_sq is not None else active[0].param.device
-                finite_stack = torch.stack(
-                    [finites[ent.name].to(device=ref_dev, dtype=torch.bool) for ent in active]
-                )
-                all_finite_dev = finite_stack.all()
-                if self._step_gnorm_sq is not None:
-                    all_finite_dev = all_finite_dev & torch.isfinite(self._step_gnorm_sq.to(device=ref_dev))
-                if not bool(all_finite_dev.item()):
-                    self._atomic_step_aborted = True
-                    return
+            ref_dev = self._step_gnorm_sq.device
+            finite_stack = torch.stack(
+                [finites[ent.name].to(device=ref_dev, dtype=torch.bool) for ent in active]
+            )
+            all_finite_dev = finite_stack.all() & torch.isfinite(self._step_gnorm_sq)
+
+            if self.skip_nonfinite and not bool(all_finite_dev.item()):
+                self._atomic_step_aborted = True
+                return
 
             for ent in active:
                 self._stepped.add(ent.name)
 
             if self.max_grad_norm is not None:
-                tot = torch.nn.utils.clip_grad_norm_(
-                    [ent.param for ent in active], max_norm=float(self.max_grad_norm)
-                )
-                tot_t = tot if isinstance(tot, torch.Tensor) else torch.tensor(float(tot))
+                max_n = float(self.max_grad_norm)
+                if self.skip_nonfinite:
+                    # All grads are verified finite above: reuse the already-computed global L2 norm
+                    # (zero duplicate 897-tensor norm pass!) and apply via fused `_foreach_mul_`.
+                    tot_t = torch.sqrt(self._step_gnorm_sq.clamp_min(0.0))
+                    clip_coef = torch.clamp(max_n / (tot_t + 1e-6), max=1.0)
+                    grad_buckets: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+                    for ent in active:
+                        g_t = ent.param.grad
+                        assert g_t is not None
+                        grad_buckets.setdefault((g_t.device, g_t.dtype), []).append(g_t)
+                    has_fmul = hasattr(torch, "_foreach_mul_")
+                    for (g_dev, g_dt), g_list in grad_buckets.items():
+                        coef_dt = torch.float64 if g_dt == torch.float64 else torch.float32
+                        coef_d = clip_coef.to(device=g_dev, dtype=coef_dt)
+                        if has_fmul and len(g_list) > 1 and not any(g.is_sparse for g in g_list):
+                            torch._foreach_mul_(g_list, coef_d)
+                        else:
+                            for g_t in g_list:
+                                g_t.mul_(coef_d)
+                else:
+                    tot = torch.nn.utils.clip_grad_norm_(
+                        [ent.param for ent in active], max_norm=max_n
+                    )
+                    tot_t = tot if isinstance(tot, torch.Tensor) else torch.tensor(float(tot))
                 self._accumulate_device_clip(
-                    (torch.isfinite(tot_t) & (tot_t > float(self.max_grad_norm))).to(dtype=torch.float64)
-                    * float(len(active))
+                    (torch.isfinite(tot_t) & (tot_t > max_n)).to(dtype=torch.float64) * float(len(active))
                 )
             else:
                 for ent in active:
@@ -895,9 +1113,20 @@ class FusedStepOptimizer:
                 pg["lr"] = float(pg.get("_qloop_base_lr", pg["lr"])) * lrf
             self._torch_adamw.step()
 
+        lite_entries: list[_Entry] = []
+        other_entries: list[_Entry] = []
         for ent in active:
             if ent.opt is self._torch_adamw:
                 continue
+            if isinstance(ent.opt, AdamWLite):
+                lite_entries.append(ent)
+            else:
+                other_entries.append(ent)
+
+        if lite_entries:
+            self._step_batched_adamw_lite(lite_entries, lrf)
+
+        for ent in other_entries:
             lr = ent.base_lr * lrf
             for g in ent.opt.param_groups:
                 g["lr"] = lr
@@ -1158,8 +1387,7 @@ class FusedStepOptimizer:
                 ent.opt.state.pop(ent.param, None)
                 continue
             new_state: dict[str, Any] = {
-                k: (v.detach().clone().to(dev) if isinstance(v, torch.Tensor) else copy.deepcopy(v))
-                for k, v in rec["state"].items()
+                k: _move_state_value(v, dev) for k, v in rec["state"].items()
             }
             if isinstance(ent.opt, torch.optim.AdamW) and isinstance(new_state.get("step"), torch.Tensor):
                 pg_fused = any(

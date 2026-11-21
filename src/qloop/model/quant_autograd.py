@@ -38,6 +38,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except Exception:
+    triton = None  # type: ignore[assignment]
+    tl = None  # type: ignore[assignment]
+    _HAS_TRITON = False
+
 log = logging.getLogger("qloop")
 
 FP8_DTYPES: tuple[torch.dtype, ...] = tuple(
@@ -474,6 +484,174 @@ def dequantize_fp8_tensor(
     return res if res.dtype == dtype else res.to(dtype=dtype)
 
 
+if _HAS_TRITON:
+
+    @triton.jit
+    def _e2m1_decode_nibble(nibble):
+        mag = nibble & 7
+        exp_bits = mag >> 1
+        mant = (mag & 1).to(tl.float32)
+        val = tl.where(
+            exp_bits == 0,
+            0.5 * mant,
+            tl.where(
+                exp_bits == 1,
+                1.0 + 0.5 * mant,
+                tl.where(exp_bits == 2, 2.0 + mant, 4.0 + 2.0 * mant),
+            ),
+        )
+        return tl.where((nibble & 8) != 0, -val, val)
+
+    @triton.jit
+    def _nvfp4_dequant_fused_kernel(
+        U8_ptr,
+        Scale_ptr,
+        GS_ptr,
+        Out_ptr,
+        stride_u_r,
+        stride_s_r,
+        stride_o_r,
+        K_bytes,
+        gs_div,
+        HAS_GS: tl.constexpr,
+        GS_IS_SCALAR: tl.constexpr,
+        IS_DIVISOR: tl.constexpr,
+        BYTES_PER_GROUP: tl.constexpr,
+        BLOCK_BYTES: tl.constexpr,
+    ):
+        row = tl.program_id(0).to(tl.int64)
+        b_blk = tl.program_id(1).to(tl.int64)
+        offs_b = b_blk * BLOCK_BYTES + tl.arange(0, BLOCK_BYTES).to(tl.int64)
+        mask_b = offs_b < K_bytes
+
+        u8 = tl.load(U8_ptr + row * stride_u_r + offs_b, mask=mask_b, other=0)
+        lo = u8 & 0x0F
+        hi = (u8 >> 4) & 0x0F
+
+        g_idx = offs_b // BYTES_PER_GROUP
+        sc = tl.where(
+            mask_b,
+            tl.load(Scale_ptr + row * stride_s_r + g_idx, mask=mask_b).to(tl.float32),
+            0.0,
+        )
+
+        v_lo = _e2m1_decode_nibble(lo) * sc
+        v_hi = _e2m1_decode_nibble(hi) * sc
+
+        if HAS_GS:
+            if GS_IS_SCALAR:  # noqa: SIM108
+                gs = tl.load(GS_ptr).to(tl.float32)
+            else:
+                gs = tl.load(GS_ptr + (row // gs_div)).to(tl.float32)
+            if IS_DIVISOR:
+                v_lo = v_lo / gs
+                v_hi = v_hi / gs
+            else:
+                v_lo = v_lo * gs
+                v_hi = v_hi * gs
+
+        out_base = Out_ptr + row * stride_o_r
+        out_ty = Out_ptr.dtype.element_ty
+        tl.store(out_base + (2 * offs_b), v_lo.to(out_ty), mask=mask_b)
+        tl.store(out_base + (2 * offs_b + 1), v_hi.to(out_ty), mask=mask_b)
+
+
+def _resolve_triton_nvfp4_gs(
+    u8_shape: tuple[int, ...],
+    weight_global_scale: torch.Tensor | float | None,
+    device: torch.device,
+) -> tuple[bool, torch.Tensor, bool, int] | None:
+    """Resolve `(has_gs, gs_1d_fp32, gs_is_scalar, gs_div)` for 2D/3D NVFP4 Triton dequant, or `None`."""
+    if weight_global_scale is None:
+        return False, torch.empty((1,), device=device, dtype=torch.float32), True, 1
+    if not isinstance(weight_global_scale, torch.Tensor):
+        return True, torch.tensor([float(weight_global_scale)], device=device, dtype=torch.float32), True, 1
+
+    raw_gs = weight_global_scale.to(device=device, dtype=torch.float32)
+    if raw_gs.ndim == 0 or raw_gs.numel() == 1:
+        return True, raw_gs.reshape(1).contiguous(), True, 1
+
+    if len(u8_shape) == 2:
+        n_rows = int(u8_shape[0])
+        if tuple(raw_gs.shape) in ((n_rows,), (n_rows, 1)):
+            return True, raw_gs.reshape(n_rows).contiguous(), False, 1
+        return None
+
+    if len(u8_shape) == 3:
+        e_cnt, m_dim = int(u8_shape[0]), int(u8_shape[1])
+        n_rows = e_cnt * m_dim
+        if tuple(raw_gs.shape) in ((e_cnt,), (e_cnt, 1), (e_cnt, 1, 1)):
+            return True, raw_gs.reshape(e_cnt).contiguous(), False, m_dim
+        if tuple(raw_gs.shape) in ((e_cnt, m_dim), (e_cnt, m_dim, 1)):
+            return True, raw_gs.reshape(n_rows).contiguous(), False, 1
+        return None
+
+    return None
+
+
+def _maybe_triton_dequant_nvfp4(
+    u8: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor | float | None,
+    dtype: torch.dtype,
+    group_size: int,
+    global_scale_mode: str,
+) -> torch.Tensor | None:
+    """Single-kernel fused NVFP4 -> bf16/fp16/fp32 dequant on CUDA (zero int64/fp32 intermediates)."""
+    if (
+        not _HAS_TRITON
+        or not u8.is_cuda
+        or u8.ndim not in (2, 3)
+        or dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        or group_size <= 0
+        or group_size % 2 != 0
+        or weight_scale.device != u8.device
+        or weight_scale.dtype not in (*FP8_DTYPES, torch.bfloat16, torch.float16, torch.float32)
+    ):
+        return None
+    bytes_per_group = group_size // 2
+    k_bytes = int(u8.shape[-1])
+    k_unpacked = k_bytes * 2
+    if k_bytes == 0 or (k_unpacked % group_size != 0):
+        return None
+    n_groups = k_unpacked // group_size
+    if weight_scale.shape[:-1] != u8.shape[:-1] or int(weight_scale.shape[-1]) != n_groups:
+        return None
+
+    u8_c = u8.contiguous()
+    s_c = weight_scale.contiguous()
+    n_rows = int(u8_c.numel() // k_bytes)
+    if n_rows == 0:
+        return torch.empty((*u8_c.shape[:-1], k_unpacked), device=u8_c.device, dtype=dtype)
+
+    resolved = _resolve_triton_nvfp4_gs(tuple(int(d) for d in u8_c.shape), weight_global_scale, u8_c.device)
+    if resolved is None:
+        return None
+    has_gs, gs_t, gs_is_scalar, gs_div = resolved
+
+    out = torch.empty((*u8_c.shape[:-1], k_unpacked), device=u8_c.device, dtype=dtype)
+    block_bytes = 256 if k_bytes >= 256 else (128 if k_bytes >= 128 else 64)
+    grid = (n_rows, (k_bytes + block_bytes - 1) // block_bytes)
+    _nvfp4_dequant_fused_kernel[grid](
+        u8_c,
+        s_c,
+        gs_t,
+        out,
+        k_bytes,
+        n_groups,
+        k_unpacked,
+        k_bytes,
+        gs_div,
+        HAS_GS=has_gs,
+        GS_IS_SCALAR=gs_is_scalar,
+        IS_DIVISOR=(global_scale_mode == "divisor"),
+        BYTES_PER_GROUP=bytes_per_group,
+        BLOCK_BYTES=block_bytes,
+        num_warps=4,
+    )
+    return out
+
+
 def dequantize_nvfp4_tensor(
     weight_packed: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -506,6 +684,12 @@ def dequantize_nvfp4_tensor(
         u8 = weight_packed.contiguous().view(torch.uint8)
     else:
         raise TypeError(f"dequantize_nvfp4_tensor expected packed integer tensor, got {weight_packed.dtype}")
+
+    fused_out = _maybe_triton_dequant_nvfp4(
+        u8, weight_scale, weight_global_scale, dtype, group_size, global_scale_mode
+    )
+    if fused_out is not None:
+        return fused_out
 
     lo = u8 & 0x0F
     hi = (u8 >> 4) & 0x0F
@@ -938,37 +1122,63 @@ def _slice_expert_scale(
     return scale
 
 
+def _contiguous_id_slice(expert_ids: list[int]) -> slice | None:
+    """Return a zero-copy `slice(e0, e1)` when `expert_ids` is a contiguous ascending range, else `None`."""
+    n = len(expert_ids)
+    if n == 0:
+        return slice(0, 0)
+    e0 = int(expert_ids[0])
+    if e0 < 0 or int(expert_ids[-1]) - e0 + 1 != n:
+        return None
+    for i in range(1, n):
+        if int(expert_ids[i]) != e0 + i:
+            return None
+    return slice(e0, e0 + n)
+
+
+def _select_dim0(t: torch.Tensor, id_slice: slice | None, eids: torch.Tensor | None) -> torch.Tensor:
+    if id_slice is not None:
+        return t[id_slice]
+    assert eids is not None
+    return t.index_select(0, eids.to(device=t.device, dtype=torch.long))
+
+
 def _slice_expert_scale_batch(
     scale: torch.Tensor | None,
-    expert_ids: torch.Tensor,
+    expert_ids: torch.Tensor | None,
     num_experts: int,
     *,
     weight_2d_shape: tuple[int, int] | None = None,
     block_size: tuple[int, int] | None = None,
+    id_slice: slice | None = None,
 ) -> torch.Tensor | None:
     if scale is None:
         return None
     if scale.ndim == 0 or scale.numel() == 1:
         return scale
-    eids = expert_ids.to(device=scale.device, dtype=torch.long)
+    eids = (
+        None
+        if (id_slice is not None or expert_ids is None)
+        else expert_ids.to(device=scale.device, dtype=torch.long)
+    )
     if scale.ndim == 2 and num_experts > 0:
         rows, cols = int(scale.shape[0]), int(scale.shape[1])
         if rows != num_experts and rows % num_experts == 0:
             s0 = rows // num_experts
-            return scale.reshape(num_experts, s0, cols).index_select(0, eids)
+            return _select_dim0(scale.reshape(num_experts, s0, cols), id_slice, eids)
         if rows == num_experts and weight_2d_shape is not None:
             m, k = int(weight_2d_shape[0]), int(weight_2d_shape[1])
             if block_size is not None:
                 b0, b1 = int(block_size[0]), int(block_size[1])
                 if math.ceil(m / b0) == 1 and math.ceil(k / b1) == cols:
-                    return scale.reshape(num_experts, 1, cols).index_select(0, eids)
+                    return _select_dim0(scale.reshape(num_experts, 1, cols), id_slice, eids)
             if cols != m:
-                return scale.reshape(num_experts, 1, cols).index_select(0, eids)
+                return _select_dim0(scale.reshape(num_experts, 1, cols), id_slice, eids)
         if rows == num_experts:
-            return scale.index_select(0, eids)
+            return _select_dim0(scale, id_slice, eids)
         return scale.unsqueeze(0)
     if scale.shape[0] == num_experts and scale.ndim in (1, 3):
-        return scale.index_select(0, eids)
+        return _select_dim0(scale, id_slice, eids)
     return scale
 
 
@@ -1139,6 +1349,7 @@ def _dequant_experts_chunk(
 ) -> tuple[torch.Tensor | list[torch.Tensor], torch.Tensor | list[torch.Tensor]]:
     """Batch-dequantize a chunk of `<= 64` active experts `[C, 2I, H]` & `[C, H, I]` in one 3D call."""
     kind = _classify_quant_module(experts_mod)
+    id_slice = _contiguous_id_slice(expert_ids)
 
     if kind == "moe_fp8":
         gu_all = experts_mod.gate_up_proj
@@ -1148,7 +1359,7 @@ def _dequant_experts_chunk(
         _, dn_s_all = _resolve_moe_fp8_scale(experts_mod, dn_all, role="dn")
         _require_moe_fp8_scales(experts_mod, gu_s_all, dn_s_all)
         bsize = _extract_block_size(experts_mod)
-        eids_t = torch.tensor(expert_ids, device=gu_all.device, dtype=torch.long)
+        eids_t = None if id_slice is not None else torch.tensor(expert_ids, device=gu_all.device, dtype=torch.long)
         gu_wshape = (int(gu_all.shape[1]), int(gu_all.shape[2]))
         dn_wshape = (int(dn_all.shape[1]), int(dn_all.shape[2]))
         gu_s_sub = _slice_expert_scale_batch(
@@ -1157,6 +1368,7 @@ def _dequant_experts_chunk(
             n_exp,
             weight_2d_shape=gu_wshape,
             block_size=bsize,
+            id_slice=id_slice,
         )
         dn_s_sub = _slice_expert_scale_batch(
             dn_s_all,
@@ -1164,10 +1376,15 @@ def _dequant_experts_chunk(
             n_exp,
             weight_2d_shape=dn_wshape,
             block_size=bsize,
+            id_slice=id_slice,
         )
         try:
-            gu_chunk = dequantize_fp8_tensor(gu_all.index_select(0, eids_t), gu_s_sub, dtype=dtype, block_size=bsize)
-            dn_chunk = dequantize_fp8_tensor(dn_all.index_select(0, eids_t), dn_s_sub, dtype=dtype, block_size=bsize)
+            gu_chunk = dequantize_fp8_tensor(
+                _select_dim0(gu_all, id_slice, eids_t), gu_s_sub, dtype=dtype, block_size=bsize
+            )
+            dn_chunk = dequantize_fp8_tensor(
+                _select_dim0(dn_all, id_slice, eids_t), dn_s_sub, dtype=dtype, block_size=bsize
+            )
             if _is_expert_pair_transposed(
                 experts_mod,
                 (int(gu_chunk.shape[1]), int(gu_chunk.shape[2])),
@@ -1187,7 +1404,7 @@ def _dequant_experts_chunk(
         if not isinstance(dn_p, torch.Tensor):
             dn_p = experts_mod.down_proj
         n_exp = int(gu_p.shape[0])
-        eids_t = torch.tensor(expert_ids, device=gu_p.device, dtype=torch.long)
+        eids_t = None if id_slice is not None else torch.tensor(expert_ids, device=gu_p.device, dtype=torch.long)
         gu_s = experts_mod.gate_up_proj_scale
         dn_s = experts_mod.down_proj_scale
         gu_gs_name, gu_gs = _first_tensor_attr(
@@ -1201,13 +1418,13 @@ def _dequant_experts_chunk(
         gsize = int(getattr(experts_mod, "group_size", None) or 16)
         gu_mode = nvfp4_mode_override or _nvfp4_scale_mode_for_module(experts_mod, gu_gs_name)
         dn_mode = nvfp4_mode_override or _nvfp4_scale_mode_for_module(experts_mod, dn_gs_name)
-        gu_s_sub = _slice_expert_scale_batch(gu_s, eids_t, n_exp)
-        dn_s_sub = _slice_expert_scale_batch(dn_s, eids_t, n_exp)
-        gu_gs_sub = _slice_expert_scale_batch(gu_gs, eids_t, n_exp)
-        dn_gs_sub = _slice_expert_scale_batch(dn_gs, eids_t, n_exp)
+        gu_s_sub = _slice_expert_scale_batch(gu_s, eids_t, n_exp, id_slice=id_slice)
+        dn_s_sub = _slice_expert_scale_batch(dn_s, eids_t, n_exp, id_slice=id_slice)
+        gu_gs_sub = _slice_expert_scale_batch(gu_gs, eids_t, n_exp, id_slice=id_slice)
+        dn_gs_sub = _slice_expert_scale_batch(dn_gs, eids_t, n_exp, id_slice=id_slice)
         try:
             gu_chunk = dequantize_nvfp4_tensor(
-                gu_p.index_select(0, eids_t),
+                _select_dim0(gu_p, id_slice, eids_t),
                 gu_s_sub,  # type: ignore[arg-type]
                 gu_gs_sub,
                 dtype=dtype,
@@ -1215,7 +1432,7 @@ def _dequant_experts_chunk(
                 global_scale_mode=gu_mode,
             )
             dn_chunk = dequantize_nvfp4_tensor(
-                dn_p.index_select(0, eids_t),
+                _select_dim0(dn_p, id_slice, eids_t),
                 dn_s_sub,  # type: ignore[arg-type]
                 dn_gs_sub,
                 dtype=dtype,
@@ -1246,9 +1463,9 @@ def _dequant_experts_chunk(
             and gu_f.dtype not in FP8_DTYPES
             and dn_f.dtype not in FP8_DTYPES
         ):
-            eids_t = torch.tensor(expert_ids, device=gu_f.device, dtype=torch.long)
-            gu_chunk = gu_f.index_select(0, eids_t).to(dtype=dtype)
-            dn_chunk = dn_f.index_select(0, eids_t).to(dtype=dtype)
+            eids_t = None if id_slice is not None else torch.tensor(expert_ids, device=gu_f.device, dtype=torch.long)
+            gu_chunk = _select_dim0(gu_f, id_slice, eids_t).to(dtype=dtype)
+            dn_chunk = _select_dim0(dn_f, id_slice, eids_t).to(dtype=dtype)
             if _is_expert_pair_transposed(
                 experts_mod,
                 (int(gu_chunk.shape[1]), int(gu_chunk.shape[2])),

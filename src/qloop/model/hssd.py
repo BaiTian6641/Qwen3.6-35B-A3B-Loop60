@@ -492,7 +492,7 @@ def _replay_chunk_on_bank(
         ve_flat = v_eff.reshape(bm, 1, hv, c_len, dv)
         la_flat = log_a.reshape(bm, 1, hv, c_len, dk)
 
-        if sync_free or _is_compiling():
+        if sync_free or _is_compiling() or (bank.is_cuda and bm <= 32):
             nxt_flat = _wy_kda_state_update(
                 bank_flat,
                 ke_flat,
@@ -553,6 +553,7 @@ class HSSDCacheState:
         replay_buf: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         _uniform_step: int | None = None,
         _cached_mid_ring: tuple[torch.Tensor, ...] | None = None,
+        _all_swa_valid: bool | None = None,
     ) -> None:
         del s_chunk_start
         require(
@@ -646,6 +647,7 @@ class HSSDCacheState:
         self.swa_k_ring: torch.Tensor = _compact(swa_k_ring.to(device=dev, dtype=p_states.dtype))
         self.swa_v_ring: torch.Tensor = _compact(swa_v_ring.to(device=dev, dtype=p_states.dtype))
         self.swa_valid_ring: torch.Tensor = _compact(swa_valid_ring.to(device=dev, dtype=torch.bool))
+        self._all_swa_valid: bool | None = _all_swa_valid
 
     def __repr__(self) -> str:
         mode = "compact" if self._boundary_ring is None else "ring"
@@ -883,6 +885,7 @@ class HSSDCacheState:
                 swa_valid_ring=_compact(self.swa_valid_ring),
                 s_seg_start_bank=None if self._s_seg_start_bank is None else _cp(self._s_seg_start_bank),
                 _uniform_step=self._uniform_step,
+                _all_swa_valid=self._all_swa_valid,
             )
         rep_cp = (
             None
@@ -910,6 +913,7 @@ class HSSDCacheState:
             s_seg_start_bank=None if self._s_seg_start_bank is None else _cp(self._s_seg_start_bank),
             replay_buf=rep_cp,
             _uniform_step=self._uniform_step,
+            _all_swa_valid=self._all_swa_valid,
         )
 
     def compact(self) -> HSSDCacheState:
@@ -1007,6 +1011,7 @@ class HSSDCacheState:
         self.swa_k_ring.zero_()
         self.swa_v_ring.zero_()
         self.swa_valid_ring.zero_()
+        self._all_swa_valid = False
         return self
 
     @classmethod
@@ -1216,6 +1221,7 @@ class HSSDCacheState:
                 swa_valid_ring=self.swa_valid_ring.clone().contiguous(),
                 s_seg_start_bank=None if self._s_seg_start_bank is None else _cl(self._s_seg_start_bank),
                 _uniform_step=self._uniform_step,
+                _all_swa_valid=self._all_swa_valid,
             )
         rep_cl = (
             None
@@ -1243,6 +1249,7 @@ class HSSDCacheState:
             s_seg_start_bank=None if self._s_seg_start_bank is None else _cl(self._s_seg_start_bank),
             replay_buf=rep_cl,
             _uniform_step=self._uniform_step,
+            _all_swa_valid=self._all_swa_valid,
         )
 
     def detach(self) -> HSSDCacheState:
@@ -1267,6 +1274,7 @@ class HSSDCacheState:
                 swa_valid_ring=_compact(self.swa_valid_ring.detach()),
                 s_seg_start_bank=None if self._s_seg_start_bank is None else _dt(self._s_seg_start_bank),
                 _uniform_step=self._uniform_step,
+                _all_swa_valid=self._all_swa_valid,
             )
         rep_dt = (
             None
@@ -1278,6 +1286,11 @@ class HSSDCacheState:
                 _compact(self.replay_buf[3].detach()),
                 _compact(self.replay_buf[4].detach()),
             )
+        )
+        mid_dt = (
+            None
+            if self._cached_mid_ring is None
+            else tuple(_dt(t) for t in self._cached_mid_ring)
         )
         return HSSDCacheState(
             step_count=_compact(self.step_count.detach()),
@@ -1294,6 +1307,8 @@ class HSSDCacheState:
             s_seg_start_bank=None if self._s_seg_start_bank is None else _dt(self._s_seg_start_bank),
             replay_buf=rep_dt,
             _uniform_step=self._uniform_step,
+            _cached_mid_ring=mid_dt,
+            _all_swa_valid=self._all_swa_valid,
         )
 
     def to(self, *args: Any, **kwargs: Any) -> HSSDCacheState:
@@ -1330,6 +1345,7 @@ class HSSDCacheState:
                 ),
                 s_seg_start_bank=None if self._s_seg_start_bank is None else _conv(self._s_seg_start_bank),
                 _uniform_step=self._uniform_step,
+                _all_swa_valid=self._all_swa_valid,
             )
         rep_cv = (
             None
@@ -1357,6 +1373,7 @@ class HSSDCacheState:
             s_seg_start_bank=None if self._s_seg_start_bank is None else _conv(self._s_seg_start_bank),
             replay_buf=rep_cv,
             _uniform_step=self._uniform_step,
+            _all_swa_valid=self._all_swa_valid,
         )
 
     def copy_(self, other: Any) -> HSSDCacheState:
@@ -1465,6 +1482,7 @@ class HSSDCacheState:
         self.swa_k_ring.copy_(other.swa_k_ring)
         self.swa_v_ring.copy_(other.swa_v_ring)
         self.swa_valid_ring.copy_(other.swa_valid_ring)
+        self._all_swa_valid = getattr(other, "_all_swa_valid", None)
         return self
 
     def index_select(self, dim: int, index: torch.Tensor) -> HSSDCacheState:
@@ -3231,6 +3249,8 @@ def recurrent_hssd_step(
             st.swa_k_ring[:, slot : slot + 1] = ks_ring
             st.swa_v_ring[:, slot : slot + 1] = vs_ring
             st.swa_valid_ring[:, slot : slot + 1] = valid_tok.unsqueeze(1)
+            if wm is not None:
+                st._all_swa_valid = None
             swa_k_ring = st.swa_k_ring
             swa_v_ring = st.swa_v_ring
             swa_valid_ring = st.swa_valid_ring
@@ -3272,6 +3292,8 @@ def recurrent_hssd_step(
             st.swa_k_ring[:, slot : slot + 1] = ks_ring
             st.swa_v_ring[:, slot : slot + 1] = vs_ring
             st.swa_valid_ring[:, slot : slot + 1] = valid_tok.unsqueeze(1)
+            if wm is not None:
+                st._all_swa_valid = None
             swa_k_ring = st.swa_k_ring
             swa_v_ring = st.swa_v_ring
             swa_valid_ring = st.swa_valid_ring
@@ -10497,7 +10519,12 @@ def _chunk_hssd_triton_fast(
 
     seg_step = max(1, int(segment_chunks))
     seg_tokens = seg_step * chunk_size
-    ckpt_every = seg_step if surprise_mode == "segment_start" else max(seg_step, 8)
+    n_chunks_tot = (seq_len + chunk_size - 1) // chunk_size
+    ckpt_every = (
+        seg_step
+        if surprise_mode == "segment_start"
+        else max(seg_step, 16 if (bsz == 1 and n_chunks_tot >= 32) else 8)
+    )
 
     step_offset = st._uniform_step if st._uniform_step is not None else int(st.step_count[0].item())
     n_0 = step_offset // chunk_size
@@ -10585,7 +10612,11 @@ def _chunk_hssd_triton_fast(
                 qs_in = torch.cat([p_qs, qs_tc], dim=1)
                 ks_in = torch.cat([p_ks, ks_tc], dim=1)
                 vs_in = torch.cat([p_vs, vs_tc], dim=1)
-                need_val_mask = (wm_f is not None) or (not bool(p_val.all()))
+                need_val_mask = (
+                    True
+                    if wm_f is not None
+                    else (False if st._all_swa_valid is True else (not bool(p_val.all())))
+                )
                 if need_val_mask:
                     vc_use = (
                         valid_cur
@@ -10634,6 +10665,7 @@ def _chunk_hssd_triton_fast(
                 st.swa_v_ring.index_copy(1, ring_slots, v_swa[:, write_from_l:].to(dtype=st.swa_v_ring.dtype))
             )
             new_val_ring = _compact(st.swa_valid_ring.index_copy(1, ring_slots, valid_cur[:, write_from_l:]))
+            final_all_swa_valid = bool(wm_f is None and (seq_len >= max_win or st._all_swa_valid is True))
             p_comp = _compact(p_cur)
             new_steps = st.step_count + seq_len
 
@@ -10720,6 +10752,7 @@ def _chunk_hssd_triton_fast(
                             _compact(new_rep_idx),
                         ),
                         _uniform_step=end_step,
+                        _all_swa_valid=final_all_swa_valid,
                     ),
                     state_dtype,
                     acc_dt,
@@ -10747,6 +10780,7 @@ def _chunk_hssd_triton_fast(
                         swa_valid_ring=new_val_ring,
                         s_seg_start_bank=final_seg_bank,
                         _uniform_step=end_step,
+                        _all_swa_valid=final_all_swa_valid,
                     ),
                     state_dtype,
                     acc_dt,

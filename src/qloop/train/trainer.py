@@ -590,6 +590,7 @@ class LMTrainer:
             "lm": float(res.total_loss),
             "bptt_segments": float(res.num_segments),
             "bptt_replayed_tokens": float(res.stats.get("bptt/mean_replayed_tokens", 0.0)),
+            "bptt_offload_to_cpu": float(res.stats.get("bptt/offload_to_cpu", 0.0)),
         }
 
     # ------------------------------------------------------------------ loop

@@ -173,6 +173,54 @@ def test_optim_batched_nonfused_parity_and_atomic_nonfinite_guard(monkeypatch):
         torch.testing.assert_close(pf, before, rtol=0.0, atol=0.0)
 
 
+class _DummyGradientProjector:
+    """Mimics `apollo_torch.random_projector.GradientProjector` holding a tensor attribute."""
+
+    def __init__(self, ortho_matrix: torch.Tensor) -> None:
+        self.ortho_matrix = ortho_matrix
+        self.rank = int(ortho_matrix.shape[0])
+
+
+def test_optim_load_state_dict_moves_nested_projector_tensors():
+    """`load_state_dict` recursively moves tensors inside custom state objects (e.g. APOLLO projector)."""
+    target_dev = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("meta")
+    proj_cpu = _DummyGradientProjector(torch.randn(8, 16, dtype=torch.float32))
+    moved = optim_mod._move_state_value(
+        {"projector": proj_cpu, "nested": [torch.ones(4), (torch.zeros(2), "tag")]},
+        target_dev,
+    )
+    assert isinstance(moved["projector"], _DummyGradientProjector)
+    assert moved["projector"] is not proj_cpu
+    assert moved["projector"].ortho_matrix.device == target_dev
+    assert moved["nested"][0].device == target_dev
+    assert moved["nested"][1][0].device == target_dev
+    assert moved["nested"][1][1] == "tag"
+    # Original CPU projector tensor must stay untouched on CPU
+    assert proj_cpu.ortho_matrix.device == torch.device("cpu")
+
+    # Also verify full `FusedStepOptimizer.load_state_dict` end-to-end with a CPU-loaded state_dict
+    p_dev = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    p = nn.Parameter(torch.randn(16, 16, device=p_dev))
+    opt = FusedStepOptimizer.from_config([("w", p)], {"lr": 1e-3, "fused": False, "impl": "builtin"}, grad_accum=1)
+    ent = opt.entries["w"]
+    ent.opt.state[p] = {
+        "step": 5,
+        "exp_avg": torch.zeros_like(p),
+        "exp_avg_sq": torch.zeros_like(p),
+        "projector": _DummyGradientProjector(torch.randn(4, 16, device=p_dev)),
+    }
+    sd = opt.state_dict()
+    # Simulate `CheckpointManager.load(map_location="cpu")` placing nested projector tensor on CPU
+    sd["params"]["w"]["state"]["projector"].ortho_matrix = sd["params"]["w"]["state"]["projector"].ortho_matrix.cpu()
+
+    p2 = nn.Parameter(torch.randn(16, 16, device=p_dev))
+    opt2 = FusedStepOptimizer.from_config([("w", p2)], {"lr": 1e-3, "fused": False, "impl": "builtin"}, grad_accum=1)
+    opt2.load_state_dict(sd)
+    loaded_proj = opt2.entries["w"].opt.state[p2]["projector"]
+    assert isinstance(loaded_proj, _DummyGradientProjector)
+    assert loaded_proj.ortho_matrix.device == p2.device
+
+
 # ==============================================================================
 # 2. NVFP4 Dequant & Contiguous Expert Slicing (`quant_autograd.py`)
 # ==============================================================================

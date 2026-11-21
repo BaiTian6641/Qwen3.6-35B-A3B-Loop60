@@ -455,6 +455,58 @@ def _copy_state(st: dict[str, Any]) -> dict[str, Any]:
     return {k: (v.detach().clone() if isinstance(v, torch.Tensor) else copy.deepcopy(v)) for k, v in st.items()}
 
 
+def _move_state_value(val: Any, dev: torch.device, _seen: dict[int, Any] | None = None) -> Any:
+    """Recursively copy & move tensors inside optimizer state values (e.g. APOLLO `GradientProjector`)."""
+    if isinstance(val, torch.Tensor):
+        return val.detach().clone().to(dev)
+    if val is None or isinstance(val, (bool, int, float, str, bytes, torch.dtype, torch.device)):
+        return val
+    if _seen is None:
+        _seen = {}
+    oid = id(val)
+    if oid in _seen:
+        return _seen[oid]
+    if isinstance(val, dict):
+        out_d: dict[Any, Any] = {}
+        _seen[oid] = out_d
+        for k, v in val.items():
+            out_d[k] = _move_state_value(v, dev, _seen)
+        return out_d
+    if isinstance(val, list):
+        out_l: list[Any] = []
+        _seen[oid] = out_l
+        for v in val:
+            out_l.append(_move_state_value(v, dev, _seen))
+        return out_l
+    if isinstance(val, tuple):
+        out_t = tuple(_move_state_value(v, dev, _seen) for v in val)
+        _seen[oid] = out_t
+        return out_t
+    copied = copy.deepcopy(val)
+    _seen[oid] = copied
+    if hasattr(copied, "__dict__"):
+        for attr, attr_val in list(vars(copied).items()):
+            moved = _move_state_value(attr_val, dev, _seen)
+            if moved is not attr_val:
+                try:
+                    setattr(copied, attr, moved)
+                except Exception:
+                    pass
+    slots = getattr(type(copied), "__slots__", ())
+    if isinstance(slots, str):
+        slots = (slots,)
+    for slot_name in slots:
+        if hasattr(copied, slot_name):
+            attr_val = getattr(copied, slot_name)
+            moved = _move_state_value(attr_val, dev, _seen)
+            if moved is not attr_val:
+                try:
+                    setattr(copied, slot_name, moved)
+                except Exception:
+                    pass
+    return copied
+
+
 @contextlib.contextmanager
 def defer_micro_step(opt: Any) -> Iterator[None]:
     """Defer per-parameter fused backward updates until the end of a multi-backward micro-step.
@@ -1335,8 +1387,7 @@ class FusedStepOptimizer:
                 ent.opt.state.pop(ent.param, None)
                 continue
             new_state: dict[str, Any] = {
-                k: (v.detach().clone().to(dev) if isinstance(v, torch.Tensor) else copy.deepcopy(v))
-                for k, v in rec["state"].items()
+                k: _move_state_value(v, dev) for k, v in rec["state"].items()
             }
             if isinstance(ent.opt, torch.optim.AdamW) and isinstance(new_state.get("step"), torch.Tensor):
                 pg_fused = any(

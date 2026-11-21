@@ -79,7 +79,7 @@ def _is_sync_restricted() -> bool:
     compiling_fn = getattr(torch.compiler, "is_compiling", None)
     if callable(compiling_fn) and bool(compiling_fn()):
         return True
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
         get_mode = getattr(torch.cuda, "get_sync_debug_mode", None)
         if callable(get_mode) and int(get_mode()) != 0:
             return True
@@ -2562,7 +2562,7 @@ def _run_detached_distill_kl(
         and nb > 0
     )
 
-    with torch.autograd.graph.saved_tensors_hooks(lambda x: x, lambda x: x):
+    with torch.autograd.graph.saved_tensors_hooks(lambda x: x.detach(), lambda x: x):
         with torch.no_grad():
             qz_all = idx.query_latent(q_pick, pass_idx=cur_pass)  # [B, G_or_H, Nq, d] (upcast dtype)
             acc_dt = qz_all.dtype

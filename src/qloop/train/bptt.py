@@ -157,6 +157,14 @@ def _detach_nested(obj: Any, seen: set[int] | None = None) -> Any:
     if isinstance(obj, torch.Tensor):
         return obj.detach()
     seen.add(oid)
+    detach_fn = getattr(obj, "detach", None)
+    if callable(detach_fn) and not isinstance(obj, (type, nn.Module)):
+        try:
+            detached = detach_fn()
+            if detached is not None:
+                return detached
+        except Exception:
+            pass
     if isinstance(obj, list):
         for i, item in enumerate(obj):
             obj[i] = _detach_nested(item, seen)
@@ -171,9 +179,34 @@ def _detach_nested(obj: Any, seen: set[int] | None = None) -> Any:
         for attr, val in list(vars(obj).items()):
             if attr.startswith("__"):
                 continue
-            if isinstance(val, (torch.Tensor, list, dict, tuple)) or hasattr(val, "__dict__"):
+            if (
+                isinstance(val, (torch.Tensor, list, dict, tuple))
+                or hasattr(val, "__dict__")
+                or hasattr(type(val), "__slots__")
+                or callable(getattr(val, "detach", None))
+            ):
                 try:
                     setattr(obj, attr, _detach_nested(val, seen))
+                except Exception:
+                    pass
+    for cls in type(obj).__mro__:
+        slots = getattr(cls, "__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot_name in slots:
+            if slot_name in ("__dict__", "__weakref__") or slot_name.startswith("__"):
+                continue
+            if not hasattr(obj, slot_name):
+                continue
+            val = getattr(obj, slot_name)
+            if (
+                isinstance(val, (torch.Tensor, list, dict, tuple))
+                or hasattr(val, "__dict__")
+                or hasattr(type(val), "__slots__")
+                or callable(getattr(val, "detach", None))
+            ):
+                try:
+                    setattr(obj, slot_name, _detach_nested(val, seen))
                 except Exception:
                     pass
     return obj
@@ -218,9 +251,18 @@ def _extract_cached_kv(cache: Any, layer_idx: int) -> tuple[torch.Tensor | None,
 class _SlotStateListProxy:
     """Checkpoint-recomputation-safe list view over `conv_states` / `recurrent_states`."""
 
+    @staticmethod
+    def _detach_slot(val: Any) -> Any:
+        if isinstance(val, torch.Tensor):
+            return val.detach()
+        detach_fn = getattr(val, "detach", None)
+        if callable(detach_fn) and not isinstance(val, (type, nn.Module)):
+            return detach_fn()
+        return val
+
     def __init__(self, backing: list[Any]) -> None:
         self._backing = backing
-        self._snapshot = [x.detach() if isinstance(x, torch.Tensor) else x for x in backing]
+        self._snapshot = [self._detach_slot(x) for x in backing]
 
     def __len__(self) -> int:
         return len(self._backing)
@@ -233,7 +275,7 @@ class _SlotStateListProxy:
     def __setitem__(self, idx: int, val: Any) -> None:
         if _in_backward():
             return
-        self._backing[idx] = val.detach() if isinstance(val, torch.Tensor) else val
+        self._backing[idx] = self._detach_slot(val)
 
 
 def _clone_detached_state(obj: Any, *, allow_zero_copy_hssd: bool = False) -> Any:
@@ -446,6 +488,12 @@ class _ReplayKVCacheProxy:
         object.__getattribute__(self, "_fp8_prefix_kv").clear()
         object.__getattribute__(self, "_conv_snap").clear()
         object.__getattribute__(self, "_rec_snap").clear()
+        cp = object.__getattribute__(self, "_conv_proxy")
+        if cp is not None:
+            cp._snapshot.clear()
+        rp = object.__getattribute__(self, "_rec_proxy")
+        if rp is not None:
+            rp._snapshot.clear()
 
     def get_conv_state(self, layer_idx: int, state_idx: int = 0, **kwargs: Any) -> torch.Tensor | None:
         base = object.__getattribute__(self, "_base_cache")
@@ -934,6 +982,45 @@ class SegmentedKVBPTTRunner:
         proxy_holder: list[_ReplayKVCacheProxy | None] = [None]
         hooks: list[Any] = []
 
+        tm, lm_head = _resolve_bptt_backbone_and_head(self.model)
+        can_pre_head = (
+            loss_fn is None
+            and tm is not self.model
+            and lm_head is not None
+            and isinstance(getattr(lm_head, "weight", None), torch.Tensor)
+            and getattr(lm_head, "bias", None) is None
+            and lm_head.weight.dtype != torch.float64
+        )
+        bypass_mask = _can_bypass_bptt_causal_mask(tm)
+        no_mask_dict: dict[str, None] = {"full_attention": None, "linear_attention": None}
+
+        # Pre-compute which segments carry at least one valid (!= -100) target token in a single
+        # batched check. Long SFT prompts or `respect_doc_boundaries=True` trailing padding can
+        # produce an entire 32K segment with all -100 labels: running those with `grad_enabled`
+        # and skipping `.backward()` wasted compute and could pin un-traversed checkpoint graphs!
+        seg_valid_flags: list[bool] = [True] * n_segs
+        if can_pre_head:
+            if target_full is None:
+                seg_valid_flags = [False] * n_segs
+            else:
+                has_any_t: list[torch.Tensor] = []
+                shape_ok: list[bool] = []
+                for chk_i in range(n_segs):
+                    c0 = chk_i * seg_len
+                    c1 = min(t_total, (chk_i + 1) * seg_len)
+                    st_chk = target_full[:, c0 + 1 : c1 + 1] if c1 < t_total else target_full[:, c0 + 1 : t_total]
+                    exp_len = (c1 - c0) if c1 < t_total else max(0, (c1 - c0) - 1)
+                    ok_s = bool(st_chk.numel() > 0 and st_chk.shape[1] == exp_len)
+                    shape_ok.append(ok_s)
+                    has_any_t.append(
+                        (st_chk != -100).any()
+                        if ok_s
+                        else torch.zeros((), device=target_full.device, dtype=torch.bool)
+                    )
+                any_flags = torch.stack(has_any_t).tolist() if has_any_t else []
+                seg_valid_flags = [bool(ok_s and has_v) for ok_s, has_v in zip(shape_ok, any_flags)]
+        last_active_seg = max((i for i, ok in enumerate(seg_valid_flags) if ok), default=-1)
+
         def make_attn_pre_hook(phys_idx: int):
             def pre_hook(attn_mod: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
                 x_cur: torch.Tensor = args[0] if len(args) > 0 else kwargs["hidden_states"]
@@ -1060,7 +1147,7 @@ class SegmentedKVBPTTRunner:
                                 and self.cfg.replay_indexer_weight > 0
                                 and (lsa_ix.wk.requires_grad or lsa_ix.wq.requires_grad or k_live.requires_grad)
                             ):
-                                with torch.autograd.graph.saved_tensors_hooks(lambda x: x, lambda x: x):
+                                with torch.autograd.graph.saved_tensors_hooks(lambda x: x.detach(), lambda x: x):
                                     kz_live = lsa_ix.k_proj(k_live)  # [B, G, K_sel, d_idx]
                                     q_proj_grad = any(p.requires_grad for p in attn_mod.q_proj.parameters())
                                     q_norm_grad = q_norm_mod is not None and any(
@@ -1095,8 +1182,8 @@ class SegmentedKVBPTTRunner:
                             if loop_ctl is not None:
                                 loop_ctl._cur = saved_cur
 
-                # Last segment (`s_idx == n_segs - 1`) is never replayed by any future segment — skip offload!
-                if not in_bwd and s_idx < n_segs - 1:
+                # Segments at or after `last_active_seg` are never replayed by any future active segment — skip offload!
+                if not in_bwd and s_idx < last_active_seg:
                     cur_seg_records[phys_idx] = _offload_prior_record(
                         x_cur,
                         cos_cur,
@@ -1111,7 +1198,6 @@ class SegmentedKVBPTTRunner:
             hooks.append(attn_mod.register_forward_pre_hook(make_attn_pre_hook(phys_idx), with_kwargs=True))
 
         # Clear any stale LSA / HSSD pending losses before starting
-        tm, lm_head = _resolve_bptt_backbone_and_head(self.model)
         for mod in tm.modules():
             lsa_ix = getattr(mod, "lsa_indexer", None)
             if lsa_ix is not None:
@@ -1120,23 +1206,19 @@ class SegmentedKVBPTTRunner:
             if hssd_ad is not None and callable(getattr(hssd_ad, "clear_aux", None)):
                 hssd_ad.clear_aux()
 
-        can_pre_head = (
-            loss_fn is None
-            and tm is not self.model
-            and lm_head is not None
-            and isinstance(getattr(lm_head, "weight", None), torch.Tensor)
-            and getattr(lm_head, "bias", None) is None
-            and lm_head.weight.dtype != torch.float64
-        )
-        bypass_mask = _can_bypass_bptt_causal_mask(tm)
-        no_mask_dict: dict[str, None] = {"full_attention": None, "linear_attention": None}
-
+        base_cache: Any = None
         try:
-            base_cache: Any = None
             for s_idx in range(n_segs):
                 active_seg_state["seg_idx"] = s_idx
                 cur_seg_records.clear()
                 seg_replay_aux.clear()
+
+                # Skip trailing all-(-100) segments (e.g. respect_doc_boundaries trailing padding):
+                # no future segment needs their KV/HSSD state and they contribute zero loss.
+                if can_pre_head and s_idx > last_active_seg:
+                    seg_losses.append(0.0)
+                    replayed_counts.append(0)
+                    continue
 
                 s0 = s_idx * seg_len
                 s1 = min(t_total, (s_idx + 1) * seg_len)
@@ -1160,6 +1242,14 @@ class SegmentedKVBPTTRunner:
                     proxy_holder[0] = None
                     pkv_arg = None
 
+                tm_out: Any = None
+                seg_hidden: torch.Tensor | None = None
+                hidden_for_loss: torch.Tensor | None = None
+                out: Any = None
+                logits: torch.Tensor | None = None
+                logits_for_loss: torch.Tensor | None = None
+
+                seg_has_targets = seg_valid_flags[s_idx]
                 if can_pre_head:
                     assert lm_head is not None
                     tm_kw: dict[str, Any] = {
@@ -1169,7 +1259,14 @@ class SegmentedKVBPTTRunner:
                     }
                     if bypass_mask and s_idx > 0:
                         tm_kw["attention_mask"] = no_mask_dict
-                    tm_out = tm(**tm_kw)
+                    if seg_has_targets:
+                        tm_out = tm(**tm_kw)
+                    else:
+                        # Interior all-(-100) segment (e.g. >32K SFT prompt prefix): advance detached
+                        # KV/HSSD caches and prior-hidden replay records under `no_grad()` so zero
+                        # autograd graph or checkpoint frames are constructed!
+                        with torch.no_grad():
+                            tm_out = tm(**tm_kw)
                     base_cache = (
                         proxy_holder[0].base_cache
                         if proxy_holder[0] is not None
@@ -1177,12 +1274,7 @@ class SegmentedKVBPTTRunner:
                     )
                     seg_hidden = tm_out.last_hidden_state if hasattr(tm_out, "last_hidden_state") else tm_out[0]
                     hidden_for_loss = seg_hidden if s1 < t_total else seg_hidden[:, :-1]
-                    if (
-                        seg_targets is not None
-                        and seg_targets.numel() > 0
-                        and hidden_for_loss.shape[1] == seg_targets.shape[1]
-                        and bool((seg_targets != -100).any())
-                    ):
+                    if seg_has_targets and seg_targets is not None:
                         seg_loss, _ = lm_loss(
                             hidden_for_loss,
                             lm_head.weight,
@@ -1252,6 +1344,17 @@ class SegmentedKVBPTTRunner:
                 else:
                     seg_losses.append(0.0)
 
+                # Release live segment outputs & LoopContext graph stashes immediately after backward
+                # (or skipped backward) so C++-bridged checkpoint frames can never remain pinned!
+                tm_out = None
+                seg_hidden = None
+                hidden_for_loss = None
+                out = None
+                logits = None
+                logits_for_loss = None
+                seg_loss = None
+                total_seg_loss = None
+
                 # Count replayed positions on this segment (from first full-attn layer if any)
                 if s_idx > 0 and full_layers and (s_idx, full_layers[0][0]) in recorded_indices:
                     replayed_counts.append(int(recorded_indices[(s_idx, full_layers[0][0])].shape[-1]))
@@ -1266,6 +1369,8 @@ class SegmentedKVBPTTRunner:
                     proxy_holder[0].reset_segment()
                 if base_cache is not None:
                     _detach_nested(base_cache)
+                if loop_ctl is not None and callable(getattr(loop_ctl, "release_graph", None)):
+                    loop_ctl.release_graph()
 
             active_losses = [val for val in seg_losses if val != 0.0]
             mean_loss = sum(active_losses) / len(active_losses) if active_losses else 0.0
@@ -1294,9 +1399,27 @@ class SegmentedKVBPTTRunner:
                 copy_stream.synchronize()
             for h in hooks:
                 h.remove()
+            if proxy_holder[0] is not None:
+                proxy_holder[0].reset_segment()
+                proxy_holder[0] = None
+            if base_cache is not None:
+                _detach_nested(base_cache)
             prior_records.clear()
             cur_seg_records.clear()
             replay_meta.clear()
+            seg_replay_aux.clear()
+            if loop_ctl is not None and callable(getattr(loop_ctl, "release_graph", None)):
+                loop_ctl.release_graph()
+            for mod in tm.modules():
+                lsa_ix = getattr(mod, "lsa_indexer", None)
+                if lsa_ix is not None:
+                    lsa_ix.pop_losses()
+                    lsa_cache = getattr(lsa_ix, "_cache", None)
+                    if isinstance(lsa_cache, dict):
+                        lsa_cache.clear()
+                hssd_ad = getattr(mod, "hssd_adapter", None)
+                if hssd_ad is not None and callable(getattr(hssd_ad, "clear_aux", None)):
+                    hssd_ad.clear_aux()
 
     run = run_step
     __call__ = run_step

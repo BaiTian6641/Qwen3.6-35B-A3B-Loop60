@@ -203,6 +203,28 @@ class LoopContext:
         self.router_probs: dict[tuple[int, int], torch.Tensor] = {}
         self.stats: dict[str, float] = {}
 
+    def release_graph(self, *, clear_routing: bool = False) -> None:
+        """Drop all live autograd-tensor references to break C++-bridged checkpoint cycles.
+
+        Under `checkpoint(use_reentrant=False)`, each `VirtualLayer` `_CheckpointFrame` captures
+        this `LoopContext` while `anchor`/`start`/`kv_stash`/`pkv_stash`/`keep`/`coef`/`aux`/
+        `div_terms` point to live tensors whose C++ `grad_fn` nodes hold `_CheckpointFrame` unpack
+        hooks. If `.backward()` is skipped or aborted, Python's cyclic GC cannot traverse C++
+        autograd nodes, permanently leaking the checkpoint graph unless these fields are cleared.
+        """
+        if self.div_terms:
+            self.div_terms = [t.detach().float() for t in self.div_terms]
+        self.anchor = None
+        self.start.clear()
+        self.kv_stash.clear()
+        self.pkv_stash.clear()
+        self.keep.clear()
+        self.coef.clear()
+        self.aux.clear()
+        self.router_probs.clear()
+        if clear_routing:
+            self.routing.clear()
+
 
 def _resolve_kv_slot_scale(
     lyr: Any,
@@ -592,7 +614,7 @@ class VirtualLayer(nn.Module):
                 kwargs[pkv_key] = SharedKVView(pkv, stash=ctx.pkv_stash, record=False)
             elif (
                 ctl.spec.kv_share
-                and ctl.spec.num_passes > 1
+                and ctl.active_passes > 1
                 and s.r == 1
                 and s.layer_type == FULL
                 and ctl.spec.prelude_end <= s.phys < ctl.spec.core_end
@@ -810,7 +832,8 @@ class LoopController:
             ctx, r = cur
             key = (phys, name)
             if r == 1:
-                ctx.kv_stash[key] = out
+                if self.active_passes > 1:
+                    ctx.kv_stash[key] = out
                 return None
             stash = ctx.kv_stash.get(key)
             if stash is None or stash.shape != out.shape:
@@ -1023,6 +1046,10 @@ class LoopController:
     # ------------------------------------------------------------------ forward-time helpers
     def _begin_forward(self) -> None:
         self.ctx = LoopContext()
+
+    def release_graph(self, *, clear_routing: bool = False) -> None:
+        """Release live autograd tensors held in `self.ctx` after backward or when skipping backward."""
+        self.ctx.release_graph(clear_routing=clear_routing)
 
     def _route(self, ctx: LoopContext, x: torch.Tensor) -> None:
         router = self.adapters.mor_router

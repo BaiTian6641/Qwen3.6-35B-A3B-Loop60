@@ -476,7 +476,9 @@ def test_segmented_kv_bptt_4seg_hybrid_loop_and_lsa_wk_grad():
     runner = SegmentedKVBPTTRunner(model, n_segments=4, replay_k=6, offload_u_to_cpu=True)
     res = runner(ids, labels=labels, backward=True)
     assert res.num_segments == 4
-    assert res.replayed_tokens_per_seg == [0, 6, 6, 6]
+    # Segment 1 (`t=16..31`, targets `17..32`) has all -100 labels and advances caches under no_grad (0 replay);
+    # Segments 2 (target `48`) & 3 (targets `49..63`) have valid labels and replay `replay_k=6` prior tokens each.
+    assert res.replayed_tokens_per_seg == [0, 0, 6, 6]
 
     ix7 = mgr.indexers[7]
     attn7 = ctl.parts.layers[7].self_attn

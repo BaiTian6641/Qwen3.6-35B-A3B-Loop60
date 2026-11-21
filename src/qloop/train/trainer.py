@@ -376,10 +376,14 @@ class LMTrainer:
                     ntok += int(n)
                 out[f"eval/loss_d{d}"] = tot / max(ntok, 1)
         finally:
-            if st.loop is not None and prev is not None:
-                st.loop.set_active_passes(prev)
+            if st.loop is not None:
+                if prev is not None:
+                    st.loop.set_active_passes(prev)
+                if callable(getattr(st.loop, "release_graph", None)):
+                    st.loop.release_graph(clear_routing=True)
             if st.lsa is not None:
                 st.lsa.aux_loss()  # drop KL terms produced in eval
+                st.lsa.clear_cache()
             if st.hssd is not None:
                 for ad in st.hssd.adapters.values():
                     ad.clear_aux()
@@ -719,6 +723,8 @@ class LMTrainer:
                                 total = total + float(aux_w.get(name, 1.0)) * a
                                 losses[name] = losses.get(name, 0.0) + float(a.detach()) / accum
                             (total / accum).backward()
+                            if st.loop is not None and callable(getattr(st.loop, "release_graph", None)):
+                                st.loop.release_graph()
                             losses["lm"] = losses.get("lm", 0.0) + float(loss.detach()) / accum
                             n = int(ntok)
                         if lcalib_on:

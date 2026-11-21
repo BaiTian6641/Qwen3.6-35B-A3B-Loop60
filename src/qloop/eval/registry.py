@@ -365,7 +365,7 @@ def adapt_hle_verified(row: dict[str, Any], idx: int, *,
         "answer": str(a),
         "answer_type": row.get("answer_type") or "exactMatch",
         "has_image": has_img,
-        "subset": subset,
+        "subset": (subset if "subset" in row else None),
         "subset_raw": row.get("subset_raw", ""),
         "raw_subject": row.get("raw_subject", ""),
         "category": row.get("category", ""),
@@ -615,7 +615,7 @@ def load_items(spec: BenchmarkSpec, limit: int | None = None, offline_items: lis
         for it in produced:
             if it.get("has_image") and not mm:
                 continue
-            if (allowed_subsets is not None and "subset" in it
+            if (allowed_subsets is not None and it.get("subset") is not None
                     and str(it["subset"]).strip().lower() not in allowed_subsets):
                 continue
             if min_date and str(it.get("contest_date", "")) and str(it.get("contest_date", ""))[:10] < str(min_date):

@@ -110,6 +110,16 @@ def test_adapt_hle_verified_subsets_and_multimodal():
     assert len(R.adapt_hle_verified(rows[0], 0)) == 1
     assert R.adapt_hle_verified(rows[2], 2) == []
 
+    # minimal offline row without "subset" key is kept consistently by both adapt_hle_verified and load_items,
+    # while explicit empty/None "subset" rows are filtered out
+    minimal = {"id": "v_min", "question": "Minimal Q", "answer": "9"}
+    empty_sub = {"id": "v_empty", "question": "Empty Q", "answer": "9", "subset": ""}
+    none_sub = {"id": "v_none", "question": "None Q", "answer": "9", "subset": None}
+    assert R.adapt_hle_verified(minimal, 0)[0]["subset"] is None
+    assert R.adapt_hle_verified(empty_sub, 1) == []
+    assert R.adapt_hle_verified(none_sub, 2) == []
+    assert [it["id"] for it in R.load_items(spec, offline_items=[minimal, empty_sub, none_sub])] == ["v_min"]
+
 
 def test_adapt_supergpqa_and_mmlu_pro_10_way_mcq():
     opts = [f"opt_{i}" for i in range(9)] + ["A protein complex"]

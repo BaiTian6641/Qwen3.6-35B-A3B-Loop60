@@ -1,26 +1,93 @@
-# Held-out evaluation with the loop-depth sweep (depth 1 = stock graph, 2 = trained, 3 = extrapolation
-# only if num_passes was raised). NEVER train on these contamination groups.
+# Late-2026 held-out evaluation suite with 3-pass Loop-HSSD v3.2 depth sweep (d=1 -> 40L stock graph,
+# d=2 -> 64L, d=3 -> 88L trained A6B architecture). NEVER train on these held-out contamination groups.
 #   python -m qloop eval -c configs/eval/suite.yaml --ckpt runs/s4_rl
 _base_: [../base.yaml, ../model/qwen36_nvfp4.yaml]
 run: {name: eval}
-lsa:
-  enabled: true
-  mode: sparse                 # evaluate the sparse attention actually used at 1M
+
 model:
   yarn_target_len: 1048576
+
+loop:
+  enabled: true
+  prelude_end: 12
+  core_end: 36
+  num_passes: 3
+  target_virtual_layers: 88
+  kv_share: true
+  bridge_init: [0.05, 0.85, 0.10]
+  bridge_rank: 256
+  bridge_mode: subspace
+  bridge_up_std: 0.01
+  attn_adapter_rank: 64
+  step_embedding: true
+  gate_init: 0.0
+  per_pass_router: true
+  router_adapter_rank: 32
+  router_repel_init: 0.0
+  router_diversity_weight: 0.0
+  mor: false
+  write_mask: true
+  checkpoint: false
+  train_pass_probs: [0.10, 0.35, 0.55]
+
+gdn2:
+  enabled: false
+
+hssd:
+  enabled: true
+  write_mode: full
+  swa_recency_init: 0.05
+  horizon_tokens: 1048576
+  compact_active_pages: true
+  compact_decode_cache: true
+  chunk_size: 64
+  window_chunks: 8
+  num_pages: 8
+  k_pages: 2
+  theta_low_rank: true
+  surprise_mode: routed
+  state_dtype: bfloat16
+  budget_weight: 1.0
+  segment_chunks: 4
+  checkpoint_segments: false
+
+lsa:
+  enabled: true
+  mode: sparse                 # evaluate the sparse D-LSA attention actually used at 1M
+  compact_active_slots: true
+  max_selected_keys: 768
+  num_query_passes: 3
+  index_dim: 64
+  index_on: nope
+  pool: 4
+  block_size: 512
+  avg_bucket_keys: 8
+  max_bucket_keys: 32
+  num_select: 64
+  window: 512
+  sinks: 64
+  search: flat
+  temperature: 0.1
+  query_chunk: 256
+
 eval:
   batch_size: 1
-  defaults: {depths: [1, 2], n_samples: 1, limit: null}
+  defaults: {depths: [1, 2, 3], n_samples: 1, limit: null}
   trained_contamination_groups: [kernelbench, arc_agi_2]   # we train on KB L1-2 and ARC train split
   benchmarks:
     - {name: aime_2026, n_samples: 16, temperature: 0.6, max_new_tokens: 32768}
+    - {name: hmmt_feb_2026, n_samples: 8, temperature: 0.6, max_new_tokens: 32768}
     - {name: gpqa_diamond, max_new_tokens: 16384}
-    - {name: hle, max_new_tokens: 16384}
-    - {name: arc_agi_2, n_samples: 2, max_new_tokens: 16384}   # pass@2, the key loop-depth benchmark
+    - {name: supergpqa, limit: 500, max_new_tokens: 16384}
+    - {name: hle_diamond, max_new_tokens: 16384}
+    - {name: hle_rolling, max_new_tokens: 16384}
+    - {name: arc_agi_2, n_samples: 2, max_new_tokens: 16384}   # pass@2, key loop-depth benchmark
     - {name: livecodebench, max_new_tokens: 16384}
     - {name: kernelbench_l3, max_new_tokens: 16384}
+    - {name: mrcr, limit: 200, max_new_tokens: 4096}           # 1M multi-needle retrieval & reasoning
     - {name: longbench_v2, max_new_tokens: 1024}
+    - {name: mmlu_pro, limit: 500, max_new_tokens: 8192}
   external:
-    harbor: {dataset: "terminal-bench@2.0", agent: terminus-2, model: openai/qloop, env: daytona,
+    harbor: {dataset: "terminal-bench/terminal-bench@4.1.0", agent: terminus-2, model: openai/qloop, env: daytona,
              api_base: "http://127.0.0.1:8000/v1", n_concurrent: 4}
     tau: {env: retail, model: qloop, api_base: "http://127.0.0.1:8000/v1"}

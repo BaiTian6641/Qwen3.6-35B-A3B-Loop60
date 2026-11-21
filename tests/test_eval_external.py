@@ -23,7 +23,7 @@ def test_harbor_command_defaults_to_daytona():
                       agent_kwargs={"max_turns": 50}, n_attempts=2, jobs_dir="/tmp/jobs")
     cmd = X.build_harbor_command(run)
     assert cmd[:2] == ["harbor", "run"]
-    assert cmd[cmd.index("--dataset") + 1] == "terminal-bench@2.0"
+    assert cmd[cmd.index("--dataset") + 1] == "terminal-bench/terminal-bench@4.1.0"
     assert cmd[cmd.index("--env") + 1] == "daytona"
     assert cmd[cmd.index("--task-name") + 1] == "hello-world"
     assert "max_turns=50" in cmd and cmd[cmd.index("--n-attempts") + 1] == "2"

@@ -42,7 +42,7 @@ class BenchmarkSpec:
     hf_id: str
     config: str | None
     split: str
-    kind: str                       # aime|math|mcq|longmcq|hle|arc|code|kernel|gaia|agentic|vision_mcq
+    kind: str                       # aime|math|mcq|longmcq|mrcr|hle|arc|code|kernel|gaia|agentic|vision_mcq
     scorer: str | None              # key into scoring.get_scorer (None => external harness only)
     requires: set[str] = field(default_factory=set)
     gated: bool = False
@@ -54,6 +54,7 @@ class BenchmarkSpec:
     max_new_tokens: int = 8192
     harness: str | None = None      # external harness name (harbor | tau_bench | openai_endpoint)
     extra: dict[str, Any] = field(default_factory=dict)
+    revision: str | None = None
 
     def build_prompt(self, item: dict[str, Any]) -> list[dict[str, Any]]:
         if item.get("messages"):
@@ -77,15 +78,35 @@ def _choices_block(choices: list[str], style: str = "{L}) {c}") -> str:
 
 def _letter(ans: Any, choices: list[str] | None = None) -> str:
     s = str(ans).strip()
-    if len(s) >= 1 and s[0].upper() in LETTERS and (len(s) == 1 or not s[1].isalnum()):
-        return s[0].upper()
+    if len(s) == 1 and s.upper() in LETTERS:
+        return s.upper()
     if s.isdigit() and choices is not None and int(s) < len(choices):
         return LETTERS[int(s)]
     if choices is not None:
         for i, c in enumerate(choices):
             if str(c).strip() == s:
                 return LETTERS[i]
+    if len(s) >= 1 and s[0].upper() in LETTERS and (len(s) == 1 or not s[1].isalnum()):
+        return s[0].upper()
+    if len(s) >= 3 and s[0] in "([" and s[1].upper() in LETTERS and s[2] in ")]":
+        return s[1].upper()
     return s[:1].upper()
+
+
+def _as_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes")
+    return bool(v)
+
+
+def _parse_chat_messages(raw: Any) -> list[dict[str, Any]] | None:
+    parsed = _maybe_json(raw)
+    if isinstance(parsed, list) and parsed and all(isinstance(m, dict) and "role" in m for m in parsed):
+        return [{"role": str(m["role"]), "content": "" if m.get("content") is None else str(m["content"])}
+                for m in parsed]
+    return None
 
 
 def _grid_text(g: list[list[int]]) -> str:
@@ -221,6 +242,15 @@ def vision_mcq_prompt(item: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"role": "user", "content": content}]
 
 
+def mrcr_prompt(item: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = item.get("messages") if item.get("messages") is not None else item.get("prompt")
+    msgs = _parse_chat_messages(raw)
+    if msgs is not None:
+        return msgs
+    q = item.get("prompt") if item.get("prompt") is not None else item.get("question", "")
+    return [{"role": "user", "content": str(q)}]
+
+
 # ============================================================================ adapters (raw row -> items)
 
 def _id(row: dict[str, Any], idx: int, keys: Iterable[str] = ("id", "_id", "task_id", "instance_id")) -> str:
@@ -317,6 +347,170 @@ def adapt_gaia(row: dict[str, Any], idx: int) -> list[dict[str, Any]]:
              "file_name": row.get("file_name") or ""}]
 
 
+def adapt_hle_verified(row: dict[str, Any], idx: int, *,
+                       subsets: Iterable[str] | None = ("gold", "revision")) -> list[dict[str, Any]]:
+    q = _first(row, ("question", "Question"))
+    a = _first(row, ("answer", "Answer"))
+    require(q is not None and a is not None, "HLE-Verified row needs question + answer", columns=sorted(row))
+    subset = str(row.get("subset") or "").strip().lower()
+    if subsets is not None and "subset" in row:
+        allowed = {str(s).strip().lower() for s in subsets}
+        if subset not in allowed:
+            return []
+    has_img = (_as_bool(row["has_image"]) if "has_image" in row and row["has_image"] is not None
+               else bool(row.get("image")))
+    return [{
+        "id": _id(row, idx),
+        "question": str(q),
+        "answer": str(a),
+        "answer_type": row.get("answer_type") or "exactMatch",
+        "has_image": has_img,
+        "subset": subset,
+        "subset_raw": row.get("subset_raw", ""),
+        "raw_subject": row.get("raw_subject", ""),
+        "category": row.get("category", ""),
+        "problem_is_valid": row.get("problem_is_valid"),
+        "answer_is_valid": row.get("answer_is_valid"),
+        "rationale_is_valid": row.get("rationale_is_valid"),
+        "image": row.get("image") or None,
+    }]
+
+
+def adapt_supergpqa(row: dict[str, Any], idx: int) -> list[dict[str, Any]]:
+    q = _first(row, ("question", "Question"))
+    opts = _maybe_json(row.get("options"))
+    require(q is not None and isinstance(opts, (list, tuple)) and len(opts) > 0,
+            "SuperGPQA row needs question + non-empty options list", columns=sorted(row))
+    choices = [str(c).strip() for c in opts]
+    require(len(choices) <= len(LETTERS), "SuperGPQA row has more options than supported letters",
+            n_choices=len(choices), max_choices=len(LETTERS))
+    ans_letter = _first(row, ("answer_letter",))
+    raw_ans = ans_letter if ans_letter is not None else _first(row, ("answer", "answer_index"))
+    require(raw_ans is not None, "SuperGPQA row needs answer_letter or answer", columns=sorted(row))
+    ans = _letter(raw_ans, choices)
+    require(ans in LETTERS[: len(choices)], "SuperGPQA answer letter out of range",
+            answer=ans, n_choices=len(choices))
+    return [{
+        "id": _id(row, idx, ("uuid", "id", "_id")),
+        "question": str(q).strip(),
+        "choices": choices,
+        "answer": ans,
+        "discipline": row.get("discipline", ""),
+        "field": row.get("field", ""),
+        "subfield": row.get("subfield", ""),
+        "difficulty": row.get("difficulty", ""),
+        "is_calculation": row.get("is_calculation"),
+    }]
+
+
+def adapt_mmlu_pro(row: dict[str, Any], idx: int) -> list[dict[str, Any]]:
+    q = _first(row, ("question", "Question"))
+    opts = _maybe_json(row.get("options"))
+    require(q is not None and isinstance(opts, (list, tuple)) and len(opts) > 0,
+            "MMLU-Pro row needs question + non-empty options list", columns=sorted(row))
+    choices = [str(c).strip() for c in opts]
+    require(len(choices) <= len(LETTERS), "MMLU-Pro row has more options than supported letters",
+            n_choices=len(choices), max_choices=len(LETTERS))
+    raw_ans = _first(row, ("answer", "answer_index"))
+    require(raw_ans is not None, "MMLU-Pro row needs answer or answer_index", columns=sorted(row))
+    ans = _letter(raw_ans, choices)
+    require(ans in LETTERS[: len(choices)], "MMLU-Pro answer letter out of range",
+            answer=ans, n_choices=len(choices))
+    return [{
+        "id": str(_first(row, ("question_id", "id", "_id"), idx)),
+        "question": str(q).strip(),
+        "choices": choices,
+        "answer": ans,
+        "category": row.get("category", ""),
+        "src": row.get("src", ""),
+    }]
+
+
+def adapt_mrcr(row: dict[str, Any], idx: int) -> list[dict[str, Any]]:
+    raw_prompt = row.get("prompt")
+    ans = row.get("answer")
+    require(raw_prompt is not None and ans is not None, "MRCR row needs prompt + answer", columns=sorted(row))
+    msgs = _parse_chat_messages(raw_prompt)
+    item: dict[str, Any] = {
+        "id": _id(row, idx, ("id", "_id", "idx")),
+        "answer": str(ans),
+        "random_string_to_prepend": str(row.get("random_string_to_prepend") or ""),
+        "n_needles": row.get("n_needles"),
+        "desired_msg_index": row.get("desired_msg_index"),
+        "total_messages": row.get("total_messages"),
+        "n_chars": row.get("n_chars"),
+        "date_added": row.get("date_added"),
+    }
+    if msgs is not None:
+        item["messages"] = msgs
+    else:
+        item["prompt"] = str(raw_prompt)
+    return [item]
+
+
+def adapt_math_arena(row: dict[str, Any], idx: int) -> list[dict[str, Any]]:
+    q = _first(row, ("problem", "question", "Problem", "Question"))
+    a = _first(row, ("answer", "Answer", "solution_answer"))
+    require(q is not None and a is not None, "MathArena row needs problem/question + answer", columns=sorted(row))
+    item: dict[str, Any] = {
+        "id": str(_first(row, ("problem_idx", "id", "ID"), idx)),
+        "question": str(q),
+        "answer": str(a).strip(),
+        "integer_answer": False,
+    }
+    if "problem_type" in row:
+        item["problem_type"] = row["problem_type"]
+    if "source" in row:
+        item["source"] = row["source"]
+    return [item]
+
+
+def adapt_browsecomp_long(row: dict[str, Any], idx: int) -> list[dict[str, Any]]:
+    q = _first(row, ("problem", "question", "Problem", "Question"))
+    a = _first(row, ("answer", "Answer"))
+    require(q is not None and a is not None, "BrowseCompLongContext row needs problem + answer", columns=sorted(row))
+    return [{
+        "id": _id(row, idx, ("id", "_id", "problem_id")),
+        "question": str(q),
+        "answer": str(a),
+        "answer_type": "exactMatch",
+        "urls": row.get("urls") or [],
+        "canary": row.get("canary") or "",
+    }]
+
+
+def adapt_frames(row: dict[str, Any], idx: int) -> list[dict[str, Any]]:
+    q = _first(row, ("Prompt", "prompt", "question", "Question"))
+    a = _first(row, ("Answer", "answer"))
+    require(q is not None and a is not None, "FRAMES row needs Prompt + Answer", columns=sorted(row))
+    rid = _first(row, ("id", "_id", "Unnamed: 0"), idx)
+    return [{
+        "id": str(rid),
+        "question": str(q),
+        "answer": str(a),
+        "answer_type": "exactMatch",
+        "reasoning_types": row.get("reasoning_types", ""),
+    }]
+
+
+def adapt_terminal_bench(row: dict[str, Any], idx: int) -> list[dict[str, Any]]:
+    instr = _first(row, ("instruction", "question", "problem_statement", "prompt", "task"))
+    require(instr is not None, "Terminal-Bench row needs instruction", columns=sorted(row))
+    name = str(_first(row, ("name", "task_id", "id", "_id"), idx))
+    return [{
+        "id": name,
+        "name": name,
+        "question": str(instr),
+        "instruction": str(instr),
+        "description": row.get("description") or "",
+        "keywords": row.get("keywords") or [],
+        "schema_version": row.get("schema_version"),
+        "location": row.get("location") or "",
+        "metadata": row.get("metadata"),
+        "answer": None,
+    }]
+
+
 def adapt_generic(row: dict[str, Any], idx: int) -> list[dict[str, Any]]:
     q = _first(row, ("question", "problem_statement", "instruction", "prompt", "task", "Question"), "")
     return [{"id": _id(row, idx), "question": q, "answer": _first(row, ("answer", "Final answer"), None), "raw": row}]
@@ -373,6 +567,27 @@ def contamination_conflicts(trained_groups: Iterable[str], names: Iterable[str] 
             if (names is None or s.name in set(names)) and s.contamination_group in tg}
 
 
+def _load_hf_rows(spec: BenchmarkSpec, token: str | None = None) -> Iterable[dict[str, Any]]:
+    try:
+        import datasets
+    except ImportError as e:
+        raise ImportError(f"loading {spec.hf_id} needs `pip install datasets` (or pass offline_items=)") from e
+    tok = token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    kw: dict[str, Any] = {"split": spec.split, "token": tok}
+    if spec.revision is not None:
+        kw["revision"] = spec.revision
+    try:
+        ds = datasets.load_dataset(spec.hf_id, spec.config, **kw)
+    except Exception as e:
+        hint = " (gated dataset: accept the terms on the HF page and set HF_TOKEN)" if spec.gated else ""
+        rev = f", revision={spec.revision!r}" if spec.revision is not None else ""
+        raise RuntimeError(f"load_dataset({spec.hf_id!r}, {spec.config!r}, split={spec.split!r}{rev}) failed{hint}: "
+                           f"{type(e).__name__}: {e}") from e
+    log.info("loaded %s/%s[%s]%s: %d rows, columns=%s", spec.hf_id, spec.config, spec.split,
+             f"@{spec.revision}" if spec.revision else "", len(ds), getattr(ds, "column_names", "?"))
+    return ds
+
+
 def load_items(spec: BenchmarkSpec, limit: int | None = None, offline_items: list[dict[str, Any]] | None = None, *,
                token: str | None = None, include_multimodal: bool | None = None) -> list[dict[str, Any]]:
     """Rows (HF `datasets`, or `offline_items` in raw or normalised form) -> normalised items."""
@@ -380,33 +595,28 @@ def load_items(spec: BenchmarkSpec, limit: int | None = None, offline_items: lis
         rows: Iterable[dict[str, Any]] = offline_items
         src = f"{len(offline_items)} offline rows"
     else:
-        try:
-            import datasets
-        except ImportError as e:
-            raise ImportError(f"loading {spec.hf_id} needs `pip install datasets` (or pass offline_items=)") from e
-        tok = token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-        try:
-            ds = datasets.load_dataset(spec.hf_id, spec.config, split=spec.split, token=tok)
-        except Exception as e:
-            hint = " (gated dataset: accept the terms on the HF page and set HF_TOKEN)" if spec.gated else ""
-            raise RuntimeError(f"load_dataset({spec.hf_id!r}, {spec.config!r}, split={spec.split!r}) failed{hint}: "
-                               f"{type(e).__name__}: {e}") from e
-        log.info("loaded %s/%s[%s]: %d rows, columns=%s", spec.hf_id, spec.config, spec.split, len(ds),
-                 getattr(ds, "column_names", "?"))
-        rows, src = ds, spec.hf_id
+        rows, src = _load_hf_rows(spec, token=token), spec.hf_id
     adapter = spec.adapter or adapt_generic
     mm = ("vision" in spec.requires) if include_multimodal is None else include_multimodal
     min_date = spec.extra.get("min_contest_date")
+    raw_subsets = spec.extra.get("subsets")
+    allowed_subsets = {str(s).strip().lower() for s in raw_subsets} if raw_subsets is not None else None
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
     for idx, row in enumerate(rows):
         try:
-            produced = adapter(dict(row), idx)
+            if adapter is adapt_hle_verified and "subsets" in spec.extra:
+                produced = adapt_hle_verified(dict(row), idx, subsets=raw_subsets)
+            else:
+                produced = adapter(dict(row), idx)
         except Exception as e:
             raise ValueError(f"{spec.name}: adapter failed on row {idx} ({src}); columns={sorted(dict(row))}: "
                              f"{type(e).__name__}: {e}") from e
         for it in produced:
             if it.get("has_image") and not mm:
+                continue
+            if (allowed_subsets is not None and "subset" in it
+                    and str(it["subset"]).strip().lower() not in allowed_subsets):
                 continue
             if min_date and str(it.get("contest_date", "")) and str(it.get("contest_date", ""))[:10] < str(min_date):
                 continue
@@ -430,15 +640,51 @@ def _register_defaults() -> None:
                 "normalised exact-match (+math equivalence), a lower bound. ~14% image questions are skipped "
                 "unless include_multimodal=True with a vision model.",
           extra={"official_requires": ["api_judge"], "optional_requires": ["vision"]}),
+        S("hle_rolling", "cais/hle-rolling", None, "test", "hle", "hle", set(), gated=True, contamination_group="hle",
+          prompt_builder=hle_prompt, adapter=adapt_hle, max_new_tokens=16384, verified=True,
+          notes="Humanity's Last Exam Rolling (1,000 rows, identical schema to cais/hle). Image questions skipped "
+                "unless include_multimodal=True.",
+          extra={"official_requires": ["api_judge"], "optional_requires": ["vision"]}),
+        S("hle_diamond", "cais/hle-diamond", None, "test", "hle", "hle", set(), gated=True, contamination_group="hle",
+          prompt_builder=hle_prompt, adapter=adapt_hle, max_new_tokens=16384, verified=True,
+          notes="Humanity's Last Exam Diamond (1,000 frozen cleaned questions: 500 reasoning + 500 expert knowledge, "
+                "Sep 2026 baseline; identical schema to cais/hle).",
+          extra={"official_requires": ["api_judge"], "optional_requires": ["vision"]}),
+        S("hle_verified", "lmms-lab/HLE-Verified", None, "test", "hle", "hle", set(), gated=False,
+          contamination_group="hle", prompt_builder=hle_prompt, adapter=adapt_hle_verified, max_new_tokens=16384,
+          verified=True,
+          notes="Open audited HLE-Verified benchmark; defaults to audited subsets {'gold', 'revision'} (override via "
+                "extra.subsets) and skips has_image=True rows unless include_multimodal=True.",
+          extra={"subsets": ["gold", "revision"], "official_requires": ["api_judge"],
+                 "optional_requires": ["vision"]}),
         S("swe_bench_pro", "ScaleAI/SWE-bench_Pro", None, "test", "agentic", None, {"remote_sandbox"},
           contamination_group="swe_bench", prompt_builder=agentic_prompt, adapter=adapt_generic,
           harness="harbor", verified=False,
           notes="Repository-level patches scored by running tests in per-instance images. Run through Harbor "
                 "(--env daytona|modal) with the agent pointed at qloop.eval.server.",
           extra={"harbor_dataset": "swebenchpro"}),
+        S("swe_bench_pro_hard", "ScaleAI/SWE-bench_Pro", "hard", "test", "agentic", None, {"remote_sandbox"},
+          gated=False, contamination_group="swe_bench", prompt_builder=agentic_prompt, adapter=adapt_generic,
+          harness="harbor", verified=True,
+          notes="SWE-bench Pro Hard subset. Run through Harbor (--dataset swebenchpro-hard --env daytona|modal) "
+                "with the agent pointed at qloop.eval.server.",
+          extra={"harbor_dataset": "swebenchpro-hard"}),
+        S("deep_swe", "datacurve/deep-swe", None, "test", "agentic", None, {"remote_sandbox"},
+          gated=True, contamination_group="swe_bench", prompt_builder=agentic_prompt, adapter=adapt_generic,
+          harness="harbor", verified=True,
+          notes="DeepSWE v1.1 (Inkling 2 Mini agentic software engineering benchmark). Run through Harbor remote "
+                "sandbox against qloop.eval.server."),
         S("aime_2026", "MathArena/aime_2026", None, "train", "aime", "aime", set(), contamination_group="aime_2026",
           prompt_builder=math_prompt, adapter=adapt_aime, max_new_tokens=32768, verified=False,
           notes="30 problems (AIME I+II 2026), integer answers 0-999. Report avg@k (k>=4) - n=30 is noisy."),
+        S("hmmt_feb_2026", "MathArena/hmmt_feb_2026", None, "train", "math", "math", set(), gated=False,
+          contamination_group="hmmt_2026", prompt_builder=math_prompt, adapter=adapt_math_arena,
+          max_new_tokens=32768, verified=True,
+          notes="HMMT Feb 2026 (33 competition math problems with symbolic answers, scored by MATH equivalence)."),
+        S("apex_shortlist", "MathArena/apex-shortlist", None, "train", "math", "math", set(), gated=False,
+          contamination_group="apex_math", prompt_builder=math_prompt, adapter=adapt_math_arena,
+          max_new_tokens=32768, verified=True,
+          notes="APEX Shortlist (47 Olympiad math problems with symbolic answers, scored by MATH equivalence)."),
         S("livecodebench", "livecodebench/code_generation_lite", "release_v6", "test", "code", "lcb", {"code_exec"},
           contamination_group="livecodebench", prompt_builder=code_prompt, adapter=adapt_lcb, max_new_tokens=32768,
           verified=False,
@@ -448,10 +694,32 @@ def _register_defaults() -> None:
         S("gpqa_diamond", "Idavidrein/gpqa", "gpqa_diamond", "train", "mcq", "mcq", set(), gated=True,
           contamination_group="gpqa", prompt_builder=mcq_prompt, adapter=adapt_gpqa, max_new_tokens=16384,
           verified=True, notes="198 questions; choices shuffled deterministically per Record ID."),
+        S("gpqa_extended", "Idavidrein/gpqa", "gpqa_extended", "train", "mcq", "mcq", set(), gated=True,
+          contamination_group="gpqa", prompt_builder=mcq_prompt, adapter=adapt_gpqa, max_new_tokens=16384,
+          verified=True, notes="546 graduate-level questions; choices shuffled deterministically per Record ID."),
+        S("supergpqa", "m-a-p/SuperGPQA", None, "train", "mcq", "mcq", set(), gated=False,
+          contamination_group="supergpqa", prompt_builder=mcq_prompt, adapter=adapt_supergpqa, max_new_tokens=16384,
+          verified=True, notes="26,529 graduate-level MCQs (up to 10 options A-J) across 285 disciplines."),
+        S("mmlu_pro", "TIGER-Lab/MMLU-Pro", None, "test", "mcq", "mcq", set(), gated=False,
+          contamination_group="mmlu_pro", prompt_builder=mcq_prompt, adapter=adapt_mmlu_pro, max_new_tokens=8192,
+          verified=True, notes="MMLU-Pro 10-way multiple-choice reasoning benchmark (options A-J)."),
+        S("frames", "google/frames-benchmark", None, "test", "hle", "hle", set(), gated=False,
+          contamination_group="frames", prompt_builder=hle_prompt, adapter=adapt_frames, max_new_tokens=8192,
+          verified=True, notes="Google FRAMES multi-hop factuality & retrieval benchmark (Prompt/Answer)."),
+        S("mrcr", "openai/mrcr", None, "train", "mrcr", "mrcr", set(), gated=False,
+          contamination_group="mrcr", prompt_builder=mrcr_prompt, adapter=adapt_mrcr, max_new_tokens=4096,
+          verified=True,
+          notes="OpenAI MRCR (2,400 multi-needle long-context conversations up to 1M tokens). Graded by "
+                "prefix-checked SequenceMatcher ratio after stripping <think> blocks."),
+        S("browsecomp_long", "openai/BrowseCompLongContext", None, "train", "hle", "hle", set(), gated=False,
+          contamination_group="browsecomp", prompt_builder=hle_prompt, adapter=adapt_browsecomp_long,
+          max_new_tokens=16384, verified=True,
+          notes="OpenAI BrowseComp LongContext (problem/answer/urls/canary); local exact/math lower bound.",
+          extra={"official_requires": ["api_judge"]}),
         S("openthoughts_tb_dev_v2", "open-thoughts/OpenThoughts-TB-dev-v2", None, "train", "agentic", None,
           {"remote_sandbox"}, contamination_group="openthoughts_agent", prompt_builder=agentic_prompt,
           adapter=adapt_generic, harness="harbor", verified=False,
-          notes="Terminal-agent dev set in Harbor task format; use as the fast dev proxy for Terminal-Bench 2.0. "
+          notes="Terminal-agent dev set in Harbor task format; use as the fast dev proxy for Terminal-Bench 4.1/2.0. "
                 "Contaminated if trained on OpenThoughts-Agent SFT/RL data."),
         S("arc_agi_2", "arcprize/ARC-AGI-2", None, "evaluation", "arc", "arc", set(), contamination_group="arc_agi_2",
           prompt_builder=arc_prompt, adapter=adapt_arc, max_new_tokens=16384, verified=False,
@@ -460,16 +728,24 @@ def _register_defaults() -> None:
         S("arc_agi_2_human", "arcprize/arc_agi_2_human_testing", None, "train", "arc", "arc", set(),
           contamination_group="arc_agi_2", prompt_builder=arc_prompt, adapter=adapt_arc, max_new_tokens=16384,
           verified=False, notes="Human testing set of ARC-AGI-2 (same contamination group as the public eval)."),
+        S("terminal_bench_4_1", "harborframework/terminal-bench", None, "test", "agentic", None, {"remote_sandbox"},
+          gated=False, contamination_group="terminal_bench", prompt_builder=agentic_prompt,
+          adapter=adapt_terminal_bench, harness="harbor", verified=True, revision="v4.1.0",
+          notes="Terminal-Bench 4.1 (66 hardened container tasks with RewardKit anti-reward-hacking verifiers; "
+                "default replacing legacy 2.0/4.0). `harbor run --dataset terminal-bench/terminal-bench@4.1.0 "
+                "--env daytona` (Colab: no Docker).",
+          extra={"harbor_dataset": "terminal-bench/terminal-bench@4.1.0"}),
         S("terminal_bench_2", "harborframework/terminal-bench-2.0", None, "train", "agentic", None, {"remote_sandbox"},
           contamination_group="terminal_bench", prompt_builder=agentic_prompt, adapter=adapt_generic,
           harness="harbor", verified=False,
-          notes="89 container tasks. `harbor run --dataset terminal-bench@2.0 --env daytona` (Colab: no Docker).",
+          notes="Legacy 89 container tasks (superseded as default by terminal_bench_4_1). "
+                "`harbor run --dataset terminal-bench@2.0 --env daytona` (Colab: no Docker).",
           extra={"harbor_dataset": "terminal-bench@2.0"}),
         S("agentworldbench", "Qwen/AgentWorldBench", None, "test", "agentic", None, {"remote_sandbox"},
           contamination_group="terminal_bench", prompt_builder=agentic_prompt, adapter=adapt_generic,
           harness="harbor", verified=False,
           notes="Built from Terminal-Bench 2.0 trajectories => same contamination group 'terminal_bench': never "
-                "train on one and report the other as held-out."),
+                "train on one and report Terminal-Bench 2.0/4.1 as held-out."),
         S("tau_bench_lilt", "lilt-ai/tau-bench-lilt", None, "train", "agentic", None, {"api_judge"},
           contamination_group="tau_bench", prompt_builder=agentic_prompt, adapter=adapt_generic,
           harness="tau_bench", verified=False,

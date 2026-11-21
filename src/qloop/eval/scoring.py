@@ -10,6 +10,7 @@ the last `</think>` before extraction (if the think block never closed, the whol
 """
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import math
@@ -383,8 +384,9 @@ def extract_mcq(text: str, n_choices: int | None = None, letters: str = LETTERS,
         return None
     L = f"[{valid}]"
     pats = [
-        rf"\\boxed\{{\s*(?:\\text(?:bf)?\{{)?\s*\(?({L})\)?",
-        rf"(?i:answer)(?:\s+(?i:is))?\s*[:：]?\s*[*_\s]*(?i:option|choice)?\s*[*_\s]*[\(\[]?\s*({L})\s*[\)\]]?(?![A-Za-z])",
+        rf"\\boxed\{{\s*(?:\\(?:text|textbf|mathrm|mathbf)\{{)?\s*\(?({L})\)?",
+        rf"(?i:answer)[*_\s]*(?:(?i:is)\b|[:：=])[*_\s]*(?:(?i:option|choice)\b)?[*_\s]*[\(\[]?\s*({L})\s*[\)\]]?(?![A-Za-z])",
+        rf"(?i:answer)\s+[\(\[]({L})[\)\]]",
         rf"(?i:option|choice)\s+[\(\[]?({L})[\)\]]?(?![A-Za-z])",
         rf"\*\*\s*[\(\[]?({L})[\)\]]?[.:]?\s*\*\*",
         rf"(?m)^\s*[\(\[]?({L})[\)\]]?[.:]?\s*$",
@@ -619,6 +621,35 @@ def extract_gaia_answer(text: str) -> str | None:
     return None
 
 
+# ============================================================================ MRCR (OpenAI 1M retrieval)
+
+def extract_mrcr_answer(text: str, random_string_to_prepend: str = "") -> str | None:
+    """Strip `<think>...</think>` reasoning; trim leading whitespace when locating the required prefix."""
+    pred = strip_thinking(text)
+    prefix = str(random_string_to_prepend or "")
+    if prefix:
+        if not pred.startswith(prefix):
+            pred = pred.lstrip()
+    else:
+        pred = pred.strip()
+    return pred if pred != "" else None
+
+
+def score_mrcr(text: str, gold: Any, random_string_to_prepend: str = "") -> float:
+    """OpenAI official MRCR grading: 0.0 if `random_string_to_prepend` is missing after `<think>` stripping,
+    else `difflib.SequenceMatcher(None, pred[len(prefix):], gold[len(prefix):]).ratio()`."""
+    pred = extract_mrcr_answer(text, random_string_to_prepend)
+    if pred is None:
+        return 0.0
+    prefix = str(random_string_to_prepend or "")
+    gold_s = "" if gold is None else str(gold)
+    if prefix and not pred.startswith(prefix):
+        return 0.0
+    pred_body = pred[len(prefix):]
+    gold_body = gold_s[len(prefix):] if (prefix and gold_s.startswith(prefix)) else gold_s
+    return float(difflib.SequenceMatcher(None, pred_body, gold_body).ratio())
+
+
 # ============================================================================ pass@k / maj@k
 
 def pass_at_k(n: int, c: int, k: int) -> float:
@@ -719,6 +750,22 @@ def _arc_eval(text: str, item: dict[str, Any]) -> dict[str, Any]:
             "pred": json.dumps(pred) if pred is not None else None}
 
 
+def _mrcr_extract(text: str, item: dict[str, Any]) -> str | None:
+    return extract_mrcr_answer(text, str(item.get("random_string_to_prepend") or ""))
+
+
+def _mrcr_eval(text: str, item: dict[str, Any]) -> dict[str, Any]:
+    prefix = str(item.get("random_string_to_prepend") or "")
+    pred = extract_mrcr_answer(text, prefix)
+    gold = "" if item.get("answer") is None else str(item["answer"])
+    if pred is None or (prefix and not pred.startswith(prefix)):
+        return {"score": 0.0, "pred": pred, "prefix_ok": False}
+    pred_body = pred[len(prefix):]
+    gold_body = gold[len(prefix):] if (prefix and gold.startswith(prefix)) else gold
+    ratio = float(difflib.SequenceMatcher(None, pred_body, gold_body).ratio())
+    return {"score": ratio, "pred": pred, "prefix_ok": True}
+
+
 AIME = Scorer("aime", lambda t, it: extract_aime_answer(t), lambda p, it: p == parse_int_answer(it["answer"]))
 MATH = Scorer("math", lambda t, it: extract_math_answer(t), lambda p, it: math_equal(p, it["answer"]),
               equal=math_equal)
@@ -731,8 +778,11 @@ GAIA = Scorer("gaia", lambda t, it: extract_gaia_answer(t), lambda p, it: gaia_m
               equal=gaia_match)
 EXACT = Scorer("exact", lambda t, it: extract_hle_answer(t), lambda p, it: exact_match(p, it["answer"]),
                equal=exact_match)
+MRCR = Scorer("mrcr", _mrcr_extract,
+              lambda p, it: score_mrcr(p or "", it.get("answer"), str(it.get("random_string_to_prepend") or "")) >= 1.0,
+              evaluate_fn=_mrcr_eval)
 
-SCORERS: dict[str, Scorer] = {s.name: s for s in (AIME, MATH, MCQ, HLE, ARC, GAIA, EXACT)}
+SCORERS: dict[str, Scorer] = {s.name: s for s in (AIME, MATH, MCQ, HLE, ARC, GAIA, EXACT, MRCR)}
 
 
 def get_scorer(name: str) -> Scorer:

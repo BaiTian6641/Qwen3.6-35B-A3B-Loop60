@@ -1,7 +1,7 @@
 """Evaluation + serving for the looped Qwen3.6 stack.
 
     generate     Generator / GenOut: cache-based sampling (toy, looped and HF models), loop depth switch
-    scoring      answer extraction + scorers (AIME, math, MCQ, ARC grids, HLE, GAIA), pass@k, maj@k
+    scoring      answer extraction + scorers (AIME, math, MCQ A-J, MRCR, ARC grids, HLE, GAIA), pass@k, maj@k
     code_exec    LiveCodeBench-style test execution
     kernelbench  KernelBench correctness + speedup in a subprocess
     registry     BenchmarkSpec registry + prompt builders + load_items

@@ -1,7 +1,8 @@
 """External harnesses for benchmarks that cannot be scored in-process on Colab.
 
-Colab (RTX PRO 6000 runtime) has NO Docker daemon, so container benchmarks (Terminal-Bench 2.0,
-SWE-bench Pro, AgentWorldBench, OpenThoughts-TB-dev) run through **Harbor** with a remote sandbox
+Colab (RTX PRO 6000 runtime) has NO Docker daemon, so container benchmarks (Terminal-Bench 4.1 /
+legacy 2.0, SWE-bench Pro / Hard, DeepSWE v1.1, AgentWorldBench, OpenThoughts-TB-dev) run through
+**Harbor** with a remote sandbox
 provider (`--env daytona` default, or `modal`). The agent loop (e.g. terminus-2) runs locally
 and talks to our looped model through the OpenAI-compatible `qloop.eval.server`; only the task
 containers are remote. (Agents that are *installed inside* the container, e.g. claude-code,
@@ -140,7 +141,7 @@ def check_harbor_env(env: str = "daytona", model: str | None = None, api_base: s
 
 @dataclass
 class HarborRun:
-    dataset: str = "terminal-bench@2.0"
+    dataset: str = "terminal-bench/terminal-bench@4.1.0"
     agent: str = "terminus-2"
     model: str = "openai/qloop"
     env: str = "daytona"
@@ -154,6 +155,9 @@ class HarborRun:
     api_key: str | None = None
     extra_args: list[str] = field(default_factory=list)
     binary: str = "harbor"
+
+
+HarborConfig = HarborRun
 
 
 def build_harbor_command(run: HarborRun, docker_sock: str = DOCKER_SOCK,

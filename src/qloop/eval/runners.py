@@ -142,6 +142,8 @@ def run_benchmark(spec: BenchmarkSpec | str, generator: Any, limit: int | None =
         cfg = {"benchmark": spec.name, "hf_id": spec.hf_id, "config": spec.config, "split": spec.split,
                "n_samples": n_samples, "max_new_tokens": max_new, "temperature": temperature, "top_p": top_p,
                "top_k": top_k, "seed": seed, "depths": [_depth_label(d) for d in depths]}
+        if spec.revision is not None:
+            cfg["revision"] = spec.revision
         cfg_path = os.path.join(bdir, "run_config.json")
         if os.path.exists(cfg_path):
             with open(cfg_path, encoding="utf-8") as f:

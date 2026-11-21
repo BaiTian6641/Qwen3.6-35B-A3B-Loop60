@@ -290,6 +290,8 @@ def _hf_rows(spec: DatasetSpec, seed: int, epoch: int, skip: int, streaming: boo
         kw: dict[str, Any] = {"split": split, "streaming": streaming}
         if token:
             kw["token"] = token
+        if spec.revision is not None:
+            kw["revision"] = spec.revision
         if spec.data_files is not None:
             ds = datasets.load_dataset("json", data_files=spec.data_files, **kw)
         else:
@@ -370,6 +372,32 @@ def make_source_factory(spec: DatasetSpec, seed: int, drops: DropCounter, src_cf
 
 # ============================================================================ eval providers
 
+def _iter_eval_strings(val: Any) -> Iterator[str]:
+    """Yield plain text segments from an eval column, unwrapping JSON-encoded chat message lists (e.g. MRCR)."""
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list) and parsed and all(isinstance(m, dict) and "content" in m for m in parsed):
+                for m in parsed:
+                    c = m.get("content")
+                    if isinstance(c, str) and c.strip():
+                        yield c
+                return
+        yield s
+    elif isinstance(val, list):
+        for item in val:
+            if isinstance(item, dict) and isinstance(item.get("content"), str) and item["content"].strip():
+                yield item["content"]
+            elif isinstance(item, str) and item.strip():
+                yield item
+
+
 def eval_text_provider(spec: DatasetSpec, src_cfg: dict[str, Any] | None = None) -> EvalTextProvider:
     """Callable yielding the benchmark texts of an eval spec (for decontamination)."""
     cfg = src_cfg or {}
@@ -384,17 +412,16 @@ def eval_text_provider(spec: DatasetSpec, src_cfg: dict[str, Any] | None = None)
         found = False
         for row in raw_rows(spec, 0, 0, src_cfg={**cfg, "shuffle_buffer": 0}, streaming=False):
             for f in fields:
-                v = row.get(f)
-                if isinstance(v, str) and v.strip():
+                for text in _iter_eval_strings(row.get(f)):
                     found = True
-                    yield v
+                    yield text
         require(found, f"eval set '{spec.name}' yielded no text in fields {fields}", hf_id=spec.hf_id)
 
     return provider
 
 
-def default_eval_providers(groups: list[str], extra: dict[str, list[DatasetSpec]] | None = None
-                           ) -> dict[str, EvalTextProvider]:
+def default_eval_providers(groups: list[str], extra: dict[str, list[DatasetSpec]] | None = None, *,
+                           on_missing: str = "error") -> dict[str, EvalTextProvider]:
     out: dict[str, EvalTextProvider] = {}
     for g in groups:
         specs = list((extra or {}).get(g, [])) or eval_specs_for_group(g)
@@ -402,12 +429,21 @@ def default_eval_providers(groups: list[str], extra: dict[str, list[DatasetSpec]
             raise KeyError(f"decontam group '{g}' has no eval dataset in the registry (role=eval, "
                            f"contamination_group='{g}'). Known groups: "
                            f"{sorted({s.contamination_group for s in REGISTRY.values() if s.role == 'eval'})}")
-        out[g] = _chain_providers([eval_text_provider(s) for s in specs])
+        out[g] = _chain_providers([(s.name, eval_text_provider(s)) for s in specs], on_missing=on_missing)
     return out
 
 
-def _chain_providers(provs: list[EvalTextProvider]) -> EvalTextProvider:
-    return lambda: itertools.chain.from_iterable(p() for p in provs)
+def _chain_providers(provs: list[tuple[str, EvalTextProvider]], on_missing: str = "error") -> EvalTextProvider:
+    def _iter() -> Iterator[str]:
+        for name, p in provs:
+            try:
+                yield from p()
+            except Exception as e:
+                if on_missing != "warn":
+                    raise
+                log.warning("[decontam] eval source '%s' failed (%s: %s); skipping this source",
+                            name, type(e).__name__, e)
+    return _iter
 
 
 # ============================================================================ train stream
@@ -598,7 +634,7 @@ def build_train_stream(data_cfg: dict[str, Any], tokenizer: Any, seed: int = 0,
             providers = dict(eval_providers or {})
             missing = [g for g in groups if g not in providers]
             if missing:
-                providers.update(default_eval_providers(missing))
+                providers.update(default_eval_providers(missing, on_missing=str(dc.get("on_missing", "error"))))
             with stage("data:decontam-index"):
                 decontaminator = Decontaminator.from_providers(
                     {g: providers[g] for g in (groups or list(providers))}, n=int(dc.get("ngram", 13)),

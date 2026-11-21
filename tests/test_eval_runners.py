@@ -44,8 +44,11 @@ def test_registry_covers_required_benchmarks():
                "zai-org/LongBench-v2", "MMMU/MMMU_Pro"):
         assert hf in ids, hf
     assert R.get_spec("agentworldbench").contamination_group == R.get_spec("terminal_bench_2").contamination_group
-    assert R.contamination_conflicts(["terminal_bench"]) == {"terminal_bench_2": "terminal_bench",
-                                                             "agentworldbench": "terminal_bench"}
+    assert R.contamination_conflicts(["terminal_bench"]) == {
+        "terminal_bench_2": "terminal_bench",
+        "terminal_bench_4_1": "terminal_bench",
+        "agentworldbench": "terminal_bench",
+    }
     assert R.get_spec("gpqa_diamond").config == "gpqa_diamond"
     assert "remote_sandbox" in R.get_spec("terminal_bench_2").requires
     with pytest.raises(KeyError, match="registered"):

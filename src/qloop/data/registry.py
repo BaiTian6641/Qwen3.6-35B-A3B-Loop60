@@ -49,6 +49,7 @@ class DatasetSpec:
     drop_system_prompts: list[str] = field(default_factory=list)  # exact system prompts to strip
     data_files: Any = None               # passed to load_dataset (local / non-standard layouts)
     min_chars: int = 1                   # pretrain: drop shorter docs
+    revision: str | None = None          # optional HF git tag/commit (only forwarded when not None)
 
     def __post_init__(self) -> None:
         require(self.role in ROLES, f"DatasetSpec[{self.name}]: role must be one of {ROLES}", role=self.role)
@@ -188,15 +189,77 @@ _SPECS: list[DatasetSpec] = [
         stages=["eval"], contamination_group="aime_2026", text_fields=["problem"], verified=True,
     ),
     DatasetSpec(
+        "hmmt_feb_2026", "MathArena/hmmt_feb_2026", split="train", role="eval", format="eval_text",
+        license="cc-by-nc-sa-4.0", stages=["eval"], contamination_group="hmmt_2026", text_fields=["problem"],
+        verified=True, notes="HMMT February 2026 (33 competition math problems).",
+    ),
+    DatasetSpec(
+        "apex_shortlist", "MathArena/apex-shortlist", split="train", role="eval", format="eval_text",
+        license="cc-by-nc-sa-4.0", stages=["eval"], contamination_group="apex_math", text_fields=["problem"],
+        verified=True, notes="APEX Shortlist (47 Olympiad math problems).",
+    ),
+    DatasetSpec(
         "gpqa_diamond", "Idavidrein/gpqa", config="gpqa_diamond", role="eval", format="eval_text", gated=True,
         license="cc-by-4.0", stages=["eval"], contamination_group="gpqa",
         text_fields=["Question", "Correct Answer"], verified=True,
         notes="gated (auto-accept, no-leak terms). Config gpqa_diamond -> gpqa_diamond.csv (GPQA release columns).",
     ),
     DatasetSpec(
+        "gpqa_extended", "Idavidrein/gpqa", config="gpqa_extended", split="train", role="eval", format="eval_text",
+        gated=True, license="cc-by-4.0", stages=["eval"], contamination_group="gpqa",
+        text_fields=["Question", "Correct Answer"], verified=True,
+        notes="gated (auto-accept). 546 graduate science MCQs in the gpqa contamination group.",
+    ),
+    DatasetSpec(
+        "supergpqa", "m-a-p/SuperGPQA", split="train", role="eval", format="eval_text", gated=False,
+        license="odc-by", stages=["eval"], contamination_group="supergpqa", text_fields=["question"], verified=True,
+        notes="26,529 graduate 10-way MCQs across 285 disciplines.",
+    ),
+    DatasetSpec(
         "hle", "cais/hle", split="test", role="eval", format="eval_text", gated=True, license="mit",
         stages=["eval"], contamination_group="hle", text_fields=["question"], verified=False,
         notes="gated (auto-accept). Repo verified; split/column not re-checked (gated).",
+    ),
+    DatasetSpec(
+        "hle_rolling", "cais/hle-rolling", split="test", role="eval", format="eval_text", gated=True, license="mit",
+        stages=["eval"], contamination_group="hle", text_fields=["question"], verified=True,
+        notes="gated (auto-accept). HLE Rolling (1,000 rows, identical schema to cais/hle).",
+    ),
+    DatasetSpec(
+        "hle_diamond", "cais/hle-diamond", split="test", role="eval", format="eval_text", gated=True, license="mit",
+        stages=["eval"], contamination_group="hle", text_fields=["question"], verified=True,
+        notes="gated (auto-accept). HLE Diamond (1,000 frozen cleaned questions, Sep 2026 baseline).",
+    ),
+    DatasetSpec(
+        "hle_verified", "lmms-lab/HLE-Verified", split="test", role="eval", format="eval_text", gated=False,
+        license="mit", stages=["eval"], contamination_group="hle", text_fields=["question"], verified=True,
+        notes="open audited HLE-Verified benchmark in the hle contamination group.",
+    ),
+    DatasetSpec(
+        "mrcr", "openai/mrcr", split="train", role="eval", format="eval_text", gated=False, license="mit",
+        stages=["eval"], contamination_group="mrcr", text_fields=["prompt", "answer"], verified=True,
+        notes="OpenAI MRCR 1M long-context retrieval (2,400 conversations; JSON-encoded chat prompt + answer).",
+    ),
+    DatasetSpec(
+        "browsecomp_long", "openai/BrowseCompLongContext", split="train", role="eval", format="eval_text",
+        gated=False, license="mit", stages=["eval"], contamination_group="browsecomp", text_fields=["problem"],
+        verified=True, notes="OpenAI BrowseComp LongContext (problem/answer/urls/canary).",
+    ),
+    DatasetSpec(
+        "terminal_bench_4_1", "harborframework/terminal-bench", split="test", revision="v4.1.0", role="eval",
+        format="eval_text", gated=False, license="apache-2.0", stages=["eval"],
+        contamination_group="terminal_bench", text_fields=["instruction"], verified=True,
+        notes="Terminal-Bench 4.1 (66 hardened container tasks at revision v4.1.0).",
+    ),
+    DatasetSpec(
+        "mmlu_pro", "TIGER-Lab/MMLU-Pro", split="test", role="eval", format="eval_text", gated=False, license="mit",
+        stages=["eval"], contamination_group="mmlu_pro", text_fields=["question"], verified=True,
+        notes="MMLU-Pro 10-way multiple-choice reasoning benchmark.",
+    ),
+    DatasetSpec(
+        "frames", "google/frames-benchmark", split="test", role="eval", format="eval_text", gated=False,
+        license="apache-2.0", stages=["eval"], contamination_group="frames", text_fields=["Prompt"], verified=True,
+        notes="Google FRAMES multi-hop factuality & retrieval benchmark.",
     ),
     DatasetSpec(
         "arc_agi2_eval", "github:arcprize/ARC-AGI-2", split="evaluation", role="eval", format="arc_agi",
@@ -240,6 +303,10 @@ def eval_specs_for_group(group: str) -> list[DatasetSpec]:
     return [s for s in REGISTRY.values() if s.role == "eval" and s.contamination_group == group]
 
 
+def eval_groups() -> list[str]:
+    return sorted({s.contamination_group for s in REGISTRY.values() if s.role == "eval" and s.contamination_group})
+
+
 # ----------------------------------------------------------------------------- verification
 
 def _verify_github(spec: DatasetSpec, timeout: float) -> dict[str, Any]:
@@ -258,7 +325,8 @@ def _verify_hf(spec: DatasetSpec, token: str | None) -> dict[str, Any]:
     from huggingface_hub import HfApi
 
     api = HfApi(token=token)
-    info = api.dataset_info(spec.hf_id)
+    info_kw: dict[str, Any] = {"revision": spec.revision} if spec.revision is not None else {}
+    info = api.dataset_info(spec.hf_id, **info_kw)
     gated = getattr(info, "gated", False)
     out: dict[str, Any] = {"exists": True, "gated": bool(gated), "private": bool(getattr(info, "private", False)),
                            "access": None, "detail": f"sha={str(getattr(info, 'sha', ''))[:10]}"}

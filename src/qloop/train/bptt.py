@@ -45,15 +45,53 @@ class BPTTConfig:
     replay_k: int = 2_048
     replay_enabled: bool = True
     offload_u_to_cpu: bool = True
-    offload_prior_hidden: bool | None = None
+    offload_prior_hidden: bool | str | None = None
+    async_offload: bool = True
+    hbm_headroom_gib: float = 8.0
+    loss_impl: str = "auto"
     replay_indexer_weight: float = 0.1
     query_sim_chunk: int = 256
 
     def __post_init__(self) -> None:
-        if self.offload_prior_hidden is not None:
-            self.offload_u_to_cpu = bool(self.offload_prior_hidden)
+        raw = self.offload_prior_hidden
+        if isinstance(raw, str):
+            norm = raw.strip().lower()
+            if norm == "auto":
+                self.offload_prior_hidden = "auto"
+                self.offload_u_to_cpu = False
+            elif norm in ("true", "1", "yes"):
+                self.offload_prior_hidden = True
+                self.offload_u_to_cpu = True
+            elif norm in ("false", "0", "no"):
+                self.offload_prior_hidden = False
+                self.offload_u_to_cpu = False
+            else:
+                raise ValueError(
+                    f"bptt.offload_prior_hidden must be bool or 'auto', got {raw!r}"
+                )
+        elif raw is not None:
+            self.offload_prior_hidden = bool(raw)
+            self.offload_u_to_cpu = bool(raw)
         else:
             self.offload_prior_hidden = bool(self.offload_u_to_cpu)
+
+    def resolve_offload_to_cpu(self, device: torch.device, estimated_bytes: int) -> bool:
+        """Decide whether prior-segment hidden states offload to CPU or stay HBM-resident."""
+        if self.offload_prior_hidden == "auto":
+            if device.type != "cuda" or not torch.cuda.is_available():
+                return False
+            try:
+                free_b, _total_b = torch.cuda.mem_get_info(device)
+                cached_free = max(
+                    0,
+                    int(torch.cuda.memory_reserved(device)) - int(torch.cuda.memory_allocated(device)),
+                )
+                avail_b = int(free_b) + cached_free
+                headroom_b = int(max(0.0, float(self.hbm_headroom_gib)) * (1024 ** 3))
+                return bool(estimated_bytes + headroom_b > avail_b)
+            except Exception:
+                return True
+        return bool(self.offload_u_to_cpu)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> BPTTConfig:
@@ -198,12 +236,16 @@ class _SlotStateListProxy:
         self._backing[idx] = val.detach() if isinstance(val, torch.Tensor) else val
 
 
-def _clone_detached_state(obj: Any) -> Any:
+def _clone_detached_state(obj: Any, *, allow_zero_copy_hssd: bool = False) -> Any:
     """Return an independent detached clone of a conv/recurrent state (safe against in-place `.copy_`)."""
     if obj is None:
         return None
     if isinstance(obj, torch.Tensor):
         return obj.detach().clone()
+    if allow_zero_copy_hssd and type(obj).__name__ == "HSSDCacheState":
+        detach_fn = getattr(obj, "detach", None)
+        if callable(detach_fn):
+            return detach_fn()
     clone_fn = getattr(obj, "clone", None)
     if callable(clone_fn):
         return _detach_nested(clone_fn())
@@ -264,30 +306,32 @@ def _chunked_replay_indexer_kl(
     with torch.no_grad():
         qz_d = upcast(qz_view.detach())
         kz_d = upcast(kz_live.detach())
+        kn_t_tr = kn_t.unsqueeze(2).transpose(-1, -2)
+        kz_d_tr = kz_d.unsqueeze(2).transpose(-1, -2) if per_head_q else kz_d.transpose(-1, -2)
         g_qz = torch.zeros_like(qz_d)
         g_kz = torch.zeros_like(kz_d)
         kl_sum = qz_d.new_zeros(())
         for c0 in range(0, t_seg, chunk):
             c1 = min(t_seg, c0 + chunk)
-            raw_sc = torch.einsum("bghcd,bgkd->bghck", qn_t[:, :, :, c0:c1], kn_t) * scale_nope
+            raw_sc = torch.matmul(qn_t[:, :, :, c0:c1], kn_t_tr) * scale_nope
             if per_head_q:
                 tgt_p = torch.softmax(raw_sc, dim=-1)  # [B, G, Hg, C, K]
                 qz_c = qz_d[:, :, :, c0:c1]
-                pred_logits = torch.einsum("bghcd,bgkd->bghck", qz_c, kz_d) * inv_temp
+                pred_logits = torch.matmul(qz_c, kz_d_tr) * inv_temp
                 log_pred = torch.log_softmax(pred_logits, dim=-1)
                 kl_sum = kl_sum + (tgt_p * (torch.log(tgt_p.clamp_min(1e-30)) - log_pred)).sum()
                 d_logits = (log_pred.exp() - tgt_p) * (inv_temp / denom)
-                g_qz[:, :, :, c0:c1] = torch.einsum("bghck,bgkd->bghcd", d_logits, kz_d)
-                g_kz.add_(torch.einsum("bghck,bghcd->bgkd", d_logits, qz_c))
+                g_qz[:, :, :, c0:c1] = torch.matmul(d_logits, kz_d.unsqueeze(2))
+                g_kz.add_(torch.matmul(d_logits.transpose(-1, -2), qz_c).sum(dim=2))
             else:
                 tgt_p = torch.softmax(raw_sc, dim=-1).mean(dim=2)  # [B, G, C, K]
                 qz_c = qz_d[:, :, c0:c1]
-                pred_logits = torch.einsum("bgcd,bgkd->bgck", qz_c, kz_d) * inv_temp
+                pred_logits = torch.matmul(qz_c, kz_d_tr) * inv_temp
                 log_pred = torch.log_softmax(pred_logits, dim=-1)
                 kl_sum = kl_sum + (tgt_p * (torch.log(tgt_p.clamp_min(1e-30)) - log_pred)).sum()
                 d_logits = (log_pred.exp() - tgt_p) * (inv_temp / denom)
-                g_qz[:, :, c0:c1] = torch.einsum("bgck,bgkd->bgcd", d_logits, kz_d)
-                g_kz.add_(torch.einsum("bgck,bgcd->bgkd", d_logits, qz_c))
+                g_qz[:, :, c0:c1] = torch.matmul(d_logits, kz_d)
+                g_kz.add_(torch.matmul(d_logits.transpose(-1, -2), qz_c))
 
     kl_val = (kl_sum / denom).to(qz_live.dtype)
     g_qz_cast = g_qz.to(qz_live.dtype).reshape_as(qz_live)
@@ -352,9 +396,11 @@ class _ReplayKVCacheProxy:
         *,
         readonly_base: bool = False,
         fp8_prefix_kv: dict[int, tuple[Any, Any]] | None = None,
+        zero_copy_hssd: bool = False,
     ) -> None:
         object.__setattr__(self, "_base_cache", base_cache)
         object.__setattr__(self, "_readonly_base", bool(readonly_base))
+        object.__setattr__(self, "_zero_copy_hssd", bool(zero_copy_hssd))
         object.__setattr__(self, "_detach_recurrent_state", True)
         object.__setattr__(self, "_fp8_prefix_kv", dict(fp8_prefix_kv) if fp8_prefix_kv else {})
         object.__setattr__(self, "_pending_replay", {})
@@ -454,13 +500,14 @@ class _ReplayKVCacheProxy:
 
     def get_recurrent_state(self, layer_idx: int, state_idx: int = 0, **kwargs: Any) -> Any:
         base = object.__getattribute__(self, "_base_cache")
+        zc_hssd: bool = object.__getattribute__(self, "_zero_copy_hssd")
         rec_snap: dict[tuple[int, int], Any] = object.__getattribute__(self, "_rec_snap")
         key = (int(layer_idx), int(state_idx))
         if _in_backward() and key in rec_snap:
             return rec_snap[key]
         if not _in_backward() and key not in rec_snap:
             val = base.get_recurrent_state(layer_idx, state_idx=state_idx, **kwargs)
-            rec_snap[key] = _clone_detached_state(val)
+            rec_snap[key] = _clone_detached_state(val, allow_zero_copy_hssd=zc_hssd)
         if key in rec_snap:
             return rec_snap[key]
         return base.get_recurrent_state(layer_idx, state_idx=state_idx, **kwargs)
@@ -475,13 +522,14 @@ class _ReplayKVCacheProxy:
         if _in_backward():
             return recurrent_states
         base = object.__getattribute__(self, "_base_cache")
+        zc_hssd: bool = object.__getattribute__(self, "_zero_copy_hssd")
         rec_snap: dict[tuple[int, int], Any] = object.__getattribute__(self, "_rec_snap")
         key = (int(layer_idx), int(state_idx))
         if key not in rec_snap and hasattr(base, "get_recurrent_state"):
             prev = base.get_recurrent_state(layer_idx, state_idx=state_idx)
-            rec_snap[key] = _clone_detached_state(prev)
+            rec_snap[key] = _clone_detached_state(prev, allow_zero_copy_hssd=zc_hssd)
         return base.update_recurrent_state(
-            _clone_detached_state(recurrent_states),
+            _clone_detached_state(recurrent_states, allow_zero_copy_hssd=zc_hssd),
             layer_idx,
             state_idx=state_idx,
             **kwargs,
@@ -587,20 +635,82 @@ class _PriorSegRecord:
     u: torch.Tensor    # [B, T_seg, hidden_size] detached (CPU or device)
     cos: torch.Tensor  # [B, T_seg, rot_dim] detached
     sin: torch.Tensor  # [B, T_seg, rot_dim] detached
+    done_ev: Any = None
+
+    def wait_ready(self) -> None:
+        if self.done_ev is not None:
+            self.done_ev.synchronize()
+            self.done_ev = None
+
+
+def _offload_prior_record(
+    u: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    offload_to_cpu: bool,
+    copy_stream: Any | None,
+) -> _PriorSegRecord:
+    """Capture prior-segment `(u, cos, sin)` either HBM-resident or via async pinned-memory DMA."""
+    if not offload_to_cpu:
+        return _PriorSegRecord(u.detach(), cos.detach(), sin.detach())
+    if copy_stream is not None and u.is_cuda:
+        dev = u.device
+        u_s = u.detach().contiguous()
+        c_s = cos.detach().contiguous()
+        s_s = sin.detach().contiguous()
+        ready_ev = torch.cuda.Event()
+        ready_ev.record(torch.cuda.current_stream(dev))
+        u_dst = torch.empty(u_s.shape, dtype=u_s.dtype, pin_memory=True)
+        c_dst = torch.empty(c_s.shape, dtype=c_s.dtype, pin_memory=True)
+        s_dst = torch.empty(s_s.shape, dtype=s_s.dtype, pin_memory=True)
+        with torch.cuda.stream(copy_stream):
+            copy_stream.wait_event(ready_ev)
+            u_dst.copy_(u_s, non_blocking=True)
+            u_s.record_stream(copy_stream)
+            if c_s.is_cuda:
+                c_dst.copy_(c_s, non_blocking=True)
+                c_s.record_stream(copy_stream)
+            else:
+                c_dst.copy_(c_s)
+            if s_s.is_cuda:
+                s_dst.copy_(s_s, non_blocking=True)
+                s_s.record_stream(copy_stream)
+            else:
+                s_dst.copy_(s_s)
+            done_ev = torch.cuda.Event()
+            done_ev.record(copy_stream)
+        return _PriorSegRecord(u_dst, c_dst, s_dst, done_ev=done_ev)
+    return _PriorSegRecord(u.detach().to("cpu"), cos.detach().to("cpu"), sin.detach().to("cpu"))
 
 
 def _gather_prior_field(tensors: list[torch.Tensor], idx: torch.Tensor) -> torch.Tensor:
     """Gather `[B, M, D]` along dim=1 from per-segment `[B, T_i, D]` tensors without concatenating them."""
     ref = tensors[0]
-    idx_d = idx.to(ref.device)
+    idx_d = idx if idx.device == ref.device else idx.to(ref.device)
+    bsz_r = int(ref.shape[0])
     if len(tensors) == 1:
+        if bsz_r == 1:
+            return ref[0].index_select(0, idx_d[0]).unsqueeze(0)
         return ref.gather(1, idx_d.unsqueeze(-1).expand(-1, -1, ref.shape[-1]))
-    out = ref.new_empty((ref.shape[0], idx_d.shape[1], ref.shape[-1]))
+    out = ref.new_empty((bsz_r, idx_d.shape[1], ref.shape[-1]))
     offset = 0
+    if bsz_r == 1 and ref.device.type == "cpu":
+        idx_1d = idx_d[0]
+        for t in tensors:
+            t_len = int(t.shape[1])
+            pos = torch.nonzero((idx_1d >= offset) & (idx_1d < offset + t_len), as_tuple=False).flatten()
+            if pos.numel() > 0:
+                out[0, pos] = t[0].index_select(0, idx_1d.index_select(0, pos) - offset)
+            offset += t_len
+        return out
     for t in tensors:
         t_len = int(t.shape[1])
         local = (idx_d - offset).clamp(0, t_len - 1)
-        gathered = t.gather(1, local.unsqueeze(-1).expand(-1, -1, t.shape[-1]))
+        if bsz_r == 1:
+            gathered = t[0].index_select(0, local[0]).unsqueeze(0)
+        else:
+            gathered = t.gather(1, local.unsqueeze(-1).expand(-1, -1, t.shape[-1]))
         mask = (idx_d >= offset) & (idx_d < offset + t_len)
         out = torch.where(mask.unsqueeze(-1), gathered, out)
         offset += t_len
@@ -619,7 +729,10 @@ class SegmentedKVBPTTRunner:
         n_segments: int | None = None,
         replay_enabled: bool = True,
         offload_u_to_cpu: bool = True,
-        offload_prior_hidden: bool | None = None,
+        offload_prior_hidden: bool | str | None = None,
+        async_offload: bool = True,
+        hbm_headroom_gib: float = 8.0,
+        loss_impl: str = "auto",
         replay_indexer_weight: float = 0.1,
         query_sim_chunk: int = 256,
         cfg: BPTTConfig | dict[str, Any] | None = None,
@@ -637,13 +750,18 @@ class SegmentedKVBPTTRunner:
                 replay_enabled=replay_enabled,
                 offload_u_to_cpu=offload_u_to_cpu,
                 offload_prior_hidden=offload_prior_hidden,
+                async_offload=async_offload,
+                hbm_headroom_gib=hbm_headroom_gib,
+                loss_impl=loss_impl,
                 replay_indexer_weight=replay_indexer_weight,
                 query_sim_chunk=query_sim_chunk,
             )
 
     @staticmethod
-    def _extract_query_heads(attn_mod: nn.Module, x_in: torch.Tensor) -> tuple[torch.Tensor, int, int, int]:
-        """Project `x_in` (`[B, T, hidden]`) through `q_proj` (+ `q_norm` if present) -> `[B, H, T, D]`."""
+    def _extract_query_heads_split(
+        attn_mod: nn.Module, x_in: torch.Tensor
+    ) -> tuple[torch.Tensor, nn.Module | None, int, int, int]:
+        """Project `x_in` (`[B, T, hidden]`) through `q_proj` -> `(q_pre_norm [B, T, H, D], q_norm, H, G, D)`."""
         bsz, t_len, _ = x_in.shape
         q_raw = attn_mod.q_proj(x_in)
         k_out = attn_mod.k_proj.out_features
@@ -670,6 +788,12 @@ class SegmentedKVBPTTRunner:
             q_states, _ = q_raw.view(bsz, t_len, num_heads, 2 * head_dim).chunk(2, dim=-1)
         else:
             q_states = q_raw.view(bsz, t_len, num_heads, head_dim)
+        return q_states, q_norm, num_heads, num_kv_heads, head_dim
+
+    @classmethod
+    def _extract_query_heads(cls, attn_mod: nn.Module, x_in: torch.Tensor) -> tuple[torch.Tensor, int, int, int]:
+        """Project `x_in` (`[B, T, hidden]`) through `q_proj` (+ `q_norm` if present) -> `[B, H, T, D]`."""
+        q_states, q_norm, num_heads, num_kv_heads, head_dim = cls._extract_query_heads_split(attn_mod, x_in)
         if q_norm is not None:
             q_states = q_norm(q_states)
         return q_states.transpose(1, 2), num_heads, num_kv_heads, head_dim
@@ -688,34 +812,37 @@ class SegmentedKVBPTTRunner:
         hg = h_cnt // g_cnt
         lsa_ix = getattr(attn_mod, "lsa_indexer", None)
         chunk = max(1, int(self.cfg.query_sim_chunk))
+        if q_cur_detached.is_cuda:
+            chunk = max(chunk, 512 if t_prior > 65536 else 1024)
 
         with torch.no_grad():
             if lsa_ix is not None:
                 qz = lsa_ix.query_latent(q_cur_detached)      # [B, G | H, T_seg, d_idx]
                 kz = lsa_ix.key_latent(k_prior_cached)        # [B, G, T_prior, d_idx]
-                kz_m = kz.to(qz.dtype)
+                kz_m_tr = kz.to(qz.dtype).transpose(-1, -2)
                 sim = qz.new_full((bsz, g_cnt, t_prior), float("-inf"))
                 if qz.shape[1] != g_cnt:
                     hg_q = qz.shape[1] // g_cnt
                     qz_g = qz.view(bsz, g_cnt, hg_q, t_seg, -1)
+                    kz_g_tr = kz_m_tr.unsqueeze(2)
                     for c0 in range(0, t_seg, chunk):
                         qc = qz_g[:, :, :, c0 : c0 + chunk]
-                        sc = torch.einsum("bghcd,bgtd->bghct", qc, kz_m).amax(dim=(2, 3))
+                        sc = torch.matmul(qc, kz_g_tr).amax(dim=(2, 3))
                         sim = torch.maximum(sim, sc)
                 else:
                     for c0 in range(0, t_seg, chunk):
                         qc = qz[:, :, c0 : c0 + chunk]
-                        sc = torch.einsum("bgcd,bgtd->bgct", qc, kz_m).amax(dim=2)
+                        sc = torch.matmul(qc, kz_m_tr).amax(dim=2)
                         sim = torch.maximum(sim, sc)
             else:
                 lo = rot_dim if rot_dim < dh else 0
                 scale_nope = 1.0 / math.sqrt(max(1, dh - lo))
                 q_nope = upcast(q_cur_detached[..., lo:]).view(bsz, g_cnt, hg, t_seg, -1)
-                k_nope = upcast(k_prior_cached[..., lo:])
+                k_nope_tr = upcast(k_prior_cached[..., lo:]).unsqueeze(2).transpose(-1, -2)
                 sim = q_nope.new_full((bsz, g_cnt, t_prior), float("-inf"))
                 for c0 in range(0, t_seg, chunk):
                     qc = q_nope[:, :, :, c0 : c0 + chunk]
-                    sc = (torch.einsum("bghcd,bgtd->bghct", qc, k_nope) * scale_nope).amax(dim=(2, 3))
+                    sc = (torch.matmul(qc, k_nope_tr) * scale_nope).amax(dim=(2, 3))
                     sim = torch.maximum(sim, sc)
 
             top_idx = sim.topk(k_sel, dim=-1).indices
@@ -765,6 +892,7 @@ class SegmentedKVBPTTRunner:
         lsa_aux_weight: float = 1.0,
         loop_aux_weight: float = 1.0,
         ce_chunk_size: int = 2048,
+        loss_scale: float = 1.0,
     ) -> BPTTStepResult:
         """Execute segmented forward (+ per-segment backward with K/V replay) over `input_ids` `[B, T]`."""
         if input_ids.ndim != 2:
@@ -774,12 +902,26 @@ class SegmentedKVBPTTRunner:
         n_segs = math.ceil(t_total / seg_len)
         target_full = input_ids if (labels is None and loss_fn is None) else labels
 
-        phys_list, _text_cfg, loop_ctl = physical_layers(self.model)
+        phys_list, text_cfg, loop_ctl = physical_layers(self.model)
         full_layers: list[tuple[int, nn.Module]] = []
         for phys_idx, layer_mod in phys_list:
             lt = getattr(layer_mod, "layer_type", None)
             if lt == FULL or (lt is None and hasattr(layer_mod, "self_attn")):
                 full_layers.append((phys_idx, layer_mod.self_attn))
+
+        # Resolve HBM-resident vs async pinned-memory CPU offload once per step
+        hidden_est = int(getattr(text_cfg, "hidden_size", 2048) or 2048)
+        first_p = next(self.model.parameters(), None)
+        elem_b = int(first_p.element_size()) if isinstance(first_p, torch.Tensor) else 2
+        est_prior_bytes = (
+            max(0, n_segs - 1) * len(full_layers) * bsz * seg_len * hidden_est * elem_b * 105 // 100
+        )
+        offload_to_cpu = self.cfg.resolve_offload_to_cpu(input_ids.device, est_prior_bytes)
+        copy_stream = (
+            torch.cuda.Stream(device=input_ids.device)
+            if (offload_to_cpu and self.cfg.async_offload and input_ids.is_cuda)
+            else None
+        )
 
         prior_records: dict[int, list[_PriorSegRecord]] = {p: [] for p, _ in full_layers}
         cur_seg_records: dict[int, _PriorSegRecord] = {}
@@ -836,17 +978,21 @@ class SegmentedKVBPTTRunner:
                         try:
                             dev, dt = x_cur.device, x_cur.dtype
                             cached_meta = replay_meta.get((s_idx, phys_idx)) if in_bwd else None
+                            q_pre_norm_det: torch.Tensor | None = None
+                            q_norm_mod: nn.Module | None = None
                             if cached_meta is not None:
-                                top_idx_cpu, uniq_pad_cpu, num_kv_heads, head_dim = cached_meta
-                                top_idx = top_idx_cpu.to(device=dev)
-                                uniq_pad = uniq_pad_cpu.to(device=dev)
+                                top_idx_c, uniq_pad_c, num_kv_heads, head_dim = cached_meta
+                                top_idx = top_idx_c if top_idx_c.device == dev else top_idx_c.to(device=dev)
+                                uniq_pad = uniq_pad_c if uniq_pad_c.device == dev else uniq_pad_c.to(device=dev)
                                 max_u = int(uniq_pad.shape[1])
                                 q_det: torch.Tensor | None = None
                             else:
                                 with torch.no_grad():
-                                    q_det, _nh, num_kv_heads, head_dim = self._extract_query_heads(
-                                        attn_mod, x_cur.detach()
+                                    q_pre_norm_det, q_norm_mod, _nh, num_kv_heads, head_dim = (
+                                        self._extract_query_heads_split(attn_mod, x_cur.detach())
                                     )
+                                    q_det_t = q_norm_mod(q_pre_norm_det) if q_norm_mod is not None else q_pre_norm_det
+                                    q_det = q_det_t.transpose(1, 2)
                                 top_idx = self._select_replay_indices(
                                     attn_mod, q_det, k_prior, rot_dim=rot_dim, k_sel=k_sel
                                 )
@@ -863,22 +1009,28 @@ class SegmentedKVBPTTRunner:
                                     if u_b.numel() < max_u:
                                         uniq_pad[b_i, u_b.numel() :] = u_b[-1]
                                 if not in_bwd:
-                                    top_cpu = top_idx.detach().cpu()
-                                    recorded_indices[(s_idx, phys_idx)] = top_cpu
+                                    top_det = top_idx.detach()
+                                    recorded_indices[(s_idx, phys_idx)] = top_det
+                                    # Keep tiny 64 KB replay meta on device (zero forward D2H / backward H2D syncs)
                                     replay_meta[(s_idx, phys_idx)] = (
-                                        top_cpu,
-                                        uniq_pad.detach().cpu(),
+                                        top_det,
+                                        uniq_pad.detach(),
                                         num_kv_heads,
                                         head_dim,
                                     )
 
                             recs = prior_records[phys_idx]
-                            u_sel = _gather_prior_field([r.u for r in recs], uniq_pad).to(device=dev, dtype=dt)
+                            for rec in recs:
+                                rec.wait_ready()
+                            nb_h2d = bool(dev.type == "cuda" and recs[0].u.is_pinned())
+                            u_sel = _gather_prior_field([r.u for r in recs], uniq_pad).to(
+                                device=dev, dtype=dt, non_blocking=nb_h2d
+                            )
                             cos_sel = _gather_prior_field([r.cos for r in recs], uniq_pad).to(
-                                device=dev, dtype=cos_cur.dtype
+                                device=dev, dtype=cos_cur.dtype, non_blocking=nb_h2d
                             )
                             sin_sel = _gather_prior_field([r.sin for r in recs], uniq_pad).to(
-                                device=dev, dtype=sin_cur.dtype
+                                device=dev, dtype=sin_cur.dtype, non_blocking=nb_h2d
                             )
 
                             # Live differentiable re-projection through k_proj, k_norm, and v_proj!
@@ -910,7 +1062,16 @@ class SegmentedKVBPTTRunner:
                             ):
                                 with torch.autograd.graph.saved_tensors_hooks(lambda x: x, lambda x: x):
                                     kz_live = lsa_ix.k_proj(k_live)  # [B, G, K_sel, d_idx]
-                                    q_live_for_idx, _, _, _ = self._extract_query_heads(attn_mod, x_cur.detach())
+                                    q_proj_grad = any(p.requires_grad for p in attn_mod.q_proj.parameters())
+                                    q_norm_grad = q_norm_mod is not None and any(
+                                        p.requires_grad for p in q_norm_mod.parameters()
+                                    )
+                                    if q_proj_grad:
+                                        q_live_for_idx, _, _, _ = self._extract_query_heads(attn_mod, x_cur.detach())
+                                    elif q_norm_grad and q_pre_norm_det is not None and q_norm_mod is not None:
+                                        q_live_for_idx = q_norm_mod(q_pre_norm_det).transpose(1, 2)
+                                    else:
+                                        q_live_for_idx = q_det
                                     qz_live = lsa_ix.query_latent(q_live_for_idx)  # [B, G | H, T_seg, d_idx]
                                     per_head_q = qz_live.shape[1] != num_kv_heads
                                     lo = lsa_ix.lo
@@ -934,11 +1095,15 @@ class SegmentedKVBPTTRunner:
                             if loop_ctl is not None:
                                 loop_ctl._cur = saved_cur
 
-                if not in_bwd:
-                    u_store = x_cur.detach().to("cpu") if self.cfg.offload_u_to_cpu else x_cur.detach()
-                    c_store = cos_cur.detach().to("cpu") if self.cfg.offload_u_to_cpu else cos_cur.detach()
-                    s_store = sin_cur.detach().to("cpu") if self.cfg.offload_u_to_cpu else sin_cur.detach()
-                    cur_seg_records[phys_idx] = _PriorSegRecord(u_store, c_store, s_store)
+                # Last segment (`s_idx == n_segs - 1`) is never replayed by any future segment — skip offload!
+                if not in_bwd and s_idx < n_segs - 1:
+                    cur_seg_records[phys_idx] = _offload_prior_record(
+                        x_cur,
+                        cos_cur,
+                        sin_cur,
+                        offload_to_cpu=offload_to_cpu,
+                        copy_stream=copy_stream,
+                    )
 
             return pre_hook
 
@@ -988,7 +1153,7 @@ class SegmentedKVBPTTRunner:
                 if base_cache is None:
                     base_cache = _maybe_create_initial_cache(tm)
                 if base_cache is not None:
-                    proxy = _ReplayKVCacheProxy(base_cache)
+                    proxy = _ReplayKVCacheProxy(base_cache, zero_copy_hssd=(s1 - s0 > 1))
                     proxy_holder[0] = proxy
                     pkv_arg: Any = proxy
                 else:
@@ -1022,7 +1187,7 @@ class SegmentedKVBPTTRunner:
                             hidden_for_loss,
                             lm_head.weight,
                             seg_targets,
-                            impl="chunked",
+                            impl=self.cfg.loss_impl,
                             chunk_size=int(ce_chunk_size),
                             shift=False,
                             ignore_index=-100,
@@ -1083,7 +1248,7 @@ class SegmentedKVBPTTRunner:
                 if total_seg_loss is not None:
                     seg_losses.append(float(total_seg_loss.detach()))
                     if backward and total_seg_loss.requires_grad:
-                        (total_seg_loss / float(n_segs)).backward()
+                        (total_seg_loss * (float(loss_scale) / float(n_segs))).backward()
                 else:
                     seg_losses.append(0.0)
 
@@ -1104,10 +1269,14 @@ class SegmentedKVBPTTRunner:
 
             active_losses = [val for val in seg_losses if val != 0.0]
             mean_loss = sum(active_losses) / len(active_losses) if active_losses else 0.0
+            recorded_indices_cpu = {
+                k: (v.cpu() if v.device.type != "cpu" else v) for k, v in recorded_indices.items()
+            }
             stats = {
                 "bptt/num_segments": float(n_segs),
                 "bptt/seg_len": float(seg_len),
                 "bptt/replay_k": float(self.cfg.replay_k if self.cfg.replay_enabled else 0),
+                "bptt/offload_to_cpu": 1.0 if offload_to_cpu else 0.0,
                 "bptt/mean_replayed_tokens": (
                     sum(replayed_counts[1:]) / max(1, len(replayed_counts) - 1) if n_segs > 1 else 0.0
                 ),
@@ -1117,10 +1286,12 @@ class SegmentedKVBPTTRunner:
                 segment_losses=seg_losses,
                 num_segments=n_segs,
                 replayed_tokens_per_seg=replayed_counts,
-                replayed_indices=recorded_indices,
+                replayed_indices=recorded_indices_cpu,
                 stats=stats,
             )
         finally:
+            if copy_stream is not None:
+                copy_stream.synchronize()
             for h in hooks:
                 h.remove()
             prior_records.clear()

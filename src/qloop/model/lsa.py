@@ -29,7 +29,7 @@ import math
 import weakref
 from collections import OrderedDict
 from collections.abc import Hashable, Iterator
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 from typing import Any, Callable
 
 import torch
@@ -39,6 +39,16 @@ from torch.utils.checkpoint import checkpoint
 
 from ._dtype import upcast
 from .introspect import FULL, attention_module, find_text_model, inspect_model
+
+try:
+    import triton
+    import triton.language as tl
+
+    _TRITON_AVAILABLE = True
+except Exception:  # pragma: no cover - CPU / non-Triton environments
+    triton = None  # type: ignore[assignment]
+    tl = None  # type: ignore[assignment]
+    _TRITON_AVAILABLE = False
 
 log = logging.getLogger("qloop")
 
@@ -329,6 +339,7 @@ class _CacheEntry:
     unit_members: torch.Tensor            # [B,G,nb,spb,max_units]
     centroids: torch.Tensor | None        # [B,G,nb,spb,d] kept for no-grad incremental reuse
     wk_version: int = -1                  # self.wk._version for safe centroid reuse across opt steps
+    assembled: BucketIndex | None = None  # cached assembled BucketIndex for no-grad full reuse
 
 
 class _PassQueryProj(nn.Module):
@@ -339,7 +350,7 @@ class _PassQueryProj(nn.Module):
         self.weight = nn.Parameter(init_weight.clone())
 
     def forward(self, q_slice: torch.Tensor) -> torch.Tensor:
-        return torch.einsum("bhtd,hde->bhte", q_slice.to(self.weight.dtype), self.weight)
+        return torch.matmul(q_slice.to(self.weight.dtype), self.weight)
 
 
 class LSAIndexer(nn.Module):
@@ -447,9 +458,9 @@ class LSAIndexer(nn.Module):
         if self.wq.ndim == 4:
             p_idx = min(max(r - 1, 0), self.wq.shape[0] - 1)
             w_r = self.wq[p_idx]
-            z = torch.einsum("bhtd,hde->bhte", q_sl.to(w_r.dtype), w_r)
+            z = torch.matmul(q_sl.to(w_r.dtype), w_r)
         elif r <= 1 or self.cfg.num_query_passes <= 1 or len(self.q_proj_extra) == 0:
-            z = torch.einsum("bhtd,hde->bhte", q_sl.to(self.wq.dtype), self.wq)
+            z = torch.matmul(q_sl.to(self.wq.dtype), self.wq)
         else:
             z = self.q_proj_extra[r - 2](q_sl)
         z = F.normalize(upcast(z), dim=-1)
@@ -459,7 +470,7 @@ class LSAIndexer(nn.Module):
         return z.view(b, self.g, self.hg, t, d).sum(2)
 
     def key_latent(self, k: torch.Tensor) -> torch.Tensor:
-        z = torch.einsum("bgtd,gde->bgte", k[..., self.lo:].to(self.wk.dtype), self.wk)
+        z = torch.matmul(k[..., self.lo:].to(self.wk.dtype), self.wk)
         return F.normalize(upcast(z), dim=-1)
 
     def q_proj(self, q: torch.Tensor, pass_idx: int | None = None) -> torch.Tensor:
@@ -640,6 +651,15 @@ class LSAIndexer(nn.Module):
             k, kin, nb, grad_mode, cache_key
         )
 
+        # Fast path: identical block set in no-grad mode -> return cached BucketIndex directly
+        # (avoids re-allocating members / key2slot / slot_end across loop passes & ckpt recompute).
+        if not grad_mode and reuse == nb and ent is not None and ent.assembled is not None:
+            ent.last_tk = tk
+            ent.k_ident = (int(kin.data_ptr()), int(kin._version))
+            if lkey is not None and lkey in self._cache:
+                self._cache.move_to_end(lkey)
+            return ent.assembled
+
         with torch.no_grad():
             if reuse < nb:
                 znew = self.key_latent(kin[:, :, reuse * bs : nb * bs]).view(b, g, nb - reuse, bs, -1)
@@ -680,6 +700,7 @@ class LSAIndexer(nn.Module):
                     z = self.key_latent(kin[:, :, : nb * bs]).view(b, g, nb, n, pool, -1).sum(4)
                     cent = self._centroids(z, slot_labels, slot_counts, spb)
 
+        assembled = self._assemble(labels, slot_labels, slot_counts, umem, cent)
         if lkey is not None and cfg.cache_entries > 0:
             self._cache[lkey] = _CacheEntry(
                 n_blocks=nb,
@@ -693,12 +714,13 @@ class LSAIndexer(nn.Module):
                 unit_members=umem,
                 centroids=None if grad_mode else cent.detach(),
                 wk_version=int(self.wk._version),
+                assembled=None if grad_mode else assembled,
             )
             self._cache.move_to_end(lkey)
             while len(self._cache) > cfg.cache_entries:
                 self._cache.popitem(last=False)
 
-        return self._assemble(labels, slot_labels, slot_counts, umem, cent)
+        return assembled
 
     bucket_index = build
 
@@ -761,14 +783,14 @@ class LSAIndexer(nn.Module):
         if per_head:
             hg = q_heads // self.g
             qz_g = qz.view(b, self.g, hg, c, d)
-            s = torch.einsum("bghcd,bgsd->bghcs", qz_g, cent) / cfg.temperature
+            s = torch.matmul(qz_g, cent.unsqueeze(2).transpose(-1, -2)) / cfg.temperature
             if cfg.search == "tree" and not flat:
                 tmask = self._tree_mask_per_head(qz_g, index, elig, qpos)
                 s = s.masked_fill(~tmask, float("-inf"))
             s = s.masked_fill(~elig[:, :, None, :, :], float("-inf"))
             return s.reshape(b, q_heads, c, s_total)
 
-        s = torch.einsum("bgcd,bgsd->bgcs", qz, cent) / cfg.temperature
+        s = torch.matmul(qz, cent.transpose(-1, -2)) / cfg.temperature
         if cfg.search == "tree" and not flat:
             s = s.masked_fill(~self._tree_mask(qz, index, elig, qpos), float("-inf"))
         return s.masked_fill(~elig, float("-inf"))
@@ -803,7 +825,7 @@ class LSAIndexer(nn.Module):
         cs, full, ng, spb = self._tree_super_summaries(index, b, g)
         fb = qpos // cfg.block_size
         jq, rem = fb // tg, fb % tg
-        ss = torch.einsum("bgcd,bgnd->bgcn", qz, full.to(qz.dtype))
+        ss = torch.matmul(qz, full.to(qz.dtype).transpose(-1, -2))
         part = F.normalize(cs[:, :, jq.clamp(max=ng - 1), (rem - 1).clamp(min=0)], dim=-1)
         sp = (qz * part.to(qz.dtype)).sum(-1)
         jn = torch.arange(ng, device=qz.device)
@@ -830,7 +852,7 @@ class LSAIndexer(nn.Module):
         cs, full, ng, spb = self._tree_super_summaries(index, b, g)
         fb = qpos // cfg.block_size
         jq, rem = fb // tg, fb % tg
-        ss = torch.einsum("bghcd,bgnd->bghcn", qz_g, full.to(qz_g.dtype))
+        ss = torch.matmul(qz_g, full.to(qz_g.dtype).unsqueeze(2).transpose(-1, -2))
         part = F.normalize(cs[:, :, jq.clamp(max=ng - 1), (rem - 1).clamp(min=0)], dim=-1)
         sp = (qz_g * part.to(qz_g.dtype)[:, :, None, :, :]).sum(-1)
         jn = torch.arange(ng, device=qz_g.device)
@@ -1021,6 +1043,7 @@ def _pack_valid_members(
     tk: int,
     eff_cap: int,
     sync_free: bool,
+    out_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int] | None:
     """Pack valid (`m_b`) bucket key indices per query row down to `L_pack <= eff_cap` (`D6`)."""
     dev = mem.device
@@ -1038,19 +1061,24 @@ def _pack_valid_members(
             return None
         l_pack = min(max_valid, eff_cap, kb_n)
 
+    # Use int32 internally on CUDA when indices fit comfortably in int31 (2x faster sort/topk + half HBM).
+    use_i32 = dev.type == "cuda" and (tk + l_pack) < (1 << 30) and kb_n < (1 << 30)
+    work_dt = torch.int32 if use_i32 else torch.long
+    mem_work = mem.to(work_dt) if mem.dtype != work_dt else mem
+
     # Priority `Kb - j` keeps earliest / highest-scoring selected buckets first when capped!
-    ar_kb = torch.arange(kb_n, device=dev, dtype=torch.long)
+    ar_kb = torch.arange(kb_n, device=dev, dtype=work_dt)
     prio = torch.where(m_b, kb_n - ar_kb, torch.zeros_like(ar_kb))
     if l_pack < kb_n:
         top_prio, pack_idx = prio.topk(l_pack, dim=-1, largest=True, sorted=True)
-        mem_p = mem.gather(-1, pack_idx)
+        mem_p = mem_work.gather(-1, pack_idx)
         m_p = top_prio > 0
     else:
-        mem_p = mem
+        mem_p = mem_work
         m_p = m_b
 
     # Sort packed valid indices ascending for coalesced KV gather & exact deduplication
-    sentinel = tk + torch.arange(mem_p.shape[-1], device=dev, dtype=torch.long)
+    sentinel = tk + torch.arange(mem_p.shape[-1], device=dev, dtype=work_dt)
     key_for_sort = torch.where(m_p, mem_p, sentinel)
     key_sorted, _ = key_for_sort.sort(dim=-1)
     if key_sorted.shape[-1] > 1:
@@ -1059,6 +1087,9 @@ def _pack_valid_members(
         is_dup = torch.zeros_like(key_sorted, dtype=torch.bool)
     m_final = (key_sorted < tk) & (~is_dup)
     mem_final = torch.where(m_final, key_sorted, torch.zeros_like(key_sorted))
+    target_dt = out_dtype if out_dtype is not None else torch.long
+    if mem_final.dtype != target_dt:
+        mem_final = mem_final.to(target_dt)
     if not sync_free:
         n_sel = int(m_final.sum())
     return mem_final, m_final, n_sel
@@ -1233,6 +1264,1576 @@ def _distill_kl(
     logp = torch.where(target > 0, logp, torch.zeros_like(logp))
     kl = (target * (torch.log(target.clamp_min(1e-30)) - logp)).sum(-1)
     return kl[ok].mean() if bool(ok.any()) else None
+
+
+# ============================================================================ Triton sparse & distill kernels
+
+
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _lsa_sparse_attn_fwd_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        MEM_ptr,
+        O_ptr,
+        LSE_ptr,
+        sq_b,
+        sq_g,
+        sq_h,
+        sq_t,
+        sq_d,
+        sk_b,
+        sk_g,
+        sk_t,
+        sk_d,
+        sv_b,
+        sv_g,
+        sv_t,
+        sv_d,
+        sm_b,
+        sm_g,
+        sm_t,
+        sm_l,
+        so_b,
+        so_g,
+        so_h,
+        so_t,
+        so_d,
+        sl_b,
+        sl_g,
+        sl_h,
+        sl_t,
+        G,
+        TQ,
+        TK,
+        Q_BASE,
+        WIN,
+        NS,
+        L_PACK,
+        SCALE,
+        HG: tl.constexpr,
+        D_HEAD: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        HAS_BUCKETS: tl.constexpr,
+    ):
+        qi = tl.program_id(0)
+        bg = tl.program_id(1)
+        b_idx = bg // G
+        g_idx = bg % G
+
+        b64 = b_idx.to(tl.int64)
+        g64 = g_idx.to(tl.int64)
+        qi64 = qi.to(tl.int64)
+
+        offs_h = tl.arange(0, BLOCK_H)
+        offs_d = tl.arange(0, D_HEAD)
+        offs_k = tl.arange(0, BLOCK_K)
+        h_mask = offs_h < HG
+        offs_h64 = offs_h.to(tl.int64)
+        offs_d64 = offs_d.to(tl.int64)
+
+        q_base = Q_ptr + b64 * sq_b + g64 * sq_g + qi64 * sq_t
+        q_tile = tl.load(
+            q_base + offs_h64[:, None] * sq_h + offs_d64[None, :] * sq_d,
+            mask=h_mask[:, None],
+            other=0.0,
+        )
+        k_base = K_ptr + b64 * sk_b + g64 * sk_g
+        v_base = V_ptr + b64 * sv_b + g64 * sv_g
+
+        m_i = tl.full([BLOCK_H], -float("inf"), dtype=tl.float32)
+        l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_H, D_HEAD], dtype=tl.float32)
+
+        qpos = Q_BASE + qi
+        win_lo = qpos - WIN + 1
+
+        # Phase 1: Local window [max(0, win_lo), min(TK, qpos + 1))
+        w_start = tl.maximum(0, win_lo)
+        w_end = tl.minimum(TK, qpos + 1)
+        for k0 in range(w_start, w_end, BLOCK_K):
+            k_offs = k0 + offs_k
+            k_valid = k_offs < w_end
+            k64 = k_offs.to(tl.int64)
+            k_tile = tl.load(
+                k_base + k64[:, None] * sk_t + offs_d64[None, :] * sk_d,
+                mask=k_valid[:, None],
+                other=0.0,
+            )
+            v_tile = tl.load(
+                v_base + k64[:, None] * sv_t + offs_d64[None, :] * sv_d,
+                mask=k_valid[:, None],
+                other=0.0,
+            )
+            qk = tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32) * SCALE
+            qk = tl.where(k_valid[None, :], qk, -float("inf"))
+            m_ij = tl.max(qk, axis=1)
+            m_new = tl.maximum(m_i, m_ij)
+            safe_m_i = tl.where(m_i > -1e30, m_i, 0.0)
+            safe_m_new = tl.where(m_new > -1e30, m_new, 0.0)
+            alpha = tl.where(m_i > -1e30, tl.exp(safe_m_i - safe_m_new), 0.0)
+            p = tl.where(k_valid[None, :], tl.exp(qk - safe_m_new[:, None]), 0.0)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile, out_dtype=tl.float32)
+            m_i = m_new
+
+        # Phase 2: Sinks [0, min(NS, max(0, min(win_lo, qpos + 1))))
+        s_end = tl.minimum(NS, tl.maximum(0, tl.minimum(win_lo, qpos + 1)))
+        for k0 in range(0, s_end, BLOCK_K):
+            k_offs = k0 + offs_k
+            k_valid = k_offs < s_end
+            k64 = k_offs.to(tl.int64)
+            k_tile = tl.load(
+                k_base + k64[:, None] * sk_t + offs_d64[None, :] * sk_d,
+                mask=k_valid[:, None],
+                other=0.0,
+            )
+            v_tile = tl.load(
+                v_base + k64[:, None] * sv_t + offs_d64[None, :] * sv_d,
+                mask=k_valid[:, None],
+                other=0.0,
+            )
+            qk = tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32) * SCALE
+            qk = tl.where(k_valid[None, :], qk, -float("inf"))
+            m_ij = tl.max(qk, axis=1)
+            m_new = tl.maximum(m_i, m_ij)
+            safe_m_i = tl.where(m_i > -1e30, m_i, 0.0)
+            safe_m_new = tl.where(m_new > -1e30, m_new, 0.0)
+            alpha = tl.where(m_i > -1e30, tl.exp(safe_m_i - safe_m_new), 0.0)
+            p = tl.where(k_valid[None, :], tl.exp(qk - safe_m_new[:, None]), 0.0)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile, out_dtype=tl.float32)
+            m_i = m_new
+
+        # Phase 3: Packed deduplicated bucket members (strictly disjoint from window & sinks)
+        if HAS_BUCKETS:
+            mem_base = MEM_ptr + b64 * sm_b + g64 * sm_g + qi64 * sm_t
+            for j0 in range(0, L_PACK, BLOCK_K):
+                j_offs = j0 + offs_k
+                k_ids = tl.load(
+                    mem_base + j_offs.to(tl.int64) * sm_l,
+                    mask=j_offs < L_PACK,
+                    other=-1,
+                )
+                valid_b = (k_ids >= 0) & (k_ids < TK)
+                if tl.sum(valid_b.to(tl.int32), axis=0) > 0:
+                    k_safe = tl.where(valid_b, k_ids, 0).to(tl.int64)
+                    k_tile = tl.load(
+                        k_base + k_safe[:, None] * sk_t + offs_d64[None, :] * sk_d,
+                        mask=valid_b[:, None],
+                        other=0.0,
+                    )
+                    v_tile = tl.load(
+                        v_base + k_safe[:, None] * sv_t + offs_d64[None, :] * sv_d,
+                        mask=valid_b[:, None],
+                        other=0.0,
+                    )
+                    qk = tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32) * SCALE
+                    qk = tl.where(valid_b[None, :], qk, -float("inf"))
+                    m_ij = tl.max(qk, axis=1)
+                    m_new = tl.maximum(m_i, m_ij)
+                    safe_m_i = tl.where(m_i > -1e30, m_i, 0.0)
+                    safe_m_new = tl.where(m_new > -1e30, m_new, 0.0)
+                    alpha = tl.where(m_i > -1e30, tl.exp(safe_m_i - safe_m_new), 0.0)
+                    p = tl.where(valid_b[None, :], tl.exp(qk - safe_m_new[:, None]), 0.0)
+                    l_i = l_i * alpha + tl.sum(p, axis=1)
+                    acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile, out_dtype=tl.float32)
+                    m_i = m_new
+
+        inv_l = tl.where(l_i > 0.0, 1.0 / l_i, 0.0)
+        o_tile = (acc * inv_l[:, None]).to(q_tile.dtype)
+        o_base = O_ptr + b64 * so_b + g64 * so_g + qi64 * so_t
+        tl.store(
+            o_base + offs_h64[:, None] * so_h + offs_d64[None, :] * so_d,
+            o_tile,
+            mask=h_mask[:, None],
+        )
+        lse_val = tl.where(l_i > 0.0, m_i + tl.log(tl.where(l_i > 0.0, l_i, 1.0)), -1e30)
+        lse_base = LSE_ptr + b64 * sl_b + g64 * sl_g + qi64 * sl_t
+        tl.store(lse_base + offs_h64 * sl_h, lse_val, mask=h_mask)
+
+    @triton.jit
+    def _lsa_sparse_bwd_delta_kernel(
+        O_ptr,
+        DO_ptr,
+        DELTA_ptr,
+        so_b,
+        so_g,
+        so_h,
+        so_t,
+        so_d,
+        sdo_b,
+        sdo_g,
+        sdo_h,
+        sdo_t,
+        sdo_d,
+        sd_b,
+        sd_g,
+        sd_h,
+        sd_t,
+        G,
+        HG,
+        TQ,
+        D_HEAD: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        pid_t = tl.program_id(0)
+        bgh = tl.program_id(1)
+        h_idx = bgh % HG
+        bg = bgh // HG
+        g_idx = bg % G
+        b_idx = bg // G
+
+        b64 = b_idx.to(tl.int64)
+        g64 = g_idx.to(tl.int64)
+        h64 = h_idx.to(tl.int64)
+
+        offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+        offs_d = tl.arange(0, D_HEAD)
+        t_mask = offs_t < TQ
+        t64 = offs_t.to(tl.int64)
+        d64 = offs_d.to(tl.int64)
+
+        o_tile = tl.load(
+            O_ptr + b64 * so_b + g64 * so_g + h64 * so_h + t64[:, None] * so_t + d64[None, :] * so_d,
+            mask=t_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        do_tile = tl.load(
+            DO_ptr + b64 * sdo_b + g64 * sdo_g + h64 * sdo_h + t64[:, None] * sdo_t + d64[None, :] * sdo_d,
+            mask=t_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        delta = tl.sum(o_tile * do_tile, axis=1)
+        tl.store(
+            DELTA_ptr + b64 * sd_b + g64 * sd_g + h64 * sd_h + t64 * sd_t,
+            delta,
+            mask=t_mask,
+        )
+
+    @triton.jit
+    def _lsa_sparse_attn_bwd_dq_and_buckets_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        MEM_ptr,
+        DO_ptr,
+        LSE_ptr,
+        DELTA_ptr,
+        DQ_ptr,
+        DK_ptr,
+        DV_ptr,
+        sq_b,
+        sq_g,
+        sq_h,
+        sq_t,
+        sq_d,
+        sk_b,
+        sk_g,
+        sk_t,
+        sk_d,
+        sv_b,
+        sv_g,
+        sv_t,
+        sv_d,
+        sm_b,
+        sm_g,
+        sm_t,
+        sm_l,
+        sdo_b,
+        sdo_g,
+        sdo_h,
+        sdo_t,
+        sdo_d,
+        sl_b,
+        sl_g,
+        sl_h,
+        sl_t,
+        sdq_b,
+        sdq_g,
+        sdq_h,
+        sdq_t,
+        sdq_d,
+        sdk_b,
+        sdk_g,
+        sdk_t,
+        sdk_d,
+        G,
+        TQ,
+        TK,
+        Q_BASE,
+        WIN,
+        NS,
+        L_PACK,
+        SCALE,
+        HG: tl.constexpr,
+        D_HEAD: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        HAS_BUCKETS: tl.constexpr,
+        COMPUTE_DQ: tl.constexpr,
+        COMPUTE_DKV: tl.constexpr,
+    ):
+        qi = tl.program_id(0)
+        bg = tl.program_id(1)
+        b_idx = bg // G
+        g_idx = bg % G
+
+        b64 = b_idx.to(tl.int64)
+        g64 = g_idx.to(tl.int64)
+        qi64 = qi.to(tl.int64)
+
+        offs_h = tl.arange(0, BLOCK_H)
+        offs_d = tl.arange(0, D_HEAD)
+        offs_k = tl.arange(0, BLOCK_K)
+        h_mask = offs_h < HG
+        offs_h64 = offs_h.to(tl.int64)
+        offs_d64 = offs_d.to(tl.int64)
+
+        q_base = Q_ptr + b64 * sq_b + g64 * sq_g + qi64 * sq_t
+        q_tile = tl.load(
+            q_base + offs_h64[:, None] * sq_h + offs_d64[None, :] * sq_d,
+            mask=h_mask[:, None],
+            other=0.0,
+        )
+        do_base = DO_ptr + b64 * sdo_b + g64 * sdo_g + qi64 * sdo_t
+        do_tile = tl.load(
+            do_base + offs_h64[:, None] * sdo_h + offs_d64[None, :] * sdo_d,
+            mask=h_mask[:, None],
+            other=0.0,
+        )
+        lse_base = LSE_ptr + b64 * sl_b + g64 * sl_g + qi64 * sl_t
+        lse_h = tl.load(lse_base + offs_h64 * sl_h, mask=h_mask, other=0.0)
+        delta_base = DELTA_ptr + b64 * sl_b + g64 * sl_g + qi64 * sl_t
+        delta_h = tl.load(delta_base + offs_h64 * sl_h, mask=h_mask, other=0.0)
+
+        k_base = K_ptr + b64 * sk_b + g64 * sk_g
+        v_base = V_ptr + b64 * sv_b + g64 * sv_g
+
+        dq_acc = tl.zeros([BLOCK_H, D_HEAD], dtype=tl.float32)
+
+        qpos = Q_BASE + qi
+        win_lo = qpos - WIN + 1
+
+        # Window + sink loops only needed for dQ (key-parallel kernels B2/B3 compute window & sink dK/dV atomic-free)
+        if COMPUTE_DQ:
+            w_start = tl.maximum(0, win_lo)
+            w_end = tl.minimum(TK, qpos + 1)
+            for k0 in range(w_start, w_end, BLOCK_K):
+                k_offs = k0 + offs_k
+                k_valid = k_offs < w_end
+                k64 = k_offs.to(tl.int64)
+                k_tile = tl.load(
+                    k_base + k64[:, None] * sk_t + offs_d64[None, :] * sk_d,
+                    mask=k_valid[:, None],
+                    other=0.0,
+                )
+                v_tile = tl.load(
+                    v_base + k64[:, None] * sv_t + offs_d64[None, :] * sv_d,
+                    mask=k_valid[:, None],
+                    other=0.0,
+                )
+                qk = tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32) * SCALE
+                dp = tl.dot(do_tile, tl.trans(v_tile), out_dtype=tl.float32)
+                valid_hk = h_mask[:, None] & k_valid[None, :]
+                p = tl.where(valid_hk, tl.exp(qk - lse_h[:, None]), 0.0)
+                ds = tl.where(valid_hk, p * (dp - delta_h[:, None]), 0.0)
+                dq_acc += tl.dot(ds.to(k_tile.dtype), k_tile, out_dtype=tl.float32)
+
+            s_end = tl.minimum(NS, tl.maximum(0, tl.minimum(win_lo, qpos + 1)))
+            for k0 in range(0, s_end, BLOCK_K):
+                k_offs = k0 + offs_k
+                k_valid = k_offs < s_end
+                k64 = k_offs.to(tl.int64)
+                k_tile = tl.load(
+                    k_base + k64[:, None] * sk_t + offs_d64[None, :] * sk_d,
+                    mask=k_valid[:, None],
+                    other=0.0,
+                )
+                v_tile = tl.load(
+                    v_base + k64[:, None] * sv_t + offs_d64[None, :] * sv_d,
+                    mask=k_valid[:, None],
+                    other=0.0,
+                )
+                qk = tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32) * SCALE
+                dp = tl.dot(do_tile, tl.trans(v_tile), out_dtype=tl.float32)
+                valid_hk = h_mask[:, None] & k_valid[None, :]
+                p = tl.where(valid_hk, tl.exp(qk - lse_h[:, None]), 0.0)
+                ds = tl.where(valid_hk, p * (dp - delta_h[:, None]), 0.0)
+                dq_acc += tl.dot(ds.to(k_tile.dtype), k_tile, out_dtype=tl.float32)
+
+        if HAS_BUCKETS:
+            mem_base = MEM_ptr + b64 * sm_b + g64 * sm_g + qi64 * sm_t
+            dk_base = DK_ptr + b64 * sdk_b + g64 * sdk_g
+            dv_base = DV_ptr + b64 * sdk_b + g64 * sdk_g
+            for j0 in range(0, L_PACK, BLOCK_K):
+                j_offs = j0 + offs_k
+                k_ids = tl.load(
+                    mem_base + j_offs.to(tl.int64) * sm_l,
+                    mask=j_offs < L_PACK,
+                    other=-1,
+                )
+                valid_b = (k_ids >= 0) & (k_ids < TK)
+                if tl.sum(valid_b.to(tl.int32), axis=0) > 0:
+                    k_safe = tl.where(valid_b, k_ids, 0).to(tl.int64)
+                    k_tile = tl.load(
+                        k_base + k_safe[:, None] * sk_t + offs_d64[None, :] * sk_d,
+                        mask=valid_b[:, None],
+                        other=0.0,
+                    )
+                    v_tile = tl.load(
+                        v_base + k_safe[:, None] * sv_t + offs_d64[None, :] * sv_d,
+                        mask=valid_b[:, None],
+                        other=0.0,
+                    )
+                    qk = tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32) * SCALE
+                    dp = tl.dot(do_tile, tl.trans(v_tile), out_dtype=tl.float32)
+                    valid_hk = h_mask[:, None] & valid_b[None, :]
+                    p = tl.where(valid_hk, tl.exp(qk - lse_h[:, None]), 0.0)
+                    ds = tl.where(valid_hk, p * (dp - delta_h[:, None]), 0.0)
+                    if COMPUTE_DQ:
+                        dq_acc += tl.dot(ds.to(k_tile.dtype), k_tile, out_dtype=tl.float32)
+                    if COMPUTE_DKV:
+                        # Reduce all Hg query heads via Tensor Cores before atomic scatter-add (8x fewer atomics)
+                        dv_b = tl.dot(tl.trans(p.to(do_tile.dtype)), do_tile, out_dtype=tl.float32)
+                        tl.atomic_add(
+                            dv_base + k_safe[:, None] * sdk_t + offs_d64[None, :] * sdk_d,
+                            dv_b,
+                            mask=valid_b[:, None],
+                        )
+                        dk_b = tl.dot(tl.trans(ds.to(q_tile.dtype)), q_tile, out_dtype=tl.float32) * SCALE
+                        tl.atomic_add(
+                            dk_base + k_safe[:, None] * sdk_t + offs_d64[None, :] * sdk_d,
+                            dk_b,
+                            mask=valid_b[:, None],
+                        )
+
+        if COMPUTE_DQ:
+            dq_base = DQ_ptr + b64 * sdq_b + g64 * sdq_g + qi64 * sdq_t
+            tl.store(
+                dq_base + offs_h64[:, None] * sdq_h + offs_d64[None, :] * sdq_d,
+                (dq_acc * SCALE).to(q_tile.dtype),
+                mask=h_mask[:, None],
+            )
+
+    @triton.jit
+    def _lsa_sparse_attn_bwd_dkv_win_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        DO_ptr,
+        LSE_ptr,
+        DELTA_ptr,
+        DK_ptr,
+        DV_ptr,
+        sq_b,
+        sq_g,
+        sq_h,
+        sq_t,
+        sq_d,
+        sk_b,
+        sk_g,
+        sk_t,
+        sk_d,
+        sv_b,
+        sv_g,
+        sv_t,
+        sv_d,
+        sdo_b,
+        sdo_g,
+        sdo_h,
+        sdo_t,
+        sdo_d,
+        sl_b,
+        sl_g,
+        sl_h,
+        sl_t,
+        sdk_b,
+        sdk_g,
+        sdk_t,
+        sdk_d,
+        G,
+        TQ,
+        K_WIN_START,
+        K_WIN_END,
+        Q_BASE,
+        WIN,
+        SCALE,
+        HG: tl.constexpr,
+        D_HEAD: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_Q: tl.constexpr,
+    ):
+        pid_k = tl.program_id(0)
+        bg = tl.program_id(1)
+        b_idx = bg // G
+        g_idx = bg % G
+
+        b64 = b_idx.to(tl.int64)
+        g64 = g_idx.to(tl.int64)
+
+        k0 = K_WIN_START + pid_k * BLOCK_K
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        offs_d = tl.arange(0, D_HEAD)
+        offs_q_rel = tl.arange(0, BLOCK_Q)
+        k_valid = offs_k < K_WIN_END
+        k64 = offs_k.to(tl.int64)
+        d64 = offs_d.to(tl.int64)
+
+        k_base = K_ptr + b64 * sk_b + g64 * sk_g
+        v_base = V_ptr + b64 * sv_b + g64 * sv_g
+        k_tile = tl.load(k_base + k64[:, None] * sk_t + d64[None, :] * sk_d, mask=k_valid[:, None], other=0.0)
+        v_tile = tl.load(v_base + k64[:, None] * sv_t + d64[None, :] * sv_d, mask=k_valid[:, None], other=0.0)
+
+        dk_acc = tl.zeros([BLOCK_K, D_HEAD], dtype=tl.float32)
+        dv_acc = tl.zeros([BLOCK_K, D_HEAD], dtype=tl.float32)
+
+        qi_start = tl.maximum(0, k0 - Q_BASE)
+        qi_end = tl.minimum(TQ, k0 + BLOCK_K + WIN - 1 - Q_BASE)
+
+        q_bg = Q_ptr + b64 * sq_b + g64 * sq_g
+        do_bg = DO_ptr + b64 * sdo_b + g64 * sdo_g
+        lse_bg = LSE_ptr + b64 * sl_b + g64 * sl_g
+        del_bg = DELTA_ptr + b64 * sl_b + g64 * sl_g
+
+        for q0 in range(qi_start, qi_end, BLOCK_Q):
+            q_offs = q0 + offs_q_rel
+            q_valid = q_offs < qi_end
+            q64 = q_offs.to(tl.int64)
+            qpos = Q_BASE + q_offs
+            m_win = (
+                q_valid[:, None]
+                & k_valid[None, :]
+                & (offs_k[None, :] <= qpos[:, None])
+                & (offs_k[None, :] >= (qpos[:, None] - WIN + 1))
+            )
+            zero64 = b64 * 0
+            for h in range(HG):
+                h64 = zero64 + h
+                q_tile = tl.load(
+                    q_bg + h64 * sq_h + q64[:, None] * sq_t + d64[None, :] * sq_d,
+                    mask=q_valid[:, None],
+                    other=0.0,
+                )
+                do_tile = tl.load(
+                    do_bg + h64 * sdo_h + q64[:, None] * sdo_t + d64[None, :] * sdo_d,
+                    mask=q_valid[:, None],
+                    other=0.0,
+                )
+                lse_q = tl.load(lse_bg + h64 * sl_h + q64 * sl_t, mask=q_valid, other=0.0)
+                del_q = tl.load(del_bg + h64 * sl_h + q64 * sl_t, mask=q_valid, other=0.0)
+                qk = tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32) * SCALE
+                dp = tl.dot(do_tile, tl.trans(v_tile), out_dtype=tl.float32)
+                p = tl.where(m_win, tl.exp(qk - lse_q[:, None]), 0.0)
+                ds = tl.where(m_win, p * (dp - del_q[:, None]), 0.0)
+                dv_acc += tl.dot(tl.trans(p.to(do_tile.dtype)), do_tile, out_dtype=tl.float32)
+                dk_acc += tl.dot(tl.trans(ds.to(q_tile.dtype)), q_tile, out_dtype=tl.float32)
+
+        dk_ptrs = DK_ptr + b64 * sdk_b + g64 * sdk_g + k64[:, None] * sdk_t + d64[None, :] * sdk_d
+        dv_ptrs = DV_ptr + b64 * sdk_b + g64 * sdk_g + k64[:, None] * sdk_t + d64[None, :] * sdk_d
+        dk_cur = tl.load(dk_ptrs, mask=k_valid[:, None], other=0.0)
+        dv_cur = tl.load(dv_ptrs, mask=k_valid[:, None], other=0.0)
+        tl.store(dk_ptrs, dk_cur + dk_acc * SCALE, mask=k_valid[:, None])
+        tl.store(dv_ptrs, dv_cur + dv_acc, mask=k_valid[:, None])
+
+    @triton.jit
+    def _lsa_sparse_attn_bwd_dkv_sink_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        DO_ptr,
+        LSE_ptr,
+        DELTA_ptr,
+        DK_ptr,
+        DV_ptr,
+        sq_b,
+        sq_g,
+        sq_h,
+        sq_t,
+        sq_d,
+        sk_b,
+        sk_g,
+        sk_t,
+        sk_d,
+        sv_b,
+        sv_g,
+        sv_t,
+        sv_d,
+        sdo_b,
+        sdo_g,
+        sdo_h,
+        sdo_t,
+        sdo_d,
+        sl_b,
+        sl_g,
+        sl_h,
+        sl_t,
+        sdk_b,
+        sdk_g,
+        sdk_t,
+        sdk_d,
+        G,
+        TQ,
+        NS_EFF,
+        Q_BASE,
+        WIN,
+        SPLIT_Q,
+        SCALE,
+        HG: tl.constexpr,
+        D_HEAD: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_Q: tl.constexpr,
+    ):
+        pid_k = tl.program_id(0)
+        pid_s = tl.program_id(1)
+        bg = tl.program_id(2)
+        b_idx = bg // G
+        g_idx = bg % G
+
+        k0 = pid_k * BLOCK_K
+        qi_min = tl.maximum(0, k0 + WIN - Q_BASE)
+        n_rem = TQ - qi_min
+        chunk = tl.maximum(1, (n_rem + SPLIT_Q - 1) // SPLIT_Q)
+        s_start = qi_min + pid_s * chunk
+        s_end = tl.minimum(TQ, s_start + chunk)
+        if (n_rem > 0) & (s_start < s_end):
+            b64 = b_idx.to(tl.int64)
+            g64 = g_idx.to(tl.int64)
+            zero64 = b64 * 0
+
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            offs_d = tl.arange(0, D_HEAD)
+            offs_q_rel = tl.arange(0, BLOCK_Q)
+            k_valid = offs_k < NS_EFF
+            k64 = offs_k.to(tl.int64)
+            d64 = offs_d.to(tl.int64)
+
+            k_base = K_ptr + b64 * sk_b + g64 * sk_g
+            v_base = V_ptr + b64 * sv_b + g64 * sv_g
+            k_tile = tl.load(k_base + k64[:, None] * sk_t + d64[None, :] * sk_d, mask=k_valid[:, None], other=0.0)
+            v_tile = tl.load(v_base + k64[:, None] * sv_t + d64[None, :] * sv_d, mask=k_valid[:, None], other=0.0)
+
+            dk_acc = tl.zeros([BLOCK_K, D_HEAD], dtype=tl.float32)
+            dv_acc = tl.zeros([BLOCK_K, D_HEAD], dtype=tl.float32)
+
+            q_bg = Q_ptr + b64 * sq_b + g64 * sq_g
+            do_bg = DO_ptr + b64 * sdo_b + g64 * sdo_g
+            lse_bg = LSE_ptr + b64 * sl_b + g64 * sl_g
+            del_bg = DELTA_ptr + b64 * sl_b + g64 * sl_g
+
+            for q0 in range(s_start, s_end, BLOCK_Q):
+                q_offs = q0 + offs_q_rel
+                q_valid = q_offs < s_end
+                q64 = q_offs.to(tl.int64)
+                qpos = Q_BASE + q_offs
+                m_sink = (
+                    q_valid[:, None]
+                    & k_valid[None, :]
+                    & (offs_k[None, :] < (qpos[:, None] - WIN + 1))
+                    & (offs_k[None, :] <= qpos[:, None])
+                )
+                for h in range(HG):
+                    h64 = zero64 + h
+                    q_tile = tl.load(
+                        q_bg + h64 * sq_h + q64[:, None] * sq_t + d64[None, :] * sq_d,
+                        mask=q_valid[:, None],
+                        other=0.0,
+                    )
+                    do_tile = tl.load(
+                        do_bg + h64 * sdo_h + q64[:, None] * sdo_t + d64[None, :] * sdo_d,
+                        mask=q_valid[:, None],
+                        other=0.0,
+                    )
+                    lse_q = tl.load(lse_bg + h64 * sl_h + q64 * sl_t, mask=q_valid, other=0.0)
+                    del_q = tl.load(del_bg + h64 * sl_h + q64 * sl_t, mask=q_valid, other=0.0)
+                    qk = tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32) * SCALE
+                    dp = tl.dot(do_tile, tl.trans(v_tile), out_dtype=tl.float32)
+                    p = tl.where(m_sink, tl.exp(qk - lse_q[:, None]), 0.0)
+                    ds = tl.where(m_sink, p * (dp - del_q[:, None]), 0.0)
+                    dv_acc += tl.dot(tl.trans(p.to(do_tile.dtype)), do_tile, out_dtype=tl.float32)
+                    dk_acc += tl.dot(tl.trans(ds.to(q_tile.dtype)), q_tile, out_dtype=tl.float32)
+
+            dk_ptrs = DK_ptr + b64 * sdk_b + g64 * sdk_g + k64[:, None] * sdk_t + d64[None, :] * sdk_d
+            dv_ptrs = DV_ptr + b64 * sdk_b + g64 * sdk_g + k64[:, None] * sdk_t + d64[None, :] * sdk_d
+            tl.atomic_add(dk_ptrs, dk_acc * SCALE, mask=k_valid[:, None])
+            tl.atomic_add(dv_ptrs, dv_acc, mask=k_valid[:, None])
+
+    @triton.jit
+    def _lsa_distill_lse_kernel(
+        Q_ptr,
+        K_ptr,
+        QPOS_ptr,
+        LSE_ptr,
+        sq_b,
+        sq_g,
+        sq_h,
+        sq_t,
+        sq_d,
+        sk_b,
+        sk_g,
+        sk_t,
+        sk_d,
+        sl_b,
+        sl_g,
+        sl_h,
+        sl_t,
+        G,
+        HG,
+        NQ,
+        TK,
+        SCALE,
+        D_HEAD: tl.constexpr,
+        BLOCK_Q: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_q = tl.program_id(0)
+        bgh = tl.program_id(1)
+        h_idx = bgh % HG
+        bg = bgh // HG
+        g_idx = bg % G
+        b_idx = bg // G
+
+        b64 = b_idx.to(tl.int64)
+        g64 = g_idx.to(tl.int64)
+        h64 = h_idx.to(tl.int64)
+
+        q0 = pid_q * BLOCK_Q
+        offs_q = q0 + tl.arange(0, BLOCK_Q)
+        offs_d = tl.arange(0, D_HEAD)
+        offs_k = tl.arange(0, BLOCK_K)
+        q_valid = offs_q < NQ
+        q64 = offs_q.to(tl.int64)
+        d64 = offs_d.to(tl.int64)
+
+        qpos = tl.load(QPOS_ptr + q64, mask=q_valid, other=-1)
+        qpos_max = tl.max(qpos, axis=0)
+        q_tile = tl.load(
+            Q_ptr + b64 * sq_b + g64 * sq_g + h64 * sq_h + q64[:, None] * sq_t + d64[None, :] * sq_d,
+            mask=q_valid[:, None],
+            other=0.0,
+        )
+        k_base = K_ptr + b64 * sk_b + g64 * sk_g
+
+        m_i = tl.full([BLOCK_Q], -float("inf"), dtype=tl.float32)
+        l_i = tl.zeros([BLOCK_Q], dtype=tl.float32)
+        k_end = tl.minimum(TK, qpos_max + 1)
+        for k0 in range(0, k_end, BLOCK_K):
+            k_offs = k0 + offs_k
+            k_valid = k_offs < k_end
+            k64 = k_offs.to(tl.int64)
+            k_tile = tl.load(
+                k_base + k64[:, None] * sk_t + d64[None, :] * sk_d,
+                mask=k_valid[:, None],
+                other=0.0,
+            )
+            qk = tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32) * SCALE
+            causal = q_valid[:, None] & k_valid[None, :] & (k_offs[None, :] <= qpos[:, None])
+            qk = tl.where(causal, qk, -float("inf"))
+            m_ij = tl.max(qk, axis=1)
+            m_new = tl.maximum(m_i, m_ij)
+            safe_m_i = tl.where(m_i > -1e30, m_i, 0.0)
+            safe_m_new = tl.where(m_new > -1e30, m_new, 0.0)
+            alpha = tl.where(m_i > -1e30, tl.exp(safe_m_i - safe_m_new), 0.0)
+            p = tl.where(causal, tl.exp(qk - safe_m_new[:, None]), 0.0)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_new
+
+        lse_val = tl.where(l_i > 0.0, m_i + tl.log(tl.where(l_i > 0.0, l_i, 1.0)), -1e30)
+        tl.store(
+            LSE_ptr + b64 * sl_b + g64 * sl_g + h64 * sl_h + q64 * sl_t,
+            lse_val,
+            mask=q_valid,
+        )
+
+    @triton.jit
+    def _lsa_distill_block_mass_kernel(
+        Q_ptr,
+        K_ptr,
+        QPOS_ptr,
+        LSE_ptr,
+        SLAB_ptr,
+        MASS_ptr,
+        sq_b,
+        sq_g,
+        sq_h,
+        sq_t,
+        sq_d,
+        sk_b,
+        sk_g,
+        sk_t,
+        sk_d,
+        sl_b,
+        sl_g,
+        sl_h,
+        sl_t,
+        ss_b,
+        ss_g,
+        ss_nb,
+        ss_u,
+        sm_b,
+        sm_g,
+        sm_q,
+        sm_s,
+        G,
+        NQ,
+        NB,
+        BLOCK_SIZE,
+        SPB,
+        SCALE,
+        HG: tl.constexpr,
+        D_HEAD: tl.constexpr,
+        POOL: tl.constexpr,
+        N_UNITS: tl.constexpr,
+        BLOCK_Q: tl.constexpr,
+        BLOCK_U: tl.constexpr,
+        SPB_PAD: tl.constexpr,
+    ):
+        blk = tl.program_id(0)
+        pid_q = tl.program_id(1)
+        bg = tl.program_id(2)
+        b_idx = bg // G
+        g_idx = bg % G
+
+        q0 = pid_q * BLOCK_Q
+        offs_q = q0 + tl.arange(0, BLOCK_Q)
+        q_valid = offs_q < NQ
+        q64 = offs_q.to(tl.int64)
+        qpos = tl.load(QPOS_ptr + q64, mask=q_valid, other=0)
+        valid_q_blk = q_valid & ((qpos // BLOCK_SIZE) > blk)
+        if tl.sum(valid_q_blk.to(tl.int32), axis=0) > 0:
+            b64 = b_idx.to(tl.int64)
+            g64 = g_idx.to(tl.int64)
+            blk64 = blk.to(tl.int64)
+            zero64 = b64 * 0
+
+            offs_d = tl.arange(0, D_HEAD)
+            d64 = offs_d.to(tl.int64)
+            offs_u = tl.arange(0, BLOCK_U)
+            offs_k_rel = tl.arange(0, BLOCK_U * POOL)
+            offs_s = tl.arange(0, SPB_PAD)
+
+            q_bg = Q_ptr + b64 * sq_b + g64 * sq_g
+            lse_bg = LSE_ptr + b64 * sl_b + g64 * sl_g
+            k_base = K_ptr + b64 * sk_b + g64 * sk_g
+            slab_base = SLAB_ptr + b64 * ss_b + g64 * ss_g + blk64 * ss_nb
+
+            mass_acc = tl.zeros([BLOCK_Q, SPB_PAD], dtype=tl.float32)
+            blk_k_base = blk64 * BLOCK_SIZE
+
+            for u0 in range(0, N_UNITS, BLOCK_U):
+                u_offs = u0 + offs_u
+                u_slots = tl.load(slab_base + u_offs.to(tl.int64) * ss_u)
+                one_hot = (u_slots[:, None] == offs_s[None, :]).to(tl.float32)
+
+                k_pos64 = blk_k_base + (u0 * POOL + offs_k_rel).to(tl.int64)
+                k_tile = tl.load(k_base + k_pos64[:, None] * sk_t + d64[None, :] * sk_d)
+
+                unit_prob = tl.zeros([BLOCK_Q, BLOCK_U], dtype=tl.float32)
+                for h in range(HG):
+                    h64 = zero64 + h
+                    q_tile = tl.load(
+                        q_bg + h64 * sq_h + q64[:, None] * sq_t + d64[None, :] * sq_d,
+                        mask=valid_q_blk[:, None],
+                        other=0.0,
+                    )
+                    lse_q = tl.load(lse_bg + h64 * sl_h + q64 * sl_t, mask=valid_q_blk, other=0.0)
+                    qk = tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32) * SCALE
+                    p = tl.where(valid_q_blk[:, None], tl.exp(qk - lse_q[:, None]), 0.0)
+                    if POOL == 1:
+                        unit_prob += p
+                    else:
+                        unit_prob += tl.sum(tl.reshape(p, (BLOCK_Q, BLOCK_U, POOL)), axis=2)
+
+                mass_acc += tl.dot(unit_prob, one_hot, input_precision="ieee")
+
+            inv_hg = 1.0 / HG
+            s_mask = offs_s < SPB
+            slot_offs64 = blk64 * SPB + offs_s.to(tl.int64)
+            m_ptrs = MASS_ptr + b64 * sm_b + g64 * sm_g + q64[:, None] * sm_q + slot_offs64[None, :] * sm_s
+            tl.store(m_ptrs, mass_acc * inv_hg, mask=q_valid[:, None] & s_mask[None, :])
+
+
+class _TritonSparseGatherAttnFn(torch.autograd.Function):
+    """Fused zero-materialization Triton Sparse-Gather FlashAttention (`per_head=False`, CUDA bf16/fp16)."""
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx: Any,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mem_idx: torch.Tensor,
+        q_base_pos: int,
+        win: int,
+        ns: int,
+        scaling: float,
+    ) -> torch.Tensor:
+        qc = q.contiguous()
+        kc = k.contiguous()
+        vc = v.contiguous()
+        mc = mem_idx.contiguous()
+        b, g, hg, tq, dh = qc.shape
+        tk = kc.shape[2]
+        l_pack = int(mc.shape[-1])
+        has_buckets = l_pack > 0
+        mem_arg = mc if has_buckets else torch.empty((1,), device=qc.device, dtype=torch.int32)
+        sm_b, sm_g, sm_t, sm_l = mc.stride() if has_buckets else (0, 0, 0, 0)
+
+        out = torch.empty_like(qc)
+        lse = torch.empty((b, g, hg, tq), device=qc.device, dtype=torch.float32)
+
+        block_h = max(16, triton.next_power_of_2(hg))
+        block_k = 32
+        grid = (tq, b * g)
+        _lsa_sparse_attn_fwd_kernel[grid](
+            qc,
+            kc,
+            vc,
+            mem_arg,
+            out,
+            lse,
+            *qc.stride(),
+            *kc.stride(),
+            *vc.stride(),
+            sm_b,
+            sm_g,
+            sm_t,
+            sm_l,
+            *out.stride(),
+            *lse.stride(),
+            g,
+            tq,
+            tk,
+            int(q_base_pos),
+            int(win),
+            int(ns),
+            l_pack,
+            float(scaling),
+            HG=hg,
+            D_HEAD=dh,
+            BLOCK_H=block_h,
+            BLOCK_K=block_k,
+            HAS_BUCKETS=has_buckets,
+            num_warps=4,
+            num_stages=2,
+        )
+
+        ctx.save_for_backward(qc, kc, vc, mc, out, lse)
+        ctx.q_base_pos = int(q_base_pos)
+        ctx.win = int(win)
+        ctx.ns = int(ns)
+        ctx.scaling = float(scaling)
+        return out
+
+    @staticmethod
+    def backward(ctx: Any, grad_out: torch.Tensor) -> tuple[torch.Tensor | None, ...]:  # type: ignore[override]
+        qc, kc, vc, mc, out, lse = ctx.saved_tensors
+        need_q = bool(ctx.needs_input_grad[0])
+        need_k = bool(ctx.needs_input_grad[1])
+        need_v = bool(ctx.needs_input_grad[2])
+        need_kv = need_k or need_v
+        if not (need_q or need_kv):
+            return (None,) * 8
+
+        do = grad_out.contiguous()
+        b, g, hg, tq, dh = qc.shape
+        tk = kc.shape[2]
+        q_base_pos: int = ctx.q_base_pos
+        win: int = ctx.win
+        ns: int = ctx.ns
+        scaling: float = ctx.scaling
+        l_pack = int(mc.shape[-1])
+        has_buckets = l_pack > 0
+        mem_arg = mc if has_buckets else torch.empty((1,), device=qc.device, dtype=torch.int32)
+        sm_b, sm_g, sm_t, sm_l = mc.stride() if has_buckets else (0, 0, 0, 0)
+
+        delta = torch.empty_like(lse)
+        block_t_del = 64
+        _lsa_sparse_bwd_delta_kernel[(triton.cdiv(tq, block_t_del), b * g * hg)](
+            out,
+            do,
+            delta,
+            *out.stride(),
+            *do.stride(),
+            *delta.stride(),
+            g,
+            hg,
+            tq,
+            D_HEAD=dh,
+            BLOCK_T=block_t_del,
+            num_warps=4,
+        )
+
+        dq = torch.empty_like(qc) if need_q else None
+        dq_arg = dq if dq is not None else torch.empty((1,), device=qc.device, dtype=qc.dtype)
+        sdq = dq.stride() if dq is not None else (0, 0, 0, 0, 0)
+
+        dk_fp32 = torch.zeros((b, g, tk, dh), device=qc.device, dtype=torch.float32) if need_kv else None
+        dv_fp32 = torch.zeros((b, g, tk, dh), device=qc.device, dtype=torch.float32) if need_kv else None
+        dk_arg = dk_fp32 if dk_fp32 is not None else torch.empty((1,), device=qc.device, dtype=torch.float32)
+        dv_arg = dv_fp32 if dv_fp32 is not None else torch.empty((1,), device=qc.device, dtype=torch.float32)
+        sdk = dk_fp32.stride() if dk_fp32 is not None else (0, 0, 0, 0)
+
+        block_h = max(16, triton.next_power_of_2(hg))
+        block_k = 32
+        if need_q or (need_kv and has_buckets):
+            _lsa_sparse_attn_bwd_dq_and_buckets_kernel[(tq, b * g)](
+                qc,
+                kc,
+                vc,
+                mem_arg,
+                do,
+                lse,
+                delta,
+                dq_arg,
+                dk_arg,
+                dv_arg,
+                *qc.stride(),
+                *kc.stride(),
+                *vc.stride(),
+                sm_b,
+                sm_g,
+                sm_t,
+                sm_l,
+                *do.stride(),
+                *lse.stride(),
+                *sdq,
+                *sdk,
+                g,
+                tq,
+                tk,
+                q_base_pos,
+                win,
+                ns,
+                l_pack,
+                scaling,
+                HG=hg,
+                D_HEAD=dh,
+                BLOCK_H=block_h,
+                BLOCK_K=block_k,
+                HAS_BUCKETS=has_buckets,
+                COMPUTE_DQ=need_q,
+                COMPUTE_DKV=need_kv,
+                num_warps=4,
+                num_stages=1,
+            )
+
+        if need_kv:
+            assert dk_fp32 is not None and dv_fp32 is not None
+            # Atomic-free key-parallel window dK/dV
+            k_win_start = max(0, q_base_pos - win + 1)
+            k_win_end = min(tk, q_base_pos + tq)
+            if k_win_end > k_win_start:
+                bk_w = 32
+                bq_w = 32
+                _lsa_sparse_attn_bwd_dkv_win_kernel[(triton.cdiv(k_win_end - k_win_start, bk_w), b * g)](
+                    qc,
+                    kc,
+                    vc,
+                    do,
+                    lse,
+                    delta,
+                    dk_fp32,
+                    dv_fp32,
+                    *qc.stride(),
+                    *kc.stride(),
+                    *vc.stride(),
+                    *do.stride(),
+                    *lse.stride(),
+                    *dk_fp32.stride(),
+                    g,
+                    tq,
+                    k_win_start,
+                    k_win_end,
+                    q_base_pos,
+                    win,
+                    scaling,
+                    HG=hg,
+                    D_HEAD=dh,
+                    BLOCK_K=bk_w,
+                    BLOCK_Q=bq_w,
+                    num_warps=8,
+                    num_stages=2,
+                )
+
+            # Split-Q key-parallel sink dK/dV (32 atomics per sink key vs 32,768)
+            ns_eff = min(ns, tk)
+            if ns_eff > 0 and (q_base_pos + tq - 1) >= win:
+                bk_s = 32
+                bq_s = 64
+                split_q = min(32, max(1, tq // 256))
+                _lsa_sparse_attn_bwd_dkv_sink_kernel[(triton.cdiv(ns_eff, bk_s), split_q, b * g)](
+                    qc,
+                    kc,
+                    vc,
+                    do,
+                    lse,
+                    delta,
+                    dk_fp32,
+                    dv_fp32,
+                    *qc.stride(),
+                    *kc.stride(),
+                    *vc.stride(),
+                    *do.stride(),
+                    *lse.stride(),
+                    *dk_fp32.stride(),
+                    g,
+                    tq,
+                    ns_eff,
+                    q_base_pos,
+                    win,
+                    split_q,
+                    scaling,
+                    HG=hg,
+                    D_HEAD=dh,
+                    BLOCK_K=bk_s,
+                    BLOCK_Q=bq_s,
+                    num_warps=8,
+                    num_stages=2,
+                )
+
+        dk_out = dk_fp32.to(kc.dtype) if (need_k and dk_fp32 is not None) else None
+        dv_out = dv_fp32.to(vc.dtype) if (need_v and dv_fp32 is not None) else None
+        return dq, dk_out, dv_out, None, None, None, None, None
+
+
+@torch.no_grad()
+def _build_sparse_mem_table(
+    qz_span: torch.Tensor,
+    qpos_span: torch.Tensor,
+    index: BucketIndex | None,
+    idx: LSAIndexer,
+    *,
+    tk: int,
+    q_base_pos: int,
+    cur_pass: int,
+    record_tail_len: int,
+    record_stats: bool,
+) -> torch.Tensor:
+    """Build `[B, G, T_span, L_pack]` int32 packed bucket-member table (`-1` = invalid), zero intermediate syncs."""
+    cfg = idx.cfg
+    b, g, t_span, _ = qz_span.shape
+    dev = qz_span.device
+    w = cfg.resolved_window()
+    ns = min(cfg.sinks, tk)
+    sync_free = _is_sync_restricted()
+
+    n_hist_max = max(0, (q_base_pos + t_span - 1 - w + 1) - ns)
+    if index is None or t_span == 0:
+        if record_stats and not sync_free and not _in_backward() and t_span > 0:
+            t_tail = min(t_span, max(1, record_tail_len))
+            qp_t = qpos_span[-t_tail:]
+            lo_t = max(0, q_base_pos + t_span - t_tail - w + 1)
+            hi_t = q_base_pos + t_span
+            kpos_t = torch.arange(lo_t, hi_t, device=dev)
+            win_lo_t = qp_t - w + 1
+            m_win_t = (kpos_t[None] <= qp_t[:, None]) & (kpos_t[None] >= win_lo_t[:, None])
+            ns_t = min(cfg.sinks, hi_t)
+            spos_t = torch.arange(ns_t, device=dev)
+            m_sink_t = (spos_t[None] < win_lo_t[:, None]) & (spos_t[None] <= qp_t[:, None])
+            kpq = float(m_win_t.sum() + m_sink_t.sum()) / max(1, t_tail)
+            idx.last_stats["keys_per_query"] = kpq
+            idx.last_stats[f"keys_per_query_p{cur_pass}"] = kpq
+        return torch.empty((b, g, t_span, 0), device=dev, dtype=torch.int32)
+
+    s_slots = index.centroids.shape[2]
+    kk = min(cfg.num_select, s_slots)
+    mk = index.members.shape[-1]
+    kb_n = kk * mk
+    eff_cap_max = min(_effective_member_cap(cfg, s_slots, kk, kb_n, tk), n_hist_max) if n_hist_max > 0 else 0
+    l_pack_max = min(kb_n, eff_cap_max) if (eff_cap_max > 0 and kb_n > 0) else 0
+    mem_signed = (
+        torch.full((b, g, t_span, l_pack_max), -1, device=dev, dtype=torch.int32)
+        if l_pack_max > 0
+        else torch.empty((b, g, t_span, 0), device=dev, dtype=torch.int32)
+    )
+
+    sel_chunk = max(cfg.query_chunk, 1024)
+    members_i32 = index.members.to(torch.int32) if (dev.type == "cuda" and tk < (1 << 30)) else index.members
+    neg_one_i32 = torch.tensor(-1, device=dev, dtype=torch.int32)
+
+    for c0 in range(0, t_span, sel_chunk):
+        c1 = min(t_span, c0 + sel_chunk)
+        c_len = c1 - c0
+        is_last = c1 >= t_span
+        n_hist_c = max(0, (q_base_pos + c1 - 1 - w + 1) - ns)
+        if n_hist_c <= 0 and not (is_last and record_stats):
+            continue
+
+        qpos_c = qpos_span[c0:c1]
+        scores = idx.slot_scores(qz_span[:, :, c0:c1], index, qpos_c)
+        top = scores.topk(kk, dim=-1)
+        finite_top = torch.isfinite(top.values)
+        if is_last and record_stats and not _in_backward():
+            sel_slots = torch.where(finite_top, top.indices, torch.full_like(top.indices, -1))
+            t_tail = min(c_len, max(1, record_tail_len))
+            idx.last_selected_buckets[cur_pass] = sel_slots[:, :, -t_tail:, :]
+
+        if n_hist_c > 0 and l_pack_max > 0:
+            win_lo_c = qpos_c - w + 1
+            eff_cap_c = min(_effective_member_cap(cfg, s_slots, kk, kb_n, tk), n_hist_c)
+            flat_sel = top.indices.reshape(b, g, c_len * kk, 1).expand(b, g, c_len * kk, mk)
+            mem = members_i32.gather(2, flat_sel).view(b, g, c_len, kk, mk)
+            mem = torch.where(finite_top.unsqueeze(-1), mem, torch.full_like(mem, -1)).flatten(-2)
+            m_b = (mem >= ns) & (mem < win_lo_c[None, None, :, None])
+            packed = _pack_valid_members(
+                mem,
+                m_b,
+                tk=tk,
+                eff_cap=eff_cap_c,
+                sync_free=True,
+                out_dtype=torch.int32,
+            )
+            if packed is not None:
+                mem_final, m_final, _ = packed
+                l_c = mem_final.shape[-1]
+                mem_signed[:, :, c0:c1, :l_c] = torch.where(m_final, mem_final, neg_one_i32)
+
+    if record_stats and not sync_free and not _in_backward():
+        t_tail = min(t_span, max(1, record_tail_len))
+        qp_t = qpos_span[-t_tail:]
+        lo_t = max(0, q_base_pos + t_span - t_tail - w + 1)
+        hi_t = q_base_pos + t_span
+        kpos_t = torch.arange(lo_t, hi_t, device=dev)
+        win_lo_t = qp_t - w + 1
+        m_win_t = (kpos_t[None] <= qp_t[:, None]) & (kpos_t[None] >= win_lo_t[:, None])
+        ns_t = min(cfg.sinks, hi_t)
+        spos_t = torch.arange(ns_t, device=dev)
+        m_sink_t = (spos_t[None] < win_lo_t[:, None]) & (spos_t[None] <= qp_t[:, None])
+        n_sel_t = int((mem_signed[:, :, -t_tail:, :] >= 0).sum()) if l_pack_max > 0 else 0
+        kpq = float(m_win_t.sum() + m_sink_t.sum()) / max(1, t_tail) + n_sel_t / max(1, b * g * t_tail)
+        idx.last_stats["keys_per_query"] = kpq
+        idx.last_stats[f"keys_per_query_p{cur_pass}"] = kpq
+
+    return mem_signed
+
+
+def _run_detached_distill_kl(
+    qin: torch.Tensor,
+    key: torch.Tensor,
+    qpos_all: torch.Tensor,
+    index: BucketIndex,
+    idx: LSAIndexer,
+    active_wq: nn.Parameter,
+    scaling: float,
+    cur_pass: int,
+) -> None:
+    """Fast exact detached-input KL distillation with analytic `(d_qz, d_cent)` and fused Triton teacher mass."""
+    cfg = idx.cfg
+    b, h, tq, dh = qin.shape
+    g, tk = key.shape[1], key.shape[2]
+    hg = h // g
+    dev = qin.device
+    q_base_pos = tk - tq
+
+    # Avoid `torch.nonzero` GPU->CPU sync: `qpos_all[i] = q_base_pos + i` is strictly increasing.
+    cand_start = max(0, cfg.block_size - q_base_pos)
+    n_cand = max(0, tq - cand_start)
+    if n_cand <= 0:
+        return
+
+    nq = max(1, int(n_cand * cfg.distill_query_frac))
+    pick = (torch.randperm(n_cand, device=dev)[:nq] + cand_start).sort().values
+    qpos_pick = qpos_all[pick]
+    q_pick = qin[:, :, pick]
+
+    need_wq = bool(active_wq.requires_grad)
+    need_wk = bool(idx.wk.requires_grad)
+    per_head = bool(cfg.per_head_select)
+    s_slots = index.centroids.shape[2]
+    spb = index.slots_per_block or (s_slots // max(1, index.n_blocks))
+    nb = index.n_blocks
+
+    can_triton_distill = (
+        _TRITON_AVAILABLE
+        and q_pick.is_cuda
+        and q_pick.dtype in (torch.bfloat16, torch.float16)
+        and key.dtype == q_pick.dtype
+        and not per_head
+        and dh in (32, 64, 128, 256)
+        and hg <= 32
+        and cfg.pool in (1, 2, 4, 8)
+        and (cfg.block_size % (16 * cfg.pool) == 0)
+        and index.slot_labels is not None
+        and spb <= 128
+        and nb > 0
+    )
+
+    with torch.autograd.graph.saved_tensors_hooks(lambda x: x, lambda x: x):
+        with torch.no_grad():
+            qz_all = idx.query_latent(q_pick, pass_idx=cur_pass)  # [B, G_or_H, Nq, d] (upcast dtype)
+            acc_dt = qz_all.dtype
+            cent = index.centroids.detach().to(acc_dt)  # [B, G, S, d]
+            d_qz_all = torch.zeros_like(qz_all) if need_wq else None
+            g_cent_sum = torch.zeros_like(cent) if need_wk else None
+            loss_sum_t = torch.zeros((), device=dev, dtype=acc_dt)
+            n_chunks_ok_t = torch.zeros((), device=dev, dtype=acc_dt)
+            zero_acc = torch.zeros((), device=dev, dtype=acc_dt)
+
+            dc = max(1, int(cfg.distill_chunk))
+            if can_triton_distill:
+                # Pass 1: exact causal LSE across all sampled queries in one fused Triton launch
+                qg_pick = q_pick.view(b, g, hg, nq, dh).contiguous()
+                kc = key.detach().contiguous()
+                qpos_i32 = qpos_pick.to(torch.int32).contiguous()
+                lse_all = torch.empty((b, g, hg, nq), device=dev, dtype=torch.float32)
+                bq_lse = 64
+                bk_lse = 64
+                _lsa_distill_lse_kernel[(triton.cdiv(nq, bq_lse), b * g * hg)](
+                    qg_pick,
+                    kc,
+                    qpos_i32,
+                    lse_all,
+                    *qg_pick.stride(),
+                    *kc.stride(),
+                    *lse_all.stride(),
+                    g,
+                    hg,
+                    nq,
+                    tk,
+                    float(scaling),
+                    D_HEAD=dh,
+                    BLOCK_Q=bq_lse,
+                    BLOCK_K=bk_lse,
+                    num_warps=4,
+                    num_stages=2,
+                )
+                assert index.slot_labels is not None
+                slab_i32 = index.slot_labels.to(torch.int32).contiguous()
+                spb_pad = max(16, triton.next_power_of_2(spb))
+                n_units = cfg.block_size // cfg.pool
+                # Outer chunk size aligned to `distill_chunk` (bounds `mass`/`logits` to ~33 MiB)
+                q_outer = max(dc, (256 // dc) * dc) if dc <= 256 else dc
+                inv_temp = 1.0 / float(cfg.temperature)
+                for o0 in range(0, nq, q_outer):
+                    o1 = min(nq, o0 + q_outer)
+                    oc = o1 - o0
+                    mass_c = torch.zeros((b, g, oc, s_slots), device=dev, dtype=torch.float32)
+                    qg_o = qg_pick[:, :, :, o0:o1]
+                    lse_o = lse_all[:, :, :, o0:o1]
+                    qp_o = qpos_i32[o0:o1]
+                    bq_m = 16
+                    _lsa_distill_block_mass_kernel[(nb, triton.cdiv(oc, bq_m), b * g)](
+                        qg_o,
+                        kc,
+                        qp_o,
+                        lse_o,
+                        slab_i32,
+                        mass_c,
+                        *qg_o.stride(),
+                        *kc.stride(),
+                        *lse_o.stride(),
+                        *slab_i32.stride(),
+                        *mass_c.stride(),
+                        g,
+                        oc,
+                        nb,
+                        cfg.block_size,
+                        spb,
+                        float(scaling),
+                        HG=hg,
+                        D_HEAD=dh,
+                        POOL=cfg.pool,
+                        N_UNITS=n_units,
+                        BLOCK_Q=bq_m,
+                        BLOCK_U=16,
+                        SPB_PAD=spb_pad,
+                        num_warps=4,
+                        num_stages=2,
+                    )
+                    mass = mass_c.to(acc_dt)
+                    tot = mass.sum(-1, keepdim=True)
+                    target = mass / tot.clamp_min(1e-30)
+                    qpos_o_long = qpos_pick[o0:o1]
+                    frontier_o = (qpos_o_long // cfg.block_size) * cfg.block_size
+                    elig_o = index.active[:, :, None, :] & (
+                        index.slot_end[None, None, None, :] <= frontier_o[None, None, :, None]
+                    )
+                    ok_o = (frontier_o > 0)[None, None, :] & (tot.squeeze(-1) > 0)
+                    qz_o = qz_all[:, :, o0:o1]
+                    logits_o = (torch.matmul(qz_o, cent.transpose(-1, -2)) * inv_temp).masked_fill(
+                        ~elig_o, float("-inf")
+                    )
+                    logp_o = torch.log_softmax(logits_o, dim=-1)
+                    probs_o = torch.where(elig_o, torch.exp(logp_o), zero_acc)
+                    logp_safe = torch.where(target > 0, logp_o, zero_acc)
+                    kl_rows = (target * (torch.log(target.clamp_min(1e-30)) - logp_safe)).sum(-1)
+
+                    # Exact chunk-mean weighting matching `for s0 in range(0, nq, distill_chunk)`
+                    row_scale = torch.zeros_like(kl_rows)
+                    for sub0 in range(0, oc, dc):
+                        sub1 = min(oc, sub0 + dc)
+                        ok_s = ok_o[:, :, sub0:sub1]
+                        cnt_s = ok_s.sum().to(acc_dt)
+                        has_s = (cnt_s > 0).to(acc_dt)
+                        inv_cnt = has_s / cnt_s.clamp_min(1.0)
+                        n_chunks_ok_t = n_chunks_ok_t + has_s
+                        loss_sum_t = loss_sum_t + torch.where(ok_s, kl_rows[:, :, sub0:sub1], zero_acc).sum() * inv_cnt
+                        row_scale[:, :, sub0:sub1] = torch.where(ok_s, inv_cnt, zero_acc)
+
+                    if need_wq or need_wk:
+                        d_logits = torch.where(
+                            ok_o.unsqueeze(-1) & elig_o,
+                            (probs_o - target) * (row_scale.unsqueeze(-1) * inv_temp),
+                            zero_acc,
+                        )
+                        if d_qz_all is not None:
+                            d_qz_all[:, :, o0:o1] = torch.matmul(d_logits, cent)
+                        if g_cent_sum is not None:
+                            g_cent_sum = g_cent_sum + torch.matmul(d_logits.transpose(-1, -2), qz_o)
+                    del mass_c, mass, target, logits_o, logp_o, probs_o
+            else:
+                # Exact PyTorch fallback (CPU / fp32 / fp64 / per_head=True / non-standard block/head dims):
+                # hoists `upcast(key)` ONCE outside the chunk loop and uses exact analytic `(d_qz, d_cent)`.
+                hi_max = int(qpos_pick[-1]) + 1
+                k_up = upcast(key[:, :, :hi_max].detach())
+                kpos_all_hi = torch.arange(hi_max, device=dev)
+                qg_pick = q_pick.view(b, g, hg, nq, dh)
+                inv_temp = 1.0 / float(cfg.temperature)
+                for s0 in range(0, nq, dc):
+                    s1 = min(nq, s0 + dc)
+                    c_len = s1 - s0
+                    qpos_c = qpos_pick[s0:s1]
+                    frontier_c = (qpos_c // cfg.block_size) * cfg.block_size
+                    hi_c = int(qpos_c[-1]) + 1
+                    s_attn = (
+                        torch.matmul(
+                            upcast(qg_pick[:, :, :, s0:s1]),
+                            k_up[:, :, :hi_c].unsqueeze(2).transpose(-1, -2),
+                        )
+                        * scaling
+                    )
+                    kpos_c = kpos_all_hi[:hi_c]
+                    causal_m = kpos_c[None, None, None, None] > qpos_c[None, None, None, :, None]
+                    s_attn = s_attn.masked_fill(causal_m, float("-inf"))
+                    a = torch.softmax(s_attn, dim=-1)
+                    nk = min(hi_c, index.key2slot.shape[-1])
+                    a = a[..., :nk] * (kpos_c[:nk][None] < frontier_c[:, None])[None, None, None]
+                    slots = index.key2slot[:, :, :nk][:, :, None, None, :].expand(b, g, hg, c_len, nk)
+                    mass_h = torch.zeros(b, g, hg, c_len, s_slots, device=dev, dtype=a.dtype)
+                    mass_h = mass_h.scatter_add_(-1, slots, a)
+                    mass = mass_h.reshape(b, g * hg, c_len, s_slots) if per_head else mass_h.mean(2)
+                    tot = mass.sum(-1, keepdim=True)
+                    target = mass / tot.clamp_min(1e-30)
+                    ok_c = (frontier_c > 0)[None, None, :] & (tot.squeeze(-1) > 0)
+                    elig_c = index.active[:, :, None, :] & (
+                        index.slot_end[None, None, None, :] <= frontier_c[None, None, :, None]
+                    )
+                    qz_c = qz_all[:, :, s0:s1]
+                    logits_c = idx.slot_scores(qz_c, index, qpos_c, flat=True)
+                    logp_c = torch.log_softmax(logits_c, dim=-1)
+                    elig_cmp = (
+                        elig_c[:, :, None, :, :]
+                        .expand(b, g, hg, c_len, s_slots)
+                        .reshape(b, h, c_len, s_slots)
+                        if per_head
+                        else elig_c
+                    )
+                    probs_c = torch.where(elig_cmp, torch.exp(logp_c), zero_acc)
+                    logp_safe = torch.where(target > 0, logp_c, zero_acc)
+                    kl_rows = (target * (torch.log(target.clamp_min(1e-30)) - logp_safe)).sum(-1)
+
+                    cnt_c = ok_c.sum().to(acc_dt)
+                    has_c = (cnt_c > 0).to(acc_dt)
+                    inv_cnt = has_c / cnt_c.clamp_min(1.0)
+                    n_chunks_ok_t = n_chunks_ok_t + has_c
+                    loss_sum_t = loss_sum_t + torch.where(ok_c, kl_rows, zero_acc).sum() * inv_cnt
+
+                    if need_wq or need_wk:
+                        row_scale = torch.where(ok_c, inv_cnt, zero_acc)
+                        d_logits = torch.where(
+                            ok_c.unsqueeze(-1) & elig_cmp,
+                            (probs_c - target) * (row_scale.unsqueeze(-1) * inv_temp),
+                            zero_acc,
+                        )
+                        if per_head:
+                            d_logits_g = d_logits.view(b, g, hg, c_len, s_slots)
+                            if d_qz_all is not None:
+                                d_qz_all[:, :, s0:s1] = torch.matmul(d_logits_g, cent.unsqueeze(2)).reshape(
+                                    b, h, c_len, -1
+                                )
+                            if g_cent_sum is not None:
+                                qz_cg = qz_c.view(b, g, hg, c_len, -1)
+                                g_cent_sum = g_cent_sum + torch.matmul(d_logits_g.transpose(-1, -2), qz_cg).sum(dim=2)
+                        else:
+                            if d_qz_all is not None:
+                                d_qz_all[:, :, s0:s1] = torch.matmul(d_logits, cent)
+                            if g_cent_sum is not None:
+                                g_cent_sum = g_cent_sum + torch.matmul(d_logits.transpose(-1, -2), qz_c)
+
+        sync_free = _is_sync_restricted()
+        if not sync_free:
+            n_ok_f, loss_sum_f = torch.stack([n_chunks_ok_t, loss_sum_t]).tolist()
+            if n_ok_f <= 0.0:
+                return
+            inv_n_f = 1.0 / n_ok_f
+            loss_val = loss_sum_f * inv_n_f
+            inv_n_t = n_chunks_ok_t.new_tensor(inv_n_f)
+        else:
+            inv_n_t = torch.where(n_chunks_ok_t > 0, 1.0 / n_chunks_ok_t.clamp_min(1.0), zero_acc)
+            loss_val_t = loss_sum_t * inv_n_t
+
+        g_wq_avg: torch.Tensor | None = None
+        if need_wq and d_qz_all is not None:
+            qz_live = idx.query_latent(q_pick, pass_idx=cur_pass)
+            (gwq_tot,) = torch.autograd.grad(
+                qz_live,
+                active_wq,
+                grad_outputs=(d_qz_all * inv_n_t).to(qz_live.dtype),
+                allow_unused=True,
+            )
+            if gwq_tot is not None:
+                g_wq_avg = gwq_tot.detach()
+            del qz_live
+
+        g_wk_avg: torch.Tensor | None = None
+        if (
+            need_wk
+            and g_cent_sum is not None
+            and index.slot_labels is not None
+            and index.slot_counts is not None
+        ):
+            g_cent_avg = g_cent_sum * inv_n_t
+            bs = cfg.block_size
+            pool = cfg.pool
+            n_units_k = bs // pool
+            kin_det = key.detach()
+            g_wk_acc = torch.zeros_like(idx.wk)
+            for b0 in range(0, nb, 64):
+                b1 = min(nb, b0 + 64)
+                nb_c = b1 - b0
+                z_b = (
+                    idx.key_latent(kin_det[:, :, b0 * bs : b1 * bs])
+                    .view(b, g, nb_c, n_units_k, pool, -1)
+                    .sum(4)
+                )
+                c_b = idx._centroids(
+                    z_b,
+                    index.slot_labels[:, :, b0:b1],
+                    index.slot_counts[:, :, b0:b1],
+                    spb,
+                ).reshape(b, g, nb_c * spb, -1)
+                go_b = g_cent_avg[:, :, b0 * spb : b1 * spb].to(c_b.dtype)
+                (gw_b,) = torch.autograd.grad(c_b, idx.wk, grad_outputs=go_b, allow_unused=True)
+                if gw_b is not None:
+                    g_wk_acc = g_wk_acc + gw_b.detach()
+                del z_b, c_b, go_b, gw_b
+            g_wk_avg = g_wk_acc
+            del g_cent_avg
+
+        surrogate = active_wq.new_tensor(loss_val) if not sync_free else loss_val_t.to(active_wq.dtype)
+        if need_wq and g_wq_avg is not None:
+            term_q = (active_wq * g_wq_avg.to(active_wq.dtype)).sum()
+            surrogate = surrogate + (term_q - term_q.detach())
+        if need_wk and g_wk_avg is not None:
+            term_k = (idx.wk * g_wk_avg.to(idx.wk.dtype)).sum()
+            surrogate = surrogate + (term_k - term_k.detach())
+        idx.pending.append(cfg.distill_weight * surrogate)
+        if not sync_free:
+            idx.last_stats["distill_kl"] = loss_val
 
 
 def _resolve_hybrid_sparse(
@@ -1596,109 +3197,16 @@ def lsa_attention(
 
     if want_kl and index is not None:
         if cfg.detach_inputs:
-            # Exact zero-checkpoint-unpack, O(distill_chunk * S) memory KL distillation:
-            # isolates `lsa_kl` from any outer `VirtualLayer` `checkpoint(use_reentrant=False)` frame
-            # via identity `saved_tensors_hooks`, computes exact `(dKL/dwq, dKL/dwk)` chunk-by-chunk,
-            # and appends an exact first-order surrogate scalar to `idx.pending`.
+            # Exact zero-checkpoint-unpack, zero-inner-sync KL distillation with analytic `(d_qz, d_cent)`
+            # and fused 2-pass Triton teacher bucket-mass kernels on CUDA bf16/fp16.
             if not _in_backward():
-                with torch.autograd.graph.saved_tensors_hooks(lambda x: x, lambda x: x):
-                    cand = torch.nonzero((qpos_all // cfg.block_size) > 0).flatten()
-                    if cand.numel():
-                        nq = max(1, int(cand.numel() * cfg.distill_query_frac))
-                        pick = cand[torch.randperm(cand.numel(), device=cand.device)[:nq]].sort().values
-                        qg_kl = qin.view(b, g, h // g, tq, dh)
-                        need_wq = bool(active_wq.requires_grad)
-                        need_wk = bool(idx.wk.requires_grad)
-                        cent_leaf = index.centroids.detach().requires_grad_(need_wk)
-                        kl_index = replace(index, centroids=cent_leaf)
-                        g_wq_sum: torch.Tensor | None = None
-                        g_cent_sum: torch.Tensor | None = None
-                        loss_sum = 0.0
-                        n_chunks_ok = 0
-                        for s0 in range(0, pick.numel(), cfg.distill_chunk):
-                            sel = pick[s0 : s0 + cfg.distill_chunk]
-                            qz = idx.query_latent(qin[:, :, sel], pass_idx=cur_pass)
-                            kl = _distill_kl(
-                                qg_kl[:, :, :, sel], qz, qpos_all[sel], key.detach(), kl_index, idx, scaling
-                            )
-                            if kl is None:
-                                del qz
-                                continue
-                            loss_sum += float(kl.detach())
-                            n_chunks_ok += 1
-                            grad_targets: list[torch.Tensor] = []
-                            if need_wq:
-                                grad_targets.append(active_wq)
-                            if need_wk:
-                                grad_targets.append(cent_leaf)
-                            if grad_targets and kl.requires_grad:
-                                grads = torch.autograd.grad(kl, grad_targets, allow_unused=True)
-                                gi_t = 0
-                                if need_wq:
-                                    gwq_c = grads[gi_t]
-                                    gi_t += 1
-                                    if gwq_c is not None:
-                                        g_wq_sum = gwq_c.detach() if g_wq_sum is None else (g_wq_sum + gwq_c.detach())
-                                if need_wk:
-                                    gct_c = grads[gi_t]
-                                    if gct_c is not None:
-                                        g_cent_sum = (
-                                            gct_c.detach() if g_cent_sum is None else (g_cent_sum + gct_c.detach())
-                                        )
-                            del qz, kl
-                        if n_chunks_ok > 0:
-                            inv_n = 1.0 / float(n_chunks_ok)
-                            loss_val = loss_sum * inv_n
-                            g_wq_avg = (g_wq_sum * inv_n) if g_wq_sum is not None else None
-                            g_wk_avg: torch.Tensor | None = None
-                            if (
-                                need_wk
-                                and g_cent_sum is not None
-                                and index.slot_labels is not None
-                                and index.slot_counts is not None
-                            ):
-                                g_cent_avg = g_cent_sum * inv_n
-                                bs = cfg.block_size
-                                pool = cfg.pool
-                                n_units = bs // pool
-                                spb = index.slots_per_block or (index.centroids.shape[2] // max(1, index.n_blocks))
-                                kin_det = key.detach()
-                                g_wk_acc = torch.zeros_like(idx.wk)
-                                for b0 in range(0, index.n_blocks, 64):
-                                    b1 = min(index.n_blocks, b0 + 64)
-                                    nb_c = b1 - b0
-                                    z_b = (
-                                        idx.key_latent(kin_det[:, :, b0 * bs : b1 * bs])
-                                        .view(b, g, nb_c, n_units, pool, -1)
-                                        .sum(4)
-                                    )
-                                    c_b = idx._centroids(
-                                        z_b,
-                                        index.slot_labels[:, :, b0:b1],
-                                        index.slot_counts[:, :, b0:b1],
-                                        spb,
-                                    ).reshape(b, g, nb_c * spb, -1)
-                                    go_b = g_cent_avg[:, :, b0 * spb : b1 * spb].to(c_b.dtype)
-                                    (gw_b,) = torch.autograd.grad(c_b, idx.wk, grad_outputs=go_b, allow_unused=True)
-                                    if gw_b is not None:
-                                        g_wk_acc = g_wk_acc + gw_b.detach()
-                                    del z_b, c_b, go_b, gw_b
-                                g_wk_avg = g_wk_acc
-                                del g_cent_avg
-                            surrogate = active_wq.new_tensor(loss_val)
-                            if need_wq and g_wq_avg is not None:
-                                term_q = (active_wq * g_wq_avg.to(active_wq.dtype)).sum()
-                                surrogate = surrogate + (term_q - term_q.detach())
-                            if need_wk and g_wk_avg is not None:
-                                term_k = (idx.wk * g_wk_avg.to(idx.wk.dtype)).sum()
-                                surrogate = surrogate + (term_k - term_k.detach())
-                            idx.pending.append(cfg.distill_weight * surrogate)
-                            idx.last_stats["distill_kl"] = loss_val
+                _run_detached_distill_kl(qin, key, qpos_all, index, idx, active_wq, scaling, cur_pass)
         else:
-            cand = torch.nonzero((qpos_all // cfg.block_size) > 0).flatten()
-            if cand.numel():
-                nq = max(1, int(cand.numel() * cfg.distill_query_frac))
-                pick = cand[torch.randperm(cand.numel(), device=cand.device)[:nq]].sort().values
+            cand_start = max(0, cfg.block_size - (tk - tq))
+            n_cand = max(0, tq - cand_start)
+            if n_cand > 0:
+                nq = max(1, int(n_cand * cfg.distill_query_frac))
+                pick = (torch.randperm(n_cand, device=query.device)[:nq] + cand_start).sort().values
                 qg_kl = qin.view(b, g, h // g, tq, dh)
                 kls = []
                 for s0 in range(0, pick.numel(), cfg.distill_chunk):
@@ -1722,11 +3230,60 @@ def lsa_attention(
     if not _in_backward() and not _is_sync_restricted():
         idx.last_stats["forward_sparse"] = 1.0
 
-    qg = query.view(b, g, h // g, tq, dh)
+    hg = h // g
+    qg = query.view(b, g, hg, tq, dh)
     with torch.no_grad():
         qz_all = idx.query_latent(qin.detach(), pass_idx=cur_pass)
-    outs = []
     q_base_pos = tk - tq
+
+    per_head = cfg.per_head_select or (qz_all.shape[1] == g * hg and hg > 1)
+    can_triton_sparse = (
+        _TRITON_AVAILABLE
+        and query.is_cuda
+        and query.dtype in (torch.bfloat16, torch.float16)
+        and key.dtype == query.dtype
+        and value.dtype == query.dtype
+        and not per_head
+        and dh in (32, 64, 128, 256)
+        and hg <= 32
+        and tq > 0
+        and tk > 0
+    )
+    if can_triton_sparse:
+        w = cfg.resolved_window()
+        ns = min(cfg.sinks, tk)
+        max_span = 32768
+        tail_len = tq - ((tq - 1) // cfg.query_chunk) * cfg.query_chunk
+        outs: list[torch.Tensor] = []
+        for s0 in range(0, tq, max_span):
+            s1 = min(tq, s0 + max_span)
+            is_last_span = s1 >= tq
+            mem_span = _build_sparse_mem_table(
+                qz_all[:, :, s0:s1],
+                qpos_all[s0:s1],
+                index,
+                idx,
+                tk=tk,
+                q_base_pos=q_base_pos + s0,
+                cur_pass=cur_pass,
+                record_tail_len=tail_len,
+                record_stats=is_last_span,
+            )
+            o_span = _TritonSparseGatherAttnFn.apply(
+                qg[:, :, :, s0:s1],
+                key,
+                value,
+                mem_span,
+                q_base_pos + s0,
+                w,
+                ns,
+                float(scaling),
+            )
+            outs.append(o_span)
+        out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=3)
+        return out.reshape(b, h, tq, dh).transpose(1, 2).contiguous(), None
+
+    outs = []
     for c0 in range(0, tq, cfg.query_chunk):
         c1 = min(tq, c0 + cfg.query_chunk)
         sl = slice(c0, c1)

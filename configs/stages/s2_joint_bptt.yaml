@@ -83,7 +83,8 @@ bptt:
   n_segments: 4
   seg_len: 32768
   replay_k: 2048                        # differentiable re-projection on Top-2048 selected prior-segment tokens
-  offload_prior_hidden: true            # CPU/HBM pre-attention hidden buffer (< 2 GiB VRAM)
+  offload_prior_hidden: auto            # HBM-resident when free VRAM >= needed + 8 GiB headroom, else async pinned DMA
+  query_sim_chunk: 1024                 # 4x fewer similarity matmul passes on Blackwell 96 GiB
 
 experts:
   enabled: false                        # optional: pass `-s experts.enabled=true` after `qloop scan-experts`

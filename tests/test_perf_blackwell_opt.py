@@ -492,17 +492,18 @@ def test_lsa_fast_detached_distill_kl_matches_autograd_reference(per_head: bool)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton LSA kernel parity")
+@pytest.mark.parametrize("dh", [64, 256])
 @pytest.mark.parametrize("with_buckets", [False, True])
-def test_cuda_triton_sparse_gather_attn_fwd_bwd_parity(with_buckets: bool):
+def test_cuda_triton_sparse_gather_attn_fwd_bwd_parity(dh: int, with_buckets: bool):
     """Fused Triton Sparse-Gather FlashAttention matches PyTorch `_sparse_chunk` in fwd + dq/dk/dv bwd."""
     torch.manual_seed(55)
-    b, g, hg, dh = 1, 2, 8, 64
+    b, g, hg = 1, 2, 8
     tk, tq = 1024, 512
     q_base = tk - tq
     cfg = LSAConfig(
         mode="sparse",
         index_dim=32,
-        rotary_dim=16,
+        rotary_dim=dh // 4,
         pool=4,
         block_size=128,
         avg_bucket_keys=8,

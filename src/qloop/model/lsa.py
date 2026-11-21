@@ -2363,7 +2363,7 @@ class _TritonSparseGatherAttnFn(torch.autograd.Function):
             ns_eff = min(ns, tk)
             if ns_eff > 0 and (q_base_pos + tq - 1) >= win:
                 bk_s = 32
-                bq_s = 64
+                bq_s = 32 if dh >= 256 else 64
                 split_q = min(32, max(1, tq // 256))
                 _lsa_sparse_attn_bwd_dkv_sink_kernel[(triton.cdiv(ns_eff, bk_s), split_q, b * g)](
                     qc,

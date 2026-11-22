@@ -438,9 +438,11 @@ def test_offline_export_e2e_dedup_rollback_svgs_and_secret_redaction(tmp_path: P
     assert [int(r["step"]) for r in s1b_rows] == [400, 675, 1500]
     assert float(s1b_rows[-1]["skipped_total"]) == 0.0
 
-    # 3. Verify summary_metrics.json captures s2 regimes and rollback incident
+    # 3. Verify summary_metrics.json captures s2 regimes, live step vs Hub step, and rollback incident
     sm = json.loads((out_dir / "summary_metrics.json").read_text(encoding="utf-8"))
     assert sm["stages"]["s1_loop_a6b"]["latest_commit_sha"] == "32eb565e"
+    assert sm["stages"]["s2_joint_bptt"]["latest_hub_step"] == 200
+    assert sm["stages"]["s2_joint_bptt"]["latest_step"] == 270
     assert sm["rollback_summary"]["s1_reset_commits"] == 1
     assert sm["rollback_summary"]["s1b_phase2_explosion_commits"] == 2
     assert sm["rollback_summary"]["s1b_explosion_peak_loss"] == pytest.approx(12.0742)

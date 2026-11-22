@@ -1042,9 +1042,13 @@ def normalize_experiment_data(
         post_skip_max = (
             round(max(p2_skips), 1) if p2_skips else (round(max(sk_vals), 1) if sk_vals else None)
         )
+        latest_hub_step = _safe_int(meta.get("step"))
+        latest_row_step = _safe_int(rows[-1]["step"]) if rows else 0
+        latest_step_val = max(latest_hub_step or 0, latest_row_step or 0)
         stage_summaries[st] = {
             "status": meta.get("status") or (rows[-1]["status"] if rows else "unknown"),
-            "latest_step": meta.get("step") or (rows[-1]["step"] if rows else 0),
+            "latest_step": latest_step_val,
+            "latest_hub_step": latest_hub_step,
             "target_steps": meta.get("target_steps"),
             "latest_commit_sha": meta.get("commit_sha") or (rows[-1]["commit_sha"] if rows else ""),
             "n_params": meta.get("n_params"),
@@ -1460,8 +1464,12 @@ def render_experiment_report_md(
             tps_cell = f"`{s2_pre_mean:.1f} → {s2_post_mean:.1f}` (`{s2_speedup:.2f}×`)"
         else:
             tps_cell = f"`{_fmt_f(st_s.get('tok_per_s_mean'), 1)}`"
+        sha_cell = f"`{st_s.get('latest_commit_sha') or '—'}`"
+        hub_st = st_s.get("latest_hub_step")
+        if hub_st and st_s.get("latest_step") and int(st_s["latest_step"]) > int(hub_st):
+            sha_cell = f"`{st_s.get('latest_commit_sha') or '—'}` (`@s{hub_st}`)"
         a(
-            f"| {label} | `{st_s['status']}` | {st_step} | `{st_s.get('latest_commit_sha') or '—'}` | "
+            f"| {label} | `{st_s['status']}` | {st_step} | {sha_cell} | "
             f"{p_str} | {t_str} | {tps_cell} | `{_fmt_f(st_s.get('mem_peak_max_gib'), 2)}` | "
             f"{sk_str} | {d_str} | {dg_str} |"
         )
@@ -1544,12 +1552,22 @@ def render_experiment_report_md(
     # 3.3 s1_loop_a6b
     a("### 3.3 `s1_loop_a6b` — 88-Layer ETD Sandwich Loop Healing (`1,000` Steps, `131.07M` Tokens)")
     a("")
+    s1_tps_str = f"`{_fmt_f(s1.get('tok_per_s_mean'), 1)} tok/s`"
+    s1_sup = next(
+        (x for x in (sm.get("supervisor_stage_head_summary") or []) if x.get("stage") == "s1_loop_a6b"),
+        None,
+    )
+    if s1_sup and s1_sup.get("tok_per_s_mean"):
+        s1_tps_str += (
+            f" (Hub ckpts; `{s1_sup['tok_per_s_mean']:.1f} tok/s` across "
+            f"`{s1_sup['n_samples']}` supervisor samples)"
+        )
     a(
         "Following an initial poisoned run (`d1d92064`, `step=100, loss=9.6577`) that was purged via "
         "reset commit `ad646651` when locking `unsloth/Qwen3.6-35B-A3B-NVFP4`, the clean `s1_loop_a6b` "
         "stage completed **`1,000/1,000` steps** (`10486e72 → 32eb565e`, `~18.0 h` in a single Colab G4 "
-        "session) training only **`18.41M` parameters (`0.053%`)** at **`2,112 tok/s`** mean (`54.24 GiB` "
-        "peak VRAM, **`0` skipped updates**)."
+        f"session) training only **`18.41M` parameters (`0.053%`)** at **{s1_tps_str}** mean "
+        f"(`{_fmt_f(s1.get('mem_peak_max_gib'), 2)} GiB` peak VRAM, **`0` skipped updates**)."
     )
     a("")
     a(
@@ -1707,13 +1725,19 @@ def render_experiment_report_md(
         if (s2_params_m is not None and s2_pct_params is not None)
         else "`< 0.6%` cumulative bundle"
     )
+    s2_hub_step = s2.get("latest_hub_step")
+    s2_hub_note = (
+        f"latest Hub ckpt `{s2.get('latest_commit_sha') or '—'}` @ step `{s2_hub_step}`"
+        if (s2_hub_step and s2_latest_step > int(s2_hub_step))
+        else f"Hub ckpt `{s2.get('latest_commit_sha') or '—'}`"
+    )
     a(
         "`s2_joint_bptt` jointly trains loop adapters, HSSD v3.2, D-LSA indexers, attention `k/v/o_proj` "
         f"& QK-norms (`104.86M` active trainable params / {s2_bundle_lbl}, `32.212B` NVFP4 experts frozen) "
         "on `131,072`-token reasoning/agent/code sequences split into `4 × 32,768` segments with "
         "differentiable re-projection of the Top-`2,048` selected prior-segment K/V tokens "
-        f"(`grad_accum=2` → `262,144` tokens/step). Through step **`{s2_latest_step}`** "
-        f"(`{s2.get('latest_commit_sha') or '—'}`, `{s2['tokens_seen']/1e6:.2f}M` tokens, "
+        f"(`grad_accum=2` → `262,144` tokens/step). Through live step **`{s2_latest_step}`** "
+        f"({s2_hub_note}, `{s2['tokens_seen']/1e6:.2f}M` tokens, "
         "**`0` skipped updates**), held-out `131K` `d=3` NLL has already fallen "
         f"**`{_fmt_f(s2_d3_delta, 4, True)}`** nats "
         f"(`{_fmt_f(s2_ev_first.get('d3'))} → {_fmt_f(s2_ev_last.get('d3'))}`)."
@@ -1747,17 +1771,25 @@ def render_experiment_report_md(
         "Post-Step Alloc (`GiB`) | Peak VRAM (`GiB`) | Mean GPU Power / Util | Outcome |"
     )
     a("| :--- | :---: | :---: | :---: | :---: | :---: | :--- |")
+    pre_rg = s2_reg.get("pre_opt_2e37bf6") or {}
+    post_rg = s2_reg.get("post_leak_fix_5a82677") or {}
+    sup_sp = (
+        post_rg["tok_per_s_mean"] / pre_rg["tok_per_s_mean"]
+        if (pre_rg.get("tok_per_s_mean") and post_rg.get("tok_per_s_mean"))
+        else None
+    )
+    sup_sp_lbl = f"{sup_sp:.2f}×" if sup_sp else "~2×"
     regime_defs = (
         ("pre_opt_2e37bf6", "Pre-Opt Baseline (`2e37bf6`)", "Healthy baseline; HBM/sync-starved (~580 s/step)"),
         (
             "post_opt_leaky_b2c5513",
             "Post-Opt Pre-Leak-Fix (`b2c5513`)",
-            "2× speedup, **OOM crash** at step 60+ (zero-label C++ cycle)",
+            "~2× speedup, **OOM crash** at step 60+ (zero-label C++ cycle)",
         ),
         (
             "post_leak_fix_5a82677",
             "**Post-Leak-Fix Production (`5a82677`)**",
-            "**2.05× speed, `-7.0 GiB` alloc vs baseline, 17+ h flat, 0 OOMs**",
+            f"**{sup_sp_lbl} speed, `-7.0 GiB` alloc vs baseline, 17+ h flat, 0 OOMs**",
         ),
     )
     for reg_key, reg_lbl, outcome in regime_defs:
@@ -1823,12 +1855,18 @@ def render_experiment_report_md(
     )
     s3_pk_rec = _fmt_f(max(s3_rec_vals) if s3_rec_vals else None, 4)
     s3_end_rec = _fmt_f(s3_rec_vals[-1] if s3_rec_vals else None, 4)
+    s2_kl_vals = [float(r["lsa_kl_mean"]) for r in s2_rows if r.get("lsa_kl_mean") is not None]
+    s2_kl_desc = (
+        f"`{min(s2_kl_vals):.2f}–{max(s2_kl_vals):.2f}`, latest `{s2_kl_vals[-1]:.3f}`"
+        if s2_kl_vals
+        else "monitored per layer"
+    )
     a(
         f"2. **`512K–1M` D-LSA Top-64 Bucket Recall Ceiling (`~46%–48.5%`):** In `s3_long_1m_lsa`, mean "
         f"`512K–1M` Top-64 bucket recall plateaued at **`{s3_pk_rec}`** peak / **`{s3_end_rec}`** final "
         "(min-head avg `~0.30`), below our `0.70` `recall_ready` auto-switch threshold. Although "
-        "`s2_joint_bptt` is co-training sparse D-LSA (`forward_sparse=1.0`, per-layer KL dropping further "
-        "to `~0.87–1.43`), we explicitly gate a `v3.3` indexer capacity upgrade (`index_dim: 64 → 96`, "
+        f"`s2_joint_bptt` is co-training sparse D-LSA (`forward_sparse=1.0`, per-layer mean KL {s2_kl_desc}), "
+        "we explicitly gate a `v3.3` indexer capacity upgrade (`index_dim: 64 → 96`, "
         "multi-scale `pool=2 + pool=8` needle buckets) on our upcoming `MRCR 1M` bucketed audit."
     )
     s2_pct_done = 100.0 * s2_latest_step / max(s2_target, 1)
@@ -1843,11 +1881,13 @@ def render_experiment_report_md(
         "**`step 400` truth-check eval** will establish whether `d=3` re-widens its advantage as `lr` "
         "enters cosine decay on hard reasoning traces."
     )
+    s2_tps_prose = f"`~{s2_post_mean:.0f} tok/s`" if s2_post_mean else "`~930+ tok/s`"
+    s2_step_min = (262_144.0 / s2_post_mean / 60.0) if s2_post_mean else 4.7
     a(
         "4. **Single-GPU Training Wall-Clock Bottleneck on Online RL Rollouts:** While SFT/BPTT reaches "
-        "`~931–938 tok/s` (`~4.7 min/step`) on a single RTX PRO 6000 Blackwell, autoregressive `d=3` (`88L`) "
-        "GRPO/SI-RSI rollouts over long chains-of-thought (`4K–16K` tokens × `group=8`) and full "
-        "16-benchmark 2026 Frontier Suite sweeps (`d=1, 2, 3`) remain strongly throughput-bound on a "
+        f"{s2_tps_prose} (`~{s2_step_min:.1f} min/step`) on a single RTX PRO 6000 Blackwell, autoregressive "
+        "`d=3` (`88L`) GRPO/SI-RSI rollouts over long chains-of-thought (`4K–16K` tokens × `group=8`) and "
+        "full 16-benchmark 2026 Frontier Suite sweeps (`d=1, 2, 3`) remain strongly throughput-bound on a "
         "single GPU without Pass-1 (`40L`) → Pass-3 (`88L`) self-speculative drafting and multi-GPU "
         "rollout parallelism."
     )
@@ -1888,12 +1928,17 @@ def render_experiment_report_md(
         "de-risks every technical unknown before requesting dedicated multi-GPU academic/industry compute:"
     )
     a("")
+    s1_steps_n = int(s1.get("latest_step") or 0)
+    s1b_p2_steps_n = max(int(s1b.get("latest_step") or 0) - 400, 0)
+    s3_steps_n = int(s3.get("latest_step") or 0)
+    total_post_fix_steps = s1_steps_n + s1b_p2_steps_n + s3_steps_n + int(s2_latest_step)
+    e2e_sp_lbl = f"{s2_speedup:.2f}×" if s2_speedup else "~2.0×"
     a(
         "- **De-Risked Stack on `1×` Rented GPU (`~111` Productive GPU-Hours to Date):** All architectural "
         "surgery, mathematical invariants (`> 590` unit & CUDA parity tests), `1M`-token FP8 calibration "
         "(`78.60 GiB`), `131K` K/V-replay BPTT (`70.1 GiB` flat), and custom Blackwell `sm_120` Triton "
-        "kernels (`5.8×–19.0×` micro-speedups, `2.05×` E2E speedup) are already built, open, and proven "
-        "stable (`0` post-fix skipped steps across `> 2,975` training steps)."
+        f"kernels (`5.8×–19.0×` micro-speedups, `{e2e_sp_lbl}` E2E speedup) are already built, open, and "
+        f"proven stable (`0` post-fix skipped steps across `{total_post_fix_steps:,}` training steps)."
     )
     a("- **Targeted Grant Allocation (`1× 8×B200/H200` Node for `2–3` Weeks = `~2,500–4,000` GPU-Hours):**")
     a(

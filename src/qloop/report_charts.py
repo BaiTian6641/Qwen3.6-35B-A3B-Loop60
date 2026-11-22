@@ -915,6 +915,29 @@ def render_s2_bptt_throughput_vram_svg(bundle: dict[str, Any]) -> str:
         )
 
     # Panel B: Throughput (tok/s)
+    def _dedup_tok_seen(rows_in: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out_r: list[dict[str, Any]] = []
+        seen_t: set[int] = set()
+        for r in rows_in:
+            ts_k = r.get("tokens_seen")
+            if isinstance(ts_k, int) and ts_k > 0:
+                if ts_k in seen_t:
+                    continue
+                seen_t.add(ts_k)
+            out_r.append(r)
+        return out_r
+
+    pre_rows = _dedup_tok_seen(
+        [r for r in s2_rows if float(r["step"]) <= 43 and isinstance(r.get("tok_per_s"), (int, float))]
+    )
+    post_rows = _dedup_tok_seen(
+        [r for r in s2_rows if float(r["step"]) >= 50 and isinstance(r.get("tok_per_s"), (int, float))]
+    )
+    pre_avg = (sum(float(r["tok_per_s"]) for r in pre_rows) / len(pre_rows)) if pre_rows else None
+    post_tps = [float(r["tok_per_s"]) for r in post_rows]
+    post_avg = (sum(post_tps) / len(post_tps)) if post_tps else None
+    sp_title = f"({post_avg / pre_avg:.2f}×)" if (pre_avg and post_avg) else "(~2×)"
+
     tps_vals = [float(r["tok_per_s"]) for r in s2_rows if isinstance(r.get("tok_per_s"), (int, float))]
     yb_hi = max(1150.0, (max(tps_vals) * 1.12) if tps_vals else 1150.0)
     yb_lo, yb_hi, yb_ticks = _nice_ticks(0.0, yb_hi, n_ticks=6)
@@ -934,26 +957,7 @@ def render_s2_bptt_throughput_vram_svg(bundle: dict[str, Any]) -> str:
         x_label="s2_joint_bptt Step",
         y_label="Throughput (tok/s)",
         y_digits=0,
-        panel_title="B. Blackwell sm_120 Triton Speedup (~2.05×)",
-    )
-
-    def _dedup_tok_seen(rows_in: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        out_r: list[dict[str, Any]] = []
-        seen_t: set[int] = set()
-        for r in rows_in:
-            ts_k = r.get("tokens_seen")
-            if isinstance(ts_k, int) and ts_k > 0:
-                if ts_k in seen_t:
-                    continue
-                seen_t.add(ts_k)
-            out_r.append(r)
-        return out_r
-
-    pre_rows = _dedup_tok_seen(
-        [r for r in s2_rows if float(r["step"]) <= 43 and isinstance(r.get("tok_per_s"), (int, float))]
-    )
-    post_rows = _dedup_tok_seen(
-        [r for r in s2_rows if float(r["step"]) >= 50 and isinstance(r.get("tok_per_s"), (int, float))]
+        panel_title=f"B. Blackwell sm_120 Triton Speedup {sp_title}",
     )
 
     x_split = _map_lin(45.0, x_lo_s, x_hi_s, p2_x, p2_x + p2_w)
@@ -971,14 +975,11 @@ def render_s2_bptt_throughput_vram_svg(bundle: dict[str, Any]) -> str:
     for cx, cy in post_pts:
         svg.circle(cx, cy, 3.0, fill=C_TEAL)
 
-    if pre_rows:
-        pre_avg = sum(float(r["tok_per_s"]) for r in pre_rows) / len(pre_rows)
+    if pre_avg is not None:
         y_pa = _map_lin(pre_avg, yb_lo, yb_hi, y_top + p_h, y_top)
         svg.line(p2_x, y_pa, x_split, y_pa, stroke=C_AMBER, stroke_width=1.4, dash="3,2")
         svg.badge(p2_x + 6, y_pa + 24, f"Pre: {pre_avg:.1f} tok/s", bg=C_AMBER, font_size=9.0)
-    if post_rows:
-        post_tps = [float(r["tok_per_s"]) for r in post_rows]
-        post_avg = sum(post_tps) / len(post_tps)
+    if post_avg is not None:
         y_po = _map_lin(post_avg, yb_lo, yb_hi, y_top + p_h, y_top)
         svg.line(x_split, y_po, p2_x + p2_w, y_po, stroke=C_TEAL, stroke_width=1.4, dash="3,2")
         svg.badge(

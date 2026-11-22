@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-11-22T04:56:07Z",
+  "generated_at_utc": "2026-11-22T05:03:10Z",
   "repo": "TassP0lar/Qwen3.6-35B-A3B-Loop64",
   "base_model": "unsloth/Qwen3.6-35B-A3B-NVFP4",
   "hardware": "1x NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120, 96 GiB HBM)",
@@ -9,6 +9,7 @@
     "s1_loop_a6b": {
       "status": "completed",
       "latest_step": 1000,
+      "latest_hub_step": 1000,
       "target_steps": 1000,
       "latest_commit_sha": "32eb565e",
       "n_params": 18412598,
@@ -60,6 +61,7 @@
     "s1b_hssd_distill": {
       "status": "completed",
       "latest_step": 1500,
+      "latest_hub_step": 1500,
       "target_steps": 1500,
       "latest_commit_sha": "2fb912db",
       "n_params": 76917638,
@@ -111,6 +113,7 @@
     "s3_long_1m_lsa": {
       "status": "completed",
       "latest_step": 600,
+      "latest_hub_step": 600,
       "target_steps": 600,
       "latest_commit_sha": "55c7a680",
       "n_params": 83061638,
@@ -160,7 +163,8 @@
     },
     "s2_joint_bptt": {
       "status": "in_progress",
-      "latest_step": 275,
+      "latest_step": 280,
+      "latest_hub_step": 275,
       "target_steps": 1200,
       "latest_commit_sha": "c5f7391d",
       "n_params": 187919238,

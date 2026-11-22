@@ -2,7 +2,7 @@
 
 > **Repository:** [`TassP0lar/Qwen3.6-35B-A3B-Loop64`](https://huggingface.co/TassP0lar/Qwen3.6-35B-A3B-Loop64) · **Base Backbone:** `unsloth/Qwen3.6-35B-A3B-NVFP4` (`34.661B` text decoder; `32.212B` MoE experts **100% frozen**, SHA-256 verified)  
 > **Hardware:** `1x NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120, 96 GiB HBM)` (single rented Google Colab G4 VM, zero multi-node cluster)  
-> **Telemetry Snapshot:** `2026-11-22T04:56:07Z` · **`163` Hugging Face Hub commits** + live read-only `loop64` `metrics.jsonl` + `runs/colab_supervisor.log`
+> **Telemetry Snapshot:** `2026-11-22T05:03:10Z` · **`163` Hugging Face Hub commits** + live read-only `loop64` `metrics.jsonl` + `runs/colab_supervisor.log`
 
 > [!IMPORTANT]
 > **Strict Empirical Grounding:** Every metric, commit SHA, loss value, recall score, throughput rate, and VRAM figure in this document is extracted directly from verified Hugging Face Hub `manifest.json` commits, `artifacts/probes/probe_report.json`, `artifacts/s1_loop_a6b/quality_check.json`, live `metrics.jsonl`, `runs/colab_supervisor.log`, `docs/PERF_PROFILE_S2.md`, and git-verified CUDA benchmarks. Zero numbers are extrapolated or fabricated; all negative findings and rollbacks are documented transparently.
@@ -11,7 +11,7 @@
 
 ## 1. Executive Summary
 
-On a **single rented Google Colab RTX PRO 6000 Blackwell (`96 GiB` HBM)**, we retrofitted a 35B NVFP4 Mixture-of-Experts model (`unsloth/Qwen3.6-35B-A3B-NVFP4`) into an **88-virtual-layer looped hybrid reasoning & 1M-context architecture (`Qwen3.6-35B-A6B-LoopHSSD v3.2`)** while modifying **`187.92M` cumulative adapter/state parameters (`0.54%` of the `34.661B` text decoder, `< 0.6%` total)** and keeping all `32.212B` routed MoE expert weights **100% frozen (SHA-256 verified)** across **`423.56M` total tokens** (`s0_probe → s1_loop_a6b → s1b_hssd_distill → s3_long_1m_lsa → s2_joint_bptt` step `275/1200`).
+On a **single rented Google Colab RTX PRO 6000 Blackwell (`96 GiB` HBM)**, we retrofitted a 35B NVFP4 Mixture-of-Experts model (`unsloth/Qwen3.6-35B-A3B-NVFP4`) into an **88-virtual-layer looped hybrid reasoning & 1M-context architecture (`Qwen3.6-35B-A6B-LoopHSSD v3.2`)** while modifying **`187.92M` cumulative adapter/state parameters (`0.54%` of the `34.661B` text decoder, `< 0.6%` total)** and keeping all `32.212B` routed MoE expert weights **100% frozen (SHA-256 verified)** across **`423.56M` total tokens** (`s0_probe → s1_loop_a6b → s1b_hssd_distill → s3_long_1m_lsa → s2_joint_bptt` step `280/1200`).
 
 ### Headline Verified Achievements
 
@@ -20,7 +20,7 @@ On a **single rented Google Colab RTX PRO 6000 Blackwell (`96 GiB` HBM)**, we re
 | **Parameter Efficiency** | `18.41M` (`0.053%`) in `s1` → `76.92M` (`0.222%`) in `s1b` → `83.06M` (`0.240%`) in `s3` → **`187.92M` (`0.54%`)** cumulative bundle in `s2` (`104.86M` active in `s2`; `32.212B` NVFP4 experts 100% frozen) | Hub `manifest.json` (`c5f7391d`), `docs/PERF_PROFILE_S2.md` |
 | **Monotonic Depth Scaling (`40L → 64L → 88L`)** | Positive `depth_gain = NLL(d=1) − NLL(d=3)` across **every** stage: `s1` `0.000 → +0.0609`, `s1b` peak `+0.1241` / end `+0.0626`, `s3` `+0.0750 → +0.1414` (**+88.5%**), `s2` 131K `d=3` NLL **`1.3508 → 1.2219`** (`-0.1289` nats) | Hub commits `32eb565e`, `2fb912db`, `55c7a680`, `876de138` |
 | **1M Context Memory Efficiency** | **`15.82 GiB`** total 1M context state (`10.00 GiB` FP8 `1.0×` SharedKV + `~5.50 GiB` HSSD `bf16` + `0.32 GiB` D-LSA centroids) — **`2.03×` smaller than Inkling 2 Mini's `32.16 GiB` (`32.00 GiB` F16 KV)** and **`11.1×` smaller than unshared 88L full-attn (`176.00 GiB`)** | Exact formula + live `1,048,576`-token pass at **`78.60 GiB` peak** (`513879f`) |
-| **Post-Fix Numerical Stability** | **`0` skipped updates** across `1,000` `s1` steps, `1,100` post-fix `s1b` Phase-2 steps, `600` `s3` steps (incl. `60` live `512K–1M` passes), and `275` live `s2` `4×32K` BPTT steps (`skipped_total = 0.0`) | Hub `manifest.json` + live `s2` `metrics.jsonl` |
+| **Post-Fix Numerical Stability** | **`0` skipped updates** across `1,000` `s1` steps, `1,100` post-fix `s1b` Phase-2 steps, `600` `s3` steps (incl. `60` live `512K–1M` passes), and `280` live `s2` `4×32K` BPTT steps (`skipped_total = 0.0`) | Hub `manifest.json` + live `s2` `metrics.jsonl` |
 | **Blackwell `sm_120` Triton Speedup & Leak Fix** | `s2_joint_bptt` throughput **`453.5 → 938.0 tok/s` (`2.07×` sustained**, `836–1,041 tok/s` range); post-step VRAM alloc dropped **`-7.0 GiB`** vs baseline (`32.6 → 25.3–25.4 GiB` flat over **17+ hours**, peak `70.1 GiB`) and **`-26.6 GiB`** vs leaky `b2c5513` (`52.0 GiB` OOM) | `runs/colab_supervisor.log`, `docs/PERF_PROFILE_S2.md`, `5a82677` |
 
 ## 2. Architecture & 1M-Context Memory Efficiency
@@ -56,7 +56,7 @@ On a **single rented Google Colab RTX PRO 6000 Blackwell (`96 GiB` HBM)**, we re
 | `s1_loop_a6b` (8K) | `completed` | `1000/1000` | `32eb565e` | `18.41M` (`0.053%`) | `131.07M` | `2117.5` | `54.24` | `0` | `0.9800 → 0.9191` | **`+0.0609`** |
 | `s1b_hssd_distill` (16K) | `completed` | `1500/1500` | `2fb912db` | `76.92M` (`0.222%`) | `98.30M` | `946.7` | `68.97` | `0` | `1.7679 → 1.7052` | **`+0.0626`** |
 | `s3_long_1m_lsa` (64K / 1M) | `completed` | `600/600` | `55c7a680` | `83.06M` (`0.240%`) | `120.78M` | `1049.8` | `81.23` | `0` | `2.0171 → 1.8757` | **`+0.1414`** |
-| `s2_joint_bptt` (131K BPTT) | `in_progress` | `275/1200` | `c5f7391d` | `187.92M` (`0.542%`) | `73.40M` | `453.5 → 938.0` (`2.07×`) | `72.51` | `0` | `1.2945 → 1.2219` | **`+0.0726`** |
+| `s2_joint_bptt` (131K BPTT) | `in_progress` | `280/1200` | `c5f7391d` (`@s275`) | `187.92M` (`0.542%`) | `73.40M` | `453.5 → 938.0` (`2.07×`) | `72.51` | `0` | `1.2945 → 1.2219` | **`+0.0726`** |
 
 ![Held-Out Evaluation Depth Curves Across Stages](experiment_logs/charts/eval_depth_curves.svg)
 
@@ -75,7 +75,7 @@ Completed in **`177.44 s`** (`artifacts/probes/probe_report.json`, Hub commits `
 
 ### 3.3 `s1_loop_a6b` — 88-Layer ETD Sandwich Loop Healing (`1,000` Steps, `131.07M` Tokens)
 
-Following an initial poisoned run (`d1d92064`, `step=100, loss=9.6577`) that was purged via reset commit `ad646651` when locking `unsloth/Qwen3.6-35B-A3B-NVFP4`, the clean `s1_loop_a6b` stage completed **`1,000/1,000` steps** (`10486e72 → 32eb565e`, `~18.0 h` in a single Colab G4 session) training only **`18.41M` parameters (`0.053%`)** at **`2,112 tok/s`** mean (`54.24 GiB` peak VRAM, **`0` skipped updates**).
+Following an initial poisoned run (`d1d92064`, `step=100, loss=9.6577`) that was purged via reset commit `ad646651` when locking `unsloth/Qwen3.6-35B-A3B-NVFP4`, the clean `s1_loop_a6b` stage completed **`1,000/1,000` steps** (`10486e72 → 32eb565e`, `~18.0 h` in a single Colab G4 session) training only **`18.41M` parameters (`0.053%`)** at **`2117.5 tok/s` (Hub ckpts; `2112.3 tok/s` across `138` supervisor samples)** mean (`54.24 GiB` peak VRAM, **`0` skipped updates**).
 
 | Step | Hub SHA | `eval/loss_d1` (`40L`) | `eval/loss_d2` (`64L`) | `eval/loss_d3` (`88L`) | `eval/depth_gain` (`d1−d3`) | Source |
 | ---: | :---: | :---: | :---: | :---: | :---: | :--- |
@@ -127,9 +127,9 @@ Training `~23.5M` active read-side/D-LSA parameters (`83.06M` cumulative bundle,
 | `400` | `35948a28` | `2.0214` | `1.9616` | `1.8910` | **`+0.1305`** | `1.951` | `0.4410` |
 | `600` | `55c7a680` | `2.0171` | `1.9511` | `1.8757` | **`+0.1414`** | `1.979` | `0.4595` |
 
-### 3.6 `s2_joint_bptt` — `4×32K = 131K` K/V-Replay BPTT (Live Through Step `275/1200`)
+### 3.6 `s2_joint_bptt` — `4×32K = 131K` K/V-Replay BPTT (Live Through Step `280/1200`)
 
-`s2_joint_bptt` jointly trains loop adapters, HSSD v3.2, D-LSA indexers, attention `k/v/o_proj` & QK-norms (`104.86M` active trainable params / `187.92M` cumulative bundle = `0.54%`, `32.212B` NVFP4 experts frozen) on `131,072`-token reasoning/agent/code sequences split into `4 × 32,768` segments with differentiable re-projection of the Top-`2,048` selected prior-segment K/V tokens (`grad_accum=2` → `262,144` tokens/step). Through step **`275`** (`c5f7391d`, `73.40M` tokens, **`0` skipped updates**), held-out `131K` `d=3` NLL has already fallen **`-0.1289`** nats (`1.3508 → 1.2219`).
+`s2_joint_bptt` jointly trains loop adapters, HSSD v3.2, D-LSA indexers, attention `k/v/o_proj` & QK-norms (`104.86M` active trainable params / `187.92M` cumulative bundle = `0.54%`, `32.212B` NVFP4 experts frozen) on `131,072`-token reasoning/agent/code sequences split into `4 × 32,768` segments with differentiable re-projection of the Top-`2,048` selected prior-segment K/V tokens (`grad_accum=2` → `262,144` tokens/step). Through live step **`280`** (latest Hub ckpt `c5f7391d` @ step `275`, `73.40M` tokens, **`0` skipped updates**), held-out `131K` `d=3` NLL has already fallen **`-0.1289`** nats (`1.3508 → 1.2219`).
 
 ![s2 Joint BPTT Held-Out NLL, Blackwell Speedup, and VRAM Leak Fix](experiment_logs/charts/s2_bptt_throughput_vram.svg)
 
@@ -146,8 +146,8 @@ Training `~23.5M` active read-side/D-LSA parameters (`83.06M` cumulative bundle,
 | Code Regime (Git HEAD) | Observed Steps | Throughput (`tok/s`) | Post-Step Alloc (`GiB`) | Peak VRAM (`GiB`) | Mean GPU Power / Util | Outcome |
 | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
 | Pre-Opt Baseline (`2e37bf6`) | `10–40` (`n=4`) | `427–481` (**avg `453.5`**) | **`32.4–32.6`** | `72.5–72.5` | `324.2 W` / `98.2%` | Healthy baseline; HBM/sync-starved (~580 s/step) |
-| Post-Opt Pre-Leak-Fix (`b2c5513`) | `60–60` (`n=1`) | `930–930` (**avg `930.0`**) | **`52.0–52.0`** | `89.8–89.8` | `358.5 W` / `99.0%` | 2× speedup, **OOM crash** at step 60+ (zero-label C++ cycle) |
-| **Post-Leak-Fix Production (`5a82677`)** | `60–280` (`n=16`) | `836–1041` (**avg `935.7`**) | **`25.3–25.4`** | `70.0–70.1` | `372.6 W` / `98.5%` | **2.05× speed, `-7.0 GiB` alloc vs baseline, 17+ h flat, 0 OOMs** |
+| Post-Opt Pre-Leak-Fix (`b2c5513`) | `60–60` (`n=1`) | `930–930` (**avg `930.0`**) | **`52.0–52.0`** | `89.8–89.8` | `358.5 W` / `99.0%` | ~2× speedup, **OOM crash** at step 60+ (zero-label C++ cycle) |
+| **Post-Leak-Fix Production (`5a82677`)** | `60–280` (`n=16`) | `836–1041` (**avg `935.7`**) | **`25.3–25.4`** | `70.0–70.1` | `372.6 W` / `98.5%` | **2.06× speed, `-7.0 GiB` alloc vs baseline, 17+ h flat, 0 OOMs** |
 
 ---
 
@@ -176,9 +176,9 @@ Training an 88-virtual-layer 35B hybrid MoE up to `1,048,576`-token sequences on
 ### 5.1 Honest Scientific Limitations
 
 1. **No Post-Training RL or 2026 Frontier Benchmark Scores Claimed Yet:** Current results measure held-out language-modeling NLL (`8K`, `16K`, `64K`, `131K`), zero-training diagnostic probes (`s0_probe`), and a 5-task `s1` generation smoke check (`4/5` at `d=3`, `5/5` at `d=1/2`). End-to-end reasoning accuracy (`HLE-Diamond/Rolling`, `GPQA/SuperGPQA`, `AIME/HMMT-2026`, `ARC-AGI-2`, `MRCR 1M`, `KernelBench L3/L4`, `Terminal-Bench 4.1`) will only be claimed after `s2_joint_bptt` and `s4_rl` finish and pass our strict 13-gram decontaminated depth-sweep (`d=1, 2, 3`).
-2. **`512K–1M` D-LSA Top-64 Bucket Recall Ceiling (`~46%–48.5%`):** In `s3_long_1m_lsa`, mean `512K–1M` Top-64 bucket recall plateaued at **`0.4848`** peak / **`0.4595`** final (min-head avg `~0.30`), below our `0.70` `recall_ready` auto-switch threshold. Although `s2_joint_bptt` is co-training sparse D-LSA (`forward_sparse=1.0`, per-layer KL dropping further to `~0.87–1.43`), we explicitly gate a `v3.3` indexer capacity upgrade (`index_dim: 64 → 96`, multi-scale `pool=2 + pool=8` needle buckets) on our upcoming `MRCR 1M` bucketed audit.
-3. **`s2_joint_bptt` Is Mid-Stage (`step 275/1200`, `22.9%` Complete):** Held-out `131K` NLL has dropped sharply (`1.3508 → 1.2219`), while `depth_gain` compressed slightly from `+0.1135` (step 0) to `+0.0726` (step 200) as `d=1` (`40L`) also benefited heavily from 131K SFT adaptation (`1.4642 → 1.2945`). The upcoming **`step 400` truth-check eval** will establish whether `d=3` re-widens its advantage as `lr` enters cosine decay on hard reasoning traces.
-4. **Single-GPU Training Wall-Clock Bottleneck on Online RL Rollouts:** While SFT/BPTT reaches `~931–938 tok/s` (`~4.7 min/step`) on a single RTX PRO 6000 Blackwell, autoregressive `d=3` (`88L`) GRPO/SI-RSI rollouts over long chains-of-thought (`4K–16K` tokens × `group=8`) and full 16-benchmark 2026 Frontier Suite sweeps (`d=1, 2, 3`) remain strongly throughput-bound on a single GPU without Pass-1 (`40L`) → Pass-3 (`88L`) self-speculative drafting and multi-GPU rollout parallelism.
+2. **`512K–1M` D-LSA Top-64 Bucket Recall Ceiling (`~46%–48.5%`):** In `s3_long_1m_lsa`, mean `512K–1M` Top-64 bucket recall plateaued at **`0.4848`** peak / **`0.4595`** final (min-head avg `~0.30`), below our `0.70` `recall_ready` auto-switch threshold. Although `s2_joint_bptt` is co-training sparse D-LSA (`forward_sparse=1.0`, per-layer mean KL `0.87–1.65`, latest `0.953`), we explicitly gate a `v3.3` indexer capacity upgrade (`index_dim: 64 → 96`, multi-scale `pool=2 + pool=8` needle buckets) on our upcoming `MRCR 1M` bucketed audit.
+3. **`s2_joint_bptt` Is Mid-Stage (`step 280/1200`, `23.3%` Complete):** Held-out `131K` NLL has dropped sharply (`1.3508 → 1.2219`), while `depth_gain` compressed slightly from `+0.1135` (step 0) to `+0.0726` (step 200) as `d=1` (`40L`) also benefited heavily from 131K SFT adaptation (`1.4642 → 1.2945`). The upcoming **`step 400` truth-check eval** will establish whether `d=3` re-widens its advantage as `lr` enters cosine decay on hard reasoning traces.
+4. **Single-GPU Training Wall-Clock Bottleneck on Online RL Rollouts:** While SFT/BPTT reaches `~938 tok/s` (`~4.7 min/step`) on a single RTX PRO 6000 Blackwell, autoregressive `d=3` (`88L`) GRPO/SI-RSI rollouts over long chains-of-thought (`4K–16K` tokens × `group=8`) and full 16-benchmark 2026 Frontier Suite sweeps (`d=1, 2, 3`) remain strongly throughput-bound on a single GPU without Pass-1 (`40L`) → Pass-3 (`88L`) self-speculative drafting and multi-GPU rollout parallelism.
 
 ### 5.2 Immediate Experimental Roadmap
 
@@ -191,7 +191,7 @@ Training an 88-virtual-layer 35B hybrid MoE up to `1,048,576`-token sequences on
 
 The empirical trajectory above demonstrates **unusually high scientific yield per GPU-hour** and de-risks every technical unknown before requesting dedicated multi-GPU academic/industry compute:
 
-- **De-Risked Stack on `1×` Rented GPU (`~111` Productive GPU-Hours to Date):** All architectural surgery, mathematical invariants (`> 590` unit & CUDA parity tests), `1M`-token FP8 calibration (`78.60 GiB`), `131K` K/V-replay BPTT (`70.1 GiB` flat), and custom Blackwell `sm_120` Triton kernels (`5.8×–19.0×` micro-speedups, `2.05×` E2E speedup) are already built, open, and proven stable (`0` post-fix skipped steps across `> 2,975` training steps).
+- **De-Risked Stack on `1×` Rented GPU (`~111` Productive GPU-Hours to Date):** All architectural surgery, mathematical invariants (`> 590` unit & CUDA parity tests), `1M`-token FP8 calibration (`78.60 GiB`), `131K` K/V-replay BPTT (`70.1 GiB` flat), and custom Blackwell `sm_120` Triton kernels (`5.8×–19.0×` micro-speedups, `2.07×` E2E speedup) are already built, open, and proven stable (`0` post-fix skipped steps across `2,980` training steps).
 - **Targeted Grant Allocation (`1× 8×B200/H200` Node for `2–3` Weeks = `~2,500–4,000` GPU-Hours):**
   1. **Controlled Ablation Matrix (`~600` GPU-h):** FLOP-matched `d=1` vs `d=2` vs `d=3` vs `d=4` (`112L`), HSSD v3.2 vs stock GDN at `256K–1M`, and Inkling-style cross-pass MoE gating (`v3.3`).
   2. **High-Throughput Multi-Round Verifiable RL / SI-RSI (`s4_rl → s5_rsi_rft → s6_rsi_rl → s7_agentic_rsi`, `~1,800` GPU-h):** Decoupled vLLM/SGLang-style rollout workers + Harbor containerized execution for `Terminal-Bench 4.1` / `SWE-rebench` / `KernelBench L1–L2` verifiable self-improvement.

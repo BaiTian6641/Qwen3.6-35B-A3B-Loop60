@@ -35,6 +35,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..debug import cuda_mem_brief, describe, require
+from ._cache_compat import cache_kwarg_name, extract_output_cache
 from ._dtype import upcast
 from .introspect import FULL, LINEAR, inspect_model, router_of
 from .loop import LoopSpec, _looks_like_probs, apply_loop, sha256_frozen_experts
@@ -259,14 +260,16 @@ def probe_core_ranges(
 
 @torch.no_grad()
 def _greedy(model: nn.Module, ids: torch.Tensor, steps: int) -> tuple[torch.Tensor, torch.Tensor]:
+    cache_kw = cache_kwarg_name(model)
     out = model(input_ids=ids, use_cache=True)
-    cache, seq, logits = out.past_key_values, ids, [out.logits[:, -1]]
+    cache, seq, logits = extract_output_cache(out), ids, [out.logits[:, -1]]
     for _ in range(steps):
         nxt = logits[-1].argmax(-1, keepdim=True)
         seq = torch.cat([seq, nxt], 1)
-        out = model(input_ids=nxt, past_key_values=cache, use_cache=True)
-        if getattr(out, "past_key_values", None) is not None:
-            cache = out.past_key_values
+        out = model(input_ids=nxt, **{cache_kw: cache, "use_cache": True})
+        nxt_cache = extract_output_cache(out)
+        if nxt_cache is not None:
+            cache = nxt_cache
         logits.append(out.logits[:, -1])
     return seq, torch.stack(logits, 1)
 
@@ -274,14 +277,16 @@ def _greedy(model: nn.Module, ids: torch.Tensor, steps: int) -> tuple[torch.Tens
 @torch.no_grad()
 def _cached_forward_seq(model: nn.Module, seq: torch.Tensor, prefix_len: int) -> torch.Tensor:
     """Teacher-forced cached decode over `seq[:, prefix_len:]` after prefilling `seq[:, :prefix_len]`."""
+    cache_kw = cache_kwarg_name(model)
     out = model(input_ids=seq[:, :prefix_len], use_cache=True)
-    cache = out.past_key_values
+    cache = extract_output_cache(out)
     logits = [out.logits[:, -1]]
     for pos in range(prefix_len, int(seq.shape[1])):
         nxt = seq[:, pos : pos + 1]
-        out = model(input_ids=nxt, past_key_values=cache, use_cache=True)
-        if getattr(out, "past_key_values", None) is not None:
-            cache = out.past_key_values
+        out = model(input_ids=nxt, **{cache_kw: cache, "use_cache": True})
+        nxt_cache = extract_output_cache(out)
+        if nxt_cache is not None:
+            cache = nxt_cache
         logits.append(out.logits[:, -1])
     return torch.stack(logits, 1)
 

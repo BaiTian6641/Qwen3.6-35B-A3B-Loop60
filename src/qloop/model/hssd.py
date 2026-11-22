@@ -48,6 +48,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ..debug import require
+from ._cache_compat import extract_cache_from_kwargs
 from ._dtype import upcast
 from .gdn2 import _infer_gdn_dims, l2norm, logistic_shift
 from .introspect import LINEAR, attention_module, find_text_model, inspect_model, layer_type_of
@@ -13058,9 +13059,7 @@ def apply_hssd(model: nn.Module, cfg: HSSDConfig | dict[str, Any] | None = None)
                 amask = kwargs.get("attention_mask", args[2] if len(args) >= 3 else None)
                 if amask is None and amask_stack:
                     amask = amask_stack[-1]
-                cache_p = kwargs.get("cache_params")
-                if cache_p is None:
-                    cache_p = kwargs.get("past_key_values")
+                cache_p = extract_cache_from_kwargs(kwargs)
                 if cache_p is None:
                     for _arg in args[1:]:
                         if getattr(_arg, "_detach_recurrent_state", False):

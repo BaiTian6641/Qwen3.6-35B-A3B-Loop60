@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ..model._cache_compat import cache_kwarg_name, extract_cache_kwarg, extract_output_cache
 from ..model._dtype import upcast
 from ..model.experts import physical_layers
 from ..model.introspect import FULL, find_text_model
@@ -1022,20 +1023,32 @@ class SegmentedKVBPTTRunner:
         last_active_seg = max((i for i, ok in enumerate(seg_valid_flags) if ok), default=-1)
 
         def make_attn_pre_hook(phys_idx: int):
-            def pre_hook(attn_mod: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+            def pre_hook(attn_mod: nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
                 x_cur: torch.Tensor = args[0] if len(args) > 0 else kwargs["hidden_states"]
                 pos_emb = args[1] if len(args) > 1 else kwargs.get("position_embeddings")
-                pkv = args[3] if len(args) > 3 else kwargs.get("past_key_values")
+                pkv_key: str | None = None
+                pkv_from_pos = False
+                pkv: Any = None
+                if len(args) > 3 and args[3] is not None:
+                    pkv = args[3]
+                    pkv_from_pos = True
+                else:
+                    pkv_key, pkv = extract_cache_kwarg(kwargs)
                 if pos_emb is None:
-                    return
+                    return None
 
                 # Skip pass >= 2 when kv_share=True (Pass 1 already computed live replay for this slot)
                 if loop_ctl is not None and getattr(loop_ctl, "_cur", None) is not None:
                     _ctx, r_pass = loop_ctl._cur
                     if r_pass >= 2 and getattr(loop_ctl.spec, "kv_share", True):
-                        return
+                        return None
                 if pkv is not None and type(pkv).__name__ == "SharedKVView":
-                    return
+                    try:
+                        is_rec = bool(object.__getattribute__(pkv, "_record"))
+                    except AttributeError:
+                        is_rec = False
+                    if not is_rec:
+                        return None
 
                 cos_cur, sin_cur = pos_emb
                 rot_dim = int(cos_cur.shape[-1])
@@ -1192,6 +1205,15 @@ class SegmentedKVBPTTRunner:
                         copy_stream=copy_stream,
                     )
 
+                if proxy is not None and pkv is proxy.base_cache:
+                    if pkv_key is not None:
+                        new_kw = dict(kwargs)
+                        new_kw[pkv_key] = proxy
+                        return args, new_kw
+                    if pkv_from_pos:
+                        return (*args[:3], proxy, *args[4:]), kwargs
+                return None
+
             return pre_hook
 
         for phys_idx, attn_mod in full_layers:
@@ -1206,6 +1228,8 @@ class SegmentedKVBPTTRunner:
             if hssd_ad is not None and callable(getattr(hssd_ad, "clear_aux", None)):
                 hssd_ad.clear_aux()
 
+        tm_cache_kw = cache_kwarg_name(tm)
+        model_cache_kw = cache_kwarg_name(self.model)
         base_cache: Any = None
         try:
             for s_idx in range(n_segs):
@@ -1254,7 +1278,7 @@ class SegmentedKVBPTTRunner:
                     assert lm_head is not None
                     tm_kw: dict[str, Any] = {
                         "input_ids": seg_ids,
-                        "past_key_values": pkv_arg,
+                        tm_cache_kw: pkv_arg,
                         "use_cache": True,
                     }
                     if bypass_mask and s_idx > 0:
@@ -1270,7 +1294,7 @@ class SegmentedKVBPTTRunner:
                     base_cache = (
                         proxy_holder[0].base_cache
                         if proxy_holder[0] is not None
-                        else getattr(tm_out, "past_key_values", None)
+                        else extract_output_cache(tm_out)
                     )
                     seg_hidden = tm_out.last_hidden_state if hasattr(tm_out, "last_hidden_state") else tm_out[0]
                     hidden_for_loss = seg_hidden if s1 < t_total else seg_hidden[:, :-1]
@@ -1287,14 +1311,14 @@ class SegmentedKVBPTTRunner:
                     else:
                         seg_loss = None
                 else:
-                    fwd_kw: dict[str, Any] = {"past_key_values": pkv_arg, "use_cache": True}
+                    fwd_kw: dict[str, Any] = {model_cache_kw: pkv_arg, "use_cache": True}
                     if bypass_mask and s_idx > 0:
                         fwd_kw["attention_mask"] = no_mask_dict
                     out = self.model(seg_ids, **fwd_kw)
                     base_cache = (
                         proxy_holder[0].base_cache
                         if proxy_holder[0] is not None
-                        else getattr(out, "past_key_values", None)
+                        else extract_output_cache(out)
                     )
                     logits = out.logits
                     logits_for_loss = logits if (s1 < t_total or loss_fn is not None) else logits[:, :-1]

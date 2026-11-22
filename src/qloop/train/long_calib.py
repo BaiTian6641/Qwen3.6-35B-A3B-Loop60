@@ -31,6 +31,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ..model._cache_compat import cache_kwarg_name, extract_output_cache
 from ..model.introspect import find_lm_head, find_text_model
 from ..model.offload import FP8KVCacheQuantizer, QuantizedFP8KV
 from .bptt import _detach_nested, _ReplayKVCacheProxy
@@ -357,6 +358,8 @@ def prefix_suffix_calibration_step(
     prefix_mode_used: str | None = None
 
     # Phase 1: Stream `[0 : prefix_len]` in `chunk_size` chunks under `torch.no_grad()`
+    tm_cache_kw = cache_kwarg_name(tm) if tm is not None else "past_key_values"
+    root_cache_kw = cache_kwarg_name(root)
     bypass_mask = _can_bypass_hf_causal_mask(tm, lsa_manager)
     no_mask_dict: dict[str, None] = {"full_attention": None, "linear_attention": None}
     cache: Any = None
@@ -372,15 +375,15 @@ def prefix_suffix_calibration_step(
                     if tm is not None and tm is not root:
                         tm_kw: dict[str, Any] = {
                             "input_ids": p_chunk,
-                            "past_key_values": cache,
+                            tm_cache_kw: cache,
                             "use_cache": True,
                         }
                         if bypass_mask and cache is not None:
                             tm_kw["attention_mask"] = no_mask_dict
                         p_out = tm(**tm_kw)
                     else:
-                        p_out = root(p_chunk, past_key_values=cache, use_cache=True)
-                    cache = p_out.past_key_values
+                        p_out = root(p_chunk, **{root_cache_kw: cache, "use_cache": True})
+                    cache = extract_output_cache(p_out)
                     n_prefix_chunks += 1
         fp8_prefix_kv: dict[int, tuple[QuantizedFP8KV, QuantizedFP8KV]] = {}
         if cache is not None:
@@ -427,7 +430,7 @@ def prefix_suffix_calibration_step(
             assert tm is not None and lm_head is not None
             suf_kw: dict[str, Any] = {
                 "input_ids": suffix_ids,
-                "past_key_values": suffix_cache,
+                tm_cache_kw: suffix_cache,
                 "use_cache": True,
             }
             if bypass_mask and suffix_cache is not None:
@@ -474,7 +477,7 @@ def prefix_suffix_calibration_step(
                 if want_logits:
                     suffix_logits_out = raw_logits.detach()
         else:
-            suffix_out = root(suffix_ids, past_key_values=suffix_cache, use_cache=True)
+            suffix_out = root(suffix_ids, **{root_cache_kw: suffix_cache, "use_cache": True})
             raw_logits = suffix_out.logits if hasattr(suffix_out, "logits") else suffix_out
             task_loss = _invoke_calib_loss(loss_fn, raw_logits, suffix_ids, suffix_labels)
             want_logits = (

@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from ._cache_compat import extract_cache_from_kwargs
 from ._dtype import upcast
 from .introspect import FULL, attention_module, find_text_model, inspect_model
 
@@ -3149,10 +3150,12 @@ def lsa_attention(
 
     cfg = idx.cfg
     cache_key = kwargs.pop("cache_key", None)
-    if cache_key is None and "past_key_values" in kwargs and kwargs["past_key_values"] is not None:
-        pkv_root, pkv_ok = _unwrap_pkv_for_cache(kwargs["past_key_values"])
-        if pkv_ok and pkv_root is not None:
-            idx._active_pkv = (_weakref_or_none(pkv_root), id(pkv_root), True)
+    if cache_key is None:
+        pkv_kw = extract_cache_from_kwargs(kwargs)
+        if pkv_kw is not None:
+            pkv_root, pkv_ok = _unwrap_pkv_for_cache(pkv_kw)
+            if pkv_ok and pkv_root is not None:
+                idx._active_pkv = (_weakref_or_none(pkv_root), id(pkv_root), True)
 
     b, h, tq, dh = query.shape
     g, tk = key.shape[1], key.shape[2]
@@ -3630,11 +3633,7 @@ def _make_attn_pkv_pre_hook(ix: LSAIndexer) -> Callable[..., None]:
     """Overwrite-only pre-hook recording the active `past_key_values` object id with zero host syncs."""
 
     def _pre(_mod: nn.Module, args: tuple[Any, ...], kw: dict[str, Any]) -> None:
-        pkv = kw.get("past_key_values")
-        if pkv is None:
-            pkv = kw.get("past_key_value")
-        if pkv is None:
-            pkv = kw.get("cache")
+        pkv = extract_cache_from_kwargs(kw)
         if pkv is None and len(args) >= 4:
             pkv = args[3]
         if pkv is None:

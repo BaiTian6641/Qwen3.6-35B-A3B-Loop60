@@ -27,6 +27,7 @@ from torch import nn
 
 from ..debug import require
 from ..hub import resolve_hf_token
+from ..model._cache_compat import cache_kwarg_name, extract_output_cache
 from ..model.experts import HotExpertDeltas, attach_hot_expert_deltas
 from ..model.gdn2 import GDN2Config, GDN2Manager, install_gdn2
 from ..model.introspect import find_lm_head, find_text_model
@@ -385,6 +386,10 @@ class CausalLMPackOutput:
         self.hidden_states = hidden_states
         self.attentions = attentions
 
+    @property
+    def cache(self) -> Any:
+        return self.past_key_values
+
     def __getitem__(self, key: int | str) -> Any:
         if isinstance(key, str):
             return getattr(self, key)
@@ -678,12 +683,14 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
         logits_to_keep: int | None = None,
         **kwargs: Any,
     ) -> Any:
-        if self.loop_controller is not None and past_key_values is not None:
-            self.loop_controller._sync_cache_last_linear(past_key_values)
+        kw_cache = kwargs.pop("cache", None)
+        eff_cache = kw_cache if past_key_values is None else past_key_values
+        if self.loop_controller is not None and eff_cache is not None:
+            self.loop_controller._sync_cache_last_linear(eff_cache)
         if logits_to_keep is not None and labels is None:
             tm_kw: dict[str, Any] = {
                 "input_ids": input_ids,
-                "past_key_values": past_key_values,
+                cache_kwarg_name(self._text_model): eff_cache,
                 "use_cache": bool(use_cache),
             }
             if inputs_embeds is not None:
@@ -702,7 +709,7 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
             out = CausalLMPackOutput(
                 logits=logits,
                 loss=None,
-                past_key_values=getattr(tm_out, "past_key_values", None),
+                past_key_values=extract_output_cache(tm_out),
                 hidden_states=getattr(tm_out, "hidden_states", None),
             )
             return out if return_dict is not False else (logits, out.past_key_values)
@@ -712,8 +719,8 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
             call_kw["attention_mask"] = attention_mask
         if position_ids is not None:
             call_kw["position_ids"] = position_ids
-        if past_key_values is not None:
-            call_kw["past_key_values"] = past_key_values
+        if eff_cache is not None:
+            call_kw[cache_kwarg_name(self.backbone)] = eff_cache
         if inputs_embeds is not None:
             call_kw["inputs_embeds"] = inputs_embeds
         if labels is not None:
@@ -726,7 +733,7 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
             call_kw["output_hidden_states"] = output_hidden_states
         res = self.backbone(input_ids=input_ids, **call_kw)
         if return_dict is False:
-            return (res.logits, getattr(res, "past_key_values", None))
+            return (res.logits, extract_output_cache(res))
         return res
 
     def prepare_inputs_for_generation(
@@ -736,13 +743,15 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
         attention_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        if past_key_values is not None:
-            seq_len = getattr(past_key_values, "get_seq_length", lambda: 0)()
+        kw_cache = kwargs.pop("cache", None)
+        eff_cache = kw_cache if past_key_values is None else past_key_values
+        if eff_cache is not None:
+            seq_len = getattr(eff_cache, "get_seq_length", lambda: 0)()
             if seq_len > 0 and input_ids.shape[1] > 1:
                 input_ids = input_ids[:, -1:]
         return {
             "input_ids": input_ids,
-            "past_key_values": past_key_values,
+            "past_key_values": eff_cache,
             "use_cache": True,
             "attention_mask": attention_mask,
             **kwargs,
@@ -1172,6 +1181,7 @@ import contextlib
 import copy
 import functools
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -6579,11 +6589,40 @@ else:
             self.hidden_states = hidden_states
             self.attentions = attentions
 
+        @property
+        def cache(self) -> Any:
+            return self.past_key_values
+
         def __getitem__(self, key: int | str) -> Any:
             if isinstance(key, str):
                 return getattr(self, key)
             items = [x for x in (self.loss, self.logits, self.past_key_values, self.hidden_states) if x is not None]
             return items[key]
+
+    _SA_CACHE_KWARGS: tuple[str, ...] = ("cache", "cache_params", "past_key_values", "past_key_value")
+
+    def _sa_extract_cache_kwarg(kw: dict[str, Any]) -> tuple[str | None, Any]:
+        for ck in _SA_CACHE_KWARGS:
+            cv = kw.get(ck)
+            if cv is not None:
+                return ck, cv
+        return None, None
+
+    def _sa_extract_output_cache(out: Any) -> Any:
+        c = getattr(out, "cache", None)
+        if c is None:
+            c = getattr(out, "past_key_values", None)
+        return c
+
+    def _sa_cache_kwarg_name(mod: Any) -> str:
+        fn = getattr(mod, "forward", mod)
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return "past_key_values"
+        if "cache" in params and "past_key_values" not in params:
+            return "cache"
+        return "past_key_values"
 
     def _find_children(parent: nn.Module, names: list[str] | tuple[str, ...]) -> dict[str, nn.Module]:
         out: dict[str, nn.Module] = {}
@@ -7293,8 +7332,7 @@ else:
                     ctx["start"][r] = x
                     assert ow._loop_adapters is not None
                     x = ow._loop_adapters.bridge(x, ctx["anchor"], r - 2)
-            pkv_k = next((k for k in ("past_key_values", "past_key_value", "cache") if k in kwargs), None)
-            pkv = kwargs.get(pkv_k) if pkv_k is not None else None
+            pkv_k, pkv = _sa_extract_cache_kwarg(kwargs)
             if vidx == 0 and pkv is not None:
                 ow._sync_cache_last_linear(pkv)
             if pkv is not None and pkv_k is not None:
@@ -8398,11 +8436,7 @@ else:
             self._slot_meta = [(v, r, lt) for v, ((_i, r), lt) in enumerate(zip(order, ltypes))]
 
             def _tm_cache_pre(_m: nn.Module, _a: tuple[Any, ...], kw: dict[str, Any]) -> None:
-                pkv = kw.get("past_key_values")
-                if pkv is None:
-                    pkv = kw.get("past_key_value")
-                if pkv is None:
-                    pkv = kw.get("cache")
+                _, pkv = _sa_extract_cache_kwarg(kw)
                 if pkv is not None:
                     self._sync_cache_last_linear(pkv)
 
@@ -8631,12 +8665,15 @@ else:
             **kwargs: Any,
         ) -> Any:
             try:
-                if past_key_values is not None:
-                    self._sync_cache_last_linear(past_key_values)
+                kw_cache = kwargs.pop("cache", None)
+                eff_cache = kw_cache if past_key_values is None else past_key_values
+                if eff_cache is not None:
+                    self._sync_cache_last_linear(eff_cache)
                 if logits_to_keep is not None and labels is None:
+                    tm_mod = self._find_tm()
                     tm_kw: dict[str, Any] = {
                         "input_ids": input_ids,
-                        "past_key_values": past_key_values,
+                        _sa_cache_kwarg_name(tm_mod): eff_cache,
                         "use_cache": bool(use_cache),
                     }
                     if inputs_embeds is not None:
@@ -8647,7 +8684,7 @@ else:
                         tm_kw["position_ids"] = position_ids
                     if output_hidden_states is not None:
                         tm_kw["output_hidden_states"] = output_hidden_states
-                    tm_out = self._find_tm()(**tm_kw, **kwargs)
+                    tm_out = tm_mod(**tm_kw, **kwargs)
                     h_last = tm_out.last_hidden_state
                     keep = int(logits_to_keep)
                     h_slice = h_last[:, -keep:, :] if keep > 0 else h_last[:, :0, :]
@@ -8655,7 +8692,7 @@ else:
                     out = _StandaloneCausalLMOutput(
                         logits=logits,
                         loss=None,
-                        past_key_values=getattr(tm_out, "past_key_values", None),
+                        past_key_values=_sa_extract_output_cache(tm_out),
                         hidden_states=getattr(tm_out, "hidden_states", None),
                     )
                     return out if return_dict is not False else (logits, out.past_key_values)
@@ -8665,8 +8702,8 @@ else:
                     call_kw["attention_mask"] = attention_mask
                 if position_ids is not None:
                     call_kw["position_ids"] = position_ids
-                if past_key_values is not None:
-                    call_kw["past_key_values"] = past_key_values
+                if eff_cache is not None:
+                    call_kw[_sa_cache_kwarg_name(self.backbone)] = eff_cache
                 if inputs_embeds is not None:
                     call_kw["inputs_embeds"] = inputs_embeds
                 if labels is not None:
@@ -8678,7 +8715,7 @@ else:
                 if output_hidden_states is not None:
                     call_kw["output_hidden_states"] = output_hidden_states
                 res = self.backbone(input_ids=input_ids, **call_kw)
-                return (res.logits, getattr(res, "past_key_values", None)) if return_dict is False else res
+                return (res.logits, _sa_extract_output_cache(res)) if return_dict is False else res
             finally:
                 self._amask_stack.clear()
 

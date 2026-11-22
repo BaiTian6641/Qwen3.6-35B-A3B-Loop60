@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..debug import require
+from ..model._cache_compat import cache_kwarg_name, extract_output_cache
 from ..model.experts import physical_layers
 from ..model.introspect import find_lm_head, find_text_model
 from ..model.loop import LoopController
@@ -792,8 +793,7 @@ class OptimizedLoopInferenceEngine:
         try:
             tm_out = self.text_model(
                 input_ids=step_ids,
-                past_key_values=cache,
-                use_cache=True,
+                **{cache_kwarg_name(self.text_model): cache, "use_cache": True},
             )
             executed_r = 1 if ctl is None else int(ctl.active_passes)
         finally:
@@ -802,7 +802,7 @@ class OptimizedLoopInferenceEngine:
             if ctl is not None:
                 ctl.active_passes = orig_r
 
-        next_cache = getattr(tm_out, "past_key_values", None)
+        next_cache = extract_output_cache(tm_out)
         if next_cache is None:
             next_cache = cache
         return tm_out, next_cache, executed_r

@@ -33,6 +33,7 @@ from typing import Any, Union
 import torch
 
 from qloop.debug import describe, require
+from qloop.model._cache_compat import extract_output_cache
 
 log = logging.getLogger("qloop")
 
@@ -122,6 +123,7 @@ class Generator:
         params = _forward_params(model)
         self._accepts_mask = "attention_mask" in params
         self._logits_kw = next((k for k in ("logits_to_keep", "num_logits_to_keep") if k in params), None)
+        self._cache_kw = "cache" if ("cache" in params and "past_key_values" not in params) else "past_key_values"
         if self.padded_batching and not self._accepts_mask:
             raise ValueError(f"padded_batching=True but {type(model).__name__}.forward has no attention_mask "
                              "argument; left padding would silently corrupt outputs")
@@ -263,7 +265,7 @@ class Generator:
     def _forward(self, ids: torch.Tensor, cache: Any, mask: torch.Tensor | None, prefill: bool) -> Any:
         kwargs: dict[str, Any] = {"use_cache": True}
         if cache is not None:
-            kwargs["past_key_values"] = cache
+            kwargs[self._cache_kw] = cache
         if mask is not None:
             kwargs["attention_mask"] = mask
         if prefill and self._logits_kw:
@@ -273,8 +275,8 @@ class Generator:
         if logits is None and isinstance(out, (tuple, list)):
             logits = out[0]
         require(logits is not None and logits.dim() == 3, "model output has no [B,T,V] .logits", out=out)
-        new_cache = getattr(out, "past_key_values", None)
-        require(new_cache is not None, "model returned no past_key_values with use_cache=True; Generator needs a "
+        new_cache = extract_output_cache(out)
+        require(new_cache is not None, "model returned no past_key_values/cache with use_cache=True; Generator needs a "
                 "cache-capable model", model=type(self.model).__name__)
         return logits[:, -1, :].float(), new_cache
 

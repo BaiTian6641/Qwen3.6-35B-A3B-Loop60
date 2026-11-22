@@ -900,6 +900,197 @@ def detect_pathology(
     return issues
 
 
+# Synthetic Track B CoT artifact detection & rubric-header stripping
+_RUBRIC_BEAT_LINE_RE = re.compile(
+    r"(?:^|\n)[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}Beat[ \t]*[123]\b",
+    re.IGNORECASE,
+)
+_RUBRIC_BEAT_INLINE_RE = re.compile(
+    r"(?:^|[.!?\s])(?<!\bon )(?<!\bat )\*{0,2}Beat[ \t]*[123](?:[ \t]*\([^)\n]{1,60}\))?\*{0,2}[ \t]*:",
+    re.IGNORECASE,
+)
+_RUBRIC_EXPLICIT_HEADER_RE = re.compile(
+    r"(?:^|\n)[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}"
+    r"(?:Adversarial[ \t]+Self[- ]Audit|Synthesis[ \t]+Plan|"
+    r"Restraint[ \t]*(?:&|and)[ \t]*Synthesis|Framing[ \t]*(?:&|and)[ \t]*Invariants)"
+    r"\*{0,2}[ \t]*(?::|[—–-]|(?=\n|$))",
+    re.IGNORECASE,
+)
+_RUBRIC_FRAMING_HDR_RE = re.compile(
+    r"(?:^|\n)[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}Framing\*{0,2}[ \t]*(?::|(?=\n|$))",
+    re.IGNORECASE,
+)
+_RUBRIC_AUDIT_OR_SYNTH_HDR_RE = re.compile(
+    r"(?:^|\n)[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}"
+    r"(?:(?:Adversarial[ \t]+)?Self[- ]Audit|Synthesis(?:[ \t]+Plan)?)\*{0,2}[ \t]*(?::|(?=\n|$))",
+    re.IGNORECASE,
+)
+
+_SPOILER_FIRST_RE = re.compile(
+    r"(?:^[ \t]*(?:[-*•][ \t]+)?(?:#{1,4}[ \t]+)?"
+    r"(?:(?:okay|ok|alright|well|so|thus|therefore|hence|clearly|note|wait)[,:\s]+)?"
+    r"\*{0,2}(?:(?:(?:final|target)[ \t]+)?answer\*{0,2}[ \t]*:|the[ \t]+(?:final|target)[ \t]+answer[ \t]+is\b))"
+    r"|(?:(?:^|[\n.,:;(\[—–-])\s*\*{0,2}"
+    r"(?:(?:final|target)[ \t]+answer\*{0,2}[ \t]*:|the[ \t]+(?:final|target)[ \t]+answer[ \t]+is\b))"
+    r"|(?:(?:^|\n)[ \t]*\*{0,2}answer\*{0,2}[ \t]*:)",
+    re.IGNORECASE,
+)
+
+_META_STUB_PHRASES: list[re.Pattern[str]] = [
+    re.compile(r"\bstandard\s+processing\s+applied\b", re.IGNORECASE),
+    re.compile(
+        r"\binitial\b(?:[^.\n]|\.\d){0,45}\bparameters?(?:[^.\n]|\.\d){0,30}\b(?:are|is|were)\s+validated\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bconfirms?\s+(?:that\s+)?there\s+are\s+no\s+hidden\s+"
+        r"(?:fees|traps|edge\s+cases|errors|issues)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bthe\s+(?:arithmetic|mathematical|computational)\s+logic\s+holds\s+cleanly\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:verify(?:ing)?\s+the\s+result\s+by\s+substituting\s+back\s+and\s+)?"
+        r"running\s+an?\s+edge[- ]case\s+check\s+on\s+the\s+problem\s+wording\b",
+        re.IGNORECASE,
+    ),
+]
+_META_STUB_SHORT_PHRASES: list[re.Pattern[str]] = [
+    re.compile(r"\ball\s+constraints\s+and\s+invariants\s+(?:are|remain)\s+satisfied\b", re.IGNORECASE),
+    re.compile(
+        r"\bverify(?:ing)?\s+the\s+result\s+by\s+substituting\s+back\s+and\s+running\s+an?\s+edge[- ]case\s+check\b",
+        re.IGNORECASE,
+    ),
+]
+_ORDINAL_LABEL_RE = re.compile(r"\b(?:beat|step|phase|part)\s+[1-9]\b", re.IGNORECASE)
+_CONCRETE_COMPUTE_TOKEN_RE = re.compile(
+    r"`[^`\n]{2,}`"
+    r"|(?<![A-Za-z_])\d+(?:\.\d+)?(?![A-Za-z_])"
+    r"|[A-Za-z0-9_)\]]\s*(?:==|!=|<=|>=|->|=>|=)\s*[A-Za-z0-9_(\[\-\\]"
+    r"|\\[A-Za-z]+\{"
+)
+
+_RUBRIC_KNOWN_SUBTITLE = (
+    r"(?:Framing(?:[ \t]*(?:&|and)[ \t]*Invariants)?|"
+    r"(?:Adversarial[ \t]+)?Self[- ]Audit|"
+    r"Verified[ \t]+Recovery|"
+    r"Restraint(?:[ \t]*(?:&|and)[ \t]*Synthesis)?|"
+    r"Synthesis(?:[ \t]+Plan)?|"
+    r"Audit|Verification)"
+)
+_STRIP_BEAT_STANDALONE_RE = re.compile(
+    r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}Beat[ \t]*[123]"
+    r"(?:[ \t]*\([^)\n]{1,60}\)|[ \t]*[:—–-][ \t]*" + _RUBRIC_KNOWN_SUBTITLE + r")?"
+    r"\*{0,2}[ \t]*[:.]?\*{0,2}[ \t]*(?:\n|$)"
+)
+_STRIP_BEAT_LINE_PREFIX_RE = re.compile(
+    r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}Beat[ \t]*[123]"
+    r"(?:[ \t]*\([^)\n]{1,60}\)|[ \t]*[—–-][ \t]*" + _RUBRIC_KNOWN_SUBTITLE + r")?"
+    r"\*{0,2}[ \t]*(?::|[—–])\*{0,2}[ \t]*"
+)
+_STRIP_BEAT_MD_PREFIX_RE = re.compile(
+    r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?#{1,4}[ \t]+\*{0,2}Beat[ \t]*[123]"
+    r"(?:[ \t]*\([^)\n]{1,60}\))?\*{0,2}[ \t]*[:—–-]\*{0,2}[ \t]*"
+)
+_STRIP_BEAT_INLINE_PREFIX_RE = re.compile(
+    r"(?i)(?<=[.!?\s])(?<!\bon )(?<!\bat )\*{0,2}Beat[ \t]*[123]"
+    r"(?:[ \t]*\([^)\n]{1,60}\))?\*{0,2}[ \t]*:\*{0,2}[ \t]*"
+)
+_STRIP_EXPLICIT_STANDALONE_RE = re.compile(
+    r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}"
+    r"(?:Adversarial[ \t]+Self[- ]Audit|Synthesis[ \t]+Plan|"
+    r"Restraint[ \t]*(?:&|and)[ \t]*Synthesis|Framing[ \t]*(?:&|and)[ \t]*Invariants)"
+    r"\*{0,2}[ \t]*:?\*{0,2}[ \t]*(?:\n|$)"
+)
+_STRIP_EXPLICIT_PREFIX_RE = re.compile(
+    r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}"
+    r"(?:Adversarial[ \t]+Self[- ]Audit|Synthesis[ \t]+Plan|"
+    r"Restraint[ \t]*(?:&|and)[ \t]*Synthesis|Framing[ \t]*(?:&|and)[ \t]*Invariants)"
+    r"\*{0,2}[ \t]*:\*{0,2}[ \t]*"
+)
+_STRIP_PAIRED_HDR_STANDALONE_RE = re.compile(
+    r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}"
+    r"(?:Framing|(?:Adversarial[ \t]+)?Self[- ]Audit|Synthesis(?:[ \t]+Plan)?)"
+    r"\*{0,2}[ \t]*:?\*{0,2}[ \t]*(?:\n|$)"
+)
+_STRIP_PAIRED_HDR_PREFIX_RE = re.compile(
+    r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}"
+    r"(?:Framing|(?:Adversarial[ \t]+)?Self[- ]Audit|Synthesis(?:[ \t]+Plan)?)"
+    r"\*{0,2}[ \t]*:\*{0,2}[ \t]*"
+)
+
+
+def detect_synthetic_cot_artifacts(thinking: str, response: str = "", domain: str = "") -> list[str]:
+    """Detect synthetic CoT defects: rubric headers, spoiler-first openings, and meta-summary stubs."""
+    _ = (response, domain)
+    t = (thinking or "").strip()
+    if not t:
+        return []
+
+    issues: list[str] = []
+
+    # 1. Robotic rubric headers (`Beat 1/2/3`, `Framing:` + `Adversarial Self-Audit:`, `Synthesis Plan:`, etc.)
+    has_rubric_header = bool(
+        _RUBRIC_BEAT_LINE_RE.search(t)
+        or _RUBRIC_BEAT_INLINE_RE.search(t)
+        or _RUBRIC_EXPLICIT_HEADER_RE.search(t)
+        or (_RUBRIC_FRAMING_HDR_RE.search(t) and _RUBRIC_AUDIT_OR_SYNTH_HDR_RE.search(t))
+    )
+    if has_rubric_header:
+        issues.append("cot:rubric_header")
+
+    # 2. Spoiler-first rationalization in the opening 60 chars of `<think>`
+    m_spoiler = _SPOILER_FIRST_RE.search(t[:90])
+    if m_spoiler is not None and m_spoiler.start() < 60:
+        issues.append("cot:spoiler_first")
+
+    # 3. Rubber-stamp meta-summary stubs instead of concrete step-by-step computation
+    has_meta_stub = any(pat.search(t) for pat in _META_STUB_PHRASES)
+    if not has_meta_stub and any(pat.search(t) for pat in _META_STUB_SHORT_PHRASES):
+        word_count = len(normalize_words(t))
+        stripped_ord = _ORDINAL_LABEL_RE.sub("", t)
+        compute_tokens = len(_CONCRETE_COMPUTE_TOKEN_RE.findall(stripped_ord))
+        if word_count < 140 and compute_tokens <= 2:
+            has_meta_stub = True
+    if has_meta_stub:
+        issues.append("cot:meta_summary_stub")
+
+    return issues
+
+
+def strip_rubric_headers(thinking: str) -> str:
+    """Remove literal `Beat 1/2/3 (...)` and rubric section labels from `thinking` without corrupting prose."""
+    if not thinking or not thinking.strip():
+        return ""
+
+    out = thinking
+    had_rubric_context = bool(
+        _RUBRIC_BEAT_LINE_RE.search(out)
+        or _RUBRIC_BEAT_INLINE_RE.search(out)
+        or _RUBRIC_EXPLICIT_HEADER_RE.search(out)
+        or (_RUBRIC_FRAMING_HDR_RE.search(out) and _RUBRIC_AUDIT_OR_SYNTH_HDR_RE.search(out))
+    )
+
+    out = _STRIP_BEAT_STANDALONE_RE.sub("", out)
+    out = _STRIP_BEAT_LINE_PREFIX_RE.sub("", out)
+    out = _STRIP_BEAT_MD_PREFIX_RE.sub("", out)
+    out = _STRIP_BEAT_INLINE_PREFIX_RE.sub("", out)
+    out = _STRIP_EXPLICIT_STANDALONE_RE.sub("", out)
+    out = _STRIP_EXPLICIT_PREFIX_RE.sub("", out)
+
+    if had_rubric_context:
+        out = _STRIP_PAIRED_HDR_STANDALONE_RE.sub("", out)
+        out = _STRIP_PAIRED_HDR_PREFIX_RE.sub("", out)
+
+    if out == thinking:
+        return thinking
+
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
 def _infer_sub_domain(base_domain: str, prompt: str, response: str, raw_meta: dict[str, Any] | None = None) -> str:
     meta = raw_meta or {}
     cat = str(meta.get("category") or meta.get("domain") or meta.get("split") or "").lower()
@@ -1880,8 +2071,11 @@ def load_golden_seeds(
 
         hard = detect_pathology(prompt, reasoning, response, messages=msgs)
         dom_hard, _, extracted_ans = check_domain_sanity(domain, prompt, reasoning, response, messages=msgs)
-        if hard or dom_hard:
-            raise ValueError(f"Golden seed #{idx} ({item.get('id')}) failed quality gate: {hard + dom_hard}")
+        cot_artifacts = detect_synthetic_cot_artifacts(reasoning, response, domain)
+        if hard or dom_hard or cot_artifacts:
+            raise ValueError(
+                f"Golden seed #{idx} ({item.get('id')}) failed quality gate: {hard + dom_hard + cot_artifacts}"
+            )
 
         slop = score_anti_slop(response, reasoning)
         beats = score_three_beat_cot(reasoning, response, prompt)
@@ -2097,10 +2291,18 @@ class AsyncTeacherClient:
 _SALVAGE_REWRITE_SYS = (
     "You are an expert reasoning editor for a frontier 3-pass looped reasoning model.\n"
     "Rewrite the reasoning trace and final answer into:\n"
-    "1. `<think>...</think>` structured in three explicit beats:\n"
-    "   - Beat 1 (Framing): identify constraints, invariants, and exact goal.\n"
-    "   - Beat 2 (Adversarial Self-Audit): actively test an edge case, substitute back, or check a subtle pitfall.\n"
-    "   - Beat 3 (Synthesis Plan): decide the tightest presentation.\n"
+    "1. `<think>...</think>` written in authentic Fable-5.1-style organic, kinetic, first-person "
+    "engineering/scientific reasoning:\n"
+    "   - Reason forward from the problem's constraints, invariants, and concrete symbols, numbers, or code inline.\n"
+    "   - Carry out every derivation step explicitly, then mid-stream perform a concrete adversarial self-check "
+    "(substitute values back in, test a small/boundary edge case, or check a subtle pitfall with explicit "
+    "arithmetic or code).\n"
+    "   - HARD PROHIBITIONS inside `<think>`: ZERO literal `Beat 1` / `Beat 2` / `Beat 3`, `Framing:`, "
+    "`Adversarial Self-Audit:`, or `Synthesis Plan:` section headers; ZERO spoiler-first openings "
+    "(`Final answer:`, `Answer:`, `The final answer is`, or `Target answer:` at the top of `<think>`); "
+    "ZERO rubber-stamp meta-summary hand-waving (never write 'Standard processing applied', "
+    "'Initial parameters are validated', 'confirms there are no hidden fees/traps', or 'all constraints "
+    "and invariants are satisfied' in place of real step-by-step computation).\n"
     "2. Final answer after `</think>`: crisp, opinionated, zero AI-slop (NO 'Certainly!', 'delve', 'tapestry', "
     "'in conclusion', 'it is important to note', or bold-bullet walls).\n"
     "CRITICAL: Preserve the exact verified final mathematical value, ARC grid, or code semantics."
@@ -2110,7 +2312,11 @@ _AESTHETIC_CRAFT_SYS = (
     "You generate high-craft aesthetic critique-and-refactor training pairs (UI/Visual, Technical Writing, or "
     "Software Architecture). Output strict JSON with keys: "
     "`prompt`, `chosen_thinking`, `chosen_response`, `rejected_thinking`, `rejected_response`, `critique`.\n"
-    "`chosen_thinking` must follow 3-beat Looped-CoT with an explicit Beat-2 self-audit. "
+    "`chosen_thinking` must read as authentic Fable-5.1-style organic, kinetic, first-person engineering/design "
+    "reasoning: diagnose concrete defects inline (exact hex colors, pixel metrics, word counts, types, failure "
+    "modes) and actively self-audit edge cases (WCAG contrast, keyboard focus, API ergonomics, budget limits). "
+    "NEVER emit literal `Beat 1`/`Beat 2`/`Beat 3`, `Framing:`, or `Adversarial Self-Audit:` headers, NEVER open "
+    "with `Final answer:`/`Answer:`, and NEVER use rubber-stamp meta-summary hand-waving.\n"
     "`chosen_response` must have zero AI-slop. `rejected_response` should exhibit realistic generic AI slop."
 )
 
@@ -2118,6 +2324,10 @@ _SIRSI_RECOVERY_SYS = (
     "You generate SI-RSI 'teacher-slap' self-recovery trajectories where a model begins a realistic failure "
     "(sign error, loop onset, API hallucination, or spec assumption), catches itself mid-thought with a crisp "
     "`[Audit — stop: ...]` diagnostic interruption, and recovers cleanly to a verified solution.\n"
+    "Write `chosen_thinking` in authentic Fable-5.1-style organic, kinetic, first-person engineering/scientific "
+    "reasoning with concrete symbols, numbers, and explicit small/boundary-case verification inline — "
+    "ZERO literal `Beat 1`/`Beat 2`/`Beat 3` or `Framing:`/`Adversarial Self-Audit:` labels, ZERO spoiler-first "
+    "openings (`Final answer:`/`Answer:`/`Target answer:`), and ZERO rubber-stamp meta-summary hand-waving.\n"
     "Output strict JSON with keys: "
     "`prompt`, `chosen_thinking`, `chosen_response`, `rejected_thinking`, `rejected_response`, `critique`."
 )
@@ -2169,13 +2379,18 @@ def verify_synthesized_row(
     orig_response: str = "",
     decontaminator: Decontaminator | None = None,
 ) -> tuple[bool, list[str], dict[str, float]]:
-    """Strict post-synthesis verification gate: answer invariance + anti-slop + pathology + 3-beat + decontam."""
+    """Strict post-synthesis gate: answer invariance, anti-slop, pathology, CoT artifacts, 3-beat, decontam."""
     reasons: list[str] = []
 
     # 1. Pathology gate
     hard = detect_pathology(prompt, thinking, response)
     if hard:
         reasons.extend(hard)
+
+    # 1b. Synthetic CoT artifact gate (anti-rubric-header, anti-spoiler-first, anti-meta-summary-stub)
+    cot_artifacts = detect_synthetic_cot_artifacts(thinking, response, domain)
+    if cot_artifacts:
+        reasons.extend(cot_artifacts)
 
     # 2. Domain sanity gate (AST for Python, grid for ARC, etc.)
     dom_hard, _, new_extracted = check_domain_sanity(domain, prompt, thinking, response)
@@ -2296,7 +2511,9 @@ class TrackBSynthesizer:
                 f"Problem:\n{row['prompt'][:4000]}\n\n"
                 f"Original Draft Thinking:\n{row.get('thinking', '')[:3000]}\n\n"
                 f"Original Draft Answer:\n{row.get('response', '')[:3000]}\n\n"
-                "Rewrite into <think>...</think> (3-beat Looped-CoT with explicit Beat-2 self-audit) "
+                "Rewrite into <think>...</think> using authentic Fable-5.1-style organic, kinetic, first-person "
+                "reasoning (forward step-by-step computation with concrete numbers/symbols and an inline self-check — "
+                "NO `Beat 1/2/3` headers, NO `Final answer:` at top of `<think>`, NO meta-summary stubs) "
                 "followed by a crisp, anti-slop final answer preserving the verified answer."
             )
             res = await self.client.chat_completion([
@@ -3244,6 +3461,7 @@ __all__ = [
     "check_domain_sanity",
     "compute_distinct_n",
     "detect_pathology",
+    "detect_synthetic_cot_artifacts",
     "deterministic_salvage",
     "load_golden_seeds",
     "publish_to_hub",
@@ -3253,6 +3471,7 @@ __all__ = [
     "score_three_beat_cot",
     "stream_source_rows",
     "strip_eval_boilerplate",
+    "strip_rubric_headers",
     "triage_example",
     "verify_synthesized_row",
     "verify_upstream_licenses",

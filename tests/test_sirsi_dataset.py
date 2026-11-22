@@ -12,6 +12,9 @@ import yaml
 
 from qloop.data.formats import Example
 from qloop.data.sirsi_dataset import (
+    _AESTHETIC_CRAFT_SYS,
+    _SALVAGE_REWRITE_SYS,
+    _SIRSI_RECOVERY_SYS,
     ALL_AUDITED_SOURCES,
     ALLOWED_LICENSES,
     EXCLUDED_SOURCES,
@@ -24,6 +27,7 @@ from qloop.data.sirsi_dataset import (
     build_or_load_decontaminator,
     check_domain_sanity,
     detect_pathology,
+    detect_synthetic_cot_artifacts,
     deterministic_salvage,
     load_golden_seeds,
     publish_to_hub,
@@ -33,6 +37,7 @@ from qloop.data.sirsi_dataset import (
     score_three_beat_cot,
     stream_source_rows,
     strip_eval_boilerplate,
+    strip_rubric_headers,
     triage_example,
     verify_synthesized_row,
     verify_upstream_licenses,
@@ -500,6 +505,7 @@ def test_golden_seeds_all_18_pass_strict_gates():
         assert row["provenance"]["source_license"] == "apache-2.0"
         assert row["quality_scores"]["slop_score"] < 0.15
         assert row["quality_scores"]["three_beat_score"] >= 0.65
+        assert detect_synthetic_cot_artifacts(row["thinking"], row["response"], row["domain"]) == []
     for p in pref:
         assert p["chosen_response"] != p["rejected_response"]
         assert p["critique"].strip()
@@ -546,8 +552,9 @@ def test_track_b_synthesis_accept_reject_and_resume(tmp_path: Path):
             "status_code": 200,
             "error": "",
             "content": (
-                "<think>\nBeat 1 (Framing): Given 6 and 7, compute the product 6 * 7 = 42. "
-                "Beat 2 (Self-Audit): Verify by splitting 6 * (5 + 2) = 30 + 12 = 42; check boundary 6 * 1 = 6.\n"
+                "<think>\nGiven 6 and 7, compute the product directly: 6 * 7 = 42. "
+                "Wait — verify by splitting 7 = 5 + 2: 6 * 5 + 6 * 2 = 30 + 12 = 42, "
+                "and check boundary 6 * 1 = 6. Matches cleanly.\n"
                 "</think>\n\nMultiply $6 \\times 7 = \\boxed{42}$."
             ),
         },
@@ -556,7 +563,8 @@ def test_track_b_synthesis_accept_reject_and_resume(tmp_path: Path):
             "status_code": 200,
             "error": "",
             "content": (
-                "<think>\nBeat 1: Given 9 and 9, compute 9*9. Beat 2: Verify edge case carefully -> 99.\n</think>\n\n"
+                "<think>\nGiven 9 and 9, compute 9 * 9 = 99. Wait — double-check boundary 9 * 10 = 90; "
+                "testing 9 * 9 -> 99.\n</think>\n\n"
                 "The product is \\boxed{99}."
             ),
         },
@@ -565,7 +573,8 @@ def test_track_b_synthesis_accept_reject_and_resume(tmp_path: Path):
             "status_code": 200,
             "error": "",
             "content": (
-                "<think>\nBeat 1: Given 5 and 5. Beat 2: Verify 5*5 = 25.\n</think>\n\n"
+                "<think>\nGiven 5 and 5, compute 5 * 5 = 25. Double-check by repeated addition: "
+                "5 + 5 + 5 + 5 + 5 = 25.\n</think>\n\n"
                 "Certainly! Great question! Let's delve into the tapestry of 5 * 5. "
                 "It is important to note this game-changer gives \\boxed{25}. In conclusion, hope this helps!"
             ),
@@ -588,7 +597,10 @@ def test_track_b_synthesis_accept_reject_and_resume(tmp_path: Path):
     ok_d, reasons_d, _ = verify_synthesized_row(
         domain="math",
         prompt=eval_leak,
-        thinking="Beat 1: Given prime pair. Beat 2: Check edge cases and verify solution carefully.",
+        thinking=(
+            "Given twin primes p and q = p + 2, check small cases p = 3, q = 5: 9 + 125 = 134, not a fifth power. "
+            "Verify mod 3 and boundary cases carefully."
+        ),
         response="Answer: \\boxed{0}.",
         decontaminator=decontam,
     )
@@ -598,8 +610,9 @@ def test_track_b_synthesis_accept_reject_and_resume(tmp_path: Path):
     struct_payload = json.dumps({
         "prompt": "Design a clean status badge in CSS.",
         "chosen_thinking": (
-            "Beat 1 (Framing): Given a telemetry badge, define clear contrast and tabular numerals. "
-            "Beat 2 (Self-Audit): Check WCAG AA contrast and verify no neon glow competes with alerts."
+            "Given a telemetry status badge, define high-contrast semantic colors (`#166534` on `#dcfce7`) "
+            "with 11px uppercase 600-weight `tabular-nums`. Wait — check WCAG AA contrast (> 4.5:1) and "
+            "verify no neon glow or pulsing animation competes with real alerts."
         ),
         "chosen_response": "Use `#166534` text on `#dcfce7` surface with 11px uppercase 600-weight type.",
         "rejected_thinking": "Add glowing purple gradients.",
@@ -653,9 +666,9 @@ def test_track_b_transient_retry_corrupt_ckpt_and_structured_guards(tmp_path: Pa
         "status_code": 200,
         "error": "",
         "content": (
-            "<think>\nBeat 1 (Framing): Given the input-output pairs, the invariant maps every single-cell "
-            "grid to its complement color 7. Beat 2 (Self-Audit): Double-check the boundary condition across "
-            "both training pairs and verify there is no off-by-one color shift -> [[7]].\n</think>\n\n7"
+            "<think>\nGiven the input-output pairs, the invariant maps every single-cell grid to its "
+            "complement color 7. Double-check the boundary condition across both training pairs and "
+            "verify there is no off-by-one color shift -> [[7]].\n</think>\n\n7"
         ),
     }])
     synth2 = TrackBSynthesizer(mock_ok, out_dir=tmp_path, decontaminator=decontam)
@@ -666,8 +679,8 @@ def test_track_b_transient_retry_corrupt_ckpt_and_structured_guards(tmp_path: Pa
 
     # 2. ARC 1x1 invariance check inside verify_synthesized_row
     arc_think = (
-        "Beat 1 (Framing): Given the training examples, notice the rule maps the input cell to color 7. "
-        "Beat 2 (Self-Audit): Verify boundary case and check every example to confirm zero contradiction."
+        "Given the training examples, notice the invariant rule maps the single input cell to color 7. "
+        "Wait — verify the boundary case across every training pair to confirm zero contradiction with [[7]]."
     )
     ok_1x1, _, _ = verify_synthesized_row(
         domain="arc",
@@ -688,8 +701,8 @@ def test_track_b_transient_retry_corrupt_ckpt_and_structured_guards(tmp_path: Pa
 
     # 3. Structured mode guards: non-dict JSON, empty rejected_response, and contaminated rejected_response
     good_c_think = (
-        "Beat 1 (Framing): Given a telemetry badge, define clear contrast and tabular numerals. "
-        "Beat 2 (Self-Audit): Check WCAG AA contrast and verify no neon glow competes with alerts."
+        "Given a telemetry badge, define clear contrast (`#166534` on `#dcfce7`) and tabular numerals. "
+        "Double-check WCAG AA contrast (> 4.5:1) and verify no neon glow competes with alerts."
     )
     good_c_resp = "Use `#166534` text on `#dcfce7` surface with 11px uppercase 600-weight type."
     mock_bad_struct = _MockTeacherClient([
@@ -847,4 +860,286 @@ def test_cli_dry_run_manifest_validation(tmp_path: Path):
         "--out-dir", str(out_dir),
     ])
     assert rc == 0
+
+
+# ============================================================================ 9. v1.1 Anti-Stub / Fable-5.1 CoT Gates
+
+def test_detect_synthetic_cot_artifacts_rubric_headers():
+    assert detect_synthetic_cot_artifacts("") == []
+    assert detect_synthetic_cot_artifacts("   \n\t ") == []
+
+    for bad in (
+        "Beat 1 (Framing): Given n = 10, sum = 55.\nBeat 2 (Adversarial Self-Audit): Check n = 1 -> 1.",
+        "### Beat 1\nFactor x^2 - 1 = (x - 1)(x + 1).\n\n### Beat 2\nCheck x = 1 gives 0.",
+        "**Beat 1 (Framing):** Set up linear system.\n**Beat 3 (Synthesis Plan):** Present cleanly.",
+        "- Beat 2 (Self-Audit): Verify boundary case k = 0.",
+        "First compute 6 * 7 = 42. Beat 2 (Self-Audit): Split 6 * (5 + 2) = 42.",
+        "Framing: Given x > 0, apply AM-GM.\nAdversarial Self-Audit: Test x = 1 -> 2.",
+        "Framing: Compute exact derivative.\nSelf-Audit: Verify at x = 0.",
+        "Check every boundary case carefully.\n### Synthesis Plan\nReturn the boxed integer.",
+        "Compute the sum.\nRestraint & Synthesis: Output 55 directly.",
+    ):
+        assert "cot:rubric_header" in detect_synthetic_cot_artifacts(bad), f"missed rubric header: {bad!r}"
+
+    # Must NOT false-positive on SI-RSI recovery markers or organic prose
+    for clean in (
+        (
+            "Let S = (1/2) * sum_{k=1}^{20} (1/k - 1/(k+2)). Naive telescoping gives (1/2)*(1 - 1/22).\n\n"
+            "[Audit — stop: telescoping step error! Shift is distance 2, so two head and two tail terms survive.]\n\n"
+            "Verify n = 2: 1/3 + 1/8 = 11/24 = (1/2)*(1 + 1/2 - 1/3 - 1/4)."
+        ),
+        "In 4/4 time, on beat 1 of measure 4 the snare hits, and on beat 2 the hi-hat closes.",
+        "We want to beat 2 baseline systems by at least 5% latency on 128-token prompts.",
+        "Wait — let's do an adversarial self-audit of x = 0: substituting gives 0^2 + 1 = 1 != 0.",
+        "Framing the camera at 35mm avoids barrel distortion near the edges.",
+    ):
+        assert "cot:rubric_header" not in detect_synthetic_cot_artifacts(clean), f"false positive: {clean!r}"
+
+
+def test_detect_synthetic_cot_artifacts_spoiler_first():
+    for bad in (
+        "Final answer: 42. Now let's check why 6 * 7 equals 42.",
+        "**Final Answer:** \\boxed{55}\nLet S = 1 + 2 + ... + 10.",
+        "Answer: 1012. Factor n^3 + 2n^2 + n = n(n + 1)^2.",
+        "### Answer: 7\nSet up the Markov chain transition equations.",
+        "The final answer is 325/462. First decompose 1/(k(k+2)).",
+        "Target answer: [[1, 0], [0, 1]]. Looking at the grid flip...",
+        "Okay, final answer: 42. Let's verify 6 * 7 = 42.",
+        "So the final answer is 42. Let's verify 6 * 7 = 42.",
+        "Quick note — the final answer is 55; verify pairwise sum.",
+    ):
+        assert "cot:spoiler_first" in detect_synthetic_cot_artifacts(bad), f"missed spoiler-first: {bad!r}"
+
+    # Conditional/forward mentions and late conclusions (> 60 chars in) must NOT trigger
+    for clean in (
+        "Check if the final answer is positive before boxing: x^2 + 1 >= 1 > 0 for all real x.",
+        "Verify whether the final answer is an integer by checking divisibility by 12.",
+        (
+            "Given n = 10, compute S = n(n+1)/2 = 10 * 11 / 2 = 55. Double-check pairwise: "
+            "(1+10) + (2+9) + (3+8) + (4+7) + (5+6) = 55. Final answer: 55."
+        ),
+    ):
+        assert "cot:spoiler_first" not in detect_synthetic_cot_artifacts(clean), f"false positive: {clean!r}"
+
+
+def test_detect_synthetic_cot_artifacts_meta_summary_stubs():
+    for bad in (
+        "Standard processing applied to the starting balance yields the net figure cleanly.",
+        "Initial arithmetic parameters and interest constraints are validated before computing.",
+        "Initial arithmetic parameters (rate 0.05) are validated before computing.",
+        "Re-checking the wording confirms there are no hidden fees/traps in this problem.",
+        "A quick pass confirms that there are no hidden edge cases in the specification.",
+        "After reviewing the setup, the arithmetic logic holds cleanly across every step.",
+        "Now verify the result by substituting back and running an edge-case check on the problem wording.",
+        (
+            "Step 1: read the setup carefully. Step 2: apply the expected rule. "
+            "Step 3: double-check the output; all constraints and invariants are satisfied."
+        ),
+        "Given 2 variables and 1 objective, all constraints and invariants are satisfied.",
+    ):
+        assert "cot:meta_summary_stub" in detect_synthetic_cot_artifacts(bad), f"missed meta stub: {bad!r}"
+
+    # Real concrete computation OR long conceptual reasoning ending with "all constraints and invariants are satisfied"
+    with_compute = (
+        "Let x = 5 and y = 12, so x^2 + y^2 = 25 + 144 = 169 = 13^2. "
+        "Verify boundary x = 3, y = 4 -> 9 + 16 = 25 = 5^2. "
+        "All constraints and invariants are satisfied."
+    )
+    assert "cot:meta_summary_stub" not in detect_synthetic_cot_artifacts(with_compute)
+
+    long_conceptual = (
+        "Consider a distributed consensus protocol operating under partial synchrony where network partitions "
+        "delay messages arbitrarily before global stabilization time. Safety requires that no two honest nodes "
+        "commit conflicting blocks at the same height, which follows from quorum intersection because any two "
+        "quorums share at least one honest validator who refuses to equivocate across views. Liveness requires "
+        "view changes with exponentially increasing timeouts so a correct leader eventually receives votes from "
+        "a supermajority within the synchrony bound. Auditing leader rotation under message loss shows that "
+        "locking on the highest prepared certificate prevents a new leader from overwriting a potentially "
+        "committed branch while still allowing recovery once honest replicas synchronize on the highest lock. "
+        "Furthermore, pacemaker synchronization guarantees honest replicas eventually overlap in the same view "
+        "long enough to complete prepare, pre-commit, and commit phases without splitting votes across timers. "
+        "Checking crash faults, Byzantine equivocation, and delayed view-change messages confirms every safety "
+        "and liveness property holds, so all constraints and invariants are satisfied."
+    )
+    assert len(long_conceptual.split()) >= 140
+    assert "cot:meta_summary_stub" not in detect_synthetic_cot_artifacts(long_conceptual)
+
+    # Combined trace catches all 3 defects at once
+    triple_bad = (
+        "Beat 1 (Framing): Final answer: 42. Initial arithmetic parameters are validated.\n"
+        "Beat 2 (Adversarial Self-Audit): Standard processing applied; confirms there are no hidden traps."
+    )
+    assert set(detect_synthetic_cot_artifacts(triple_bad)) == {
+        "cot:rubric_header",
+        "cot:spoiler_first",
+        "cot:meta_summary_stub",
+    }
+
+
+def test_strip_rubric_headers_salvage_and_prose_preservation():
+    # 1. Realistic terminal_agentic trace wrapped in Beat 1/2/3 labels
+    agentic_trace = (
+        "### Beat 1 (Framing)\n"
+        "The failing CI job reports `sqlite3.OperationalError: database is locked` under parallel pytest workers. "
+        "First inspect `src/db.py` with `rg -n \"sqlite3.connect\" src/` to see timeout and WAL settings.\n\n"
+        "**Beat 2 (Adversarial Self-Audit):** Wait — setting `timeout=30.0` alone still serializes readers "
+        "under rollback journal mode. Check `PRAGMA journal_mode=WAL` and `PRAGMA busy_timeout=5000`, and "
+        "verify in-memory `:memory:` test DBs ignore WAL harmlessly without failing.\n\n"
+        "Beat 3 (Synthesis Plan): Patch `src/db.py`, run `pytest -n 4 tests/test_db.py`, and report the diff."
+    )
+    cleaned = strip_rubric_headers(agentic_trace)
+    assert "Beat 1" not in cleaned and "Beat 2" not in cleaned and "Beat 3" not in cleaned
+    assert "Framing" not in cleaned and "Adversarial Self-Audit" not in cleaned and "Synthesis Plan" not in cleaned
+    assert "`sqlite3.OperationalError: database is locked`" in cleaned
+    assert "PRAGMA journal_mode=WAL" in cleaned
+    assert "pytest -n 4 tests/test_db.py" in cleaned
+    assert detect_synthetic_cot_artifacts(cleaned) == []
+    assert strip_rubric_headers(cleaned) == cleaned  # idempotent
+
+    ok, reasons, _ = verify_synthesized_row(
+        domain="agentic",
+        prompt="Fix SQLite lock contention in `src/db.py` under parallel pytest workers.",
+        thinking=cleaned,
+        response="Enabled `PRAGMA journal_mode=WAL` and `PRAGMA busy_timeout=5000` in `src/db.py`.",
+    )
+    assert ok, f"salvaged organic trace should pass verify_synthesized_row, got: {reasons}"
+
+    # 2. Inline Beat 2, bold prose preservation, and non-Beat paired rubric headers
+    inline = "Beat 1 (Framing): Given 6 and 7, compute 6 * 7 = 42. Beat 2 (Self-Audit): Check 6*(5+2)=42."
+    assert strip_rubric_headers(inline) == "Given 6 and 7, compute 6 * 7 = 42. Check 6*(5+2)=42."
+
+    bold_prose = "**Beat 1 (Framing)**: **Important**: check `n = 0` boundary."
+    assert strip_rubric_headers(bold_prose) == "**Important**: check `n = 0` boundary."
+
+    paired_non_beat = (
+        "Framing: Given x > 0, let f(x) = x + 1/x.\n\n"
+        "Adversarial Self-Audit: Test x = 1 -> 2 and x = 0.5 -> 2.5.\n\n"
+        "Synthesis Plan: Return \\boxed{2}."
+    )
+    cleaned_paired = strip_rubric_headers(paired_non_beat)
+    assert detect_synthetic_cot_artifacts(cleaned_paired) == []
+    assert "Given x > 0, let f(x) = x + 1/x." in cleaned_paired
+    assert "Test x = 1 -> 2 and x = 0.5 -> 2.5." in cleaned_paired
+
+    # 3. Clean prose and SI-RSI markers must remain untouched verbatim
+    for untouched in (
+        "On beat 1 of measure 4, hit the kick drum.\nThen beat 2 rests.",
+        "Start derivation.\n\n[Audit — stop: sign error on term k = 2!]\n\nRecompute cleanly.",
+        "Framing: crop the viewport to 16:9 before rendering.",
+    ):
+        assert strip_rubric_headers(untouched) == untouched
+
+
+def test_verify_synthesized_row_blocks_cot_artifacts_and_prompts_enforce_fable51(tmp_path: Path):
+    prompt = "Compute the sum of the first 10 positive integers. Put your final answer in \\boxed{}."
+    resp = "Using $n(n+1)/2$ for $n = 10$ gives $\\frac{10 \\cdot 11}{2} = \\boxed{55}$."
+
+    # 1. Genuine organic Fable-5.1 trace passes cleanly
+    organic = (
+        "Given n = 10, the goal is S = 1 + 2 + ... + 10. Using the Gauss invariant n(n + 1)/2 gives "
+        "10 * 11 / 2 = 55. Wait — double-check by pairing ends: (1 + 10) + (2 + 9) + (3 + 8) + (4 + 7) + "
+        "(5 + 6) = 5 * 11 = 55, and verify the boundary n = 1 -> 1 * 2 / 2 = 1. No off-by-one slip."
+    )
+    ok_org, reasons_org, _ = verify_synthesized_row(
+        domain="math", prompt=prompt, thinking=organic, response=resp, orig_extracted_answer="55"
+    )
+    assert ok_org and not reasons_org
+
+    # 2. SI-RSI recovery trace with `[Audit — stop: ...]` passes cleanly
+    recovery = (
+        "Given S = 1 + 2 + ... + 10, try 10 * 10 / 2 = 50...\n\n"
+        "[Audit — stop: missing +1 in Gauss formula! For n = 2, 1 + 2 = 3, whereas 2 * 2 / 2 = 2 != 3.]\n\n"
+        "Use n(n + 1)/2 instead: for n = 2 -> 2 * 3 / 2 = 3; for n = 10 -> 10 * 11 / 2 = 55. "
+        "Double-check direct sum: 1+2+3+4+5+6+7+8+9+10 = 55."
+    )
+    ok_rec, reasons_rec, _ = verify_synthesized_row(
+        domain="recovery", prompt=prompt, thinking=recovery, response=resp
+    )
+    assert ok_rec and not reasons_rec
+
+    # 3. Rubric-header trace MUST be rejected even with exact math answer and high 3-beat score
+    rubric_think = (
+        "Beat 1 (Framing): Given n = 10, use n(n + 1)/2 = 10 * 11 / 2 = 55.\n"
+        "Beat 2 (Adversarial Self-Audit): Double-check pairwise sum 5 * 11 = 55 and boundary n = 1 -> 1.\n"
+        "Beat 3 (Synthesis Plan): Present the boxed integer 55."
+    )
+    ok_rub, reasons_rub, _ = verify_synthesized_row(
+        domain="math", prompt=prompt, thinking=rubric_think, response=resp, orig_extracted_answer="55"
+    )
+    assert not ok_rub and "cot:rubric_header" in reasons_rub
+
+    # 4. Spoiler-first trace MUST be rejected even with exact math answer and real audit afterwards
+    spoiler_think = (
+        "Final answer: 55. Given n = 10, n(n + 1)/2 = 10 * 11 / 2 = 55. "
+        "Wait — double-check pairwise (1+10)*5 = 55 and boundary n = 1 -> 1."
+    )
+    ok_sp, reasons_sp, _ = verify_synthesized_row(
+        domain="math", prompt=prompt, thinking=spoiler_think, response=resp, orig_extracted_answer="55"
+    )
+    assert not ok_sp and "cot:spoiler_first" in reasons_sp
+
+    # 5. Meta-summary stub trace MUST be rejected even with exact math answer and beat-2 keywords
+    stub_think = (
+        "Given the problem setup, initial arithmetic parameters are validated and standard processing applied. "
+        "Double-check confirms there are no hidden fees/traps and the arithmetic logic holds cleanly; "
+        "verify the result by substituting back and running an edge-case check on the problem wording."
+    )
+    ok_st, reasons_st, _ = verify_synthesized_row(
+        domain="math", prompt=prompt, thinking=stub_think, response=resp, orig_extracted_answer="55"
+    )
+    assert not ok_st and "cot:meta_summary_stub" in reasons_st
+
+    # 6. TrackBSynthesizer end-to-end rejects all 3 artifact classes and tracks per-artifact stats
+    def _mk_row(sid: str, p: str) -> dict[str, Any]:
+        return {
+            "id": sid,
+            "domain": "math",
+            "prompt": p,
+            "thinking": "Draft.",
+            "response": "55",
+            "extracted_answer": "55",
+            "triage_reasons": ["salvage:missing_beat2_audit"],
+            "provenance": {
+                "source_dataset": "open-thoughts/OpenThoughts3-1.2M",
+                "source_name": "openthoughts3",
+                "source_config": "default",
+                "source_split": "train",
+                "source_license": "apache-2.0",
+                "source_row_index": 0,
+                "citation_key": "guha2025openthoughts",
+                "transform_stage": "queued_for_track_b",
+                "salvage_actions": [],
+            },
+        }
+
+    batch = [
+        _mk_row("r_rubric", "CASE_RUBRIC: sum 1..10"),
+        _mk_row("r_spoiler", "CASE_SPOILER: sum 1..10"),
+        _mk_row("r_stub", "CASE_STUB: sum 1..10"),
+        _mk_row("r_organic", "CASE_ORGANIC: sum 1..10"),
+    ]
+    def _mk_reply(think: str) -> dict[str, Any]:
+        return {"ok": True, "status_code": 200, "error": "", "content": f"<think>\n{think}\n</think>\n\n{resp}"}
+
+    client = _MockTeacherClient({
+        "CASE_RUBRIC": _mk_reply(rubric_think),
+        "CASE_SPOILER": _mk_reply(spoiler_think),
+        "CASE_STUB": _mk_reply(stub_think),
+        "CASE_ORGANIC": _mk_reply(organic),
+    })
+    synth = TrackBSynthesizer(client, out_dir=tmp_path)
+    sft, pref = asyncio.run(synth.run_salvage_rewrite(batch, max_items=4))
+    assert [r["id"] for r in sft] == ["r_organic_rw"]
+    assert len(pref) == 1
+    assert synth.stats["salvage_rewrite:cot:rubric_header"] == 1
+    assert synth.stats["salvage_rewrite:cot:spoiler_first"] == 1
+    assert synth.stats["salvage_rewrite:cot:meta_summary_stub"] == 1
+
+    # 7. All 3 synthesis prompts enforce Fable-5.1 organic reasoning & ban rubric/spoiler/stub defects
+    for sys_prompt in (_SALVAGE_REWRITE_SYS, _AESTHETIC_CRAFT_SYS, _SIRSI_RECOVERY_SYS):
+        assert "Fable-5.1" in sys_prompt
+        assert "Beat 1" in sys_prompt and ("ZERO" in sys_prompt or "NEVER" in sys_prompt)
+        assert "Final answer:" in sys_prompt
+        assert "meta-summary" in sys_prompt.lower()
+
 

@@ -29,11 +29,79 @@ On November 20, 2026, Thinking Machines Lab released **Inkling 2 Mini** (alongsi
 
 ---
 
-## 2. Phase A — Baseline Depth-Sweep Audit (`d = 1, 2, 3`)
+## 2. Stage 4 SI-RSI Protocol — 3-Tier Escalation, Surgical Slap Routing & Vibrant Anti-Slop Voice Shaping
+
+Before Phase A–C scale-out, **`s4_rl`** (`configs/stages/s4_rl.yaml`, `src/qloop/train/sirsi.py`, `src/qloop/train/rl.py`) runs **Supervised Instructed Recursive Self-Improvement (SI-RSI)** directly inside `GRPOTrainer`. Standard on-policy GRPO wastes steps on `groups/all_fail` prompts, allows degenerate repetition loops or unclosed `<think>` blocks to linger when groups have zero variance, and gives zero pressure against mechanical AI-slop boilerplate when multiple samples are equally correct. SI-RSI resolves all three through a **3-tier escalation loop** that works out of the box **with zero `TEACHER_API_KEY` required** and seamlessly escalates whenever an OpenAI-compatible frontier Supervisor (`rl.teacher.base_url`) is attached.
+
+```mermaid
+flowchart LR
+    R["On-Policy GRPO Rollout (R in 1..3)"] --> V["Verifiable Oracle + detect_pathologies()"]
+    V --> T1["Tier 1 (Local): Anti-Slop Tie-Breaker + Surgical Slap Unlikelihood + sirsi_failures.jsonl"]
+    V -- "groups/all_fail + Supervisor" --> T2["Tier 2 (Guided Hint): 1-Sentence Nudge -> On-Policy Retry -> Un-Hinted Recovery NLL"]
+    T2 -- "Retry Failed" --> T3["Tier 3 (Supervisor Escalation): Verified Gold NLL + 13-Gram Decontaminated Sculpted Tasks"]
+    T1 --> U["GRPOTrainer.update(): pg + teacher + surgical slap_neg (skipped_params == 0)"]
+    T2 -- "Retry Verified" --> U
+    T3 --> U
+```
+
+### 2.1 The 3-Tier SI-RSI Escalation Loop
+
+1. **Tier 1 — Local Pathology Tagger, Bounded Span Unlikelihood ("Slap") & Failure Ledger (Always-On, Zero API Cost):**
+   - Every rollout completion passes through pure-Python deterministic `detect_pathologies(text, *, reward, cfg)` in `src/qloop/train/sirsi.py`, emitting structured tags:
+     - `LOOP_DEGENERATION`: detects repeating 8-gram / 12-gram cycles (`>= 3×`), high duplicate tail n-gram fraction (`>= 50%`), or unspaced character-run degeneration, and pinpoints the exact `loop_onset_char` offset where degenerate repetition begins (leaving valid prefix reasoning untouched).
+     - `UNCLOSED_THINK`: `<think>` opened without a matching `</think>`.
+     - `PREMATURE_EXIT`: empty or `< min_answer_chars` final answer (after `</think>`) when `reward <= 0`.
+     - `AI_SLOP`: robotic boilerplate / throat-clearing clichés detected **strictly on final-answer prose after `</think>`** (never inside `<think>`).
+   - **Exact Bounded Span Unlikelihood (`unlikelihood_span_loss`):** On `LOOP_DEGENERATION` and `UNCLOSED_THINK` failures (`r <= 0`, capped at `slap_max_seqs_per_step: 4`), `map_char_span_to_token_mask` aligns `loop_onset_char` (or tail fallback, leaving trailing EOS unpenalized) to a boolean completion mask `span_mask` and applies bounded token-level unlikelihood strictly on the degenerate span in fp32:
+     $$p_t = \min\!\Big(1 - \varepsilon,\; \exp\!\big(\min(\log \pi_\theta(y_t \mid y_{<t}), -\varepsilon)\big)\Big), \qquad \mathcal{L}_{\text{slap}} = \frac{1}{|M|}\sum_{t \in M} -\log(1 - p_t), \quad \varepsilon = 10^{-4}$$
+     which stays strictly finite even at $\log \pi_\theta = 0.0$, emits exact zero gradient outside `span_mask`, and drains `stack.aux_losses()` cleanly so `optim/skipped_params == 0`.
+   - **Structured Failure Ledger (`sirsi_failures.jsonl`):** `FailureLedger` appends every pathology-tagged rollout and `all_fail` task (`step`, `task_id`, `tags`, `reward`, `loop_onset_char`, `prompt`, `bad_completion`) inside `run_dir/sirsi_failures.jsonl` for offline auditing and Tier-3 curriculum sculpting.
+2. **Tier 2 — Guided On-Policy Recovery via 1-Sentence Supervisor Hints (Auto-Enabled with `rl.teacher.base_url`):**
+   - On `groups/all_fail` when `rl.teacher.base_url` is set and `rl.sirsi.guided_hint_enabled: true` (`max_hints_per_step: 2`), `TeacherClient.hint()` (`build_hint_messages`) requests **exactly one sentence** naming the divergence point without revealing the answer.
+   - The student retries on-policy with the hint appended and is verified by the **same deterministic oracle** `verify(t, ro.text)`. On recovery (`r_retry > 0`), the trainer appends a `"teacher"` NLL sequence pairing the **original un-hinted prompt `p_ids`** with the student's **own verified recovery tokens** (context distillation: internalizes recovery without requiring hints at test time!) and skips Tier-3 full solution synthesis.
+3. **Tier 3 — Verified Supervisor Gold Fallback & Decontaminated Curriculum Sculpting:**
+   - If Tier-2 guided retry still fails (or hints are disabled), `GRPOTrainer` falls back to `TeacherClient.solve()` verified by `verify(t, text) > 0` (`loss/teacher_nll`, weight `sft_weight: 0.1`).
+   - Between rounds, `TeacherClient.sculpt_curriculum(ledger.read_recent(), n_tasks=4, decontaminator=...)` synthesizes targeted verifiable micro-tasks addressing recurring failure tags from `sirsi_failures.jsonl`, strictly filtered by `parse_and_decontaminate_sculpted_tasks()` against the universal **13-gram `Decontaminator`** (blocking any held-out 2026 eval overlap and disallowing arbitrary `http` verifiers).
+
+### 2.2 Surgical `slap_target_groups` Gradient Routing & Hot-Expert Domain Patching
+
+Applying negative unlikelihood gradients indiscriminately across every trainable tensor can erode general recall or destabilize HSSD linear-memory decay parameters. SI-RSI eliminates collateral damage via **surgical parameter-group routing**:
+
+- Setting `rl.sirsi.slap_target_groups: [loop_adapters, router]` (default in `configs/stages/s4_rl.yaml`) resolves `param_group_of(name)` (`src/qloop/model/experts.py`) and computes `slap_neg` gradients strictly via `torch.autograd.grad(loss, target_params, allow_unused=True)`, accumulating them into `p.grad` before `pg`/`teacher` backward (identical behavior in both `optim.fused: false` and `optim.fused: true`).
+- **Invariant:** Non-targeted trainable groups (`attention`, `hssd_adapters`, `lsa_indexers`, `shared_expert`, `norms`) receive **strictly zero** `slap_neg` gradient, and base `32.212B` NVFP4 experts stay 100% frozen (`sha256_frozen_experts: true`).
+- **Hot-Expert Domain Patching Pairing:** When domain-specific failure modes persist in `sirsi_failures.jsonl` (e.g., Triton kernel syntax loops or Olympiad algebra stalls), enable top-2.5% rank-64 `HotExpertDeltas` (`-s experts.enabled=true`) and expand `slap_target_groups` to `[loop_adapters, router, expert_deltas]` so negative unlikelihood and positive verifiable GRPO jointly patch only the hot domain adapters without touching frozen base weights.
+
+### 2.3 Vibrant Anti-Slop Voice Shaping (Bounded Final-Answer Tie-Breaker)
+
+RL-trained reasoning models frequently drift toward stiff, formulaic assistant clichés (*"Certainly! Let's delve into..."*, *"In today's fast-paced..."*, *"It is important to note that..."*, *"As an AI language model..."*). SI-RSI shapes a **vibrant, natural, direct voice** without ever corrupting reasoning accuracy:
+
+- **Strictly Final-Answer Scope:** `extract_final_answer(text)` strips everything up to the last `</think>` tag before checking `slop_patterns`. Internal `<think>...</think>` scratchpads are never penalized for phrasing, preserving unconstrained exploratory reasoning.
+- **Strict Bounded Tie-Breaker Invariant:** `slop_penalty = min(anti_slop_weight, n_hits * slop_penalty_per_hit)` with `anti_slop_weight: 0.05` (applied only to GRPO advantage shaping `shaped = raw_reward + overlong - slop_penalty`, never altering raw `reward/mean` or `reward/pass_rate`):
+  $$\underbrace{1.00}_{\text{correct + direct}} \;>\; \underbrace{0.95}_{\text{correct + sloppy}} \;\gg\; \underbrace{0.00}_{\text{wrong + direct}} \;>\; \underbrace{-0.05}_{\text{wrong + sloppy}}$$
+  - Inside mixed groups, every verified correct answer stays strongly positive-advantage over every wrong answer (verifiable math/code/kernel correctness is **never** overridden).
+  - Inside `groups/all_pass` groups (which standard GRPO drops due to zero variance), crisp direct responses earn positive advantage over boilerplate-heavy responses, steadily steering the final-answer register toward sharp, vibrant prose.
+
+### 2.4 Operator Quickstart (`configs/stages/s4_rl.yaml`)
+
+```bash
+# 1. Standalone Tier-1 SI-RSI (works out of the box with ZERO TEACHER_API_KEY)
+python -m qloop train -c configs/stages/s4_rl.yaml
+
+# 2. Full 3-Tier SI-RSI with OpenAI-compatible Frontier Supervisor (auto-enables Tier 2 hints + Tier 3 fallback)
+export TEACHER_API_KEY="<your-key>"
+python -m qloop train -c configs/stages/s4_rl.yaml \
+  -s rl.teacher.base_url=https://api.example.com/v1 \
+  -s rl.teacher.model=frontier-supervisor \
+  -s rl.teacher.max_calls_per_step=2
+```
+
+---
+
+## 3. Phase A — Baseline Depth-Sweep Audit (`d = 1, 2, 3`)
 
 Immediately after `s2_joint_bptt` and `s4_rl` finish on Colab G4, run a full diagnostic depth sweep on the upgraded late-2026 suite (`configs/eval/suite.yaml`, `defaults.depths: [1, 2, 3]`) before modifying any architecture weights.
 
-### 2.1 Execution Commands
+### 3.1 Execution Commands
 ```bash
 # 1. Local / in-process depth-sweep across all 12 core 2026 benchmarks (d = 1, 2, 3)
 python -m qloop eval -c configs/eval/suite.yaml --ckpt runs/s4_rl
@@ -46,7 +114,7 @@ python -m qloop external harbor -c configs/eval/suite.yaml   # defaults to termi
 python -m qloop external harbor -c configs/eval/suite.yaml -s eval.external.harbor.dataset=swebenchpro-hard
 ```
 
-### 2.2 Benchmark Matrix & Diagnostic Signals
+### 3.2 Benchmark Matrix & Diagnostic Signals
 
 | Category | Benchmarks (`eval/registry.py`) | Primary Metric | Key Depth-Sweep Diagnostic (`Δ(d=3 − d=1)`) |
 | :--- | :--- | :--- | :--- |
@@ -58,18 +126,18 @@ python -m qloop external harbor -c configs/eval/suite.yaml -s eval.external.harb
 | **Coding & GPU Kernels** | `livecodebench` (`>=2025-02-01`), `kernelbench_l3`, `kernelbench_l4` | `pass@1`, `compiled_rate`, `fast_1`, mean speedup | Verifies code synthesis + Blackwell CUDA/Triton optimization transfer from KB L1–L2 |
 | **Hardened Container Agents** | `terminal_bench_4_1` (`v4.1.0`, `66` RewardKit tasks), `swe_bench_pro` / `swe_bench_pro_hard`, `deep_swe` (v1.1) | Harbor resolved rate | Apples-to-apples comparison against Inkling 2 Mini on anti-reward-hacking container tasks |
 
-### 2.3 Phase A Exit Criteria (Go / Diagnose Gate)
+### 3.3 Phase A Exit Criteria (Go / Diagnose Gate)
 - **Monotonic Depth Gain:** `Δ(d=3 − d=1) > 0` on `aime_2026`, `hmmt_feb_2026`, `arc_agi_2`, and `hle_diamond`, AND `d=3` beats FLOP-matched `d=1` (`2.1×` thinking tokens) on at least 3 of 4 reasoning benchmarks.
 - **No `d=1` Regression:** `d=1` stays within `≤ 1.0 pt` of stock `unsloth/Qwen3.6-35B-A3B-NVFP4` on `gpqa_diamond` and `mmlu_pro` (guaranteeing high self-speculative acceptance rate in Phase B.1!).
 - **1M Recall Profile:** Bucket `mrcr` scores into `[0–128K)`, `[128K–512K)`, `[512K–1M]`. If `[512K–1M]` drops by `> 15%` relative to `[0–128K)`, trigger Phase B.4 (`D-LSA` 1M recall upgrade) before Phase C RSI.
 
 ---
 
-## 3. Phase B — Pass-1 Self-Speculative Drafting & Architectural Refinements (`v3.3`)
+## 4. Phase B — Pass-1 Self-Speculative Drafting & Architectural Refinements (`v3.3`)
 
 Every `v3.3` modification preserves our core discipline: **zero unfreezing of the `32.212B` NVFP4 base experts** (enforced by `stack.verify_frozen_experts()`), **zero-init step-0 exact equivalence** to the `s4_rl` checkpoint, and **`< 96 GiB` single-GPU Blackwell G4** compatibility.
 
-### 3.1 B.1 — Zero-Extra-Weight Pass-1 (`40L`) → Pass-3 (`88L`) Self-Speculative Decoding
+### 4.1 B.1 — Zero-Extra-Weight Pass-1 (`40L`) → Pass-3 (`88L`) Self-Speculative Decoding
 
 GRPO/DAPO rollouts in `src/qloop/train/rl.py` (`GRPOTrainer.rollout`) and long-horizon evaluations spend `> 80%` of wall-clock time in autoregressive decoding at `d=3` (`88L`, `2.05×` per-token latency vs `40L`). Because `LoopController.set_active_passes(1)` executes the exact `40L` prelude+core-pass-1+coda graph and `kv_share=True` already shares Pass-1 K/V caches across Passes 2–3:
 
@@ -78,7 +146,7 @@ GRPO/DAPO rollouts in `src/qloop/train/rl.py` (`GRPOTrainer.rollout`) and long-h
 3. **Exact Lossless Rejection Sampling:** Accept tokens $x_i$ with probability $\min(1, p_i(x_i) / q_i(x_i))$ and resample from $\operatorname{norm}(\max(0, p_j - q_j))$ at the first rejection, rolling back only the HSSD `decode_cache` / KV cache sequence pointer by `K − accepted` slots (supported natively via `HSSDCacheState` snapshot/truncate in `src/qloop/model/hssd.py`).
 4. **Expected Speedup:** At acceptance rate $\alpha \in [0.78, 0.88]$ (typical when `d=1` is co-trained via `train_pass_probs`), `K=5` yields `3.4–4.2` verified tokens per `88L` verify call — a **`2.0×–2.5×` wall-clock speedup** for both `GRPOTrainer.rollout()` and `qloop serve` / Harbor evaluations with **0 extra parameters** and **mathematically identical target distribution** (strictly on-policy for GRPO!).
 
-### 3.2 B.2 — Inkling-Inspired Rank-64 Cross-Pass MoE-Input Gating + Adaptive Halting (`R ∈ {1, 2, 3, 4}`)
+### 4.2 B.2 — Inkling-Inspired Rank-64 Cross-Pass MoE-Input Gating + Adaptive Halting (`R ∈ {1, 2, 3, 4}`)
 
 1. **Cross-Pass MoE-Input Gate (`PassMoEMessage` in `src/qloop/model/loop.py`):**
    - Currently (`v3.2`), each core layer $l \in [12, 36)$ receives cross-pass signal via `ReEntryBridge` (loop boundary only), `PassAttnAdapters` (`q_proj`/`o_proj` on the 6 full-attn core layers), and `PassRouterAdapters` (router logits only).
@@ -96,7 +164,7 @@ GRPO/DAPO rollouts in `src/qloop/train/rl.py` (`GRPOTrainer.rollout`) and long-h
        where $\bar{R}(y) \in [1, 4]$ is the mean passes executed per generated token (logged in `GRPOTrainer` stats alongside `reward/mean`).
      - **Curriculum:** Warm-start with $\lambda_{\text{depth}} = 0.0$ for the first 50 steps so the model first exploits `R=3/4` freely on hard tokens, then anneal $\lambda_{\text{depth}} \in [0.02, 0.08]$ so boilerplate syntax/formatting tokens exit at `R=1` (`40L`) while arithmetic, proof steps, and tool-call planning tokens allocate `R=3` or `R=4` (`88L–112L`).
 
-### 3.3 B.3 — Targeted Top-2.5% Pass-2/3 Hot-Expert LoRA (`experts.enabled=true`)
+### 4.3 B.3 — Targeted Top-2.5% Pass-2/3 Hot-Expert LoRA (`experts.enabled=true`)
 
 Our `src/qloop/model/experts.py` (`scan_router_affinity`, `ExpertStats.select_hot`, `HotExpertDeltas`) already supports zero-init rank-64 SwiGLU deltas over frozen NVFP4 fused expert tensors via the exact factorized residual `W_d (h_m − h_b) + dW_d h_m`.
 
@@ -106,7 +174,7 @@ Our `src/qloop/model/experts.py` (`scan_router_affinity`, `ExpertStats.select_ho
   2. Select the **top `2.5%` Pass-2/3-enriched experts** (`~256` of `10,240` physical experts; `fraction: 0.025`, `by: affinity`, `per_pass: union`, `rank: 64`, `+96.5M` trainable params = `< 0.4 GiB` optimizer state under `APOLLO` / AdamW).
   3. Enable `-s experts.enabled=true -s experts.stats_path=runs/s4_rl/esft_stats_v32.json` during `s5_rsi_rft` / `s6_rsi_rl`, keeping all base `32.212B` NVFP4 weights strictly frozen and SHA-256 audited; fold deltas cleanly during `qloop export-pack` (`src/qloop/export_pack.py`).
 
-### 3.4 B.4 — `D-LSA` 1M Recall Upgrade (Conditional on Phase A `mrcr` Audit)
+### 4.4 B.4 — `D-LSA` 1M Recall Upgrade (Conditional on Phase A `mrcr` Audit)
 
 If Phase A `mrcr` scores degrade significantly at `512K–1M` tokens (`> 15%` drop vs `≤ 128K`):
 1. **Recall Attribution Probe:** Compare `lsa.mode: dense` vs `lsa.mode: sparse` at `128K` and `256K` on `mrcr` (`limit=50`) to separate *indexer recall loss* (`D-LSA` missing needle buckets) from *RoPE / HSSD memory dilution*.
@@ -117,7 +185,7 @@ If Phase A `mrcr` scores degrade significantly at `512K–1M` tokens (`> 15%` dr
 
 ---
 
-## 4. Phase C — Closed-Loop Multi-Round Verifiable RSI (`s5` → `s6` → `s7`)
+## 5. Phase C — Closed-Loop Multi-Round Verifiable RSI (`s5` → `s6` → `s7`)
 
 Phase C turns our verified `v3.3` stack into a disciplined, self-improving post-training loop with **verifiable-only supervision** (no unverified synthetic self-talk), **strict contamination barriers**, and **automatic holdout rollback**.
 
@@ -133,7 +201,7 @@ flowchart LR
     D --> G3{"Final 2026 Frontier Suite<br/>(d=1,2,3 + TB 4.1 + DeepSWE)"}
 ```
 
-### 4.1 Round 1 (`s5_rsi_rft`): Depth-Advantage Rejection Fine-Tuning (DA-RFT)
+### 5.1 Round 1 (`s5_rsi_rft`): Depth-Advantage Rejection Fine-Tuning (DA-RFT)
 
 **Objective:** Distill the model's *own* verified `d=3` (`88L`) breakthroughs into higher-probability trajectories and calibrate the new `v3.3` cross-pass MoE gates (`PassMoEMessage`) before online RL.
 
@@ -148,7 +216,7 @@ flowchart LR
    - Keep the **shortest verified `d=3` trace** per solved problem (suppressing reasoning bloat) that passes format checks (`has_unclosed_think == False`, no repetition loops, verified reward `>= 1.0`).
 3. **Training Step:** Run `300–500` steps of `LMTrainer` (`s5_rsi_rft`) with `train_pass_probs: [0.10, 0.30, 0.60]`, `lr = 1e-5` (cosine decay), `lr_mult: {loop_adapters: 5.0, moe_message: 10.0, hssd_adapter: 2.0}`, training only adapters + optional Top-2.5% `HotExpertDeltas` while keeping base NVFP4 experts SHA-256 frozen.
 
-### 4.2 Round 2 (`s6_rsi_rl`): Online Self-Play Frontier Challenger + GRPO/DAPO
+### 5.2 Round 2 (`s6_rsi_rl`): Online Self-Play Frontier Challenger + GRPO/DAPO
 
 **Objective:** Eliminate prompt-pool saturation (where `groups/all_pass` or `groups/all_fail` wastes GRPO steps) by dynamically generating frontier problems inside the **20%–60% pass-rate sweet spot** while jointly optimizing answer accuracy and adaptive loop depth.
 
@@ -163,7 +231,7 @@ flowchart LR
    - Maintain a `30%` anchor mix of fixed real-world verifiable tasks (`DAPO-Math-17k`, `kernelbench_train` L1–L2, coding) so the Challenger distribution never drifts off-manifold.
    - Optional TGPO fallback (`rl.teacher` already implemented in `src/qloop/train/rl.py`): on persistent `groups/all_fail` real-world tasks, query a frontier teacher only if its solution passes the **same deterministic verifier** (`verify(t, text) > 0`).
 
-### 4.3 Round 3 (`s7_agentic_rsi`): Multi-Turn Containerized Agentic RL
+### 5.3 Round 3 (`s7_agentic_rsi`): Multi-Turn Containerized Agentic RL
 
 **Objective:** Close the agentic software-engineering and terminal-execution gap against Inkling 2 Mini on **Terminal-Bench 4.1**, **SWE-bench Pro Hard**, and **DeepSWE v1.1** without touching any held-out container tasks.
 
@@ -177,7 +245,7 @@ flowchart LR
 
 ---
 
-## 5. Strict Non-Regression & Anti-Contamination Governance
+## 6. Strict Non-Regression & Anti-Contamination Governance
 
 RSI loops can silently overfit, bloat reasoning length, or leak benchmark items if ungoverned. Every stage from `s5_rsi_rft` through `s7_agentic_rsi` enforces four hard invariants:
 
@@ -216,10 +284,11 @@ RSI loops can silently overfit, bloat reasoning length, or leak benchmark items 
 
 ---
 
-## 6. Execution Schedule & Target Milestones
+## 7. Execution Schedule & Target Milestones
 
 | Stage | Primary Engineering Deliverable | Estimated G4 Compute | Promotion Gate |
 | :--- | :--- | :---: | :--- |
+| **Stage 4** (`s4_rl` SI-RSI) | GRPO + 3-tier SI-RSI (`sirsi.py`, surgical `[loop_adapters, router]` slap unlikelihood, bounded final-answer anti-slop, optional Supervisor hints/gold/sculpting) | `~18–22h` (`1` session) | `aime_2026` + `kernelbench_l3` holdout promotion gate (`min_delta >= 0`, `skipped_params == 0`, frozen NVFP4 SHA-256) |
 | **Phase A** (`eval_v32`) | Full `d ∈ {1, 2, 3}` sweep on `configs/eval/suite.yaml` + Harbor TB 4.1 / DeepSWE | `~12–18h` (`1` session) | Baseline ledger locked in Hub `eval/suite_summary.json`; `Δ(d=3−d=1) > 0` |
 | **Phase B.1–B.2** (`v3.3` code) | Self-speculative `40L → 88L` decoder + `PassMoEMessage` (`r=64`) + adaptive halting `R ∈ {1..4}` | CPU unit tests + `4h` G4 smoke | `>= 2.0×` decode speedup, exact distribution parity (`TVD == 0` under lossless spec), step-0 `torch.equal` |
 | **Phase B.3–B.4** *(conditional)* | `qloop scan-experts` Top-2.5% `HotExpertDeltas` + `D-LSA` `512K–1M` recall upgrade | `~8–12h` (if triggered by Phase A) | `mrcr @ 512K–1M` recall gap closed `< 10%` vs `128K` |

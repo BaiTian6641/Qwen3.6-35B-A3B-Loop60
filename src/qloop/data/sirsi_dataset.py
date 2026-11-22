@@ -913,7 +913,7 @@ _RUBRIC_EXPLICIT_HEADER_RE = re.compile(
     r"(?:^|\n)[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}"
     r"(?:Adversarial[ \t]+Self[- ]Audit|Synthesis[ \t]+Plan|"
     r"Restraint[ \t]*(?:&|and)[ \t]*Synthesis|Framing[ \t]*(?:&|and)[ \t]*Invariants)"
-    r"\*{0,2}[ \t]*(?::|[—–-]|(?=\n|$))",
+    r"\*{0,2}[ \t]*(?::|[—–]|-[ \t]+|(?=\n|$))",
     re.IGNORECASE,
 )
 _RUBRIC_FRAMING_HDR_RE = re.compile(
@@ -926,20 +926,48 @@ _RUBRIC_AUDIT_OR_SYNTH_HDR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Negative lookahead preventing false positives on organic problem-format recaps like
+# "The final answer is an integer between 0 and 999." while still catching MCQ "The final answer is A."
+_SPOILER_FORMAT_RECAP_GUARD = (
+    r"(?![ \t]+(?:"
+    r"an?[ \t]+(?:(?:positive|negative|non[- ]?negative|non[- ]?zero|reduced|simplified|irreducible|"
+    r"exact|real|complex|rational|irrational|whole|natural|even|odd|prime|\d+[- ]digit|single|unique|"
+    r"valid|minimal|maximal|finite|closed[- ]form|mixed|proper|improper|radical)[ \t]+)*"
+    r"(?:integer|fraction|decimal|number|value|expression|polynomial|matrix|grid|string|boolean|"
+    r"tuple|list|set|pair|triple|ratio|percentage|probability|angle|length|area|volume|count|"
+    r"sum|product|multiple|power|root|function|sequence|element|coordinate|vector|solution|"
+    r"positive|negative|non[- ]?negative|\d+[- ]digit)\b"
+    r"|to[ \t]+be\b|expected\b|required\b|requested\b|supposed\b|expressed\b|written\b|reported\b|"
+    r"stated\b|given[ \t]+(?:in|as|mod|modulo)\b|formatted\b|rounded\b|measured\b|bounded\b|"
+    r"constrained\b|limited\b|defined\b|between\b|modulo\b|mod\b|divisible\b|strictly\b|"
+    r"greater\b|less\b|at[ \t]+(?:least|most)\b|of[ \t]+the[ \t]+form\b|"
+    r"in[ \t]+(?:the[ \t]+form|terms[ \t]+of|exact|reduced|lowest|simplest)\b|not[ \t]+)"
+    r")"
+)
+_SPOILER_LABEL_HEAD = (
+    r"(?:(?:final|target)[ \t]+"
+    r"(?:answer|result|output|verdict|solution|outcomes?|translation|implementation|summary)"
+    r"\*{0,2}[ \t]*:|the[ \t]+(?:final|target)[ \t]+answer[ \t]+is\b" + _SPOILER_FORMAT_RECAP_GUARD + r")"
+)
 _SPOILER_FIRST_RE = re.compile(
     r"(?:^[ \t]*(?:[-*•][ \t]+)?(?:#{1,4}[ \t]+)?"
     r"(?:(?:okay|ok|alright|well|so|thus|therefore|hence|clearly|note|wait)[,:\s]+)?"
-    r"\*{0,2}(?:(?:(?:final|target)[ \t]+)?answer\*{0,2}[ \t]*:|the[ \t]+(?:final|target)[ \t]+answer[ \t]+is\b))"
-    r"|(?:(?:^|[\n.,:;(\[—–-])\s*\*{0,2}"
-    r"(?:(?:final|target)[ \t]+answer\*{0,2}[ \t]*:|the[ \t]+(?:final|target)[ \t]+answer[ \t]+is\b))"
-    r"|(?:(?:^|\n)[ \t]*\*{0,2}answer\*{0,2}[ \t]*:)",
+    r"\*{0,2}(?:(?:answer|conclusion|outcome)\*{0,2}[ \t]*:|" + _SPOILER_LABEL_HEAD + r"))"
+    r"|(?:(?:^|[\n.,:;(\[—–-])\s*\*{0,2}" + _SPOILER_LABEL_HEAD + r")"
+    r"|(?:(?:^|\n)[ \t]*\*{0,2}(?:answer|conclusion|outcome)\*{0,2}[ \t]*:)",
     re.IGNORECASE,
 )
 
 _META_STUB_PHRASES: list[re.Pattern[str]] = [
     re.compile(r"\bstandard\s+processing\s+applied\b", re.IGNORECASE),
     re.compile(
-        r"\binitial\b(?:[^.\n]|\.\d){0,45}\bparameters?(?:[^.\n]|\.\d){0,30}\b(?:are|is|were)\s+validated\b",
+        r"\binitial\b(?:[^.\n]|\.\d){0,110}\b(?:parameters?|constraints?)"
+        r"(?:[^.\n]|\.\d){0,90}\b(?:are|is|were)\s+(?:established\s+and\s+)?validated\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:are|is|were)\s+(?:established\s+and\s+validated|"
+        r"validated\s+as\s+established\s+context|treated\s+as\s+validated\s+established)\b",
         re.IGNORECASE,
     ),
     re.compile(
@@ -980,6 +1008,7 @@ _RUBRIC_KNOWN_SUBTITLE = (
     r"Synthesis(?:[ \t]+Plan)?|"
     r"Audit|Verification)"
 )
+_RUBRIC_PREFIX_SEP = r"(?::\*{0,2}|[—–]\*{0,2}|-\*{0,2}[ \t]+)[ \t]*"
 _STRIP_BEAT_STANDALONE_RE = re.compile(
     r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}Beat[ \t]*[123]"
     r"(?:[ \t]*\([^)\n]{1,60}\)|[ \t]*[:—–-][ \t]*" + _RUBRIC_KNOWN_SUBTITLE + r")?"
@@ -988,11 +1017,11 @@ _STRIP_BEAT_STANDALONE_RE = re.compile(
 _STRIP_BEAT_LINE_PREFIX_RE = re.compile(
     r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}Beat[ \t]*[123]"
     r"(?:[ \t]*\([^)\n]{1,60}\)|[ \t]*[—–-][ \t]*" + _RUBRIC_KNOWN_SUBTITLE + r")?"
-    r"\*{0,2}[ \t]*(?::|[—–])\*{0,2}[ \t]*"
+    r"\*{0,2}[ \t]*" + _RUBRIC_PREFIX_SEP
 )
 _STRIP_BEAT_MD_PREFIX_RE = re.compile(
     r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?#{1,4}[ \t]+\*{0,2}Beat[ \t]*[123]"
-    r"(?:[ \t]*\([^)\n]{1,60}\))?\*{0,2}[ \t]*[:—–-]\*{0,2}[ \t]*"
+    r"(?:[ \t]*\([^)\n]{1,60}\))?\*{0,2}[ \t]*" + _RUBRIC_PREFIX_SEP
 )
 _STRIP_BEAT_INLINE_PREFIX_RE = re.compile(
     r"(?i)(?<=[.!?\s])(?<!\bon )(?<!\bat )\*{0,2}Beat[ \t]*[123]"
@@ -1002,23 +1031,23 @@ _STRIP_EXPLICIT_STANDALONE_RE = re.compile(
     r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}"
     r"(?:Adversarial[ \t]+Self[- ]Audit|Synthesis[ \t]+Plan|"
     r"Restraint[ \t]*(?:&|and)[ \t]*Synthesis|Framing[ \t]*(?:&|and)[ \t]*Invariants)"
-    r"\*{0,2}[ \t]*:?\*{0,2}[ \t]*(?:\n|$)"
+    r"\*{0,2}[ \t]*[:.]?\*{0,2}[ \t]*(?:\n|$)"
 )
 _STRIP_EXPLICIT_PREFIX_RE = re.compile(
     r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}"
     r"(?:Adversarial[ \t]+Self[- ]Audit|Synthesis[ \t]+Plan|"
     r"Restraint[ \t]*(?:&|and)[ \t]*Synthesis|Framing[ \t]*(?:&|and)[ \t]*Invariants)"
-    r"\*{0,2}[ \t]*:\*{0,2}[ \t]*"
+    r"\*{0,2}[ \t]*" + _RUBRIC_PREFIX_SEP
 )
 _STRIP_PAIRED_HDR_STANDALONE_RE = re.compile(
     r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}"
     r"(?:Framing|(?:Adversarial[ \t]+)?Self[- ]Audit|Synthesis(?:[ \t]+Plan)?)"
-    r"\*{0,2}[ \t]*:?\*{0,2}[ \t]*(?:\n|$)"
+    r"\*{0,2}[ \t]*[:.]?\*{0,2}[ \t]*(?:\n|$)"
 )
 _STRIP_PAIRED_HDR_PREFIX_RE = re.compile(
     r"(?im)^[ \t]*(?:(?:[-*•]|\d+\.)[ \t]+)?(?:#{1,4}[ \t]+)?\*{0,2}"
     r"(?:Framing|(?:Adversarial[ \t]+)?Self[- ]Audit|Synthesis(?:[ \t]+Plan)?)"
-    r"\*{0,2}[ \t]*:\*{0,2}[ \t]*"
+    r"\*{0,2}[ \t]*" + _RUBRIC_PREFIX_SEP
 )
 
 
@@ -1042,7 +1071,7 @@ def detect_synthetic_cot_artifacts(thinking: str, response: str = "", domain: st
         issues.append("cot:rubric_header")
 
     # 2. Spoiler-first rationalization in the opening 60 chars of `<think>`
-    m_spoiler = _SPOILER_FIRST_RE.search(t[:90])
+    m_spoiler = _SPOILER_FIRST_RE.search(t[:160])
     if m_spoiler is not None and m_spoiler.start() < 60:
         issues.append("cot:spoiler_first")
 

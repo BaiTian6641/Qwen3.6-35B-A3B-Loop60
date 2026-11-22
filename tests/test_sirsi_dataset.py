@@ -903,17 +903,38 @@ def test_detect_synthetic_cot_artifacts_spoiler_first():
         "Answer: 1012. Factor n^3 + 2n^2 + n = n(n + 1)^2.",
         "### Answer: 7\nSet up the Markov chain transition equations.",
         "The final answer is 325/462. First decompose 1/(k(k+2)).",
+        "The final answer is A. Let's confirm option A satisfies all conditions.",
+        "The final answer is A, because the derivative vanishes at x = 0.",
         "Target answer: [[1, 0], [0, 1]]. Looking at the grid flip...",
         "Okay, final answer: 42. Let's verify 6 * 7 = 42.",
         "So the final answer is 42. Let's verify 6 * 7 = 42.",
         "Quick note — the final answer is 55; verify pairwise sum.",
+        "Final result: $1,080 after applying the 10% discount.",
+        "Final verdict: Definitely true under the given axioms.",
+        "Final output: [[1, 0], [0, 1]]. Inspecting the input pairs...",
+        "Final solution: x = 4, y = 9. Substitute back to verify.",
+        "Final outcomes: both branches converge to 0.",
+        "Final translation: Bonjour le monde.",
+        "Final implementation: return sorted(merged).",
+        "Final summary: 12 nodes fail over cleanly.",
+        "Target result: 1012. Check residues mod 12.",
+        "Conclusion: the series converges to 2.",
+        "Outcome: reject the null hypothesis at p < 0.01.",
     ):
         assert "cot:spoiler_first" in detect_synthetic_cot_artifacts(bad), f"missed spoiler-first: {bad!r}"
 
-    # Conditional/forward mentions and late conclusions (> 60 chars in) must NOT trigger
+    # Conditional/forward mentions, organic format recaps, and late conclusions (> 60 chars in) must NOT trigger
     for clean in (
         "Check if the final answer is positive before boxing: x^2 + 1 >= 1 > 0 for all real x.",
         "Verify whether the final answer is an integer by checking divisibility by 12.",
+        "The final answer is an integer between 0 and 999. Let's reduce the recurrence mod 1000.",
+        "The final answer is a positive integer, so discard the negative root x = -3.",
+        "The final answer is a 3-digit number; check bounds on n first.",
+        "Note: the final answer is to be expressed as a reduced fraction p/q with gcd(p, q) = 1.",
+        "The final answer is required modulo 1000, so track remainders mod 8 and mod 125.",
+        "The final answer is given in centimeters and rounded to two decimal places.",
+        "The final answer is strictly greater than 0 and divisible by 12.",
+        "The final answer is not obvious from inspection, so expand the first four terms.",
         (
             "Given n = 10, compute S = n(n+1)/2 = 10 * 11 / 2 = 55. Double-check pairwise: "
             "(1+10) + (2+9) + (3+8) + (4+7) + (5+6) = 55. Final answer: 55."
@@ -927,6 +948,15 @@ def test_detect_synthetic_cot_artifacts_meta_summary_stubs():
         "Standard processing applied to the starting balance yields the net figure cleanly.",
         "Initial arithmetic parameters and interest constraints are validated before computing.",
         "Initial arithmetic parameters (rate 0.05) are validated before computing.",
+        (
+            "Initial logic, variables, and parameters—starting balance, monthly deposit, and compound "
+            "interest tier—are validated as established context before emitting the result."
+        ),
+        (
+            "Initial problem constraints—non-empty input, positive integer bounds, and sorted keys—"
+            "are established and validated cleanly."
+        ),
+        "All domain assumptions are treated as validated established without further derivation.",
         "Re-checking the wording confirms there are no hidden fees/traps in this problem.",
         "A quick pass confirms that there are no hidden edge cases in the specification.",
         "After reviewing the setup, the arithmetic logic holds cleanly across every step.",
@@ -1020,6 +1050,26 @@ def test_strip_rubric_headers_salvage_and_prose_preservation():
     assert detect_synthetic_cot_artifacts(cleaned_paired) == []
     assert "Given x > 0, let f(x) = x + 1/x." in cleaned_paired
     assert "Test x = 1 -> 2 and x = 0.5 -> 2.5." in cleaned_paired
+
+    # 2b. Dash / ASCII-hyphen rubric header round-trips must match detect_synthetic_cot_artifacts symmetrically
+    dash_cases = [
+        ("Beat 1 - Given x = 2", "Given x = 2"),
+        ("Beat 1 (Framing) - Given x = 2", "Given x = 2"),
+        ("Adversarial Self-Audit — check x = 0", "check x = 0"),
+        ("Synthesis Plan - output 4", "output 4"),
+        ("Framing & Invariants — x > 0", "x > 0"),
+        ("Restraint & Synthesis — output 4", "output 4"),
+        ("**Beat 1 (Framing)** - **Important**: check x = 0", "**Important**: check x = 0"),
+        (
+            "Framing - Given x = 2, compute x^2 = 4.\nAdversarial Self-Audit — check x = -2 -> 4.",
+            "Given x = 2, compute x^2 = 4.\ncheck x = -2 -> 4.",
+        ),
+    ]
+    for raw_hdr, expected_clean in dash_cases:
+        assert "cot:rubric_header" in detect_synthetic_cot_artifacts(raw_hdr), f"should detect: {raw_hdr!r}"
+        stripped = strip_rubric_headers(raw_hdr)
+        assert stripped == expected_clean
+        assert detect_synthetic_cot_artifacts(stripped) == [], f"round-trip residual on {raw_hdr!r}: {stripped!r}"
 
     # 3. Clean prose and SI-RSI markers must remain untouched verbatim
     for untouched in (

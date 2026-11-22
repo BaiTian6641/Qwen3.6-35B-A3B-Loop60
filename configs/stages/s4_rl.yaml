@@ -129,6 +129,18 @@ rl:
   verifier_workers: 8
   teacher: {}                  # {base_url: https://api.example.com/v1, model: <frontier>, api_key_env: TEACHER_API_KEY,
                                #  max_calls_per_step: 2, sft_weight: 0.1}
+  sirsi:
+    enabled: true
+    slap_weight: 0.1
+    slap_eps: 1.0e-4
+    slap_max_seqs_per_step: 4
+    slap_target_groups: [loop_adapters, router]   # surgical slap routing (zero slap grad on attention/HSSD/norms/base)
+    anti_slop_weight: 0.05                        # bounded final-answer-only tie-breaker (never overrides correctness)
+    min_answer_chars: 8
+    guided_hint_enabled: true                     # auto-escalates when rl.teacher.base_url is set; safe without TEACHER_API_KEY
+    max_hints_per_step: 2
+    failure_ledger: true
+    curriculum_sculpt_n_tasks: 4
   gate:
     every: 50
     depth: 3

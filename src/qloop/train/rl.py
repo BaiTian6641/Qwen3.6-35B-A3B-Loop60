@@ -26,6 +26,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -36,6 +37,21 @@ from ..debug import require, stage
 from .checkpoint import CheckpointManager, restore_trainable
 from .loss import token_entropy, token_logprobs
 from .optim import FusedStepOptimizer
+from .sirsi import (
+    TAG_AI_SLOP,
+    TAG_LOOP_DEGENERATION,
+    TAG_PREMATURE_EXIT,
+    TAG_UNCLOSED_THINK,
+    FailureLedger,
+    SIRSIConfig,
+    build_curriculum_sculpt_messages,
+    build_hint_messages,
+    detect_pathologies,
+    map_char_span_to_token_mask,
+    parse_and_decontaminate_sculpted_tasks,
+    resolve_slap_target_params,
+    unlikelihood_span_loss,
+)
 from .stack import Stack, build_stack
 from .trainer import MetricsLogger
 
@@ -234,20 +250,94 @@ class TeacherClient:
         self.temperature = float(cfg.get("temperature", 0.6))
         self.timeout = float(cfg.get("timeout", 600))
         self.system = cfg.get("system")
+        self.max_total_calls: int | None = (
+            int(cfg["max_total_calls"]) if cfg.get("max_total_calls") is not None else None
+        )
+        self.max_total_tokens: int | None = (
+            int(cfg["max_total_tokens"]) if cfg.get("max_total_tokens") is not None else None
+        )
         self.calls = self.tokens = 0
 
-    def solve(self, prompt: Any) -> str:
-        msgs = list(prompt) if isinstance(prompt, list) else [{"role": "user", "content": str(prompt)}]
-        if self.system:
-            msgs = [{"role": "system", "content": self.system}, *msgs]
-        res = _post_json(self.url, {"model": self.model, "messages": msgs, "max_tokens": self.max_tokens,
-                                    "temperature": self.temperature}, self.timeout, self.headers)
+    def __repr__(self) -> str:
+        return f"TeacherClient(url={self.url!r}, model={self.model!r}, calls={self.calls}, tokens={self.tokens})"
+
+    def _chat(
+        self,
+        msgs: list[dict[str, Any]],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        include_reasoning: bool = True,
+    ) -> str:
+        if self.max_total_calls is not None and self.calls >= self.max_total_calls:
+            raise RuntimeError(f"teacher call budget reached ({self.calls}/{self.max_total_calls})")
+        if self.max_total_tokens is not None and self.tokens >= self.max_total_tokens:
+            raise RuntimeError(f"teacher token budget reached ({self.tokens}/{self.max_total_tokens})")
+        payload = {
+            "model": self.model,
+            "messages": msgs,
+            "max_tokens": self.max_tokens if max_tokens is None else int(max_tokens),
+            "temperature": self.temperature if temperature is None else float(temperature),
+        }
+        res = _post_json(self.url, payload, self.timeout, self.headers)
         self.calls += 1
         self.tokens += int((res.get("usage") or {}).get("total_tokens", 0))
         msg = res["choices"][0]["message"]
         reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
         content = msg.get("content") or ""
-        return f"<think>\n{reasoning}\n</think>\n\n{content}" if reasoning else content
+        if include_reasoning and reasoning:
+            return f"<think>\n{reasoning}\n</think>\n\n{content}"
+        return content
+
+    def solve(self, prompt: Any) -> str:
+        msgs = list(prompt) if isinstance(prompt, list) else [{"role": "user", "content": str(prompt)}]
+        if self.system:
+            msgs = [{"role": "system", "content": self.system}, *msgs]
+        return self._chat(msgs, include_reasoning=True)
+
+    def hint(self, prompt: Any, bad_completion: str, tags: Sequence[str] = ()) -> str:
+        """Request a concise 1-sentence supervisory nudge before divergence (SI-RSI Tier 2)."""
+        msgs = build_hint_messages(prompt, bad_completion, tags)
+        raw = self._chat(
+            msgs,
+            max_tokens=min(self.max_tokens, 256),
+            temperature=min(self.temperature, 0.4),
+            include_reasoning=False,
+        )
+        return raw.strip()
+
+    def sculpt_curriculum(
+        self,
+        failure_records: Sequence[dict[str, Any]],
+        n_tasks: int = 4,
+        *,
+        decontaminator: Any = None,
+    ) -> list[dict[str, Any]]:
+        """Synthesize targeted verifiable micro-tasks from failure records with decontamination."""
+        msgs = build_curriculum_sculpt_messages(failure_records, n_tasks=n_tasks)
+        raw = self._chat(
+            msgs,
+            max_tokens=min(self.max_tokens, 2048),
+            temperature=self.temperature,
+            include_reasoning=False,
+        )
+        return parse_and_decontaminate_sculpted_tasks(raw, decontaminator=decontaminator)
+
+
+def _append_hint_to_prompt(prompt: Any, hint_text: str) -> Any:
+    nudge = f"\n\n[Supervisor Hint]: {hint_text.strip()}\n"
+    if isinstance(prompt, str):
+        return prompt + nudge
+    if isinstance(prompt, list):
+        msgs = [dict(m) if isinstance(m, dict) else m for m in prompt]
+        if msgs and isinstance(msgs[-1], dict) and msgs[-1].get("role") == "user" and isinstance(
+            msgs[-1].get("content"), str
+        ):
+            msgs[-1]["content"] = msgs[-1]["content"] + nudge
+        else:
+            msgs.append({"role": "user", "content": f"[Supervisor Hint]: {hint_text.strip()}"})
+        return msgs
+    return str(prompt) + nudge
 
 
 # ============================================================================ trainer
@@ -267,7 +357,9 @@ class _Seq:
     ids: list[int]
     n_prompt: int
     adv: float
-    kind: str  # "pg" | "teacher"
+    kind: str  # "pg" | "teacher" | "slap_neg"
+    span_mask: list[bool] | None = None
+    tags: tuple[str, ...] = ()
 
 
 class GRPOTrainer:
@@ -300,6 +392,22 @@ class GRPOTrainer:
                              max_context=self.rl.get("max_context"))
         self.sampler = TaskSampler(load_rl_tasks(self.rl, self.seed), self.seed)
         self.teacher = TeacherClient(self.rl["teacher"]) if (self.rl.get("teacher") or {}).get("base_url") else None
+        self.sirsi = SIRSIConfig.from_dict(self.rl.get("sirsi"))
+        self.failure_ledger: FailureLedger | None = (
+            FailureLedger(os.path.join(run_dir, self.sirsi.failure_ledger_filename))
+            if (self.sirsi.enabled and self.sirsi.failure_ledger)
+            else None
+        )
+        self._slap_target_params = (
+            resolve_slap_target_params(self.stack.named_trainable, self.sirsi.slap_target_groups)
+            if (self.sirsi.enabled and self.sirsi.slap_target_groups)
+            else None
+        )
+        if self._slap_target_params is not None and not self._slap_target_params:
+            log.warning(
+                "[sirsi] slap_target_groups=%r matched 0 trainable params; slap_neg grads will be skipped",
+                self.sirsi.slap_target_groups,
+            )
         self.temperature = float(self.rl.get("temperature", 1.0))
         self.init_entropy: float | None = None
         self.ref: dict[str, torch.Tensor] | None = None
@@ -323,8 +431,21 @@ class GRPOTrainer:
         mask = torch.zeros(len(seqs), t, dtype=torch.float32)
         adv = torch.zeros(len(seqs), dtype=torch.float32)
         for i, s in enumerate(seqs):
-            ids[i, :len(s.ids)] = torch.tensor(s.ids)
-            mask[i, s.n_prompt:len(s.ids)] = 1.0
+            ids[i, :len(s.ids)] = torch.tensor(s.ids, dtype=torch.long)
+            n_comp = len(s.ids) - s.n_prompt
+            if s.span_mask is not None:
+                require(
+                    len(s.span_mask) == n_comp,
+                    "span_mask length must match completion length",
+                    span_mask=len(s.span_mask),
+                    n_comp=n_comp,
+                )
+                if n_comp > 0:
+                    mask[i, s.n_prompt:len(s.ids)] = torch.tensor(
+                        [1.0 if b else 0.0 for b in s.span_mask], dtype=torch.float32
+                    )
+            else:
+                mask[i, s.n_prompt:len(s.ids)] = 1.0
             adv[i] = s.adv
         dev = self.stack.device
         return ids.to(dev), mask.to(dev), adv.to(dev)
@@ -358,6 +479,7 @@ class GRPOTrainer:
     # ------------------------------------------------------------------ one RL step
     def rollout(self) -> tuple[list[_Seq], dict[str, float]]:
         rl = self.rl
+        sirsi = self.sirsi
         g = int(rl.get("group_size", 8))
         tasks = self.sampler.next(int(rl.get("prompts_per_step", 4)))
         with stage("rl:rollout"):
@@ -368,17 +490,141 @@ class GRPOTrainer:
             futs = [[self.pool.submit(verify, t, o.text) for o in samples] for t, samples in zip(tasks, outs)]
             rewards = [[f.result()[0] for f in row] for row in futs]
         seqs: list[_Seq] = []
+        slap_seqs: list[_Seq] = []
         stats = {"reward/mean": 0.0, "groups/all_fail": 0.0, "groups/all_pass": 0.0, "groups/used": 0.0}
         lens, flat, teacher_ok, teacher_calls = [], [], 0, 0
+        hint_calls = hint_ok = failures_logged = 0
+        n_total = n_loop = n_unclosed = n_premature = n_slop = 0
+        slop_pen_sum = 0.0
         max_teacher = int((rl.get("teacher") or {}).get("max_calls_per_step", 2))
         for t, samples, rw in zip(tasks, outs, rewards):
             p_ids = self.gen.encode_prompt(t.prompt)
-            shaped = [r + self._overlong(o.completion_tokens) for r, o in zip(rw, samples)]
+            all_fail = all(r <= 0 for r in rw)
+            paths = (
+                [detect_pathologies(o.text, reward=r, cfg=sirsi) for o, r in zip(samples, rw)]
+                if sirsi.enabled
+                else []
+            )
+            shaped: list[float] = []
+            for idx_s, (r, o) in enumerate(zip(rw, samples)):
+                s_pen = 0.0
+                if sirsi.enabled:
+                    p_info = paths[idx_s]
+                    n_total += 1
+                    if TAG_LOOP_DEGENERATION in p_info.tags:
+                        n_loop += 1
+                    if TAG_UNCLOSED_THINK in p_info.tags:
+                        n_unclosed += 1
+                    if TAG_PREMATURE_EXIT in p_info.tags:
+                        n_premature += 1
+                    if TAG_AI_SLOP in p_info.tags:
+                        n_slop += 1
+                    if sirsi.anti_slop_weight > 0.0:
+                        s_pen = p_info.slop_penalty
+                        slop_pen_sum += s_pen
+                    if (
+                        sirsi.slap_weight > 0.0
+                        and len(slap_seqs) < sirsi.slap_max_seqs_per_step
+                        and o.token_ids
+                        and r <= 0.0
+                        and (TAG_LOOP_DEGENERATION in p_info.tags or TAG_UNCLOSED_THINK in p_info.tags)
+                    ):
+                        smask = map_char_span_to_token_mask(
+                            self.stack.tokenizer,
+                            list(o.token_ids),
+                            o.text,
+                            p_info.loop_onset_char,
+                            fallback_tail_frac=sirsi.slap_fallback_tail_frac,
+                        )
+                        if any(smask):
+                            slap_seqs.append(
+                                _Seq(
+                                    p_ids + list(o.token_ids),
+                                    len(p_ids),
+                                    -1.0,
+                                    "slap_neg",
+                                    span_mask=smask,
+                                    tags=tuple(p_info.tags),
+                                )
+                            )
+                # Apply anti-slop tie-breaker only when at least one sample succeeded (`not all_fail`),
+                # preventing std-normalized advantage amplification from positively reinforcing wrong answers.
+                shaped.append(r + self._overlong(o.completion_tokens) - (0.0 if all_fail else s_pen))
+
             flat += rw
             lens += [o.completion_tokens for o in samples]
-            if all(r <= 0 for r in rw):
+
+            if self.failure_ledger is not None:
+                logged_any = False
+                for o, r, p_info in zip(samples, rw, paths):
+                    if p_info.tags:
+                        self.failure_ledger.record(
+                            step=self.step,
+                            task_id=t.task_id,
+                            tags=p_info.tags,
+                            reward=r,
+                            loop_onset_char=p_info.loop_onset_char,
+                            prompt=t.prompt,
+                            bad_completion=o.text,
+                        )
+                        failures_logged += 1
+                        logged_any = True
+                if all_fail and not logged_any and samples:
+                    self.failure_ledger.record(
+                        step=self.step,
+                        task_id=t.task_id,
+                        tags=["ALL_FAIL"],
+                        reward=rw[0],
+                        loop_onset_char=None,
+                        prompt=t.prompt,
+                        bad_completion=samples[0].text,
+                    )
+                    failures_logged += 1
+
+            if all_fail:
                 stats["groups/all_fail"] += 1
-                if self.teacher is not None and teacher_calls < max_teacher:
+                recovered_by_hint = False
+                if (
+                    sirsi.enabled
+                    and sirsi.guided_hint_enabled
+                    and self.teacher is not None
+                    and hint_calls < sirsi.max_hints_per_step
+                    and samples
+                ):
+                    bad_idx = next((i for i, pi in enumerate(paths) if pi.tags), 0)
+                    bad_o = samples[bad_idx]
+                    bad_tags = paths[bad_idx].tags if paths else ()
+                    hint_calls += 1
+                    try:
+                        hint_text = self.teacher.hint(t.prompt, bad_o.text, bad_tags)
+                    except Exception as e:
+                        log.warning("[sirsi] supervisor hint failed on %s: %r", t.task_id, e)
+                        hint_text = ""
+                    if hint_text:
+                        guided_prompt = _append_hint_to_prompt(t.prompt, hint_text)
+                        try:
+                            retry_outs = self.gen.generate(
+                                [guided_prompt],
+                                max_new_tokens=int(rl.get("max_new_tokens", 1024)),
+                                temperature=self.temperature,
+                                top_p=float(rl.get("top_p", 1.0)),
+                                n=sirsi.guided_retry_n,
+                                seed=self.seed * 100_003 + self.step * 31 + hint_calls,
+                                stop=rl.get("stop"),
+                            )[0]
+                        except Exception as e:
+                            log.warning("[sirsi] guided retry failed on %s: %r", t.task_id, e)
+                            retry_outs = []
+                        for ro in retry_outs:
+                            r_retry, _ = verify(t, ro.text)
+                            if r_retry > 0 and ro.token_ids:
+                                hint_ok += 1
+                                recovered_by_hint = True
+                                seqs.append(
+                                    _Seq(p_ids + list(ro.token_ids), len(p_ids), 1.0, "teacher", tags=("GUIDED_HINT",))
+                                )
+                                break
+                if not recovered_by_hint and self.teacher is not None and teacher_calls < max_teacher:
                     teacher_calls += 1
                     try:
                         text = self.teacher.solve(t.prompt)
@@ -399,6 +645,7 @@ class GRPOTrainer:
             for o, a in zip(samples, adv):
                 if o.token_ids:
                     seqs.append(_Seq(p_ids + list(o.token_ids), len(p_ids), float(a), "pg"))
+        seqs.extend(slap_seqs)
         n = max(len(tasks), 1)
         stats["reward/mean"] = sum(flat) / max(len(flat), 1)
         stats["reward/pass_rate"] = sum(r >= 1 for r in flat) / max(len(flat), 1)
@@ -406,6 +653,17 @@ class GRPOTrainer:
             stats[k] /= n
         stats["completion/mean_tokens"] = sum(lens) / max(len(lens), 1)
         stats["teacher/calls"], stats["teacher/verified"] = float(teacher_calls), float(teacher_ok)
+        if sirsi.enabled:
+            denom = float(max(n_total, 1))
+            stats["sirsi/loop_degen_rate"] = n_loop / denom
+            stats["sirsi/unclosed_think_rate"] = n_unclosed / denom
+            stats["sirsi/premature_exit_rate"] = n_premature / denom
+            stats["sirsi/ai_slop_rate"] = n_slop / denom
+            stats["sirsi/mean_slop_penalty"] = slop_pen_sum / denom
+            stats["sirsi/n_slap_seqs"] = float(len(slap_seqs))
+            stats["sirsi/hint_calls"] = float(hint_calls)
+            stats["sirsi/hint_recovered"] = float(hint_ok)
+            stats["sirsi/failures_logged"] = float(failures_logged)
         return seqs, stats
 
     def update(self, seqs: list[_Seq]) -> dict[str, float]:
@@ -413,20 +671,51 @@ class GRPOTrainer:
         mb = int(rl.get("micro_batch_seqs", 4))
         eps_lo, eps_hi = float(rl.get("clip_low", 0.2)), float(rl.get("clip_high", 0.28))
         kl_coef, sft_w = float(rl.get("kl_coef", 0.0)), float((rl.get("teacher") or {}).get("sft_weight", 0.1))
+        slap_w = float(self.sirsi.slap_weight) if self.sirsi.enabled else 0.0
+        slap_eps = float(self.sirsi.slap_eps)
         aux_w = dict(self.tcfg.get("aux_weights") or {})
         epochs = int(rl.get("ppo_epochs", 1))
+        slap = [s for s in seqs if s.kind == "slap_neg"]
         pg = [s for s in seqs if s.kind == "pg"]
         te = [s for s in seqs if s.kind == "teacher"]
-        chunks = [pg[i:i + mb] for i in range(0, len(pg), mb)] + [te[i:i + mb] for i in range(0, len(te), mb)]
+        # Place slap_neg chunks before pg/teacher so surgical autograd.grad accumulates cleanly before
+        # any boundary fused-hook backward; works identically in both fused=True and fused=False modes.
+        chunks = (
+            [slap[i:i + mb] for i in range(0, len(slap), mb)]
+            + [pg[i:i + mb] for i in range(0, len(pg), mb)]
+            + [te[i:i + mb] for i in range(0, len(te), mb)]
+        )
+        n_slap_tok = max(
+            1,
+            sum(
+                sum(1 for b in (s.span_mask[1:] if s.n_prompt == 0 else s.span_mask) if b)
+                if s.span_mask is not None
+                else max(0, len(s.ids) - max(1, s.n_prompt))
+                for s in slap
+            ),
+        )
         n_pg_tok = max(1, sum(len(s.ids) - s.n_prompt for s in pg))
         n_te_tok = max(1, sum(len(s.ids) - s.n_prompt for s in te))
         old: list[torch.Tensor | None] = [None] * len(chunks)
         if epochs > 1:
             with torch.no_grad():
-                old = [self._logprobs(self._batch(c)[0]).detach() for c in chunks]
+                old = [
+                    self._logprobs(self._batch(c)[0]).detach() if c[0].kind == "pg" else None
+                    for c in chunks
+                ]
         # Drop any stale no-grad aux terms left behind by `rollout()` or `old` logprob evaluation
         self.stack.aux_losses()
-        stats = {"loss/pg": 0.0, "loss/kl": 0.0, "loss/teacher_nll": 0.0, "clip_frac": 0.0}
+        stats = {
+            "loss/pg": 0.0,
+            "loss/kl": 0.0,
+            "loss/teacher_nll": 0.0,
+            "loss/teacher": 0.0,
+            "loss/slap_neg": 0.0,
+            "clip_frac": 0.0,
+        }
+        if not chunks:
+            stats["temperature"] = self.temperature
+            return stats
         clip_n = tok_n = 0.0
         for _ep in range(epochs):
             self.opt.zero_grad(set_to_none=True)
@@ -436,9 +725,33 @@ class GRPOTrainer:
                 m = mask[:, 1:]
                 lp = self._logprobs(ids)
                 aux_now = self.stack.aux_losses()
-                if chunk[0].kind == "teacher":
+                kind = chunk[0].kind
+                if kind == "slap_neg":
+                    span_bool = m > 0.5
+                    chunk_toks = span_bool.sum()
+                    ul_mean = unlikelihood_span_loss(lp, span_bool, eps=slap_eps)
+                    loss = ul_mean * (chunk_toks.to(ul_mean.dtype) / float(n_slap_tok)) * slap_w
+                    stats["loss/slap_neg"] += float(loss.detach())
+                    if self._slap_target_params is not None:
+                        if self._slap_target_params and loss.requires_grad:
+                            grads = torch.autograd.grad(loss, self._slap_target_params, allow_unused=True)
+                            with torch.no_grad():
+                                for p, g_t in zip(self._slap_target_params, grads):
+                                    if g_t is None:
+                                        continue
+                                    g_det = g_t.detach()
+                                    if p.grad is None:
+                                        p.grad = g_det.clone()
+                                    else:
+                                        p.grad.add_(g_det)
+                            del grads
+                        del aux_now, lp, loss, ul_mean, span_bool, chunk_toks, ids, mask, m, adv
+                        continue
+                elif kind == "teacher":
                     loss = -(lp * m).sum() / n_te_tok * sft_w
-                    stats["loss/teacher_nll"] += float(loss.detach())
+                    t_val = float(loss.detach())
+                    stats["loss/teacher_nll"] += t_val
+                    stats["loss/teacher"] += t_val
                 else:
                     ref_lp = old[ci] if old[ci] is not None else lp.detach()
                     ratio = torch.exp(lp - ref_lp)

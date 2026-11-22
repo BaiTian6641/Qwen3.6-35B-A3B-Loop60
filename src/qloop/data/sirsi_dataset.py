@@ -573,26 +573,81 @@ _REFUSAL_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bi cannot (?:fulfill|comply with|assist with|help with) (?:this|that) request\b", re.IGNORECASE),
     re.compile(r"\bi(?:'m| am) sorry,?\s+but i (?:can't|cannot)\b", re.IGNORECASE),
     re.compile(
-        r"\bhaven't\s+(?:actually\s+)?(?:included|provided|given|shared)\s+(?:a|the)?\s*"
-        r"(?:actual\s+)?(?:problem|question)\b",
+        r"\bi (?:can't|cannot) (?:help with this request|provide a solution without|"
+        r"answer this question because it lacks)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:missing|no|without)\s+(?:a|the|any)?\s*(?:actual\s+)?problem\s+(?:statement|description)\b",
+        r"\bhaven't\s+(?:actually\s+)?(?:included|provided|given|shared)\s+(?:a|an|the)?\s*"
+        r"(?:actual|complete|full)?\s*(?:problem|question|number puzzle)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:the )?problem statement (?:appears to be |is )?(?:missing|incomplete|truncated|not provided)\b",
+        r"\b(?:missing|no|without|lacks)\s+(?:a|an|the|any)?\s*(?:actual|specific|complete|full)?\s*"
+        r"(?:problem|question)\s*(?:statement|description|was provided|was included|to solve|included)\b",
         re.IGNORECASE,
     ),
-    re.compile(r"\bplease provide (?:the )?(?:complete |full )?(?:problem|question|input|details)\b", re.IGNORECASE),
-    re.compile(r"\bno problem (?:was |has been )?provided\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:the |your )?(?:problem|question)(?:\s+(?:statement|description))?\s+"
+        r"(?:you've provided\s+)?(?:appears to be |appears |is )?(?:missing|incomplete|truncated|"
+        r"not provided|isn't provided)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:\*\*)?(?:partial|incomplete|fragment(?:\*\*)?\s+of\s+(?:a|what appears to be))\s+"
+        r"(?:problem\s+(?:statement|description)|solution explanation)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bdon't\s+(?:have|see)\s+(?:a|an|the)\s+(?:complete|full|actual)\s+(?:problem|question)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:please|could you(?:\s+please)?)\s+(?:provide|share)\s+(?:the\s+)?"
+        r"(?:complete|full|actual|specific)\s+(?:problem|question|input|details)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bno (?:actual |specific )?(?:problem|question)\s+(?:statement\s+)?"
+        r"(?:was |has been )?(?:provided|included)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:^|\n)#{1,4}\s*(?:incomplete problem statement|missing (?:information|question))\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bappears to be part of a larger problem\b.*\b(?:need the full|full context|complete problem)\b",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"\bi(?:'m| am) not able to help with this request\b|\bthere(?:'s| is) no actual problem\b|"
+        r"\byour message appears to be incomplete\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bno (?:actual|specific) problem (?:has been (?:given|stated|provided|included)|"
+        r"or [^.\n]{1,40} (?:was|were) provided)\b",
+        re.IGNORECASE,
+    ),
 ]
 
 _REDACTED_TOOL_ARG_RE = re.compile(
-    r"<(?:file_path|directory_path|bash_command|file_content|old_string|new_string|search_query|pattern|query|path|command|url|code|content)>",
+    r"<(?:file_path|directory_path|bash_command|file_content|old_string|new_string|"
+    r"search_query|search_pattern|shell_command|dir_path|target_path|source_path|redacted)>",
     re.IGNORECASE,
 )
+
+
+def _has_redacted_tool_arg_value(obj: Any) -> bool:
+    """Recursively check parsed JSON leaf strings for exact placeholder-redacted tool arguments."""
+    if isinstance(obj, str):
+        return bool(_REDACTED_TOOL_ARG_RE.fullmatch(obj.strip()))
+    if isinstance(obj, dict):
+        return any(_has_redacted_tool_arg_value(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_has_redacted_tool_arg_value(v) for v in obj)
+    return False
 
 _FINAL_ANSWER_TAG_RE = re.compile(r"^\s*<final_answer>\s*(.*?)\s*</final_answer>\s*$", re.DOTALL | re.IGNORECASE)
 
@@ -824,8 +879,8 @@ def detect_pathology(
     if "\x00" in combined or combined.count("\ufffd") >= 5:
         issues.append("pathology:corrupted_text")
 
-    # Refusal or missing-problem boilerplate (check final response + first 400 chars of reasoning)
-    ref_target = f"{c[:600]}\n{r[:400]}"
+    # Refusal or missing-problem boilerplate (check generous window of response + reasoning)
+    ref_target = f"{c[:2000]}\n{r[:800]}"
     for pat in _REFUSAL_PATTERNS:
         if pat.search(ref_target):
             issues.append("pathology:refusal_or_incomplete_prompt")
@@ -887,6 +942,14 @@ def _check_python_blocks(response: str) -> list[str]:
     return issues
 
 
+def _parse_arc_grid(response: str) -> list[list[int]] | None:
+    """Parse ARC output grid, including valid 1x1 single-digit output grids."""
+    grid = parse_grid(response)
+    if grid is None and re.fullmatch(r"\s*[0-9]\s*", response or ""):
+        return [[int(response.strip())]]
+    return grid
+
+
 def check_domain_sanity(
     domain: str,
     prompt: str,
@@ -907,9 +970,7 @@ def check_domain_sanity(
 
     # 2. ARC grid validation (including valid 1x1 single-digit output grids)
     if domain == "arc":
-        grid = parse_grid(response)
-        if grid is None and re.fullmatch(r"\s*[0-9]\s*", response or ""):
-            grid = [[int(response.strip())]]
+        grid = _parse_arc_grid(response)
         if grid is None:
             hard_issues.append("domain:arc_grid_invalid")
         else:
@@ -952,12 +1013,12 @@ def check_domain_sanity(
                             parsed = json.loads(s_args)
                             if not isinstance(parsed, (dict, list)):
                                 has_invalid_tc = True
+                            elif _has_redacted_tool_arg_value(parsed):
+                                has_redacted_tc = True
                         except json.JSONDecodeError:
                             has_invalid_tc = True
-                    if _REDACTED_TOOL_ARG_RE.search(s_args):
-                        has_redacted_tc = True
-                elif isinstance(args, dict):
-                    if _REDACTED_TOOL_ARG_RE.search(json.dumps(args)):
+                elif isinstance(args, (dict, list)):
+                    if _has_redacted_tool_arg_value(args):
                         has_redacted_tc = True
                 elif args is not None:
                     has_invalid_tc = True
@@ -1392,7 +1453,7 @@ def build_or_load_decontaminator(
 
 def _extract_canonical_answer(domain: str, response: str) -> str:
     if domain == "arc":
-        g = parse_grid(response)
+        g = _parse_arc_grid(response)
         return json.dumps(g) if g is not None else ""
     if domain == "math":
         return extract_math_answer(response) or ""
@@ -2126,8 +2187,8 @@ def verify_synthesized_row(
         if not _answers_equivalent(domain, orig_extracted_answer, new_extracted):
             reasons.append(f"rejected:answer_mismatch(orig={orig_extracted_answer!r},new={new_extracted!r})")
     elif domain == "arc" and orig_response:
-        orig_g = parse_grid(orig_response)
-        new_g = parse_grid(response)
+        orig_g = _parse_arc_grid(orig_response)
+        new_g = _parse_arc_grid(response)
         if orig_g is not None and not grid_equal(orig_g, new_g):
             reasons.append("rejected:arc_grid_mismatch")
 
@@ -2186,10 +2247,22 @@ class TrackBSynthesizer:
         prefs: list[dict[str, Any]] = []
         if not p.exists():
             return done_ids, sft, prefs
-        for line in p.read_text(encoding="utf-8").splitlines():
+        for lineno, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             if not line.strip():
                 continue
-            entry = json.loads(line)
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                log.warning("[synth] ignoring truncated/malformed checkpoint line %d in %s", lineno, p.name)
+                continue
+            if not isinstance(entry, dict) or "source_id" not in entry:
+                continue
+            # Never mark transient API errors as permanently done so resume retries them
+            reasons = entry.get("reasons") or []
+            if entry.get("transient_error") or (
+                not entry.get("accepted") and any(str(r).startswith("api_error:") for r in reasons)
+            ):
+                continue
             done_ids.add(str(entry["source_id"]))
             if entry.get("accepted"):
                 if entry.get("sft_record"):
@@ -2201,6 +2274,7 @@ class TrackBSynthesizer:
     def _append_ckpt(self, mode: str, entry: dict[str, Any]) -> None:
         with self._ckpt_path(mode).open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            fh.flush()
 
     async def run_salvage_rewrite(
         self,
@@ -2211,6 +2285,7 @@ class TrackBSynthesizer:
         """Rewrite salvage_queue rows into verified 3-beat anti-slop SFT + preference pairs."""
         done_ids, sft_out, pref_out = self._load_ckpt("salvage_rewrite")
         todo = [r for r in salvage_rows if str(r["id"]) not in done_ids][:max_items]
+        ckpt_lock = asyncio.Lock()
 
         async def _one(row: dict[str, Any]) -> dict[str, Any]:
             sid = str(row["id"])
@@ -2231,7 +2306,15 @@ class TrackBSynthesizer:
             self.stats["salvage_rewrite:attempted"] += 1
             if not res["ok"]:
                 self.stats["salvage_rewrite:api_error"] += 1
-                return {"source_id": sid, "accepted": False, "reasons": [f"api_error:{res['status_code']}"]}
+                entry: dict[str, Any] = {
+                    "source_id": sid,
+                    "accepted": False,
+                    "transient_error": True,
+                    "reasons": [f"api_error:{res['status_code']}"],
+                }
+                async with ckpt_lock:
+                    self._append_ckpt("salvage_rewrite", entry)
+                return entry
 
             thinking, response = extract_think(res["content"])
             thinking_s = (thinking or "").strip()
@@ -2249,7 +2332,10 @@ class TrackBSynthesizer:
                 self.stats["salvage_rewrite:rejected"] += 1
                 for r in reasons:
                     self.stats[f"salvage_rewrite:{r.split('(')[0]}"] += 1
-                return {"source_id": sid, "accepted": False, "reasons": reasons}
+                entry = {"source_id": sid, "accepted": False, "reasons": reasons}
+                async with ckpt_lock:
+                    self._append_ckpt("salvage_rewrite", entry)
+                return entry
 
             self.stats["salvage_rewrite:accepted"] += 1
             prov = dict(row["provenance"])
@@ -2293,11 +2379,13 @@ class TrackBSynthesizer:
                 "quality_scores": qscores,
                 "provenance": prov,
             }
-            return {"source_id": sid, "accepted": True, "sft_record": sft_rec, "pref_record": pref_rec}
+            entry = {"source_id": sid, "accepted": True, "sft_record": sft_rec, "pref_record": pref_rec}
+            async with ckpt_lock:
+                self._append_ckpt("salvage_rewrite", entry)
+            return entry
 
         results = await asyncio.gather(*[_one(r) for r in todo])
         for entry in results:
-            self._append_ckpt("salvage_rewrite", entry)
             if entry.get("accepted"):
                 sft_out.append(entry["sft_record"])
                 pref_out.append(entry["pref_record"])
@@ -2317,6 +2405,7 @@ class TrackBSynthesizer:
         default_briefs = _DEFAULT_AESTHETIC_BRIEFS if mode == "aesthetic_craft" else _DEFAULT_RECOVERY_BRIEFS
         item_briefs = list(briefs if briefs is not None else default_briefs)[:max_items]
         done_ids, sft_out, pref_out = self._load_ckpt(mode)
+        ckpt_lock = asyncio.Lock()
 
         async def _one(idx: int, cat: str, brief: str) -> dict[str, Any]:
             sid = f"{mode}_{idx:04d}"
@@ -2329,7 +2418,15 @@ class TrackBSynthesizer:
             self.stats[f"{mode}:attempted"] += 1
             if not res["ok"]:
                 self.stats[f"{mode}:api_error"] += 1
-                return {"source_id": sid, "accepted": False, "reasons": [f"api_error:{res['status_code']}"]}
+                entry: dict[str, Any] = {
+                    "source_id": sid,
+                    "accepted": False,
+                    "transient_error": True,
+                    "reasons": [f"api_error:{res['status_code']}"],
+                }
+                async with ckpt_lock:
+                    self._append_ckpt(mode, entry)
+                return entry
 
             raw_txt = res["content"].strip()
             # Strip optional ```json fences
@@ -2339,7 +2436,16 @@ class TrackBSynthesizer:
                 obj = json.loads(raw_json)
             except json.JSONDecodeError:
                 self.stats[f"{mode}:rejected_invalid_json"] += 1
-                return {"source_id": sid, "accepted": False, "reasons": ["rejected:invalid_json"]}
+                entry = {"source_id": sid, "accepted": False, "reasons": ["rejected:invalid_json"]}
+                async with ckpt_lock:
+                    self._append_ckpt(mode, entry)
+                return entry
+            if not isinstance(obj, dict):
+                self.stats[f"{mode}:rejected_non_dict_json"] += 1
+                entry = {"source_id": sid, "accepted": False, "reasons": ["rejected:non_dict_json"]}
+                async with ckpt_lock:
+                    self._append_ckpt(mode, entry)
+                return entry
 
             prompt = str(obj.get("prompt") or brief).strip()
             c_think = str(obj.get("chosen_thinking") or "").strip()
@@ -2356,9 +2462,20 @@ class TrackBSynthesizer:
                 response=c_resp,
                 decontaminator=self.decontaminator,
             )
+            if not r_resp or r_resp == c_resp:
+                ok = False
+                reasons.append("rejected:invalid_rejected_pair")
+            if self.decontaminator is not None and (r_think or r_resp):
+                hit_r, grp_r = self.decontaminator.check(f"{r_think}\n{r_resp}", source="track_b_synth_rejected")
+                if hit_r:
+                    ok = False
+                    reasons.append(f"rejected:contaminated_rejected({grp_r})")
             if not ok:
                 self.stats[f"{mode}:rejected"] += 1
-                return {"source_id": sid, "accepted": False, "reasons": reasons}
+                entry = {"source_id": sid, "accepted": False, "reasons": reasons}
+                async with ckpt_lock:
+                    self._append_ckpt(mode, entry)
+                return entry
 
             self.stats[f"{mode}:accepted"] += 1
             prov = {
@@ -2403,13 +2520,15 @@ class TrackBSynthesizer:
                 "quality_scores": qscores,
                 "provenance": prov,
             }
-            return {"source_id": sid, "accepted": True, "sft_record": sft_rec, "pref_record": pref_rec}
+            entry = {"source_id": sid, "accepted": True, "sft_record": sft_rec, "pref_record": pref_rec}
+            async with ckpt_lock:
+                self._append_ckpt(mode, entry)
+            return entry
 
         results = await asyncio.gather(*[_one(i, cat, b) for i, (cat, b) in enumerate(item_briefs)])
         for entry in results:
             if entry.get("skipped"):
                 continue
-            self._append_ckpt(mode, entry)
             if entry.get("accepted"):
                 sft_out.append(entry["sft_record"])
                 pref_out.append(entry["pref_record"])
@@ -2654,7 +2773,7 @@ def render_dataset_card(
         lm = lic_map.get(src.name, {})
         live_l = lm.get("live_license", src.license)
         status = "INCLUDED" if lm.get("included", src.included) else "EXCLUDED"
-        note = lm.get("reason") if status == "EXCLUDED" else src.attribution_note[:110]
+        note = lm.get("reason") if status == "EXCLUDED" else src.attribution_note
         lines.append(
             f"| `{src.name}` | `{src.hf_id}` | `{src.license}` | `{live_l}` | **{status}** | {note} |"
         )
@@ -2670,21 +2789,40 @@ def render_dataset_card(
         "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |",
     ])
 
+    has_arc_expansion = False
     for name, st in per_source.items():
         streamed = int(st.get("streamed", 0))
         keep = int(st.get("keep", 0))
         det_sal = int(st.get("deterministic_salvaged_to_keep", 0))
         salvage = int(st.get("salvage", 0))
         drop = int(st.get("drop", 0))
-        keep_pct = (100.0 * keep / max(1, streamed))
-        top_r = sorted(
-            (st.get("drop_reasons") or {}).items(), key=lambda kv: kv[1], reverse=True
-        )[:3]
-        top_str = ", ".join(f"`{k}` ({v})" for k, v in top_r) if top_r else "—"
+        expanded_total = keep + salvage + drop
+        denom = expanded_total if (name == "arc_agi2_train" and expanded_total > streamed) else max(1, streamed)
+        keep_pct = 100.0 * keep / max(1, denom)
+        stream_cell = f"{streamed:,}*" if (name == "arc_agi2_train" and expanded_total > streamed) else f"{streamed:,}"
+        if name == "arc_agi2_train" and expanded_total > streamed:
+            has_arc_expansion = True
+        top_drop = sorted((st.get("drop_reasons") or {}).items(), key=lambda kv: kv[1], reverse=True)[:2]
+        top_salv = sorted((st.get("salvage_reasons") or {}).items(), key=lambda kv: kv[1], reverse=True)[:2]
+        parts: list[str] = []
+        if top_drop:
+            parts.append("Drop: " + ", ".join(f"`{k}` ({v})" for k, v in top_drop))
+        if top_salv:
+            parts.append("Salvage: " + ", ".join(f"`{k}` ({v})" for k, v in top_salv))
+        top_str = "; ".join(parts) if parts else "—"
         lines.append(
-            f"| `{name}` | {streamed:,} | {keep:,} | {det_sal:,} | "
+            f"| `{name}` | {stream_cell} | {keep:,} | {det_sal:,} | "
             f"{salvage:,} | {drop:,} | {keep_pct:.1f}% | {top_str} |"
         )
+
+    if has_arc_expansion:
+        arc_st = per_source.get("arc_agi2_train", {})
+        arc_pairs = int(arc_st.get("keep", 0)) + int(arc_st.get("salvage", 0)) + int(arc_st.get("drop", 0))
+        lines.extend([
+            "",
+            f"*\\*`arc_agi2_train` streams {int(arc_st.get('streamed', 0)):,} JSON task files, which expand "
+            f"to {arc_pairs:,} individual test I/O pairs.*",
+        ])
 
     lines.extend([
         "",
@@ -2702,7 +2840,7 @@ def render_dataset_card(
         "(e.g. `\"<bash_command>\"` in `fable51`) are quarantined to `salvage_queue` rather than "
         "poisoning tool SFT.",
         "4. **Cross-Source Deduplication:** Exact SHA-256 on `(prompt, response)` and `prompt`, "
-        "plus 64-hash banded MinHash / 5-word shingle Jaccard near-deduplication (`>= 0.85`). "
+        "plus 64-hash banded MinHash / 3-word shingle Jaccard near-deduplication (`>= 0.85`). "
         f"Unique pairs indexed: **{dedup.get('unique_indexed', 0):,}**; "
         f"duplicates removed: `{dedup.get('dup_counts', {})}`.",
         "",
@@ -3034,10 +3172,11 @@ def publish_to_hub(
     if not isinstance(card_meta, dict) or "license" not in card_meta or "configs" not in card_meta:
         raise ValueError("README.md YAML frontmatter must declare 'license' and 'configs'")
 
-    # Secret-leak scan across text artifacts
+    # Secret-leak scan across text artifacts (both generic token patterns and active HF token)
+    active_tok = token or os.environ.get("HF_TOKEN") or ""
     for rel in ("README.md", "audit_summary.json"):
         txt = (root / rel).read_text(encoding="utf-8")
-        if _SECRET_LEAK_RE.search(txt):
+        if _SECRET_LEAK_RE.search(txt) or (active_tok and active_tok in txt):
             raise RuntimeError(f"Refusing to publish: potential secret pattern detected in {rel}")
 
     manifest_files: list[dict[str, Any]] = []

@@ -218,11 +218,22 @@ def test_pathology_detection_all_failure_modes():
     assert "pathology:reasoning_redacted" in detect_pathology("q", "[redacted]", "ans")
     # Unclosed code fence
     assert "pathology:unclosed_code_fence" in detect_pathology("q", "valid reasoning here", "```python\nx = 1\n")
-    # Refusal / incomplete prompt (including disguised "no actual problem statement" templates)
+    # Refusal / incomplete prompt (including past char 600 and subtle phrasing variants)
     ref = "I notice you haven't actually included a problem statement for me to solve."
     assert "pathology:refusal_or_incomplete_prompt" in detect_pathology("q", "Checking input...", ref)
     ref2 = "However, **you haven't provided the actual problem statement or question**."
     assert "pathology:refusal_or_incomplete_prompt" in detect_pathology("q", "Checking input...", ref2)
+    ref_late = ("Context note about formatting. " * 26) + "Please provide the complete problem statement."
+    assert len(ref_late) > 750
+    assert "pathology:refusal_or_incomplete_prompt" in detect_pathology("q", "Checking input...", ref_late)
+    for variant in (
+        "I notice you've provided a partial problem statement with just a note.",
+        "I notice you've only provided a **fragment** of a problem statement.",
+        "I don't have the complete problem statement to work with.",
+        "## Incomplete Problem Statement\nOnly the input format was pasted.",
+        "As an AI, I don't watch television.",
+    ):
+        assert "pathology:refusal_or_incomplete_prompt" in detect_pathology("q", "Checking...", variant)
     # Repetition loop
     loop_txt = "\n".join(["Let me re-evaluate the exact same equation carefully now."] * 6)
     assert "pathology:repetition_loop" in detect_pathology("q", loop_txt, "42")
@@ -271,6 +282,40 @@ def test_domain_sanity_python_arc_and_agentic():
     ]
     h_r, s_r, _ = check_domain_sanity("agentic", "Inspect repo", "List dir", "", messages=msgs_redacted)
     assert not h_r and "salvage:redacted_tool_args" in s_r
+
+    # Legitimate HTML/XML/SVG tags inside tool_calls must NOT false-positive as redacted placeholders
+    msgs_html_xml = [
+        {"role": "user", "content": "Write docs and XML"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "Write HTML, Atom, sitemap, and SVG files.",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": json.dumps({
+                            "path": "docs/index.html",
+                            "content": "<p>Run <code>pytest</code></p><svg><path d='M0 0'/></svg>",
+                        }),
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": json.dumps({
+                            "path": "feed.xml",
+                            "content": "<entry><content>hi</content><url>https://x.test</url><command>ok</command></entry>",
+                        }),
+                    },
+                },
+            ],
+        },
+    ]
+    h_hx, s_hx, _ = check_domain_sanity("agentic", "Write docs", "Plan", "", messages=msgs_html_xml)
+    assert not h_hx and "salvage:redacted_tool_args" not in s_hx
 
     msgs_bad_json = [
         {"role": "user", "content": "Inspect repo"},
@@ -569,6 +614,126 @@ def test_track_b_synthesis_accept_reject_and_resume(tmp_path: Path):
     assert len(rec_sft) == 1 and len(rec_pref) == 1
 
 
+def test_track_b_transient_retry_corrupt_ckpt_and_structured_guards(tmp_path: Path):
+    eval_leak = "Find all pairs of twin primes p and q such that p squared plus q cubed equals a fifth power."
+    decontam, _ = build_or_load_decontaminator(eval_texts_override={"hmmt_2026": [eval_leak]}, n=13)
+
+    # 1. Transient api_error:503 must be retried on resume (NOT permanently marked done)
+    row = {
+        "id": "retry_me",
+        "domain": "arc",
+        "prompt": "Transform 1x1 grid.",
+        "thinking": "",
+        "response": "7",
+        "extracted_answer": "[[7]]",
+        "triage_reasons": ["salvage:missing_cot_verified_answer"],
+        "provenance": {
+            "source_dataset": "github:arcprize/ARC-AGI-2",
+            "source_name": "arc_agi2_train",
+            "source_config": "default",
+            "source_split": "training",
+            "source_license": "apache-2.0",
+            "source_row_index": 0,
+            "citation_key": "chollet2025arcagi2",
+            "transform_stage": "queued_for_track_b",
+            "salvage_actions": [],
+        },
+    }
+    mock_fail = _MockTeacherClient([{"ok": False, "status_code": 503, "content": "", "error": "overloaded"}])
+    synth1 = TrackBSynthesizer(mock_fail, out_dir=tmp_path, decontaminator=decontam)
+    sft_fail, _ = asyncio.run(synth1.run_salvage_rewrite([row], max_items=1))
+    assert len(sft_fail) == 0
+
+    # Inject a truncated corrupt trailing line into the checkpoint file to verify crash resilience
+    with (tmp_path / ".synth_ckpt_salvage_rewrite.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write('{"source_id": "truncated_crash_line"\n')
+
+    mock_ok = _MockTeacherClient([{
+        "ok": True,
+        "status_code": 200,
+        "error": "",
+        "content": (
+            "<think>\nBeat 1 (Framing): Given the input-output pairs, the invariant maps every single-cell "
+            "grid to its complement color 7. Beat 2 (Self-Audit): Double-check the boundary condition across "
+            "both training pairs and verify there is no off-by-one color shift -> [[7]].\n</think>\n\n7"
+        ),
+    }])
+    synth2 = TrackBSynthesizer(mock_ok, out_dir=tmp_path, decontaminator=decontam)
+    sft_ok, pref_ok = asyncio.run(synth2.run_salvage_rewrite([row], max_items=1))
+    assert len(mock_ok.calls) == 1
+    assert len(sft_ok) == 1 and sft_ok[0]["extracted_answer"] == "[[7]]"
+    assert len(pref_ok) == 1
+
+    # 2. ARC 1x1 invariance check inside verify_synthesized_row
+    arc_think = (
+        "Beat 1 (Framing): Given the training examples, notice the rule maps the input cell to color 7. "
+        "Beat 2 (Self-Audit): Verify boundary case and check every example to confirm zero contradiction."
+    )
+    ok_1x1, _, _ = verify_synthesized_row(
+        domain="arc",
+        prompt="ARC 1x1",
+        thinking=arc_think,
+        response="7",
+        orig_response="7",
+    )
+    assert ok_1x1
+    bad_1x1, reasons_1x1, _ = verify_synthesized_row(
+        domain="arc",
+        prompt="ARC 1x1",
+        thinking=arc_think,
+        response="3",
+        orig_response="7",
+    )
+    assert not bad_1x1 and any("arc_grid_mismatch" in r for r in reasons_1x1)
+
+    # 3. Structured mode guards: non-dict JSON, empty rejected_response, and contaminated rejected_response
+    good_c_think = (
+        "Beat 1 (Framing): Given a telemetry badge, define clear contrast and tabular numerals. "
+        "Beat 2 (Self-Audit): Check WCAG AA contrast and verify no neon glow competes with alerts."
+    )
+    good_c_resp = "Use `#166534` text on `#dcfce7` surface with 11px uppercase 600-weight type."
+    mock_bad_struct = _MockTeacherClient([
+        {"ok": True, "status_code": 200, "error": "", "content": "[1, 2, 3]"},
+        {
+            "ok": True,
+            "status_code": 200,
+            "error": "",
+            "content": json.dumps({
+                "prompt": "P",
+                "chosen_thinking": good_c_think,
+                "chosen_response": good_c_resp,
+                "rejected_thinking": "",
+                "rejected_response": "",
+                "critique": "c",
+            }),
+        },
+        {
+            "ok": True,
+            "status_code": 200,
+            "error": "",
+            "content": json.dumps({
+                "prompt": "P",
+                "chosen_thinking": good_c_think,
+                "chosen_response": good_c_resp,
+                "rejected_thinking": "",
+                "rejected_response": f"Leaked: {eval_leak}",
+                "critique": "c",
+            }),
+        },
+    ])
+    synth_bad = TrackBSynthesizer(mock_bad_struct, out_dir=tmp_path / "bad_s", decontaminator=decontam)
+    bsft, bpref = asyncio.run(
+        synth_bad.run_structured_mode(
+            "aesthetic_craft",
+            briefs=[("aesthetic_ui", "b1"), ("aesthetic_ui", "b2"), ("aesthetic_ui", "b3")],
+            max_items=3,
+        )
+    )
+    assert len(bsft) == 0 and len(bpref) == 0
+    assert synth_bad.stats["aesthetic_craft:rejected_non_dict_json"] == 1
+    assert synth_bad.stats["aesthetic_craft:rejected"] == 2
+
+
 def test_secret_scrubbing_and_probe():
     secret = "hf_superSecretTokenValue1234567890"
     assert secret not in _scrub_secret(f"Authorization failed for {secret} at router", secret)
@@ -623,6 +788,8 @@ def test_end_to_end_offline_pipeline_parquet_readme_and_dry_run(tmp_path: Path):
     readme = (tmp_path / "ds" / "README.md").read_text(encoding="utf-8")
     assert "@misc{guha2025openthoughts" in readme
     assert "agpl-3.0" in readme and "EXCLUDED" in readme
+    assert "3-word shingle" in readme and "5-word shingle" not in readme
+    assert "bloc |" not in readme and "on/of |" not in readme
     yaml_block = readme.split("---")[1]
     meta = yaml.safe_load(yaml_block)
     assert meta["license"] in ("apache-2.0", "cc-by-4.0")

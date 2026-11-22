@@ -80,6 +80,7 @@ RL-trained reasoning models frequently drift toward stiff, formulaic assistant c
   $$\underbrace{1.00}_{\text{correct + direct}} \;>\; \underbrace{0.95}_{\text{correct + sloppy}} \;\gg\; \underbrace{0.00}_{\text{wrong + direct}} \;>\; \underbrace{-0.05}_{\text{wrong + sloppy}}$$
   - Inside mixed groups, every verified correct answer stays strongly positive-advantage over every wrong answer (verifiable math/code/kernel correctness is **never** overridden).
   - Inside `groups/all_pass` groups (which standard GRPO drops due to zero variance), crisp direct responses earn positive advantage over boilerplate-heavy responses, steadily steering the final-answer register toward sharp, vibrant prose.
+  - Inside `groups/all_fail` groups (`all(r <= 0)`), `slop_penalty` is withheld from `shaped` advantages (while still logged in `sirsi/ai_slop_rate`, `sirsi/mean_slop_penalty`, and `sirsi_failures.jsonl`) so std-normalized GRPO never positively reinforces wrong answers.
 
 ### 2.4 Operator Quickstart (`configs/stages/s4_rl.yaml`)
 

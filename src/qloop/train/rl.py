@@ -499,6 +499,7 @@ class GRPOTrainer:
         max_teacher = int((rl.get("teacher") or {}).get("max_calls_per_step", 2))
         for t, samples, rw in zip(tasks, outs, rewards):
             p_ids = self.gen.encode_prompt(t.prompt)
+            all_fail = all(r <= 0 for r in rw)
             paths = (
                 [detect_pathologies(o.text, reward=r, cfg=sirsi) for o, r in zip(samples, rw)]
                 if sirsi.enabled
@@ -546,11 +547,12 @@ class GRPOTrainer:
                                     tags=tuple(p_info.tags),
                                 )
                             )
-                shaped.append(r + self._overlong(o.completion_tokens) - s_pen)
+                # Apply anti-slop tie-breaker only when at least one sample succeeded (`not all_fail`),
+                # preventing std-normalized advantage amplification from positively reinforcing wrong answers.
+                shaped.append(r + self._overlong(o.completion_tokens) - (0.0 if all_fail else s_pen))
 
             flat += rw
             lens += [o.completion_tokens for o in samples]
-            all_fail = all(r <= 0 for r in rw)
 
             if self.failure_ledger is not None:
                 logged_any = False
@@ -742,6 +744,8 @@ class GRPOTrainer:
                                         p.grad = g_det.clone()
                                     else:
                                         p.grad.add_(g_det)
+                            del grads
+                        del aux_now, lp, loss, ul_mean, span_bool, chunk_toks, ids, mask, m, adv
                         continue
                 elif kind == "teacher":
                     loss = -(lp * m).sum() / n_te_tok * sft_w

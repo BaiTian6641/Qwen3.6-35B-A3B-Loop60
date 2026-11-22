@@ -516,6 +516,40 @@ def test_grpo_sirsi_guided_hint_recovery_and_teacher_budget_caps(tmp_path, monke
     assert tc.hint("Compute 6*7", "bad", [TAG_LOOP_DEGENERATION])
     with pytest.raises(RuntimeError, match="budget reached"):
         tc.hint("Compute 6*7", "bad")
+    tr.pool.shutdown(wait=False)
+
+
+def test_antislop_does_not_positively_reinforce_all_fail_groups(tmp_path, monkeypatch):
+    """Regression: 3 crisp-wrong + 1 sloppy-wrong (all_fail) must emit 0 PG seqs and groups/used == 0.0."""
+    run_dir = str(tmp_path / "sirsi_all_fail_slop")
+    cfg = _sirsi_toy_cfg(fused=False)
+    cfg["rl"]["group_size"] = 4
+    tr = GRPOTrainer(cfg, run_dir)
+    try:
+        crisp_wrong = "After checking carefully, the product is \\boxed{41}."
+        sloppy_wrong = (
+            "Certainly! Let's delve into this calculation. In today's fast-paced world, "
+            "it is important to note that the answer is \\boxed{41}."
+        )
+        samples = [
+            GenOut(crisp_wrong, [20, 21, 22, 23]),
+            GenOut(crisp_wrong, [20, 21, 22, 24]),
+            GenOut(crisp_wrong, [20, 21, 22, 25]),
+            GenOut(sloppy_wrong, [20, 21, 22, 26]),
+        ]
+        monkeypatch.setattr(tr.gen, "generate", lambda prompts, **kw: [samples for _ in prompts])
+        monkeypatch.setattr(tr.gen, "encode_prompt", lambda prompt, **kw: [10, 11, 12])
+
+        seqs, rstats = tr.rollout()
+        assert rstats["groups/all_fail"] == 1.0
+        assert rstats["groups/used"] == 0.0
+        assert [s for s in seqs if s.kind == "pg"] == []
+        assert rstats["sirsi/ai_slop_rate"] == pytest.approx(0.25)
+        assert rstats["sirsi/mean_slop_penalty"] > 0.0
+        rows = FailureLedger(os.path.join(run_dir, "sirsi_failures.jsonl")).read_recent(limit=10)
+        assert any(TAG_AI_SLOP in r["tags"] for r in rows)
+    finally:
+        tr.pool.shutdown(wait=False)
 
 
 # ============================================================================ curriculum sculpting & decontamination

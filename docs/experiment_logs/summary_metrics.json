@@ -1,0 +1,831 @@
+{
+  "generated_at_utc": "2026-11-22T05:03:10Z",
+  "repo": "TassP0lar/Qwen3.6-35B-A3B-Loop64",
+  "base_model": "unsloth/Qwen3.6-35B-A3B-NVFP4",
+  "hardware": "1x NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120, 96 GiB HBM)",
+  "total_hub_commits": 163,
+  "total_tokens_trained": 423559168,
+  "stages": {
+    "s1_loop_a6b": {
+      "status": "completed",
+      "latest_step": 1000,
+      "latest_hub_step": 1000,
+      "target_steps": 1000,
+      "latest_commit_sha": "32eb565e",
+      "n_params": 18412598,
+      "pct_of_34_661b": 0.053,
+      "n_rows": 40,
+      "tokens_seen": 131072000,
+      "tok_per_s_mean": 2117.5,
+      "tok_per_s_min": 1747.6,
+      "tok_per_s_max": 2637.5,
+      "mem_peak_max_gib": 54.24,
+      "skipped_total_max": 0.0,
+      "post_fix_skipped_max": 0.0,
+      "grad_norm_final": 0.0345,
+      "hub_span_hours": 17.29,
+      "eval_first": {
+        "step": 0,
+        "status": "eval",
+        "d1": 0.9916223254723343,
+        "d2": 0.992261063849218,
+        "d3": 0.9918279937008111,
+        "depth_gain": -0.00020566822847678523,
+        "commit_sha": "",
+        "ts": "",
+        "source": "local_metrics_jsonl"
+      },
+      "eval_last": {
+        "step": 1000,
+        "status": "completed",
+        "d1": 0.9799966054359351,
+        "d2": 0.933597553748658,
+        "d3": 0.9191115781774115,
+        "depth_gain": 0.06088502725852363,
+        "commit_sha": "32eb565e",
+        "ts": "2026-11-16T21:16:05+00:00",
+        "source": "hub_manifest"
+      },
+      "eval_best_depth_gain": {
+        "step": 1000,
+        "status": "completed",
+        "d1": 0.9799966054359351,
+        "d2": 0.933597553748658,
+        "d3": 0.9191115781774115,
+        "depth_gain": 0.06088502725852363,
+        "commit_sha": "32eb565e",
+        "ts": "2026-11-16T21:16:05+00:00",
+        "source": "hub_manifest"
+      }
+    },
+    "s1b_hssd_distill": {
+      "status": "completed",
+      "latest_step": 1500,
+      "latest_hub_step": 1500,
+      "target_steps": 1500,
+      "latest_commit_sha": "2fb912db",
+      "n_params": 76917638,
+      "pct_of_34_661b": 0.222,
+      "n_rows": 60,
+      "tokens_seen": 98304000,
+      "tok_per_s_mean": 946.7,
+      "tok_per_s_min": 587.3,
+      "tok_per_s_max": 1737.4,
+      "mem_peak_max_gib": 68.97,
+      "skipped_total_max": 13.0,
+      "post_fix_skipped_max": 0.0,
+      "grad_norm_final": 0.7542,
+      "hub_span_hours": 46.73,
+      "eval_first": {
+        "step": 0,
+        "status": "eval",
+        "d1": 1.1287418920057373,
+        "d2": 1.0781190015171012,
+        "d3": 1.0655655489479052,
+        "depth_gain": 0.06317634305783204,
+        "commit_sha": "",
+        "ts": "",
+        "source": "local_metrics_jsonl"
+      },
+      "eval_last": {
+        "step": 1500,
+        "status": "completed",
+        "d1": 1.76785465711182,
+        "d2": 1.7375141809805594,
+        "d3": 1.7052372444790886,
+        "depth_gain": 0.06261741263273146,
+        "commit_sha": "2fb912db",
+        "ts": "2026-11-19T04:33:51+00:00",
+        "source": "hub_manifest"
+      },
+      "eval_best_depth_gain": {
+        "step": 1400,
+        "status": "in_progress",
+        "d1": 1.8489282467989137,
+        "d2": 1.7630676313645246,
+        "d3": 1.7248233533249544,
+        "depth_gain": 0.12410489347395925,
+        "commit_sha": "de9b1ff9",
+        "ts": "2026-11-19T01:57:46+00:00",
+        "source": "hub_manifest"
+      }
+    },
+    "s3_long_1m_lsa": {
+      "status": "completed",
+      "latest_step": 600,
+      "latest_hub_step": 600,
+      "target_steps": 600,
+      "latest_commit_sha": "55c7a680",
+      "n_params": 83061638,
+      "pct_of_34_661b": 0.24,
+      "n_rows": 24,
+      "tokens_seen": 120782848,
+      "tok_per_s_mean": 1049.8,
+      "tok_per_s_min": 889.5,
+      "tok_per_s_max": 1295.1,
+      "mem_peak_max_gib": 81.23,
+      "skipped_total_max": 0.0,
+      "post_fix_skipped_max": 0.0,
+      "grad_norm_final": 5.3695,
+      "hub_span_hours": 32.8,
+      "eval_first": {
+        "step": 0,
+        "d1": 2.0343,
+        "d2": 1.9932,
+        "d3": 1.9593,
+        "depth_gain": 0.075,
+        "commit_sha": "513879f",
+        "ts": "2026-11-19T10:01:58Z",
+        "source": "verified_launch_log"
+      },
+      "eval_last": {
+        "step": 600,
+        "status": "completed",
+        "d1": 2.0171016493099176,
+        "d2": 1.9511199864528004,
+        "d3": 1.875736328802505,
+        "depth_gain": 0.14136532050741257,
+        "commit_sha": "55c7a680",
+        "ts": "2026-11-20T20:09:14+00:00",
+        "source": "hub_manifest"
+      },
+      "eval_best_depth_gain": {
+        "step": 600,
+        "status": "completed",
+        "d1": 2.0171016493099176,
+        "d2": 1.9511199864528004,
+        "d3": 1.875736328802505,
+        "depth_gain": 0.14136532050741257,
+        "commit_sha": "55c7a680",
+        "ts": "2026-11-20T20:09:14+00:00",
+        "source": "hub_manifest"
+      }
+    },
+    "s2_joint_bptt": {
+      "status": "in_progress",
+      "latest_step": 280,
+      "latest_hub_step": 275,
+      "target_steps": 1200,
+      "latest_commit_sha": "c5f7391d",
+      "n_params": 187919238,
+      "pct_of_34_661b": 0.542,
+      "n_rows": 35,
+      "tokens_seen": 73400320,
+      "tok_per_s_mean": 854.5,
+      "tok_per_s_min": 427.0,
+      "tok_per_s_max": 1041.3,
+      "mem_peak_max_gib": 72.51,
+      "skipped_total_max": 0.0,
+      "post_fix_skipped_max": 0.0,
+      "grad_norm_final": 1.9844,
+      "hub_span_hours": 25.72,
+      "eval_first": {
+        "step": 0,
+        "d1": 1.4642,
+        "d2": 1.4203,
+        "d3": 1.3508,
+        "depth_gain": 0.1135,
+        "commit_sha": "2e37bf6",
+        "ts": "2026-11-20T22:34:02Z",
+        "source": "verified_launch_log"
+      },
+      "eval_last": {
+        "step": 200,
+        "status": "in_progress",
+        "d1": 1.2945143396398944,
+        "d2": 1.2728332462775231,
+        "d3": 1.221885310729084,
+        "depth_gain": 0.07262902891081047,
+        "commit_sha": "876de138",
+        "ts": "2026-11-21T22:37:18+00:00",
+        "source": "hub_manifest"
+      },
+      "eval_best_depth_gain": {
+        "step": 0,
+        "d1": 1.4642,
+        "d2": 1.4203,
+        "d3": 1.3508,
+        "depth_gain": 0.1135,
+        "commit_sha": "2e37bf6",
+        "ts": "2026-11-20T22:34:02Z",
+        "source": "verified_launch_log"
+      }
+    }
+  },
+  "eval_curves": {
+    "s1_loop_a6b": [
+      {
+        "step": 0,
+        "status": "eval",
+        "d1": 0.9916223254723343,
+        "d2": 0.992261063849218,
+        "d3": 0.9918279937008111,
+        "depth_gain": -0.00020566822847678523,
+        "commit_sha": "",
+        "ts": "",
+        "source": "local_metrics_jsonl"
+      },
+      {
+        "step": 200,
+        "status": "in_progress",
+        "d1": 0.9900956178486637,
+        "d2": 0.9469676387411956,
+        "d3": 0.945758364691699,
+        "depth_gain": 0.044337253156964684,
+        "commit_sha": "4026a4f7",
+        "ts": "2026-11-16T07:05:44+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 400,
+        "status": "in_progress",
+        "d1": 0.984122326339547,
+        "d2": 0.9386701851015369,
+        "d3": 0.932546125758401,
+        "depth_gain": 0.05157620058114598,
+        "commit_sha": "241b2ef1",
+        "ts": "2026-11-16T10:38:16+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 600,
+        "status": "in_progress",
+        "d1": 0.981282342388599,
+        "d2": 0.935902698372285,
+        "d3": 0.9251621553477293,
+        "depth_gain": 0.05612018704086974,
+        "commit_sha": "2d17ead5",
+        "ts": "2026-11-16T14:07:55+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 800,
+        "status": "in_progress",
+        "d1": 0.9806009051004456,
+        "d2": 0.9343802486938353,
+        "d3": 0.9217075480402538,
+        "depth_gain": 0.05889335706019183,
+        "commit_sha": "023e4a78",
+        "ts": "2026-11-16T17:38:31+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 1000,
+        "status": "completed",
+        "d1": 0.9799966054359351,
+        "d2": 0.933597553748658,
+        "d3": 0.9191115781774115,
+        "depth_gain": 0.06088502725852363,
+        "commit_sha": "32eb565e",
+        "ts": "2026-11-16T21:16:05+00:00",
+        "source": "hub_manifest"
+      }
+    ],
+    "s1b_hssd_distill": [
+      {
+        "step": 0,
+        "status": "eval",
+        "d1": 1.1287418920057373,
+        "d2": 1.0781190015171012,
+        "d3": 1.0655655489479052,
+        "depth_gain": 0.06317634305783204,
+        "commit_sha": "",
+        "ts": "",
+        "source": "local_metrics_jsonl"
+      },
+      {
+        "step": 200,
+        "status": "in_progress",
+        "d1": 1.1324712028556645,
+        "d2": 1.0787500589579153,
+        "d3": 1.0654362118778622,
+        "depth_gain": 0.0670349909778023,
+        "commit_sha": "6c905d4e",
+        "ts": "2026-11-17T07:51:23+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 400,
+        "status": "in_progress",
+        "d1": 1.1285012546866955,
+        "d2": 1.0782507807305504,
+        "d3": 1.0656837496029685,
+        "depth_gain": 0.06281750508372697,
+        "commit_sha": "0ff9b537",
+        "ts": "2026-11-17T10:18:14+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 600,
+        "status": "in_progress",
+        "d1": 1.3093553067374812,
+        "d2": 1.2596338300741203,
+        "d3": 1.2455882579295705,
+        "depth_gain": 0.06376704880791073,
+        "commit_sha": "eeed36dd",
+        "ts": "2026-11-18T04:36:28+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 800,
+        "status": "in_progress",
+        "d1": 2.756236464517865,
+        "d2": 2.6903490952579863,
+        "d3": 2.659060182485311,
+        "depth_gain": 0.0971762820325539,
+        "commit_sha": "e85532ca",
+        "ts": "2026-11-18T09:37:48+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 1000,
+        "status": "in_progress",
+        "d1": 2.033602279250644,
+        "d2": 1.9903286324330645,
+        "d3": 1.956659394690269,
+        "depth_gain": 0.07694288456037501,
+        "commit_sha": "a5f4c700",
+        "ts": "2026-11-18T14:40:40+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 1200,
+        "status": "in_progress",
+        "d1": 1.896777433597944,
+        "d2": 1.8654296026060706,
+        "d3": 1.8327585458701068,
+        "depth_gain": 0.06401888772783715,
+        "commit_sha": "a2ffab9a",
+        "ts": "2026-11-18T20:43:19+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 1400,
+        "status": "in_progress",
+        "d1": 1.8489282467989137,
+        "d2": 1.7630676313645246,
+        "d3": 1.7248233533249544,
+        "depth_gain": 0.12410489347395925,
+        "commit_sha": "de9b1ff9",
+        "ts": "2026-11-19T01:57:46+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 1500,
+        "status": "completed",
+        "d1": 1.76785465711182,
+        "d2": 1.7375141809805594,
+        "d3": 1.7052372444790886,
+        "depth_gain": 0.06261741263273146,
+        "commit_sha": "2fb912db",
+        "ts": "2026-11-19T04:33:51+00:00",
+        "source": "hub_manifest"
+      }
+    ],
+    "s3_long_1m_lsa": [
+      {
+        "step": 0,
+        "d1": 2.0343,
+        "d2": 1.9932,
+        "d3": 1.9593,
+        "depth_gain": 0.075,
+        "commit_sha": "513879f",
+        "ts": "2026-11-19T10:01:58Z",
+        "source": "verified_launch_log"
+      },
+      {
+        "step": 200,
+        "status": "in_progress",
+        "d1": 2.0269291217943324,
+        "d2": 1.9697681590190104,
+        "d3": 1.9161599333812227,
+        "depth_gain": 0.11076918841310968,
+        "commit_sha": "ec6eef3d",
+        "ts": "2026-11-19T21:19:11+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 400,
+        "status": "in_progress",
+        "d1": 2.021442465511974,
+        "d2": 1.961612991812894,
+        "d3": 1.890983970850661,
+        "depth_gain": 0.13045849466131276,
+        "commit_sha": "35948a28",
+        "ts": "2026-11-20T09:20:21+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 600,
+        "status": "completed",
+        "d1": 2.0171016493099176,
+        "d2": 1.9511199864528004,
+        "d3": 1.875736328802505,
+        "depth_gain": 0.14136532050741257,
+        "commit_sha": "55c7a680",
+        "ts": "2026-11-20T20:09:14+00:00",
+        "source": "hub_manifest"
+      }
+    ],
+    "s2_joint_bptt": [
+      {
+        "step": 0,
+        "d1": 1.4642,
+        "d2": 1.4203,
+        "d3": 1.3508,
+        "depth_gain": 0.1135,
+        "commit_sha": "2e37bf6",
+        "ts": "2026-11-20T22:34:02Z",
+        "source": "verified_launch_log"
+      },
+      {
+        "step": 43,
+        "status": "in_progress",
+        "d1": 1.355588255226798,
+        "d2": 1.327514619519819,
+        "d3": 1.2703788640112037,
+        "depth_gain": 0.08520939121559423,
+        "commit_sha": "f1df5c9b",
+        "ts": "2026-11-21T05:33:03+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 200,
+        "status": "in_progress",
+        "d1": 1.2945143396398944,
+        "d2": 1.2728332462775231,
+        "d3": 1.221885310729084,
+        "depth_gain": 0.07262902891081047,
+        "commit_sha": "876de138",
+        "ts": "2026-11-21T22:37:18+00:00",
+        "source": "hub_manifest"
+      }
+    ]
+  },
+  "rollback_summary": {
+    "s1_reset_commits": 1,
+    "s1b_phase2_explosion_commits": 15,
+    "s1b_explosion_step_range": [
+      425,
+      775
+    ],
+    "s1b_explosion_peak_loss": 12.0742,
+    "s1b_explosion_max_grad_norm": 6.1211654025881895e+19,
+    "s1b_explosion_max_skipped": 194510.0
+  },
+  "supervisor_s2_regimes": {
+    "pre_opt_2e37bf6": {
+      "stage": "s2_joint_bptt",
+      "head": "2e37bf6",
+      "n_samples": 4,
+      "min_step": 10,
+      "max_step": 40,
+      "tok_per_s_min": 427.0,
+      "tok_per_s_max": 481.0,
+      "tok_per_s_mean": 453.5,
+      "alloc_min_gib": 32.4,
+      "alloc_max_gib": 32.6,
+      "peak_min_gib": 72.5,
+      "peak_max_gib": 72.5,
+      "power_mean_w": 324.2,
+      "util_mean_pct": 98.2,
+      "observed_span_hours": 4.96
+    },
+    "post_opt_leaky_b2c5513": {
+      "stage": "s2_joint_bptt",
+      "head": "b2c5513",
+      "n_samples": 1,
+      "min_step": 60,
+      "max_step": 60,
+      "tok_per_s_min": 930.0,
+      "tok_per_s_max": 930.0,
+      "tok_per_s_mean": 930.0,
+      "alloc_min_gib": 52.0,
+      "alloc_max_gib": 52.0,
+      "peak_min_gib": 89.8,
+      "peak_max_gib": 89.8,
+      "power_mean_w": 358.5,
+      "util_mean_pct": 99.0,
+      "observed_span_hours": 0.0
+    },
+    "post_leak_fix_5a82677": {
+      "stage": "s2_joint_bptt",
+      "head": "5a82677",
+      "n_samples": 16,
+      "min_step": 60,
+      "max_step": 280,
+      "tok_per_s_min": 836.0,
+      "tok_per_s_max": 1041.0,
+      "tok_per_s_mean": 935.7,
+      "alloc_min_gib": 25.3,
+      "alloc_max_gib": 25.4,
+      "peak_min_gib": 70.0,
+      "peak_max_gib": 70.1,
+      "power_mean_w": 372.6,
+      "util_mean_pct": 98.5,
+      "observed_span_hours": 17.13
+    }
+  },
+  "supervisor_stage_head_summary": [
+    {
+      "stage": "s1_loop_a6b",
+      "head": "c22bf62",
+      "n_samples": 138,
+      "min_step": 5,
+      "max_step": 995,
+      "tok_per_s_min": 1632.0,
+      "tok_per_s_max": 2642.0,
+      "tok_per_s_mean": 2112.3,
+      "alloc_min_gib": 28.0,
+      "alloc_max_gib": 28.4,
+      "peak_min_gib": 54.2,
+      "peak_max_gib": 54.2,
+      "power_mean_w": 414.6,
+      "util_mean_pct": 97.5,
+      "observed_span_hours": 17.6
+    },
+    {
+      "stage": "s1b_hssd_distill",
+      "head": "fbd7a35",
+      "n_samples": 32,
+      "min_step": 40,
+      "max_step": 730,
+      "tok_per_s_min": 809.0,
+      "tok_per_s_max": 1842.0,
+      "tok_per_s_mean": 1392.2,
+      "alloc_min_gib": 25.2,
+      "alloc_max_gib": 27.0,
+      "peak_min_gib": 48.4,
+      "peak_max_gib": 69.0,
+      "power_mean_w": 376.1,
+      "util_mean_pct": 98.0,
+      "observed_span_hours": 10.98
+    },
+    {
+      "stage": "s1b_hssd_distill",
+      "head": "3a17c0d",
+      "n_samples": 77,
+      "min_step": 430,
+      "max_step": 1490,
+      "tok_per_s_min": 603.0,
+      "tok_per_s_max": 929.0,
+      "tok_per_s_mean": 710.5,
+      "alloc_min_gib": 26.9,
+      "alloc_max_gib": 27.0,
+      "peak_min_gib": 69.0,
+      "peak_max_gib": 69.0,
+      "power_mean_w": 384.9,
+      "util_mean_pct": 98.0,
+      "observed_span_hours": 28.29
+    },
+    {
+      "stage": "s3_long_1m_lsa",
+      "head": "513879f",
+      "n_samples": 28,
+      "min_step": 10,
+      "max_step": 330,
+      "tok_per_s_min": 887.0,
+      "tok_per_s_max": 1295.0,
+      "tok_per_s_mean": 1028.1,
+      "alloc_min_gib": 24.9,
+      "alloc_max_gib": 24.9,
+      "peak_min_gib": 80.1,
+      "peak_max_gib": 80.7,
+      "power_mean_w": 407.6,
+      "util_mean_pct": 95.0,
+      "observed_span_hours": 17.59
+    },
+    {
+      "stage": "s3_long_1m_lsa",
+      "head": "4f09463",
+      "n_samples": 21,
+      "min_step": 340,
+      "max_step": 590,
+      "tok_per_s_min": 889.0,
+      "tok_per_s_max": 1268.0,
+      "tok_per_s_mean": 1022.1,
+      "alloc_min_gib": 24.9,
+      "alloc_max_gib": 24.9,
+      "peak_min_gib": 80.0,
+      "peak_max_gib": 81.2,
+      "power_mean_w": 422.8,
+      "util_mean_pct": 95.9,
+      "observed_span_hours": 13.65
+    },
+    {
+      "stage": "s2_joint_bptt",
+      "head": "2e37bf6",
+      "n_samples": 4,
+      "min_step": 10,
+      "max_step": 40,
+      "tok_per_s_min": 427.0,
+      "tok_per_s_max": 481.0,
+      "tok_per_s_mean": 453.5,
+      "alloc_min_gib": 32.4,
+      "alloc_max_gib": 32.6,
+      "peak_min_gib": 72.5,
+      "peak_max_gib": 72.5,
+      "power_mean_w": 324.2,
+      "util_mean_pct": 98.2,
+      "observed_span_hours": 4.96
+    },
+    {
+      "stage": "s2_joint_bptt",
+      "head": "b2c5513",
+      "n_samples": 1,
+      "min_step": 60,
+      "max_step": 60,
+      "tok_per_s_min": 930.0,
+      "tok_per_s_max": 930.0,
+      "tok_per_s_mean": 930.0,
+      "alloc_min_gib": 52.0,
+      "alloc_max_gib": 52.0,
+      "peak_min_gib": 89.8,
+      "peak_max_gib": 89.8,
+      "power_mean_w": 358.5,
+      "util_mean_pct": 99.0,
+      "observed_span_hours": 0.0
+    },
+    {
+      "stage": "s2_joint_bptt",
+      "head": "5a82677",
+      "n_samples": 16,
+      "min_step": 60,
+      "max_step": 280,
+      "tok_per_s_min": 836.0,
+      "tok_per_s_max": 1041.0,
+      "tok_per_s_mean": 935.7,
+      "alloc_min_gib": 25.3,
+      "alloc_max_gib": 25.4,
+      "peak_min_gib": 70.0,
+      "peak_max_gib": 70.1,
+      "power_mean_w": 372.6,
+      "util_mean_pct": 98.5,
+      "observed_span_hours": 17.13
+    }
+  ],
+  "kv_memory_1m": [
+    {
+      "name": "LoopHSSD v3.2 (88L @ R=3)",
+      "subtitle": "10L FP8 1.0\u00d7 SharedKV + 66L HSSD + D-LSA",
+      "virtual_layers": 88,
+      "global_kv_layers_stored": 10,
+      "kv_dtype": "FP8 E4M3 (1B)",
+      "kv_gib": 10.0,
+      "linear_or_swa_gib": 5.5,
+      "indexer_gib": 0.32,
+      "total_gib": 15.82,
+      "highlight": true,
+      "callout": "15.82 GiB (10.00 KV + ~5.50 HSSD + 0.32 D-LSA)"
+    },
+    {
+      "name": "Stock Qwen3.6-35B-A3B (40L @ R=1)",
+      "subtitle": "10L BF16 KV + 30L GDN recurrent state",
+      "virtual_layers": 40,
+      "global_kv_layers_stored": 10,
+      "kv_dtype": "BF16 (2B)",
+      "kv_gib": 20.0,
+      "linear_or_swa_gib": 0.15,
+      "indexer_gib": 0.0,
+      "total_gib": 20.15,
+      "highlight": false,
+      "callout": "20.15 GiB (20.00 BF16 KV + 0.15 GDN)"
+    },
+    {
+      "name": "Inkling 2 Mini (48L @ R=3)",
+      "subtitle": "8 logical global F16 KV (8h\u00d7128d) + 40 SWA",
+      "virtual_layers": 48,
+      "global_kv_layers_stored": 8,
+      "kv_dtype": "F16 (2B)",
+      "kv_gib": 32.0,
+      "linear_or_swa_gib": 0.16,
+      "indexer_gib": 0.0,
+      "total_gib": 32.16,
+      "highlight": false,
+      "callout": "32.16 GiB (32.00 F16 KV \u00b7 2.03\u00d7 ours)"
+    },
+    {
+      "name": "Unshared 88L Hybrid (No SharedKV)",
+      "subtitle": "22 virtual global layers BF16 + 66L HSSD",
+      "virtual_layers": 88,
+      "global_kv_layers_stored": 22,
+      "kv_dtype": "BF16 (2B)",
+      "kv_gib": 44.0,
+      "linear_or_swa_gib": 5.5,
+      "indexer_gib": 0.0,
+      "total_gib": 49.5,
+      "highlight": false,
+      "callout": "49.50 GiB (44.00 KV \u00b7 3.13\u00d7 ours)"
+    },
+    {
+      "name": "Standard Unshared 88L Full-Attn",
+      "subtitle": "88 global layers \u00d7 2 KV heads \u00d7 256d BF16",
+      "virtual_layers": 88,
+      "global_kv_layers_stored": 88,
+      "kv_dtype": "BF16 (2B)",
+      "kv_gib": 176.0,
+      "linear_or_swa_gib": 0.0,
+      "indexer_gib": 0.0,
+      "total_gib": 176.0,
+      "highlight": false,
+      "callout": "176.00 GiB (11.1\u00d7 ours \u00b7 OOM > 96 GiB)"
+    }
+  ],
+  "probe_summary": {
+    "model_type": "qwen3_5_moe_text",
+    "num_physical_layers": 40,
+    "hidden_size": 2048,
+    "num_experts": 256,
+    "top_k": 8,
+    "requested_target_virtual": 64,
+    "effective_target_virtual": 64,
+    "all_critical_ok": true,
+    "num_gates_passed": 5,
+    "num_gates_total": 5,
+    "frozen_experts_sha256": "42f1be31694f1ad29abe451101c0f7a42784aa34096434ecf3faa01e0ed0cf7f",
+    "total_seconds": 177.4405333995819
+  },
+  "probe_gates": {
+    "0a_backward": {
+      "passed": true,
+      "metric": "input_grad_norm",
+      "value": 11.75
+    },
+    "0a_surgery": {
+      "passed": true,
+      "metric": "decode_vs_full_maxdiff",
+      "value": 17.67578125
+    },
+    "0p_1_expert_headroom": {
+      "passed": true,
+      "metric": "hard_token_headroom_nats",
+      "value": 1.3061380114078314
+    },
+    "0p_2_reentry_anchors": {
+      "passed": true,
+      "metric": "procrustes_cosine",
+      "value": 0.8588353179244266
+    },
+    "0p_3_positional_extrapolation": {
+      "passed": true,
+      "metric": "best_passkey_logit_margin",
+      "value": 13.720885700025299
+    }
+  },
+  "systems_milestones": [
+    {
+      "component": "NVFP4 MoE Dequant (Triton E2M1)",
+      "commit": "b2c5513 (41082e4)",
+      "measurement": "0.12 ms (1,144\u20131,148 GB/s) vs 2.22\u20132.23 ms eager (E=64, M=512, K=2048)",
+      "impact": "18.99\u00d7 speedup, 18.5\u00d7 less HBM traffic, max_diff=0.000000 (bf16)"
+    },
+    {
+      "component": "D-LSA Sparse FlashAttention (fwd+bwd)",
+      "commit": "b2c5513 (ff27029)",
+      "measurement": "174.56 ms (125.30 ms kernel) vs 1,627.16 ms ref (Tq=32K, Tk=131K, D=256)",
+      "impact": "9.32\u00d7 E2E / 12.99\u00d7 kernel speedup; ~70 TB/step HBM eliminated; cos >= 0.999973"
+    },
+    {
+      "component": "D-LSA 2-Pass Triton Distill KL",
+      "commit": "b2c5513 (41082e4)",
+      "measurement": "46.42 ms vs 270.49 ms legacy (Tq=32K, Tk=131K, nq=2048, nb=256)",
+      "impact": "5.83\u00d7 speedup; ~90,000 host syncs/step eliminated; cos_wq/wk = 1.000000"
+    },
+    {
+      "component": "BPTT Auto HBM-Resident / Async DMA",
+      "commit": "b2c5513 (786fdeb)",
+      "measurement": "0.64 ms HBM-resident (2.56 ms async pinned DMA) vs 34.46 ms blocking",
+      "impact": "54.03\u00d7 vs blocking (13.5\u00d7 DMA); 10.7 GiB/step PCIe eliminated on 96 GiB G4"
+    },
+    {
+      "component": "HSSD v3.2 Triton WY & Scan Kernels",
+      "commit": "fbd7a35 (f48dc72)",
+      "measurement": "Fused Triton chunk_hssd fwd+bwd + 64\u00d764 block-doubling WY solver",
+      "impact": "28\u201333\u00d7 kernel acceleration; Phase-1/2 fits < 69.0 GiB on single 96 GiB G4"
+    },
+    {
+      "component": "Live 1,048,576-Token FP8 Calibration Pass",
+      "commit": "513879f",
+      "measurement": "1,015,808 prefix + 32,768 suffix = 1,048,576 tok sparse FP8 long_calib",
+      "impact": "78.60 GiB peak VRAM, 24.57 GiB post-step alloc (0 leak), 888.9 s, 0 non-finite"
+    },
+    {
+      "component": "HSSD Phase-2 O(T) Jacobian Stability Fix",
+      "commit": "3a17c0d (a0877a3)",
+      "measurement": "Scale cumulative-phase backward by chunk_size/T + live blend + atomic guard",
+      "impact": "Eliminated 2.53e15\u20136.12e19 grad blowup & 194,510 skips \u2192 0 / 1,100 skips"
+    },
+    {
+      "component": "T=131K Triton int32 Pointer Overflow Fix",
+      "commit": "2e37bf6",
+      "measurement": "t*20480 > 2^31-1 wrapped at t=104,858; chunked all_up + tl.int64 across 32 kernels",
+      "impact": "Eliminated s2 step-0 NaN (0.00e+00 parity error); 10.74 GiB \u2192 <=671 MiB transient"
+    },
+    {
+      "component": "Zero-Label BPTT C++-Bridged VRAM Leak Fix",
+      "commit": "5a82677",
+      "measurement": "Broke LoopContext + saved_tensors_hooks C++ autograd cycles on -100 segments",
+      "impact": "Alloc 52.0G (OOM) / 32.6G (baseline) \u2192 25.3\u201325.4 GiB flat (-7.0 GiB vs baseline, 17h+)"
+    }
+  ]
+}

@@ -38,6 +38,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from ._cache_compat import extract_cache_from_kwargs, extract_cache_kwarg
 from ._dtype import upcast
 from .introspect import FULL, LINEAR, attention_module, find_children, inspect_model, modules_with_layer_idx, router_of
 from .mhc import LoopBridge
@@ -599,8 +600,7 @@ class VirtualLayer(nn.Module):
                     )
                 else:
                     x = ctl.adapters.bridge(x, ctx.anchor, s.r - 2)
-        pkv_key = next((k for k in ("past_key_values", "past_key_value", "cache") if k in kwargs), None)
-        pkv = kwargs.get(pkv_key) if pkv_key is not None else None
+        pkv_key, pkv = extract_cache_kwarg(kwargs)
         if s.vidx == 0 and pkv is not None:
             ctl._sync_cache_last_linear(pkv)
         if pkv is not None and pkv_key is not None:
@@ -745,11 +745,7 @@ class LoopController:
         spec = self.spec
 
         def _tm_cache_pre(_mod: nn.Module, _args: tuple[Any, ...], kw: dict[str, Any]) -> None:
-            pkv = kw.get("past_key_values")
-            if pkv is None:
-                pkv = kw.get("past_key_value")
-            if pkv is None:
-                pkv = kw.get("cache")
+            pkv = extract_cache_from_kwargs(kw)
             if pkv is not None:
                 self._sync_cache_last_linear(pkv)
 

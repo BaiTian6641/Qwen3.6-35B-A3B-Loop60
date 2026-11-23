@@ -886,22 +886,33 @@ def _can_use_triton_prep(
     ok_dts = (torch.bfloat16, torch.float16, torch.float32)
     if out_dtype not in ok_dts:
         return False
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        return False
+    dev = query.device
     for t in (query, key, value, g_vec, b_gate, w_gate):
-        if not t.is_cuda or t.dtype not in ok_dts:
+        if not t.is_cuda or t.device != dev or t.dtype not in ok_dts:
             return False
     bsz, seq_len, hq, dk = query.shape
     hk = key.shape[2]
     hv, dv = value.shape[2], value.shape[3]
-    if bsz * seq_len == 0 or dk > 1024 or dv > 1024 or hv % hq != 0 or hv % hk != 0:
+    if bsz <= 0 or seq_len <= 0 or hq <= 0 or hk <= 0 or hv <= 0 or dk <= 0 or dv <= 0:
+        return False
+    if dk > 1024 or dv > 1024 or hv % hq != 0 or hv % hk != 0:
+        return False
+    if key.shape != (bsz, seq_len, hk, dk) or value.shape != (bsz, seq_len, hv, dv):
         return False
     if g_vec.shape != (bsz, seq_len, hv, dk) or b_gate.shape != (bsz, seq_len, hv, dk):
         return False
     if w_gate.shape != (bsz, seq_len, hv, dv):
         return False
-    return not (
-        qed_lambda is not None
-        and (qed_lambda.numel() != hv or not qed_lambda.is_cuda or qed_lambda.dtype not in ok_dts)
-    )
+    if qed_lambda is not None:
+        if not qed_lambda.is_cuda or qed_lambda.device != dev or qed_lambda.dtype not in ok_dts:
+            return False
+        lam_shape = tuple(qed_lambda.shape)
+        is_per_head = lam_shape in ((hv,), (1, 1, hv), (1, 1, hv, 1)) or (hv == 1 and qed_lambda.ndim == 0)
+        if not is_per_head:
+            return False
+    return True
 
 
 def qed_dplr_prep(
@@ -1528,6 +1539,7 @@ class GDN2Adapter(nn.Module):
         nn.init.zeros_(self.decay_up.weight)
         self._last_stats: dict[str, float] = {}
         self._pending_stat_tensors: dict[str, torch.Tensor] = {}
+        self._is_zero_cache: tuple[tuple[Any, ...], bool] | None = None
 
     @property
     def last_stats(self) -> dict[str, float]:
@@ -1548,13 +1560,34 @@ class GDN2Adapter(nn.Module):
         self._last_stats["decay_spread"] = 0.0
         self._last_stats["decay_horizon_mult_max"] = 1.0
 
+    def _zero_check_params(self) -> tuple[nn.Parameter, ...]:
+        params: list[nn.Parameter] = [self.erase_up.weight, self.write_up.weight, self.decay_up.weight]
+        if self.qed_lambda_raw is not None:
+            params.append(self.qed_lambda_raw)
+        if self.neg_gamma_raw is not None:
+            params.append(self.neg_gamma_raw)
+        return tuple(params)
+
+    def _load_from_state_dict(self, *args: Any, **kwargs: Any) -> None:
+        self._is_zero_cache = None
+        super()._load_from_state_dict(*args, **kwargs)
+
     def is_zero(self) -> bool:
+        """Cached zero-weight check keyed by `(data_ptr, _version, shape, device, dtype)`.
+
+        Avoids per-token GPU `.any()` reductions and D2H host syncs during `T=1` decode / `eval`,
+        while automatically invalidating on any in-place mutation (`.fill_()`, `.zero_()`, `.copy_()`,
+        `opt.step()`, `restore_checkpoint()`) or `.data` replacement.
+        """
+        params = self._zero_check_params()
+        vkey = tuple((int(p.data_ptr()), int(p._version), tuple(p.shape), p.device, p.dtype) for p in params)
+        cached = self._is_zero_cache
+        if cached is not None and cached[0] == vkey:
+            return cached[1]
         with torch.no_grad():
-            if self.erase_up.weight.any() or self.write_up.weight.any() or self.decay_up.weight.any():
-                return False
-            if self.qed_lambda_raw is not None and self.qed_lambda_raw.any():
-                return False
-            return not (self.neg_gamma_raw is not None and self.neg_gamma_raw.any())
+            res = not any(bool(p.any()) for p in params)
+        self._is_zero_cache = (vkey, res)
+        return res
 
     def qed_lambda(self) -> torch.Tensor | None:
         if self.qed_lambda_raw is None:
@@ -1779,9 +1812,10 @@ def _make_rule_wrapper(
         if in_rule_box is not None:
             in_rule_box[0] += 1
         try:
-            # Fast bit-exact passthrough in eval mode (or when frozen/no_grad) while zero-initialized
+            # Fast bit-exact passthrough in eval mode (or when frozen/no_grad) while zero-initialized.
+            # Skip dynamic zero-check during `torch.compile` tracing to avoid data-dependent graph breaks.
             need_ad_grad = torch.is_grad_enabled() and any(p.requires_grad for p in adapter.parameters())
-            if (not attn.training or not need_ad_grad) and adapter.is_zero():
+            if (not _is_compiling()) and (not attn.training or not need_ad_grad) and adapter.is_zero():
                 adapter._set_zero_stats()
                 return orig_fn(query, key, value, *args, **kwargs)
 

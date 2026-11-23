@@ -515,24 +515,165 @@ def test_qed_dplr_prep_analytical_backward_parity_and_gradcheck(
     assert torch.equal(ana_partial[2], torch.zeros_like(v))
     assert torch.equal(ana_partial[5], torch.zeros_like(w))
 
-    # Finite-difference gradcheck in fp64
-    if dtype == torch.float64 and has_qed:
+    # Finite-difference gradcheck in fp64 wrapping `_qed_dplr_prep_bwd_math` directly across all 4 (use_l2, has_qed)
+    if dtype == torch.float64:
+        class _AnalyticalPrepFn(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx: Any, qq, kk, vv, gg, bb, ww, ll):
+                ctx.set_materialize_grads(False)
+                ctx.save_for_backward(qq, kk, vv, gg, bb, ww, ll)
+                return qed_dplr_prep_pytorch(qq, kk, vv, gg, bb, ww, ll, use_qk_l2norm=use_l2, out_dtype=torch.float64)
+
+            @staticmethod
+            def backward(ctx: Any, g_qh, g_kh, g_vw, g_a, g_gk):
+                qq, kk, vv, gg, bb, ww, ll = ctx.saved_tensors
+                return _qed_dplr_prep_bwd_math(qq, kk, vv, gg, bb, ww, ll, g_qh, g_kh, g_vw, g_a, g_gk,
+                                               use_qk_l2norm=use_l2)
+
         q_gc = torch.randn(1, 3, 2, 4, dtype=torch.float64, requires_grad=True)
         k_gc = torch.randn(1, 3, 2, 4, dtype=torch.float64, requires_grad=True)
         v_gc = torch.randn(1, 3, 4, 5, dtype=torch.float64, requires_grad=True)
         g_gc = (-0.1 - 0.4 * torch.rand(1, 3, 4, 4, dtype=torch.float64)).detach().requires_grad_(True)
         b_gc = (0.2 + 1.1 * torch.rand(1, 3, 4, 4, dtype=torch.float64)).detach().requires_grad_(True)
         w_gc = (0.2 + 0.6 * torch.rand(1, 3, 4, 5, dtype=torch.float64)).detach().requires_grad_(True)
-        l_gc = torch.tensor([-0.2, 0.15, -0.1, 0.28], dtype=torch.float64, requires_grad=True)
-        assert torch.autograd.gradcheck(
-            lambda qq, kk, vv, gg, bb, ww, ll: qed_dplr_prep_pytorch(
-                qq, kk, vv, gg, bb, ww, ll, use_qk_l2norm=use_l2, out_dtype=torch.float64
-            ),
-            (q_gc, k_gc, v_gc, g_gc, b_gc, w_gc, l_gc),
-            eps=1e-6,
-            atol=1e-5,
-            rtol=1e-4,
-        )
+        if has_qed:
+            l_gc = torch.tensor([-0.2, 0.15, -0.1, 0.28], dtype=torch.float64, requires_grad=True)
+            assert torch.autograd.gradcheck(
+                _AnalyticalPrepFn.apply,
+                (q_gc, k_gc, v_gc, g_gc, b_gc, w_gc, l_gc),
+                eps=1e-6,
+                atol=1e-6,
+                rtol=1e-5,
+            )
+        else:
+            assert torch.autograd.gradcheck(
+                lambda qq, kk, vv, gg, bb, ww: _AnalyticalPrepFn.apply(qq, kk, vv, gg, bb, ww, None),
+                (q_gc, k_gc, v_gc, g_gc, b_gc, w_gc),
+                eps=1e-6,
+                atol=1e-6,
+                rtol=1e-5,
+            )
+
+
+def test_is_zero_cached_zero_host_sync_and_invalidation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify `GDN2Adapter.is_zero()` caches by `(data_ptr, _version)` with 0 repeat `.any()` calls,
+    and invalidates cleanly on `.fill_()`, `.zero_()`, `.copy_()`, `opt.step()`, `load_state_dict()`, and `.data=`.
+    """
+    cfg = GDN2Config.from_dict(FULL_1M_QED_CFG)
+    ad = gdn2_mod.GDN2Adapter(hidden_size=16, num_v_heads=4, head_k_dim=8, head_v_dim=8, cfg=cfg, layer_id=0)
+    assert ad.qed_lambda_raw is not None and ad.neg_gamma_raw is not None
+
+    any_calls = 0
+    orig_any = torch.Tensor.any
+
+    def _counting_any(self: torch.Tensor, *args: Any, **kwargs: Any):
+        nonlocal any_calls
+        any_calls += 1
+        return orig_any(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "any", _counting_any)
+
+    # First call evaluates params; subsequent calls must hit cache with 0 `.any()` calls!
+    assert ad.is_zero() is True
+    calls_first = any_calls
+    assert calls_first > 0
+    for _ in range(10):
+        assert ad.is_zero() is True
+    assert any_calls == calls_first, "cached is_zero() must not re-run .any() when weights are unchanged"
+
+    # In-place `.fill_()` invalidates cache
+    with torch.no_grad():
+        ad.qed_lambda_raw.fill_(0.2)
+    assert ad.is_zero() is False
+    calls_after_fill = any_calls
+    assert calls_after_fill > calls_first
+    assert ad.is_zero() is False
+    assert any_calls == calls_after_fill
+
+    # In-place `.zero_()` restores True
+    with torch.no_grad():
+        ad.qed_lambda_raw.zero_()
+    assert ad.is_zero() is True
+
+    # In-place `.copy_()` on `neg_gamma_raw` invalidates cache
+    with torch.no_grad():
+        ad.neg_gamma_raw.copy_(torch.full_like(ad.neg_gamma_raw, 0.15))
+    assert ad.is_zero() is False
+
+    # `load_state_dict()` invalidates cache
+    zero_sd = {k: torch.zeros_like(v) for k, v in ad.state_dict().items()}
+    ad.load_state_dict(zero_sd)
+    assert ad.is_zero() is True
+
+    # Optimizer `step()` invalidates cache
+    opt = torch.optim.AdamW(ad.parameters(), lr=1e-2)
+    ad.erase_up.weight.grad = torch.ones_like(ad.erase_up.weight)
+    opt.step()
+    assert ad.is_zero() is False
+
+    # `.data = ...` replacement (different data_ptr) invalidates cache
+    ad.erase_up.weight.data = torch.zeros_like(ad.erase_up.weight)
+    assert ad.is_zero() is True
+
+
+def test_can_use_triton_prep_shape_and_device_guards(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify `_can_use_triton_prep` rejects wrong-axis `qed_lambda` shapes, shape mismatches, and device mismatches."""
+
+    class _FakeCudaTensor:
+        def __init__(
+            self, shape: tuple[int, ...], *, dtype=torch.bfloat16, device: str = "cuda:0", is_cuda: bool = True
+        ):
+            self.shape = shape
+            self.ndim = len(shape)
+            self.dtype = dtype
+            self.device = device
+            self.is_cuda = is_cuda
+
+        def numel(self) -> int:
+            n = 1
+            for s in self.shape:
+                n *= s
+            return n
+
+    monkeypatch.setattr(gdn2_mod, "_HAS_TRITON", True)
+    monkeypatch.setattr(gdn2_mod, "_is_compiling", lambda: False)
+
+    hv = 4
+    q = _FakeCudaTensor((2, 4, 2, 16))
+    k = _FakeCudaTensor((2, 4, 2, 16))
+    v = _FakeCudaTensor((2, 4, hv, 16))
+    g = _FakeCudaTensor((2, 4, hv, 16), dtype=torch.float32)
+    b = _FakeCudaTensor((2, 4, hv, 16), dtype=torch.float32)
+    w = _FakeCudaTensor((2, 4, hv, 16), dtype=torch.float32)
+
+    # Valid per-head shapes accepted
+    for ok_shape in ((hv,), (1, 1, hv), (1, 1, hv, 1)):
+        lam = _FakeCudaTensor(ok_shape, dtype=torch.float32)
+        assert gdn2_mod._can_use_triton_prep(q, k, v, g, b, w, lam, torch.bfloat16) is True
+    assert gdn2_mod._can_use_triton_prep(q, k, v, g, b, w, None, torch.bfloat16) is True
+
+    # Non-per-head shapes with same numel == hv MUST be rejected (prevents silent wrong-axis broadcast!)
+    for bad_shape in ((1, hv, 1, 1), (hv, 1, 1, 1), (hv, 1), (2, 2), (1, 1, 1, hv)):
+        lam_bad = _FakeCudaTensor(bad_shape, dtype=torch.float32)
+        assert gdn2_mod._can_use_triton_prep(q, k, v, g, b, w, lam_bad, torch.bfloat16) is False
+
+    # Mismatched device / key shape / non-positive dims MUST be rejected
+    lam_ok = _FakeCudaTensor((hv,), dtype=torch.float32)
+    assert gdn2_mod._can_use_triton_prep(
+        q, k, v, g, b, w, _FakeCudaTensor((hv,), dtype=torch.float32, device="cuda:1"), torch.bfloat16
+    ) is False
+    assert gdn2_mod._can_use_triton_prep(
+        q, _FakeCudaTensor((2, 4, 2, 8)), v, g, b, w, lam_ok, torch.bfloat16
+    ) is False
+    assert gdn2_mod._can_use_triton_prep(
+        q, k, _FakeCudaTensor((2, 3, hv, 16)), g, b, w, lam_ok, torch.bfloat16
+    ) is False
+    assert gdn2_mod._can_use_triton_prep(
+        _FakeCudaTensor((2, 0, 2, 16)), _FakeCudaTensor((2, 0, 2, 16)),
+        _FakeCudaTensor((2, 0, hv, 16)), _FakeCudaTensor((2, 0, hv, 16), dtype=torch.float32),
+        _FakeCudaTensor((2, 0, hv, 16), dtype=torch.float32), _FakeCudaTensor((2, 0, hv, 16), dtype=torch.float32),
+        lam_ok, torch.bfloat16,
+    ) is False
 
 
 def test_gdn2_triton_kernels_use_int64_indexing() -> None:
@@ -1068,14 +1209,15 @@ def test_s3_v2_to_s2_v2_gdn2_bptt_to_s4_v2_rl_eval_and_hub_e2e(
 
     # --- Stage 4: Eval `_stack_with_ckpt` & `_pipeline_stage_cmds` + Hub `load_qloop_from_hub`
     eval_cfg = _toy_stage_cfg("s4_v2_rl", checkpoint=False)
-    # Deliberately mimic `configs/eval/suite.yaml` (gdn2.enabled=false, hssd.enabled=true) to verify auto-alignment!
-    eval_cfg["gdn2"] = {"enabled": False}
+    # Deliberately mimic `configs/eval/suite.yaml` (gdn2.enabled=false, hssd.enabled=true) + explicit backend override!
+    eval_cfg["gdn2"] = {"enabled": False, "backend": "pytorch"}
     eval_cfg["hssd"] = {"enabled": True, "rank": 8, "chunk_size": 4, "window_chunks": 2, "num_pages": 4, "k_pages": 2}
     st_eval = _stack_with_ckpt(Cfg(eval_cfg), s4_dir)
     assert st_eval.hssd is None and st_eval.gdn2 is not None
     assert st_eval.gdn2.cfg.qed_enabled is True
     assert st_eval.gdn2.cfg.decay_log_min == pytest.approx(-3.0)
     assert st_eval.gdn2.cfg.neg_eigval_max_boost == pytest.approx(0.5)
+    assert st_eval.gdn2.cfg.backend == "pytorch", "explicit -s gdn2.backend override must be preserved over suite.yaml"
     for lid, ad in st_eval.gdn2.adapters.items():
         ref_ad = rl_tr.stack.gdn2.adapters[lid]
         assert ad.qed_lambda_raw is not None and ref_ad.qed_lambda_raw is not None

@@ -119,7 +119,7 @@ def _stack_with_ckpt(cfg: Cfg, ckpt: str | None):
             cur_g = dict(raw_cfg.get("gdn2") or {})
             prior_g = dict(smeta.get("gdn2") or {})
             merged_g = {**cur_g, **prior_g, "enabled": True}
-            if "backend" in cur_g and cur_g.get("enabled"):
+            if cur_g.get("backend") is not None:
                 merged_g["backend"] = cur_g["backend"]
             if "rank" not in prior_g:
                 for k, t in saved.items():

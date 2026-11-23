@@ -209,7 +209,13 @@ def is_session_missing_output(output: str, session: str) -> bool:
 
 def is_transient_capacity_error(detail: str | Exception) -> bool:
     """Detect transient Colab HTTP 503 / GPU capacity / quota provisioning failures."""
-    text = str(detail or "").lower()
+    parts = [str(detail or "")]
+    if isinstance(detail, Exception):
+        for attr in ("stdout", "stderr"):
+            val = getattr(detail, attr, None)
+            if isinstance(val, str) and val:
+                parts.append(val)
+    text = "\n".join(parts).lower()
     if not text:
         return False
     markers = (

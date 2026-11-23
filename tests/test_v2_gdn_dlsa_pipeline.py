@@ -44,6 +44,7 @@ from qloop.colab_supervisor import (
     DEFAULT_MAX_RESPAWN_BACKOFF_SEC,
     PROBE_SENTINEL,
     TAIL_SENTINEL,
+    ColabCommandError,
     ColabSupervisor,
     SupervisorConfig,
     build_arg_parser,
@@ -862,6 +863,253 @@ def test_replay_kv_cache_proxy_checkpoint_safety_hf524_layers_and_list_caches(mo
     monkeypatch.setattr(bptt_mod, "_in_backward", lambda: False)
 
 
+@pytest.mark.parametrize("readonly_base", [False, True])
+def test_replay_proxy_inplace_conv_and_rec_update_checkpoint_grad_parity(readonly_base: bool) -> None:
+    """Regression test (#397 Finding 1): 1-token in-place `causal_conv1d_update` / recurrent update
+    via `get_conv_state`/`get_recurrent_state` must match uncheckpointed gradients, preserve live
+    forward updates when `readonly_base=False`, and never mutate `base` when `readonly_base=True`."""
+    from torch.utils.checkpoint import checkpoint as torch_ckpt
+
+    class _CacheWithGetters:
+        def __init__(self, conv: torch.Tensor, rec: torch.Tensor) -> None:
+            self._conv = conv
+            self._rec = rec
+
+        def has_previous_state(self, layer_idx: int) -> bool:
+            del layer_idx
+            return True
+
+        def get_conv_state(self, layer_idx: int) -> torch.Tensor:
+            del layer_idx
+            return self._conv
+
+        def get_recurrent_state(self, layer_idx: int) -> torch.Tensor:
+            del layer_idx
+            return self._rec
+
+        def update_conv_state(
+            self, conv_states: torch.Tensor, layer_idx: int, conv_kernel_size: int | None = None
+        ) -> torch.Tensor:
+            del layer_idx
+            k = int(conv_kernel_size or self._conv.shape[-1])
+            full = torch.cat([self._conv, conv_states], dim=-1)
+            self._conv.copy_(full[..., -k:])
+            return full
+
+        def update_recurrent_state(self, recurrent_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
+            del layer_idx
+            self._rec.copy_(recurrent_states)
+            return self._rec
+
+    torch.manual_seed(123)
+    w_conv = nn.Parameter(torch.randn(4, 3))
+    w_proj = nn.Parameter(torch.randn(4, 4))
+    x_init = torch.randn(1, 4, 1)
+    init_conv = torch.randn(1, 4, 3)
+    init_rec = torch.randn(1, 4, 4)
+
+    def _step_fn(
+        x_in: torch.Tensor,
+        w_c: torch.Tensor,
+        w_p: torch.Tensor,
+        cache_obj: Any,
+    ) -> torch.Tensor:
+        # Mirror 1-token `causal_conv1d_update`: mutate conv_state in-place and compute output from it
+        cs = cache_obj.get_conv_state(0)
+        assert cs is not None
+        prev_snap = cs.clone()
+        new_cs = torch.cat([prev_snap[..., 1:], x_in.detach()], dim=-1)
+        cs.copy_(new_cs)
+        # Output depends on pre-update conv tail + live x_in (matching causal_conv1d_update semantics)
+        win = torch.cat([prev_snap[..., 1:], x_in], dim=-1)
+        y_conv = (win * w_c.unsqueeze(0)).sum(dim=-1)  # (1, 4)
+        rs = cache_obj.get_recurrent_state(0)
+        assert rs is not None
+        r_prev = rs.clone()
+        rs.add_(0.25 * y_conv.detach().unsqueeze(-1))
+        y_rec = torch.einsum("bi,bij->bj", y_conv, r_prev) @ w_p
+        return y_rec
+
+    # Reference: uncheckpointed direct execution on a clean base cache
+    base_ref = _CacheWithGetters(init_conv.clone(), init_rec.clone())
+    x_ref = x_init.clone().requires_grad_(True)
+    wc_ref = w_conv.detach().clone().requires_grad_(True)
+    wp_ref = w_proj.detach().clone().requires_grad_(True)
+    out_ref = _step_fn(x_ref, wc_ref, wp_ref, base_ref)
+    out_ref.pow(2).sum().backward()
+
+    # Checkpointed execution through `_ReplayKVCacheProxy`
+    base_chk = _CacheWithGetters(init_conv.clone(), init_rec.clone())
+    proxy_chk = _ReplayKVCacheProxy(base_chk, readonly_base=readonly_base)
+    x_chk = x_init.clone().requires_grad_(True)
+    wc_chk = w_conv.detach().clone().requires_grad_(True)
+    wp_chk = w_proj.detach().clone().requires_grad_(True)
+
+    def _wrapped(xi: torch.Tensor, wc: torch.Tensor, wp: torch.Tensor) -> torch.Tensor:
+        return _step_fn(xi, wc, wp, proxy_chk)
+
+    out_chk = torch_ckpt(_wrapped, x_chk, wc_chk, wp_chk, use_reentrant=False)
+    assert isinstance(out_chk, torch.Tensor)
+    out_chk.pow(2).sum().backward()
+
+    assert torch.allclose(out_chk, out_ref, atol=1e-6, rtol=1e-6)
+    assert x_chk.grad is not None and x_ref.grad is not None
+    assert wc_chk.grad is not None and wc_ref.grad is not None
+    assert wp_chk.grad is not None and wp_ref.grad is not None
+    assert torch.allclose(x_chk.grad, x_ref.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(wc_chk.grad, wc_ref.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(wp_chk.grad, wp_ref.grad, atol=1e-6, rtol=1e-6)
+
+    if readonly_base:
+        assert torch.equal(base_chk._conv, init_conv)
+        assert torch.equal(base_chk._rec, init_rec)
+    else:
+        assert torch.allclose(base_chk._conv, base_ref._conv, atol=1e-6)
+        assert torch.allclose(base_chk._rec, base_ref._rec, atol=1e-6)
+
+    # Also verify `get_conv_state`/`get_recurrent_state` reflect `update_*` within the same forward
+    base_seq = _CacheWithGetters(init_conv.clone(), init_rec.clone())
+    proxy_seq = _ReplayKVCacheProxy(base_seq, readonly_base=readonly_base)
+    upd_c = torch.full((1, 4, 1), 7.5)
+    upd_r = torch.full((1, 4, 4), -3.25)
+    proxy_seq.update_conv_state(upd_c, 0, conv_kernel_size=3)
+    proxy_seq.update_recurrent_state(upd_r, 0)
+    got_c = proxy_seq.get_conv_state(0)
+    got_r = proxy_seq.get_recurrent_state(0)
+    assert got_c is not None and torch.allclose(got_c[..., -1:], upd_c)
+    assert got_r is not None and torch.allclose(got_r, upd_r)
+    if readonly_base:
+        assert torch.equal(base_seq._conv, init_conv)
+        assert torch.equal(base_seq._rec, init_rec)
+    else:
+        assert torch.allclose(base_seq._conv[..., -1:], upd_c)
+        assert torch.allclose(base_seq._rec, upd_r)
+
+
+def test_replay_proxy_layer_fp8_mask_sizes_bool_hps_zero_len_bwd_and_list_sync(monkeypatch) -> None:
+    """Regression tests for #397 Findings 2, 3, and Nit 1:
+    - `get_mask_sizes(int)` and `proxy.layers[i].{get_mask_sizes, is_initialized}` under `fp8_prefix_kv`
+    - `_ReplayCacheLayerProxy` plain-`bool` `has_previous_state` + guarded `__setattr__` + `reset_segment()`
+    - 0-length `update()` during `_in_backward()` when `readonly_base=False` and `slot not in live_map`
+    - `_SlotStateListProxy` negative index & slicing after external `base` list extension."""
+    import qloop.train.bptt as bptt_mod
+    from qloop.model.offload import FP8KVCacheQuantizer
+    from qloop.train.long_calib import _extract_fp8_prefix_kv_
+
+    # --- Finding 2a & 2b: `get_mask_sizes(int)` + `proxy.layers[full_idx].{get_mask_sizes, is_initialized}` ---
+    cfg = ToyConfig(num_hidden_layers=4, hidden_size=16, num_attention_heads=2, num_key_value_heads=1, head_dim=8)
+    base524 = _MockHF524DynamicCache(cfg)
+    full_idx = next(i for i, lt in enumerate(cfg.layer_types) if lt == "full_attention")
+    k_pref = torch.randn(1, 1, 16, 8)
+    v_pref = torch.randn(1, 1, 16, 8)
+    base524.update(k_pref, v_pref, full_idx)
+    fp8_q = FP8KVCacheQuantizer()
+    fp8_kv = _extract_fp8_prefix_kv_(base524, fp8_q)
+    if fp8_q.supports_fp8(k_pref.device):
+        assert base524.layers[full_idx].is_initialized is False  # emptied by _extract_fp8_prefix_kv_
+        proxy_fp8 = _ReplayKVCacheProxy(base524, readonly_base=True, fp8_prefix_kv=fp8_kv)
+        assert proxy_fp8.get_mask_sizes(8, full_idx) == (24, 0)
+        assert proxy_fp8.get_mask_sizes(torch.arange(16, 24), full_idx) == (24, 0)
+        assert proxy_fp8.layers[full_idx].is_initialized is True
+        assert proxy_fp8.layers[full_idx].get_mask_sizes(8) == (24, 0)
+        assert proxy_fp8.layers[full_idx].get_mask_sizes(torch.arange(16, 24)) == (24, 0)
+
+    # --- Finding 2c: plain-`bool` `has_previous_state` + guarded `__setattr__` + `reset_segment()` ---
+    class _BoolHpsLayer:
+        def __init__(self) -> None:
+            self.has_previous_state: bool = False
+            self.conv_states: torch.Tensor | None = torch.zeros(1, 4, 3)
+
+    class _BoolHpsCache:
+        def __init__(self) -> None:
+            self.layers = [_BoolHpsLayer()]
+
+        def __len__(self) -> int:
+            return len(self.layers)
+
+    c_bool = _BoolHpsCache()
+    p_bool = _ReplayKVCacheProxy(c_bool, readonly_base=False)
+    assert p_bool.layers[0].has_previous_state is False
+    new_cs = torch.ones(1, 4, 3)
+    p_bool.layers[0].has_previous_state = True
+    p_bool.layers[0].conv_states = new_cs
+    assert c_bool.layers[0].has_previous_state is True
+    assert torch.equal(c_bool.layers[0].conv_states, new_cs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(bptt_mod, "_in_backward", lambda: True)
+    assert p_bool.layers[0].has_previous_state is False
+    assert torch.equal(p_bool.layers[0].conv_states, torch.zeros(1, 4, 3))
+    # Guarded setattr in backward must be a no-op and leave base intact
+    p_bool.layers[0].has_previous_state = False
+    p_bool.layers[0].conv_states = torch.full((1, 4, 3), 99.0)
+    assert c_bool.layers[0].has_previous_state is True
+    assert torch.equal(c_bool.layers[0].conv_states, new_cs)  # type: ignore[arg-type]
+    monkeypatch.setattr(bptt_mod, "_in_backward", lambda: False)
+
+    # After `reset_segment()`, Segment 1 snapshots must refresh to `True` / `new_cs`
+    p_bool.reset_segment()
+    monkeypatch.setattr(bptt_mod, "_in_backward", lambda: True)
+    assert p_bool.layers[0].has_previous_state is True
+    assert torch.equal(p_bool.layers[0].conv_states, new_cs)
+    monkeypatch.setattr(bptt_mod, "_in_backward", lambda: False)
+
+    # Under `readonly_base=True`, mutations stay in overlay and never touch `_base_layer`
+    c_ro = _BoolHpsCache()
+    p_ro = _ReplayKVCacheProxy(c_ro, readonly_base=True)
+    p_ro.layers[0].has_previous_state = True
+    p_ro.layers[0].conv_states = torch.full((1, 4, 3), 5.0)
+    assert p_ro.layers[0].has_previous_state is True
+    assert torch.equal(p_ro.layers[0].conv_states, torch.full((1, 4, 3), 5.0))
+    assert c_ro.layers[0].has_previous_state is False
+    assert torch.equal(c_ro.layers[0].conv_states, torch.zeros(1, 4, 3))  # type: ignore[arg-type]
+
+    # --- Finding 3: 0-length `update()` during `_in_backward()` when `readonly_base=False` & `slot not in live_map` ---
+    base_z = _MockHF524DynamicCache(cfg)
+    k0 = torch.randn(1, 1, 12, 8)
+    v0 = torch.randn(1, 1, 12, 8)
+    base_z.update(k0, v0, full_idx)
+    p_z = _ReplayKVCacheProxy(base_z, readonly_base=False)
+    empty_k = torch.empty(1, 1, 0, 8)
+    empty_v = torch.empty(1, 1, 0, 8)
+
+    # Case 3a: neither `live_map` nor `raw_pref` populated -> falls back to `_extract_cached_kv(base, slot)`
+    monkeypatch.setattr(bptt_mod, "_in_backward", lambda: True)
+    k_ret_a, v_ret_a = p_z.update(empty_k, empty_v, full_idx)
+    assert k_ret_a.shape == (1, 1, 12, 8) and v_ret_a.shape == (1, 1, 12, 8)
+    assert torch.equal(k_ret_a, k0) and torch.equal(v_ret_a, v0)
+    # Case 3b: `raw_pref` populated, `live_map` absent -> returns `raw_pref[slot]`
+    k_rp = torch.randn(1, 1, 10, 8)
+    v_rp = torch.randn(1, 1, 10, 8)
+    object.__getattribute__(p_z, "_raw_prefix_kv")[full_idx] = (k_rp, v_rp)
+    k_ret_b, v_ret_b = p_z.update(empty_k, empty_v, full_idx)
+    assert torch.equal(k_ret_b, k_rp) and torch.equal(v_ret_b, v_rp)
+    monkeypatch.setattr(bptt_mod, "_in_backward", lambda: False)
+
+    # --- Nit 1: `_SlotStateListProxy` after external `base` list extension (negative index & slicing) ---
+    toy_ext = ToyHybridCache(cfg)
+    toy_ext.conv_states[0] = torch.ones(1, 4, 3)
+    p_ext = _ReplayKVCacheProxy(toy_ext, readonly_base=False)
+    ext_orig = torch.full((1, 4, 3), 2.5)
+    toy_ext.conv_states.append(ext_orig.clone())
+    assert len(p_ext.conv_states) == len(toy_ext.conv_states)
+    # Negative index & slice work after external append, and in-place mutation does not corrupt backward snapshot
+    p_ext.conv_states[-1].copy_(torch.full((1, 4, 3), 8.0))
+    assert torch.equal(toy_ext.conv_states[-1], torch.full((1, 4, 3), 8.0))
+    monkeypatch.setattr(bptt_mod, "_in_backward", lambda: True)
+    assert torch.equal(p_ext.conv_states[-1], ext_orig)
+    sl_bwd = p_ext.conv_states[-2:]
+    assert len(sl_bwd) == 2 and torch.equal(sl_bwd[-1], ext_orig)
+    monkeypatch.setattr(bptt_mod, "_in_backward", lambda: False)
+
+    p_ext_ro = _ReplayKVCacheProxy(toy_ext, readonly_base=True)
+    ro_orig = torch.full((1, 4, 3), 3.5)
+    toy_ext.conv_states.append(ro_orig.clone())
+    p_ext_ro.conv_states[-1].copy_(torch.full((1, 4, 3), 9.0))
+    assert torch.equal(p_ext_ro.conv_states[-1], torch.full((1, 4, 3), 9.0))
+    assert torch.equal(toy_ext.conv_states[-1], ro_orig)
+    assert torch.equal(p_ext_ro.conv_states[-1:][0], torch.full((1, 4, 3), 9.0))
+
+
 def test_long_calib_and_bptt_native_gdn_loop_lsa_tf524(monkeypatch) -> None:
     torch.manual_seed(7)
     # 1) Long-prefix + short-suffix calibration with `fp8_kv_cache=True` on TF 5.24.0 DynamicCache + Native GDN
@@ -1302,6 +1550,25 @@ def test_colab_supervisor_v2_stages_and_503_exponential_backoff(tmp_path) -> Non
     assert is_transient_capacity_error("HTTP 503 Service Unavailable: backend overloaded")
     assert is_transient_capacity_error("Error: Cannot connect to GPU backend due to GPU capacity")
     assert not is_transient_capacity_error("SyntaxError: invalid syntax in script")
+    # #397 Nit 2: Exception whose 503 marker appears before the truncated 600-char tail of `str(exc)`
+    long_stderr_err = ColabCommandError(
+        "colab new failed (rc=1): " + ("x" * 600),
+        returncode=1,
+        cmd=("colab", "new"),
+        stdout="",
+        stderr="HTTP 503 Service Unavailable: transient capacity\n" + ("x" * 1000),
+    )
+    assert "503" not in str(long_stderr_err)
+    assert is_transient_capacity_error(long_stderr_err) is True
+    long_stdout_err = ColabCommandError(
+        "colab new failed (rc=1): " + ("y" * 600),
+        returncode=1,
+        cmd=("colab", "new"),
+        stdout="No GPU capacity available right now\n" + ("y" * 1000),
+        stderr="",
+    )
+    assert "capacity" not in str(long_stdout_err)
+    assert is_transient_capacity_error(long_stdout_err) is True
 
     seq_300 = [
         compute_respawn_backoff_sec(k, base_backoff_sec=15.0, max_backoff_sec=300.0, transient_capacity=True)

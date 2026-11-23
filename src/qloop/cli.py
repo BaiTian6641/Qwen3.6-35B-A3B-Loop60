@@ -447,7 +447,7 @@ def _pipeline_stage_cmds(
     scan_seq_len: int,
     all_stages: tuple[str, ...] = (),
 ) -> list[list[str]]:
-    from .hub import _V3_STAGE_SET, resolve_stage_config_path
+    from .hub import _V3_GDN_STAGE_SET, _V3_STAGE_SET, resolve_stage_config_path
 
     py = [sys.executable, "-u", "-m", "qloop"]
     common = ["--debug", str(debug_level), "-s", f"checkpoint.sync.hf_repo={repo_id}"]
@@ -457,16 +457,22 @@ def _pipeline_stage_cmds(
     if time_budget_hours is not None:
         train_extra.extend(["-s", f"train.time_budget_hours={time_budget_hours}"])
 
+    is_v3_gdn_pipeline = any(s in _V3_GDN_STAGE_SET for s in all_stages) or stage_name in _V3_GDN_STAGE_SET
     _v2_only_stages = {"s1_loop_heal", "s1_rescan", "s2_sft", "s3_long_lsa"}
-    is_v2_pipeline = any(s in _v2_only_stages for s in all_stages)
-    is_v3_pipeline = any(s in _V3_STAGE_SET for s in all_stages) or (
-        not is_v2_pipeline and any(s in ("s4_rl", "eval") for s in all_stages)
+    is_v2_pipeline = (not is_v3_gdn_pipeline) and any(s in _v2_only_stages for s in all_stages)
+    is_v3_pipeline = (not is_v3_gdn_pipeline) and (
+        any(s in _V3_STAGE_SET for s in all_stages)
+        or (not is_v2_pipeline and any(s in ("s4_rl", "eval") for s in all_stages))
     )
 
     if stage_name == "s0_probe":
         cpath = resolve_stage_config_path("s0_probe", config_root)
         out_stats = os.path.join(run_root, "s0_probe", "esft_stats.json")
-        probe_flags = ["--structured"] if is_v3_pipeline else ["--backward", "--surgery", "--core-ranges"]
+        probe_flags = (
+            ["--structured"]
+            if (is_v3_pipeline or is_v3_gdn_pipeline)
+            else ["--backward", "--surgery", "--core-ranges"]
+        )
         return [
             [*py, "probe", "-c", cpath, *probe_flags, *common],
             [*py, "scan-experts", "-c", cpath, "--batches", str(scan_batches), "--seq-len", str(scan_seq_len),
@@ -481,8 +487,34 @@ def _pipeline_stage_cmds(
     if stage_name == "eval":
         cpath = resolve_stage_config_path("eval", config_root)
         eval_extra = list(common)
+        ov_keys = {ov.split("=", 1)[0].strip() for ov in overrides if "=" in ov}
+        if is_v3_gdn_pipeline:
+            v3_gdn_eval_defaults = (
+                ("model.yarn_target_len", "1048576"),
+                ("loop.prelude_end", "12"),
+                ("loop.core_end", "36"),
+                ("loop.num_passes", "3"),
+                ("loop.target_virtual_layers", "88"),
+                ("loop.train_pass_probs", "[0.10,0.35,0.55]"),
+                ("loop.bridge_mode", "subspace"),
+                ("loop.bridge_rank", "256"),
+                ("loop.bridge_init", "[0.05,0.85,0.10]"),
+                ("loop.attn_adapter_rank", "64"),
+                ("gdn2.enabled", "false"),
+                ("hssd.enabled", "false"),
+                ("lsa.enabled", "true"),
+                ("lsa.mode", "sparse"),
+                ("lsa.num_query_passes", "3"),
+                ("eval.defaults.depths", "[1,2,3]"),
+            )
+            for k, v in v3_gdn_eval_defaults:
+                if k not in ov_keys:
+                    eval_extra.extend(["-s", f"{k}={v}"])
+            eval_ckpt_stage = "s4_v2_rl" if "s4_v2_rl" in all_stages else (
+                next((s for s in reversed(all_stages) if s in _V3_GDN_STAGE_SET), "s4_v2_rl")
+            )
+            return [[*py, "eval", "-c", cpath, "--ckpt", os.path.join(run_root, eval_ckpt_stage), *eval_extra]]
         if is_v3_pipeline:
-            ov_keys = {ov.split("=", 1)[0].strip() for ov in overrides if "=" in ov}
             v3_eval_defaults = (
                 ("model.yarn_target_len", "1048576"),
                 ("loop.prelude_end", "12"),
@@ -514,6 +546,13 @@ def _pipeline_stage_cmds(
 
     cpath = resolve_stage_config_path(stage_name, config_root)
     stage_extra = list(train_extra)
+    if stage_name == "s4_v2_rl":
+        ov_keys = {ov.split("=", 1)[0].strip() for ov in overrides if "=" in ov}
+        if "train.init_from" not in ov_keys and "s2_v2_joint_bptt" not in all_stages:
+            prior_gdn = [s for s in all_stages if s in ("s3_v2_long_1m_lsa", "s1_loop_a6b")]
+            if prior_gdn:
+                stage_extra.extend(["-s", f"train.init_from=runs/{prior_gdn[-1]}"])
+        return [[*py, "train", "-c", cpath, *stage_extra]]
     if stage_name == "s4_rl":
         ov_keys = {ov.split("=", 1)[0].strip() for ov in overrides if "=" in ov}
         if is_v3_pipeline:
@@ -607,7 +646,7 @@ def _run_sync_action(
     run_root: str,
     ckpt_cls: Any,
 ) -> int:
-    from .hub import _V3_STAGE_SET, PIPELINE_ORDER, V3_PIPELINE_ORDER, disk_report, reclaim_disk_space
+    from .hub import PIPELINE_ORDER, disk_report, reclaim_disk_space, resolve_pipeline_order
 
     if args.action == "disk":
         if args.clean:
@@ -621,7 +660,7 @@ def _run_sync_action(
         manifest = hub.fetch_manifest()
         commits = hub.recent_commits(limit=8)
         disk = disk_report(run_root)
-        order = V3_PIPELINE_ORDER if any(s in manifest.stages for s in _V3_STAGE_SET) else PIPELINE_ORDER
+        order = resolve_pipeline_order(manifest.stages)
         print(f"HF Repo       : https://huggingface.co/{repo_id} (public)")
         print(f"Next Stage    : {manifest.next_incomplete_stage(order) or 'ALL COMPLETED'}")
         print(f"Latest Commit : stage={manifest.latest_stage or '-'} step={manifest.latest_step} "

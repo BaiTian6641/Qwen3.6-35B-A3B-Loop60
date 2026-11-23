@@ -116,10 +116,18 @@ def _quantize_fp8_tensor_lean(
     return QuantizedFP8KV(q_fp8, scale.to(torch.float32), x.dtype, is_fp8_native=True)
 
 
+def _is_linear_cache_layer(lyr: Any) -> bool:
+    """True for `transformers >= 5.20` `LinearAttentionLayer` entries carrying conv/recurrent states."""
+    return hasattr(lyr, "conv_states") or hasattr(lyr, "recurrent_states")
+
+
 def _extract_fp8_prefix_kv_(
     cache: Any, quantizer: FP8KVCacheQuantizer
 ) -> dict[int, tuple[QuantizedFP8KV, QuantizedFP8KV]]:
-    """Quantize populated full-attention prefix KV caches into true 1-byte FP8 E4M3 and release bf16 copies."""
+    """Quantize populated full-attention prefix KV caches into true 1-byte FP8 E4M3 and release bf16 copies.
+
+    Leaves linear-attention (`conv_states` / `recurrent_states`) layers completely untouched.
+    """
     out: dict[int, tuple[QuantizedFP8KV, QuantizedFP8KV]] = {}
     kc = getattr(cache, "key_cache", None)
     vc = getattr(cache, "value_cache", None)
@@ -129,6 +137,8 @@ def _extract_fp8_prefix_kv_(
             if (
                 isinstance(k_t, torch.Tensor)
                 and isinstance(v_t, torch.Tensor)
+                and k_t.ndim >= 3
+                and v_t.ndim >= 3
                 and k_t.numel() > 0
                 and quantizer.supports_fp8(k_t.device)
             ):
@@ -142,11 +152,15 @@ def _extract_fp8_prefix_kv_(
     layers = getattr(cache, "layers", None)
     if isinstance(layers, list):
         for i, lyr in enumerate(layers):
+            if _is_linear_cache_layer(lyr):
+                continue
             k_t = getattr(lyr, "keys", None)
             v_t = getattr(lyr, "values", None)
             if (
                 isinstance(k_t, torch.Tensor)
                 and isinstance(v_t, torch.Tensor)
+                and k_t.ndim >= 3
+                and v_t.ndim >= 3
                 and k_t.numel() > 0
                 and quantizer.supports_fp8(k_t.device)
             ):
@@ -163,25 +177,28 @@ def _quantize_prefix_cache_fp8_(cache: Any, quantizer: FP8KVCacheQuantizer) -> N
     """Simulate/apply Tier-1 `FP8 E4M3` precision on populated prefix full-attention KV caches.
 
     Supports both legacy `key_cache`/`value_cache` lists (`HSSDHybridCache`, `ToyHybridCache`,
-    HF 4.x `DynamicCache`) and `transformers >= 5.x` `cache.layers[i].keys`/`values` layers.
+    HF 4.x `DynamicCache`) and `transformers >= 5.x` `cache.layers[i].keys`/`values` layers,
+    while leaving linear-attention (`conv_states` / `recurrent_states`) layers intact.
     """
     kc = getattr(cache, "key_cache", None)
     vc = getattr(cache, "value_cache", None)
     if isinstance(kc, list) and isinstance(vc, list):
         for i in range(min(len(kc), len(vc))):
-            if isinstance(kc[i], torch.Tensor) and kc[i].numel() > 0:
+            if isinstance(kc[i], torch.Tensor) and kc[i].ndim >= 3 and kc[i].numel() > 0:
                 kc[i] = quantizer.dequantize(quantizer.quantize(kc[i]), dtype=kc[i].dtype)
-            if isinstance(vc[i], torch.Tensor) and vc[i].numel() > 0:
+            if isinstance(vc[i], torch.Tensor) and vc[i].ndim >= 3 and vc[i].numel() > 0:
                 vc[i] = quantizer.dequantize(quantizer.quantize(vc[i]), dtype=vc[i].dtype)
         return
     layers = getattr(cache, "layers", None)
     if isinstance(layers, list):
         for lyr in layers:
+            if _is_linear_cache_layer(lyr):
+                continue
             k_t = getattr(lyr, "keys", None)
             v_t = getattr(lyr, "values", None)
-            if isinstance(k_t, torch.Tensor) and k_t.numel() > 0:
+            if isinstance(k_t, torch.Tensor) and k_t.ndim >= 3 and k_t.numel() > 0:
                 lyr.keys = quantizer.dequantize(quantizer.quantize(k_t), dtype=k_t.dtype)
-            if isinstance(v_t, torch.Tensor) and v_t.numel() > 0:
+            if isinstance(v_t, torch.Tensor) and v_t.ndim >= 3 and v_t.numel() > 0:
                 lyr.values = quantizer.dequantize(quantizer.quantize(v_t), dtype=v_t.dtype)
 
 

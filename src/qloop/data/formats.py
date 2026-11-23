@@ -207,6 +207,8 @@ def _norm_tool_calls(tcs: Any) -> list[dict[str, Any]] | None:
         return None
     if isinstance(tcs, dict):
         tcs = [tcs]
+    if not isinstance(tcs, list):
+        return None
     out = []
     for raw in tcs:
         tc = _maybe_json(raw)
@@ -251,7 +253,11 @@ def _norm_message(item: Any, spec: DatasetSpec, idx: int, pos: int, row: dict[st
         elif r_in:
             reasoning = f"{reasoning}\n\n{r_in}"
         msg["content"], msg["reasoning"] = content, reasoning
-        tcs = _norm_tool_calls(item.get("tool_calls") or item.get("function_call"))
+        tcs = None
+        for tc_key in ("tool_calls", "tool_calls_json", "function_call"):
+            tcs = _norm_tool_calls(item.get(tc_key))
+            if tcs:
+                break
         if tcs:
             msg["tool_calls"] = tcs
     if role == "tool" and item.get("name"):
@@ -282,7 +288,11 @@ def adapt_messages(row: dict[str, Any], spec: DatasetSpec, idx: int) -> list[Exa
     sk = _first_key(row, SYSTEM_KEYS)
     if sk and isinstance(row[sk], str) and row[sk].strip() and msgs[0]["role"] != "system":
         msgs.insert(0, {"role": "system", "content": row[sk], "reasoning": None})
-    tools = _parse_tools(row.get(spec.fields.get("tools", "tools")))
+    tools_key = spec.fields.get("tools")
+    if tools_key:
+        tools = _parse_tools(row.get(tools_key))
+    else:
+        tools = _parse_tools(row.get("tools")) or _parse_tools(row.get("tools_json"))
     return [Example(spec.name, "chat", messages=msgs, tools=tools, row_index=idx)]
 
 

@@ -49,7 +49,25 @@ V3_PIPELINE_ORDER: tuple[str, ...] = (
     "s2_joint_bptt",
     "s4_rl",
 )
+V3_GDN_PIPELINE_ORDER: tuple[str, ...] = (
+    "s0_probe",
+    "s1_loop_a6b",
+    "s3_v2_long_1m_lsa",
+    "s2_v2_joint_bptt",
+    "s4_v2_rl",
+)
 _V3_STAGE_SET = frozenset({"s1_loop_a6b", "s1b_hssd_distill", "s3_long_1m_lsa", "s2_joint_bptt"})
+_V3_GDN_STAGE_SET = frozenset({"s3_v2_long_1m_lsa", "s2_v2_joint_bptt", "s4_v2_rl"})
+
+
+def resolve_pipeline_order(stages_map: dict[str, Any] | Any) -> tuple[str, ...]:
+    """Select the active pipeline stage ordering from manifest stage keys."""
+    if stages_map:
+        if any(s in stages_map for s in _V3_GDN_STAGE_SET):
+            return V3_GDN_PIPELINE_ORDER
+        if any(s in stages_map for s in _V3_STAGE_SET):
+            return V3_PIPELINE_ORDER
+    return PIPELINE_ORDER
 
 # Artifact files produced outside `checkpoints/` that downstream stages depend on.
 ARTIFACT_PATHS: dict[str, tuple[str, str]] = {
@@ -76,7 +94,7 @@ def resolve_stage_config_path(stage_name: str, config_root: str = "configs") -> 
     if st == "s1_rescan":
         return os.path.join(config_root, "stages", "s1_loop_heal.yaml")
     cand = os.path.join(config_root, "stages", f"{st}.yaml")
-    if st in PIPELINE_ORDER or st in V3_PIPELINE_ORDER or os.path.isfile(cand):
+    if st in PIPELINE_ORDER or st in V3_PIPELINE_ORDER or st in V3_GDN_PIPELINE_ORDER or os.path.isfile(cand):
         return cand
     raise ValueError(f"unknown pipeline stage {stage_name!r}")
 
@@ -407,11 +425,19 @@ def render_model_card(manifest: HubManifest) -> str:
             "with batched Ward clustering for sub-quadratic 1M-token retrieval.",
         ]
     elif lin_attn == "stock":
-        lin_tags = ["  - gated-deltanet"]
-        lin_bullets = [
-            "- **Fast Stock Qwen3.6 Gated DeltaNet Linear Attention (`-> HSSD v3.2`)**: Heals the recurrent ETD "
+        is_gdn_dlsa = any(s in manifest.stages for s in _V3_GDN_STAGE_SET) or arch.get("sparse_attention") == "d-lsa"
+        lin_tags = ["  - gated-deltanet", "  - d-lsa"] if is_gdn_dlsa else ["  - gated-deltanet"]
+        lead_bullet = (
+            "- **Native Qwen3.6 Gated DeltaNet Linear Attention + 88L Loop + D-LSA**: Keeps all 30 native "
+            "Qwen3.6 Gated DeltaNet linear-attention layers intact (zero HSSD/GDN-2 overhead) while scaling "
+            "virtual depth to 88L and full-attention context to 1M with `D-LSA`."
+            if is_gdn_dlsa
+            else "- **Fast Stock Qwen3.6 Gated DeltaNet Linear Attention (`-> HSSD v3.2`)**: Heals the recurrent ETD "
             "loop directly over native Qwen3.6 linear-attention layers with zero adapter overhead prior to "
-            "`HSSD v3.2` distillation.",
+            "`HSSD v3.2` distillation."
+        )
+        lin_bullets = [
+            lead_bullet,
             "- **Hybrid State Isolation + MoR Recursive KV Sharing**: Independent `(layer, pass)` recurrent/conv "
             "slots for the core linear-attention layers, paired with 1.0x pass-1 FP8 KV + per-pass `D-LSA` bucket "
             "sharing on Gated Full Attention layers (zero KV memory multiplication at 1M context).",
@@ -474,7 +500,7 @@ def render_model_card(manifest: HubManifest) -> str:
         "| Stage | Status | Step | LM Loss | Depth Gain (`L_d1 - L_d2`) | Pass-2 Reroute Rate | Updated (UTC) |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :--- |",
     ]
-    order = V3_PIPELINE_ORDER if any(s in manifest.stages for s in _V3_STAGE_SET) else PIPELINE_ORDER
+    order = resolve_pipeline_order(manifest.stages)
     for st in order:
         info = manifest.stages.get(st) or {}
         status = info.get("status", "pending")
@@ -769,6 +795,9 @@ class HubSyncManager:
             manifest.architecture["gdn2_rank"] = int(gdn2_desc.get("rank", 64))
         elif stack_desc:
             manifest.architecture["linear_attention"] = "stock"
+            manifest.architecture.pop("hssd_rank", None)
+            manifest.architecture.pop("hssd_pages", None)
+            manifest.architecture.pop("gdn2_rank", None)
         if lsa_desc is not None:
             manifest.architecture["sparse_attention"] = "d-lsa"
 
@@ -1083,6 +1112,9 @@ def load_qloop_from_hub(
                 break
         gcfg["enabled"] = True
         raw_cfg["gdn2"] = gcfg
+    else:
+        raw_cfg["hssd"] = {"enabled": False}
+        raw_cfg["gdn2"] = {"enabled": False}
     if enable_lsa_if_present and any("lsa_indexer." in k for k in saved):
         prior_lsa = dict((meta.get("stack") or {}).get("lsa") or {})
         lcfg = {**dict(raw_cfg.get("lsa") or {}), **prior_lsa}

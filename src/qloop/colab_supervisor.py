@@ -61,6 +61,8 @@ DEFAULT_BOOTSTRAP_TIMEOUT_SEC = 900
 DEFAULT_MAX_RESPAWNS = 3
 DEFAULT_MAX_ROLLOVERS = 10
 DEFAULT_RESPAWN_BACKOFF_SEC = 15.0
+DEFAULT_CAPACITY_BACKOFF_BASE_SEC = 60.0
+DEFAULT_MAX_RESPAWN_BACKOFF_SEC = 300.0
 DEFAULT_LOG_FILE = "runs/colab_supervisor.log"
 DEFAULT_TAIL_FILE = "runs/colab_last_tail.log"
 
@@ -205,6 +207,51 @@ def is_session_missing_output(output: str, session: str) -> bool:
     return "pruned" in low and "stale local session" in low
 
 
+def is_transient_capacity_error(detail: str | Exception) -> bool:
+    """Detect transient Colab HTTP 503 / GPU capacity / quota provisioning failures."""
+    text = str(detail or "").lower()
+    if not text:
+        return False
+    markers = (
+        "503",
+        "service unavailable",
+        "temporarily unavailable",
+        "resource exhausted",
+        "resource_exhausted",
+        "no gpu",
+        "gpu unavailable",
+        "gpu capacity",
+        "capacity",
+        "cannot connect to gpu backend",
+        "unable to assign",
+        "usage limit",
+        "quota",
+        "too many requests",
+        "429",
+        "try again later",
+        "backend is temporarily",
+        "overloaded",
+    )
+    return any(m in text for m in markers)
+
+
+def compute_respawn_backoff_sec(
+    failure_count: int,
+    *,
+    base_backoff_sec: float = DEFAULT_RESPAWN_BACKOFF_SEC,
+    max_backoff_sec: float = DEFAULT_MAX_RESPAWN_BACKOFF_SEC,
+    transient_capacity: bool = False,
+) -> float:
+    """Compute bounded exponential retry delay (`60s -> 120s -> 240s -> 300s` on 503/capacity)."""
+    cap = max(0.0, float(max_backoff_sec))
+    base = max(0.0, float(base_backoff_sec))
+    if transient_capacity:
+        base = max(DEFAULT_CAPACITY_BACKOFF_BASE_SEC, base)
+    exp = max(0, int(failure_count) - 1)
+    delay = base * (2 ** min(exp, 10))
+    return min(cap, delay) if cap > 0.0 else delay
+
+
 @dataclass
 class SupervisorConfig:
     colab_bin: str = DEFAULT_COLAB_BIN
@@ -226,6 +273,7 @@ class SupervisorConfig:
     max_respawns: int = DEFAULT_MAX_RESPAWNS
     max_rollovers: int = DEFAULT_MAX_ROLLOVERS
     respawn_backoff_sec: float = DEFAULT_RESPAWN_BACKOFF_SEC
+    max_respawn_backoff_sec: float = DEFAULT_MAX_RESPAWN_BACKOFF_SEC
     log_file: str = DEFAULT_LOG_FILE
     tail_file: str = DEFAULT_TAIL_FILE
     keep_on_complete: bool = False
@@ -1149,22 +1197,48 @@ class ColabSupervisor:
                 self._sleep(short_sleep)
         return False
 
+    def _retry_backoff_sec(self, failure_count: int, exc: Exception | None = None) -> float:
+        is_cap = exc is not None and is_transient_capacity_error(exc)
+        return compute_respawn_backoff_sec(
+            failure_count,
+            base_backoff_sec=self.cfg.respawn_backoff_sec,
+            max_backoff_sec=self.cfg.max_respawn_backoff_sec,
+            transient_capacity=is_cap,
+        )
+
     def _launch_fresh_rollover_session(self, rollover_count: int) -> bool:
         """Provision and bootstrap a fresh 24h VM after old session termination, retrying transient errors."""
         max_attempts = 1 + max(0, int(self.cfg.max_respawns))
         last_exc: ColabSupervisorError | None = None
+        cap_failures = 0
+        other_failures = 0
         for attempt in range(1, max_attempts + 1):
             try:
                 self.ensure_session_and_launch()
                 return True
             except ColabSupervisorError as exc:
                 last_exc = exc
-                self.log(
-                    f"[WARN] rollover {rollover_count}/{self.cfg.max_rollovers} "
-                    f"provision/bootstrap attempt {attempt}/{max_attempts} failed: {exc}"
-                )
+                is_cap = is_transient_capacity_error(exc)
+                if is_cap:
+                    cap_failures += 1
+                    fail_idx = cap_failures
+                else:
+                    other_failures += 1
+                    fail_idx = other_failures
                 if attempt < max_attempts:
-                    self._sleep(self.cfg.respawn_backoff_sec)
+                    delay = self._retry_backoff_sec(fail_idx, exc)
+                    kind = "transient capacity/503" if is_cap else "transient"
+                    self.log(
+                        f"[WARN] rollover {rollover_count}/{self.cfg.max_rollovers} "
+                        f"provision/bootstrap attempt {attempt}/{max_attempts} failed ({kind}): {exc}; "
+                        f"retrying after {delay:g}s"
+                    )
+                    self._sleep(delay)
+                else:
+                    self.log(
+                        f"[WARN] rollover {rollover_count}/{self.cfg.max_rollovers} "
+                        f"provision/bootstrap attempt {attempt}/{max_attempts} failed: {exc}"
+                    )
         if isinstance(last_exc, ColabCommandError) and last_exc.returncode == 124:
             self._try_stop_session()
         self.log(
@@ -1172,6 +1246,24 @@ class ColabSupervisor:
             f"fresh session '{self.cfg.session}' after {max_attempts} attempt(s)"
         )
         return False
+
+    def _initial_launch_with_retry(self) -> dict[str, Any]:
+        """Run initial provision/bootstrap, retrying transient Colab 503 / GPU capacity errors with exp backoff."""
+        max_retries = 0 if self.cfg.once else max(0, int(self.cfg.max_respawns))
+        cap_failures = 0
+        while True:
+            try:
+                return self.ensure_session_and_launch()
+            except ColabSupervisorError as exc:
+                if not is_transient_capacity_error(exc) or cap_failures >= max_retries:
+                    raise
+                cap_failures += 1
+                delay = self._retry_backoff_sec(cap_failures, exc)
+                self.log(
+                    f"[WARN] initial provision/bootstrap hit transient capacity/503 "
+                    f"(retry {cap_failures}/{max_retries}): {exc}; waiting {delay:g}s"
+                )
+                self._sleep(delay)
 
     def _finish_completed_exit_zero(self) -> int:
         if self.cfg.keep_on_complete:
@@ -1212,19 +1304,30 @@ class ColabSupervisor:
             )
             return False, respawn_count, 0
 
+        cap_failures = 0
+        other_failures = 0
+        next_delay = float(self.cfg.respawn_backoff_sec)
         while respawn_count < self.cfg.max_respawns:
             respawn_count += 1
             self.log(
                 f"[RESPAWN] {reason} while stages {incomplete} incomplete; "
-                f"respawn {respawn_count}/{self.cfg.max_respawns} after {self.cfg.respawn_backoff_sec:g}s"
+                f"respawn {respawn_count}/{self.cfg.max_respawns} after {next_delay:g}s"
             )
-            self._sleep(self.cfg.respawn_backoff_sec)
+            self._sleep(next_delay)
             try:
                 self.ensure_session_and_launch()
                 return True, respawn_count, 0
             except ColabSupervisorError as exc:
+                is_cap = is_transient_capacity_error(exc)
+                if is_cap:
+                    cap_failures += 1
+                    next_delay = self._retry_backoff_sec(cap_failures, exc)
+                else:
+                    other_failures += 1
+                    next_delay = self._retry_backoff_sec(other_failures, None)
+                kind = "transient capacity/503" if is_cap else "transient"
                 self.log(
-                    f"[WARN] respawn attempt {respawn_count}/{self.cfg.max_respawns} failed: {exc}"
+                    f"[WARN] respawn attempt {respawn_count}/{self.cfg.max_respawns} failed ({kind}): {exc}"
                 )
 
         self.log(
@@ -1240,7 +1343,7 @@ class ColabSupervisor:
         last_rollover_progress: tuple[tuple[str, str, int], ...] | None = None
         consecutive_probe_errors = 0
 
-        self.ensure_session_and_launch()
+        self._initial_launch_with_retry()
 
         while True:
             try:
@@ -1432,7 +1535,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--respawn-backoff-sec",
         type=float,
         default=DEFAULT_RESPAWN_BACKOFF_SEC,
-        help="Backoff seconds before respawning/rolling over a session (default: 15)",
+        help="Initial backoff seconds before respawning/rolling over a session (default: 15)",
+    )
+    ap.add_argument(
+        "--max-respawn-backoff-sec",
+        type=float,
+        default=DEFAULT_MAX_RESPAWN_BACKOFF_SEC,
+        help="Cap in seconds for exponential respawn/503 capacity retry backoff (default: 300)",
     )
     ap.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="Local supervisor status log path")
     ap.add_argument("--tail-file", default=DEFAULT_TAIL_FILE, help="Local file written with remote stdout tail on exit")
@@ -1480,6 +1589,7 @@ def config_from_args(args: argparse.Namespace) -> SupervisorConfig:
         max_respawns=int(args.max_respawns),
         max_rollovers=int(args.max_rollovers),
         respawn_backoff_sec=float(args.respawn_backoff_sec),
+        max_respawn_backoff_sec=float(args.max_respawn_backoff_sec),
         log_file=str(args.log_file),
         tail_file=str(args.tail_file),
         keep_on_complete=bool(args.keep_on_complete),

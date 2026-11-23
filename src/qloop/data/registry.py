@@ -80,6 +80,13 @@ _THINK_SYS = ["detailed thinking on", "detailed thinking off"]
 _SPECS: list[DatasetSpec] = [
     # ------------------------------------------------------------------ SFT: reasoning distills
     DatasetSpec(
+        "loop64_fable_sirsi", "TassP0lar/Loop64-Fable-SIRSI-v1", config="sft_core", split="train", role="sft",
+        format="messages", license="cc-by-4.0", stages=["sft", "reasoning", "agentic"], require_reasoning=True,
+        fields={"tools": "tools_json"}, verified=True,
+        notes="Curated SIRSI v1.1 sft_core parquet (13-gram decontaminated, anti-slop, 3-beat Looped-CoT, "
+              "anti-stub/rubric/spoiler gated); messages(role/content/reasoning/tool_calls_json/name) + tools_json.",
+    ),
+    DatasetSpec(
         "fable51", "MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x", role="sft", format="messages",
         license="apache-2.0", stages=["sft", "reasoning", "agentic"], require_reasoning=True, verified=True,
         notes="messages(role/content/tool_calls/tool) + `tools` column; assistant reasoning is wrapped in "

@@ -1,0 +1,139 @@
+# Gate 2a (S3 v2 Native-GDN) - 1M GPU-Resident FP8 SharedKV + Per-Pass D-LSA + Long-Prefix / Short-Suffix Calibration.
+# Architecture: [0,12) x1 + [12,36) xR + [36,40) x1 = 88L (Native Qwen3.6 Gated DeltaNet + 88L Loop + 1M YaRN + D-LSA).
+# Clean v2 pipeline (`hssd.enabled: false`, `gdn2.enabled: false`):
+#   * Starts directly from the healed 88L Native-GDN loop checkpoint (`runs/s1_loop_a6b`)
+#   * 1M primary context (`1,048,576` tokens = `10.00 GiB` GPU FP8 KV + `320 MiB` GPU Ward centroids at 1.0x SharedKV)
+#   * Untied per-pass query indexers `W_q_idx^(r)` (`num_query_passes: 3`) with shared `W_k_idx` & Ward buckets
+#   * Pure YaRN 4.0x (`model.yarn_target_len: 1048576`, `rerope.enabled: false`)
+#   * Gentle `loop_adapters: 2.0` multiplier protects healed mHC LoopBridge/gates/pass_router from cold-indexer noise
+#   * `prefix_suffix_calibration_step`: streams 512K-992K prefix tokens under `torch.no_grad()` to populate true 1M-scale
+#     FP8 KV + centroids + live native GDN recurrent states, then backpropagates on the final 32K suffix.
+_base_: [../base.yaml, ../model/qwen36_nvfp4.yaml]
+stage: s3_v2_long_1m_lsa
+stage_type: lm
+run: {name: s3_v2_long_1m_lsa}
+
+model:
+  yarn_target_len: 1048576
+
+loop:
+  enabled: true
+  prelude_end: 12
+  core_end: 36
+  num_passes: 3
+  target_virtual_layers: 88
+  kv_share: true                        # 1.0x KV memory across all passes R in {1, 2, 3}
+  bridge_init: [0.05, 0.85, 0.10]
+  bridge_rank: 256
+  bridge_mode: subspace
+  bridge_up_std: 0.01
+  attn_adapter_rank: 64
+  step_embedding: true
+  gate_init: 0.0
+  per_pass_router: true
+  router_adapter_rank: 32
+  router_repel_init: 0.0
+  router_diversity_weight: 0.0
+  mor: false
+  write_mask: true
+  checkpoint: true
+  train_pass_probs: [0.15, 0.50, 0.35]
+
+gdn2:
+  enabled: false
+
+hssd:
+  enabled: false                        # Native Qwen3.6 Gated DeltaNet (30 linear layers untouched)
+
+lsa:
+  enabled: true
+  mode: hybrid                          # alternates sparse-forward + sampled KL so downstream Q/O & loop adapt
+  compact_active_slots: true
+  max_selected_keys: 768
+  recall_threshold: 0.70
+  hybrid_sparse_every: 2
+  num_query_passes: 3                   # untied W_q_idx^(r) for Passes 1..3; shared W_k_idx & Ward centroids
+  index_dim: 64
+  index_on: nope                        # indexes strictly the 192 position-free NoPE dims [64:256]
+  pool: 4
+  block_size: 512
+  avg_bucket_keys: 8
+  max_bucket_keys: 32
+  num_select: 64
+  window: 512
+  sinks: 64
+  search: flat
+  temperature: 0.1
+  distill_weight: 1.0
+  distill_query_frac: 0.0625
+  query_chunk: 256
+
+rerope:
+  enabled: false                        # calibrated pure YaRN 4.0x winner over rerope
+  linear_ceil: 131072
+  log_scale: 32768
+  max_pos: 240000
+  rotary_dim: 64
+
+long_calib:
+  enabled: true                         # sub-quadratic sparse-prefix + chunked-CE 32K suffix calibration
+  prefix_len: 524288                    # 512K-992K streamed prefix under `torch.no_grad()` (`use_cache=True`)
+  max_prefix_len: 1015808               # 992K prefix + 32K suffix = 1,048,576 (1M) tokens
+  suffix_len: 32768                     # 32K differentiable suffix training QK-Norm, attn gates, Q/O LoRA & D-LSA
+  chunk_size: 16384                     # exact divisor of 512K (32) and 992K (62)
+  fp8_kv_cache: true                    # Tier-1 10.00 GiB GPU FP8 E4M3 KV cache (native GDN states kept native)
+  prefix_lsa_mode: sparse
+  calib_every_steps: 10                 # 60 true 512K-1M calibration steps + 540 64K hybrid steps in 600 total steps
+  sparse_prefix_after_step: 80
+
+offload:
+  enabled: false
+  block_size: 64
+  micro_page_tokens: 4
+  prefetch_layers_ahead: 3
+  pin_memory: true
+
+experts:
+  enabled: false
+
+train:
+  init_from: runs/s1_loop_a6b           # healed 88L Native-GDN loop checkpoint from S1
+  steps: 600
+  micro_batch: 1
+  grad_accum: 2
+  ckpt_every: 25
+  sha256_frozen_experts: true
+  train_hssd: false
+  train_gdn2: false
+  train_loop_adapters: true
+  train_lsa: true
+  trainable:
+    - "self_attn\\.(q_norm|k_norm)"
+  allowed_groups: [loop_adapters, lsa_indexers, attention, norms]
+  aux_weights:
+    _replace_: true
+    loop_aux: 1.0
+    lsa_kl: 1.0
+  optim:
+    lr: 1.0e-4
+    warmup_steps: 40
+    fused: false                        # atomic whole-step guard + global clip + AdamW
+    max_grad_norm: 1.0
+    lr_mult:
+      _replace_: true
+      lsa_indexer: 10.0
+      loop_adapters: 2.0                # gentle adaptation of healed mHC bridge/gates/routers during indexer warmup
+
+data:
+  seq_len: 65536
+  respect_doc_boundaries: false
+  sources:
+    - {name: finepdfs_mix, weight: 0.45}
+    - {name: fineweb_edu, weight: 0.25}
+    - {name: openthoughts3, weight: 0.15}
+    - {name: loop64_fable_sirsi, weight: 0.15}
+  decontaminate: {enabled: false}
+
+eval_quick:
+  n_batches: 4
+  depths: [1, 2, 3]

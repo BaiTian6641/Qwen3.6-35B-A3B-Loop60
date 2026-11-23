@@ -1,0 +1,127 @@
+# Gate 3 (S2 v2 Native-GDN) - Joint 128K High-Density CoT SFT + 4x32K Differentiable K/V-Replay Truncated BPTT.
+# Architecture: [0,12) x1 + [12,36) xR + [36,40) x1 = 88L (Native Qwen3.6 Gated DeltaNet + 88L Loop + D-LSA + 1M YaRN).
+# Clean v2 pipeline (`hssd.enabled: false`, `gdn2.enabled: false`):
+#   * Splits 128K sequences into `4 x 32,768` segments carrying live Native-GDN conv/recurrent states across segments
+#   * Caches compact pre-attention hidden states and re-projects ONLY the D-LSA selected Top-2,048 prior-segment
+#     keys/values with `requires_grad=True`, restoring cross-segment retrieval gradients into `k_proj`, `v_proj`, `W_k_idx`
+#   * Emphasizes R=3 (55% of steps) so Pass-2/Pass-3 mHC ReEntryBridge, gates, pass_router, and pass_attn receive
+#     heavy high-density CoT training at effective lr = 2.0e-5 * 10 = 2.0e-4.
+#   * Uses curated SIRSI v1.1 `loop64_fable_sirsi` + clean-room Apache-2.0 / ODC-By / CC-BY-4.0 sources (13-gram decontam).
+_base_: [../base.yaml, ../model/qwen36_nvfp4.yaml]
+stage: s2_v2_joint_bptt
+stage_type: lm
+run: {name: s2_v2_joint_bptt}
+
+model:
+  yarn_target_len: 1048576
+
+loop:
+  enabled: true
+  prelude_end: 12
+  core_end: 36
+  num_passes: 3
+  target_virtual_layers: 88
+  kv_share: true
+  bridge_init: [0.05, 0.85, 0.10]
+  bridge_rank: 256
+  bridge_mode: subspace
+  bridge_up_std: 0.01
+  attn_adapter_rank: 64
+  step_embedding: true
+  gate_init: 0.0
+  per_pass_router: true
+  router_adapter_rank: 32
+  router_repel_init: 0.0
+  router_diversity_weight: 0.0
+  mor: false
+  write_mask: true
+  checkpoint: true
+  train_pass_probs: [0.10, 0.35, 0.55]  # R=3 emphasis for Pass-2/3 mHC bridge, gates, pass_router, and pass_attn
+
+gdn2:
+  enabled: false
+
+hssd:
+  enabled: false                        # Native Qwen3.6 Gated DeltaNet (30 linear layers untouched)
+
+lsa:
+  enabled: true
+  mode: sparse                          # sparse D-LSA active during 4x32K = 128K K/V-replayed BPTT
+  compact_active_slots: true
+  max_selected_keys: 768
+  num_query_passes: 3
+  index_dim: 64
+  index_on: nope
+  pool: 4
+  block_size: 512
+  avg_bucket_keys: 8
+  max_bucket_keys: 32
+  num_select: 64
+  window: 512
+  sinks: 64
+  search: flat
+  temperature: 0.1
+  query_chunk: 256
+
+bptt:
+  enabled: true                         # SegmentedKVBPTTRunner (`4 x 32K = 128K`)
+  n_segments: 4
+  seg_len: 32768
+  replay_k: 2048                        # differentiable re-projection on Top-2048 selected prior-segment tokens
+  offload_prior_hidden: auto            # HBM-resident when free VRAM >= needed + 8 GiB headroom, else async pinned DMA
+  query_sim_chunk: 1024
+
+experts:
+  enabled: false                        # optional: pass `-s experts.enabled=true` after `qloop scan-experts`
+  stats_path: runs/s1_loop_a6b/esft_stats_looped.json
+  fraction: 0.025
+  by: affinity
+  per_pass: union
+  rank: 64
+
+train:
+  init_from: runs/s3_v2_long_1m_lsa
+  steps: 600
+  micro_batch: 1
+  grad_accum: 2
+  ckpt_every: 25
+  sha256_frozen_experts: true
+  train_loop_adapters: true
+  train_hssd: false
+  train_gdn2: false
+  train_lsa: true
+  trainable:
+    - "self_attn\\.(k_proj|v_proj|o_proj|q_norm|k_norm)"
+    - "input_layernorm|post_attention_layernorm"
+  allowed_groups: [loop_adapters, lsa_indexers, attention, norms, expert_deltas]
+  aux_weights:
+    _replace_: true
+    loop_aux: 1.0
+    lsa_kl: 0.2
+  optim:
+    lr: 2.0e-5
+    warmup_steps: 50
+    fused: false                        # atomic whole-step guard + global clip + AdamW
+    max_grad_norm: 1.0
+    lr_mult:
+      _replace_: true
+      loop_adapters: 10.0
+      lsa_indexer: 5.0
+
+data:
+  seq_len: 131072                       # 4 x 32,768 tokens streamed across segments
+  respect_doc_boundaries: true
+  sources:                              # 100% Apache-2.0 / ODC-By / CC-BY-4.0 clean-room sources (13-gram decontam)
+    - {name: loop64_fable_sirsi, weight: 0.25}
+    - {name: openthoughts3, weight: 0.20}
+    - {name: nemotron_post, weight: 0.20}
+    - {name: ot_agent_sft, weight: 0.10}
+    - {name: opus46_3000x, weight: 0.08}
+    - {name: opus46_traceinv, weight: 0.07}
+    - {name: arc_agi2_train, weight: 0.05}
+    - {name: finepdfs_mix, weight: 0.05}
+  decontaminate: {enabled: true, ngram: 13, groups: [aime_2026, gpqa, hle, arc_agi_2, kernelbench], on_missing: warn}
+
+eval_quick:
+  n_batches: 2
+  depths: [1, 2, 3]

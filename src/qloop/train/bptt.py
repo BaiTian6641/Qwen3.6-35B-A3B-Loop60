@@ -249,36 +249,6 @@ def _extract_cached_kv(cache: Any, layer_idx: int) -> tuple[torch.Tensor | None,
     return None, None
 
 
-class _SlotStateListProxy:
-    """Checkpoint-recomputation-safe list view over `conv_states` / `recurrent_states`."""
-
-    @staticmethod
-    def _detach_slot(val: Any) -> Any:
-        if isinstance(val, torch.Tensor):
-            return val.detach()
-        detach_fn = getattr(val, "detach", None)
-        if callable(detach_fn) and not isinstance(val, (type, nn.Module)):
-            return detach_fn()
-        return val
-
-    def __init__(self, backing: list[Any]) -> None:
-        self._backing = backing
-        self._snapshot = [self._detach_slot(x) for x in backing]
-
-    def __len__(self) -> int:
-        return len(self._backing)
-
-    def __getitem__(self, idx: int) -> Any:
-        if _in_backward():
-            return self._snapshot[idx]
-        return self._backing[idx]
-
-    def __setitem__(self, idx: int, val: Any) -> None:
-        if _in_backward():
-            return
-        self._backing[idx] = self._detach_slot(val)
-
-
 def _clone_detached_state(obj: Any, *, allow_zero_copy_hssd: bool = False) -> Any:
     """Return an independent detached clone of a conv/recurrent state (safe against in-place `.copy_`)."""
     if obj is None:
@@ -296,6 +266,299 @@ def _clone_detached_state(obj: Any, *, allow_zero_copy_hssd: bool = False) -> An
         return _detach_nested(copy.deepcopy(obj))
     except Exception:
         return _detach_nested(obj)
+
+
+def _call_cache_method(fn: Callable[..., Any], *pos_args: Any, **kw_args: Any) -> Any:
+    """Invoke a cache method while filtering optional kwargs unsupported by its HF/Toy signature."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return fn(*pos_args, **kw_args)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return fn(*pos_args, **kw_args)
+    filtered = {k: v for k, v in kw_args.items() if k in params}
+    return fn(*pos_args, **filtered)
+
+
+class _SlotStateListProxy:
+    """Checkpoint-recomputation-safe list view over `conv_states` / `recurrent_states`.
+
+    Clones plain tensors on snapshot so in-place `.copy_()` mutations during forward never corrupt
+    the pre-segment state seen during `torch.utils.checkpoint` backward recomputation.
+    """
+
+    @staticmethod
+    def _detach_slot(val: Any) -> Any:
+        if isinstance(val, torch.Tensor):
+            return val.detach()
+        detach_fn = getattr(val, "detach", None)
+        if callable(detach_fn) and not isinstance(val, (type, nn.Module)):
+            return detach_fn()
+        return val
+
+    def __init__(
+        self,
+        backing: list[Any],
+        *,
+        zero_copy_hssd: bool = False,
+        readonly: bool = False,
+    ) -> None:
+        self._backing = backing
+        self._zero_copy_hssd = bool(zero_copy_hssd)
+        self._readonly = bool(readonly)
+        self._snapshot: list[Any] = [
+            _clone_detached_state(x, allow_zero_copy_hssd=self._zero_copy_hssd) for x in backing
+        ]
+        self._fwd_overlay: dict[int, Any] = {}
+
+    def _sync_len(self, idx: int) -> None:
+        if idx >= len(self._snapshot):
+            for j in range(len(self._snapshot), min(len(self._backing), idx + 1)):
+                self._snapshot.append(
+                    _clone_detached_state(self._backing[j], allow_zero_copy_hssd=self._zero_copy_hssd)
+                )
+            while len(self._snapshot) <= idx:
+                self._snapshot.append(None)
+
+    def __len__(self) -> int:
+        return len(self._backing)
+
+    def extend(self, values: Any) -> None:
+        if _in_backward() or self._readonly:
+            return
+        vals = list(values)
+        self._backing.extend(vals)
+        self._snapshot.extend(
+            _clone_detached_state(x, allow_zero_copy_hssd=self._zero_copy_hssd) for x in vals
+        )
+
+    def __getitem__(self, idx: int) -> Any:
+        if isinstance(idx, int) and idx >= 0:
+            self._sync_len(idx)
+        if _in_backward():
+            val = self._snapshot[idx]
+            return val.clone() if isinstance(val, torch.Tensor) else val
+        if self._readonly:
+            if isinstance(idx, int) and idx in self._fwd_overlay:
+                return self._fwd_overlay[idx]
+            val = self._snapshot[idx]
+            if isinstance(val, torch.Tensor):
+                cloned = val.clone()
+                if isinstance(idx, int):
+                    self._fwd_overlay[idx] = cloned
+                return cloned
+            return val
+        return self._backing[idx]
+
+    def __setitem__(self, idx: int, val: Any) -> None:
+        if _in_backward():
+            return
+        if isinstance(idx, int) and idx >= 0:
+            self._sync_len(idx)
+        det = self._detach_slot(val)
+        if self._readonly:
+            if isinstance(idx, int):
+                self._fwd_overlay[idx] = det
+            return
+        self._backing[idx] = det
+
+    def reset_snapshot(self) -> None:
+        self._snapshot.clear()
+        self._fwd_overlay.clear()
+
+
+class _SnapshotFlagContainer:
+    """Checkpoint-safe wrapper around `LinearAttentionLayer.has_previous_state` (dict or list)."""
+
+    def __init__(self, backing: Any, *, readonly: bool = False) -> None:
+        self._backing = backing
+        self._readonly = bool(readonly)
+        if isinstance(backing, dict):
+            self._snapshot: Any = {k: bool(v) for k, v in backing.items()}
+            self._overlay: dict[Any, bool] = {}
+        elif isinstance(backing, list):
+            self._snapshot = [bool(v) for v in backing]
+            self._overlay = {}
+        else:
+            self._snapshot = bool(backing)
+            self._overlay = {}
+
+    def __bool__(self) -> bool:
+        if _in_backward():
+            if isinstance(self._snapshot, dict):
+                return any(self._snapshot.values())
+            if isinstance(self._snapshot, list):
+                return any(self._snapshot)
+            return bool(self._snapshot)
+        if self._readonly and self._overlay:
+            return any(self._overlay.values()) or bool(self._snapshot)
+        return bool(self._backing)
+
+    def __len__(self) -> int:
+        return len(self._backing)
+
+    def __contains__(self, key: Any) -> bool:
+        return key in self._backing
+
+    def get(self, key: Any, default: Any = False) -> Any:
+        if _in_backward():
+            if isinstance(self._snapshot, dict):
+                return self._snapshot.get(key, default)
+            if isinstance(self._snapshot, list) and isinstance(key, int) and 0 <= key < len(self._snapshot):
+                return self._snapshot[key]
+            return default
+        if self._readonly and key in self._overlay:
+            return self._overlay[key]
+        if isinstance(self._backing, dict):
+            return self._backing.get(key, default)
+        if isinstance(self._backing, list) and isinstance(key, int) and 0 <= key < len(self._backing):
+            return self._backing[key]
+        return default
+
+    def __getitem__(self, key: Any) -> Any:
+        if _in_backward():
+            if isinstance(self._snapshot, dict):
+                return self._snapshot.get(key, False)
+            return self._snapshot[key]
+        if self._readonly and key in self._overlay:
+            return self._overlay[key]
+        return self._backing[key]
+
+    def __setitem__(self, key: Any, val: Any) -> None:
+        if _in_backward():
+            return
+        if isinstance(self._snapshot, dict) and key not in self._snapshot:
+            self._snapshot[key] = bool(self._backing.get(key, False))
+        if self._readonly:
+            self._overlay[key] = bool(val)
+            return
+        self._backing[key] = val
+
+
+class _ProxyHasPreviousState:
+    """Dual-mode checkpoint-safe `has_previous_state` (property bool OR callable `(layer_idx, ...)`)."""
+
+    def __init__(self, proxy: _ReplayKVCacheProxy) -> None:
+        self._proxy = proxy
+
+    def __bool__(self) -> bool:
+        return self._proxy._query_has_previous_state_global()
+
+    def __call__(self, layer_idx: int | None = None, state_idx: int = 0, **kwargs: Any) -> bool:
+        del kwargs
+        if layer_idx is None:
+            return self._proxy._query_has_previous_state_global()
+        return self._proxy._query_has_previous_state_layer(int(layer_idx), int(state_idx))
+
+
+def _read_layer_has_prev(lyr: Any, state_idx: int = 0) -> bool | None:
+    hps = getattr(lyr, "has_previous_state", None)
+    if hps is None:
+        return None
+    if isinstance(hps, dict):
+        return bool(hps.get(state_idx, False))
+    if isinstance(hps, (list, tuple)):
+        return bool(hps[state_idx]) if 0 <= state_idx < len(hps) else False
+    if callable(hps):
+        try:
+            return bool(_call_cache_method(hps, state_idx=state_idx))
+        except Exception:
+            return bool(hps())
+    return bool(hps)
+
+
+def _read_base_has_previous_state(base: Any, layer_idx: int, state_idx: int = 0) -> bool:
+    """Query `has_previous_state` on `base` across HF 5.2-5.24, HSSDHybridCache, and ToyHybridCache."""
+    layers = getattr(base, "layers", None)
+    if isinstance(layers, list) and 0 <= layer_idx < len(layers):
+        lyr = layers[layer_idx]
+        flag = _read_layer_has_prev(lyr, state_idx)
+        if flag is not None:
+            return flag
+        l_cs = getattr(lyr, "conv_states", None)
+        l_rs = getattr(lyr, "recurrent_states", None)
+        if l_cs is not None or l_rs is not None:
+            c_ok = isinstance(l_cs, list) and state_idx < len(l_cs) and l_cs[state_idx] is not None
+            r_ok = isinstance(l_rs, list) and state_idx < len(l_rs) and l_rs[state_idx] is not None
+            return bool(c_ok or r_ok)
+        return False
+    hps = getattr(base, "has_previous_state", None)
+    if callable(hps):
+        try:
+            return bool(_call_cache_method(hps, layer_idx, state_idx=state_idx))
+        except (TypeError, AttributeError):
+            try:
+                return bool(hps())
+            except Exception:
+                pass
+    if hps is not None and not callable(hps):
+        return bool(hps)
+    cs = getattr(base, "conv_states", None)
+    rs = getattr(base, "recurrent_states", None)
+    c_ok = isinstance(cs, list) and 0 <= layer_idx < len(cs) and cs[layer_idx] is not None
+    r_ok = isinstance(rs, list) and 0 <= layer_idx < len(rs) and rs[layer_idx] is not None
+    return bool(c_ok or r_ok)
+
+
+def _read_base_conv_state(base: Any, layer_idx: int, state_idx: int = 0) -> tuple[bool, torch.Tensor | None]:
+    """Read `(had_prev, conv_state)` from `base` across HF 5.x `layers[i]`, `get_conv_state`, and list caches."""
+    layers = getattr(base, "layers", None)
+    if isinstance(layers, list) and 0 <= layer_idx < len(layers):
+        lyr = layers[layer_idx]
+        flag = _read_layer_has_prev(lyr, state_idx)
+        if flag is False:
+            return False, None
+        get_cs_lyr = getattr(lyr, "get_conv_state", None)
+        if callable(get_cs_lyr):
+            val = _call_cache_method(get_cs_lyr, state_idx=state_idx)
+            if isinstance(val, torch.Tensor):
+                return True, val
+            return False, None
+        l_cs = getattr(lyr, "conv_states", None)
+        if isinstance(l_cs, list) and 0 <= state_idx < len(l_cs):
+            val = l_cs[state_idx]
+            if isinstance(val, torch.Tensor):
+                return True, val
+            return False, None
+        if isinstance(l_cs, torch.Tensor):
+            return True, l_cs
+    get_cs = getattr(base, "get_conv_state", None)
+    if callable(get_cs):
+        val = _call_cache_method(get_cs, layer_idx, state_idx=state_idx)
+        if isinstance(val, torch.Tensor):
+            return True, val
+        return False, None
+    cs = getattr(base, "conv_states", None)
+    if isinstance(cs, list) and 0 <= layer_idx < len(cs):
+        val = cs[layer_idx]
+        if isinstance(val, torch.Tensor):
+            return True, val
+    return False, None
+
+
+def _read_base_recurrent_state(base: Any, layer_idx: int, state_idx: int = 0) -> Any:
+    """Read `recurrent_state` from `base` across HF 5.x `layers[i]`, `get_recurrent_state`, and list caches."""
+    get_rs = getattr(base, "get_recurrent_state", None)
+    if callable(get_rs):
+        return _call_cache_method(get_rs, layer_idx, state_idx=state_idx)
+    layers = getattr(base, "layers", None)
+    if isinstance(layers, list) and 0 <= layer_idx < len(layers):
+        lyr = layers[layer_idx]
+        flag = _read_layer_has_prev(lyr, state_idx)
+        if flag is False:
+            return None
+        get_rs_lyr = getattr(lyr, "get_recurrent_state", None)
+        if callable(get_rs_lyr):
+            return _call_cache_method(get_rs_lyr, state_idx=state_idx)
+        l_rs = getattr(lyr, "recurrent_states", None)
+        if isinstance(l_rs, list) and 0 <= state_idx < len(l_rs):
+            return l_rs[state_idx]
+        if l_rs is not None and not isinstance(l_rs, list):
+            return l_rs
+    rs = getattr(base, "recurrent_states", None)
+    if isinstance(rs, list) and 0 <= layer_idx < len(rs):
+        return rs[layer_idx]
+    return None
 
 
 def _resolve_bptt_backbone_and_head(model: nn.Module) -> tuple[nn.Module, nn.Module | None]:
@@ -389,26 +652,50 @@ def _chunked_replay_indexer_kl(
 
 
 def _maybe_create_initial_cache(tm: nn.Module) -> Any:
-    """Create an empty hybrid KV/recurrent cache when possible so Segment 0 is checkpoint-safe."""
+    """Create an empty hybrid KV/recurrent cache when possible so Segment 0 is checkpoint-safe.
+
+    Checks `ToyHybridCache` for toy models, then `Qwen3_5MoeDynamicCache` / `Qwen3_5DynamicCache`
+    (HF 5.2-5.19), then unified `DynamicCache(config=cfg)` (HF >= 5.20 / 5.24.0).
+    """
     cfg = getattr(tm, "config", None)
-    if cfg is not None and str(getattr(cfg, "model_type", "")).startswith("toy"):
+    mtype = str(getattr(cfg, "model_type", "") or "").lower() if cfg is not None else ""
+    if cfg is not None and mtype.startswith("toy"):
         from ..model.toy import ToyHybridCache
 
         return ToyHybridCache(cfg)
-    try:
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+    if cfg is not None:
+        is_moe = (
+            ("moe" in mtype)
+            or ("moe" in type(tm).__name__.lower())
+            or (getattr(cfg, "num_experts", None) is not None)
+        )
+        candidates = (
+            (
+                ("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeDynamicCache"),
+                ("transformers.models.qwen3_5.modeling_qwen3_5", "Qwen3_5DynamicCache"),
+            )
+            if is_moe
+            else (
+                ("transformers.models.qwen3_5.modeling_qwen3_5", "Qwen3_5DynamicCache"),
+                ("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeDynamicCache"),
+            )
+        )
+        for mod_path, cls_name in candidates:
+            try:
+                mod = __import__(mod_path, fromlist=[cls_name])
+                cls = getattr(mod, cls_name)
+                return cls(cfg)
+            except Exception:
+                pass
+        try:
+            from transformers.cache_utils import DynamicCache
 
-        if cfg is not None:
-            return Qwen3_5DynamicCache(cfg)
-    except Exception:
-        pass
-    try:
-        from transformers.cache_utils import DynamicCache
-
-        if cfg is not None:
-            return DynamicCache(config=cfg)
-    except Exception:
-        pass
+            try:
+                return DynamicCache(config=cfg)
+            except TypeError:
+                return DynamicCache()
+        except Exception:
+            pass
     return None
 
 
@@ -429,9 +716,115 @@ def _dequantize_fp8_kv_lean(qkv: Any, dtype: torch.dtype, chunk_tokens: int = 65
     return out
 
 
+class _ReplayCacheLayerProxy:
+    """Checkpoint-guarded view over one `cache.layers[layer_idx]` entry (`transformers >= 5.20 / 5.24`)."""
+
+    def __init__(self, parent: _ReplayKVCacheProxy, base_layer: Any, layer_idx: int) -> None:
+        readonly = bool(object.__getattribute__(parent, "_readonly_base"))
+        zc_hssd = bool(object.__getattribute__(parent, "_zero_copy_hssd"))
+        object.__setattr__(self, "_parent", parent)
+        object.__setattr__(self, "_base_layer", base_layer)
+        object.__setattr__(self, "_layer_idx", int(layer_idx))
+        cs = getattr(base_layer, "conv_states", None)
+        rs = getattr(base_layer, "recurrent_states", None)
+        hps = getattr(base_layer, "has_previous_state", None)
+        object.__setattr__(
+            self,
+            "_conv_proxy",
+            _SlotStateListProxy(cs, zero_copy_hssd=False, readonly=readonly) if isinstance(cs, list) else None,
+        )
+        object.__setattr__(
+            self,
+            "_rec_proxy",
+            _SlotStateListProxy(rs, zero_copy_hssd=zc_hssd, readonly=readonly) if isinstance(rs, list) else None,
+        )
+        object.__setattr__(
+            self,
+            "_hps_proxy",
+            _SnapshotFlagContainer(hps, readonly=readonly) if isinstance(hps, (dict, list)) else None,
+        )
+
+    def reset_snapshot(self) -> None:
+        cp = object.__getattribute__(self, "_conv_proxy")
+        if cp is not None:
+            cp.reset_snapshot()
+        rp = object.__getattribute__(self, "_rec_proxy")
+        if rp is not None:
+            rp.reset_snapshot()
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        parent = object.__getattribute__(self, "_parent")
+        idx = object.__getattribute__(self, "_layer_idx")
+        return parent.update(key_states, value_states, idx, *args, **kwargs)
+
+    def get_seq_length(self) -> int:
+        parent = object.__getattribute__(self, "_parent")
+        idx = object.__getattribute__(self, "_layer_idx")
+        return parent.get_seq_length(idx)
+
+    def get_conv_state(self, state_idx: int = 0, **kwargs: Any) -> torch.Tensor | None:
+        parent = object.__getattribute__(self, "_parent")
+        idx = object.__getattribute__(self, "_layer_idx")
+        return parent.get_conv_state(idx, state_idx=state_idx, **kwargs)
+
+    def update_conv_state(
+        self,
+        conv_states: torch.Tensor,
+        state_idx: int = 0,
+        conv_kernel_size: int | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        parent = object.__getattribute__(self, "_parent")
+        idx = object.__getattribute__(self, "_layer_idx")
+        return parent.update_conv_state(
+            conv_states, idx, state_idx=state_idx, conv_kernel_size=conv_kernel_size, **kwargs
+        )
+
+    def get_recurrent_state(self, state_idx: int = 0, **kwargs: Any) -> Any:
+        parent = object.__getattribute__(self, "_parent")
+        idx = object.__getattribute__(self, "_layer_idx")
+        return parent.get_recurrent_state(idx, state_idx=state_idx, **kwargs)
+
+    def update_recurrent_state(self, recurrent_states: Any, state_idx: int = 0, **kwargs: Any) -> Any:
+        parent = object.__getattribute__(self, "_parent")
+        idx = object.__getattribute__(self, "_layer_idx")
+        return parent.update_recurrent_state(recurrent_states, idx, state_idx=state_idx, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "conv_states":
+            cp = object.__getattribute__(self, "_conv_proxy")
+            if cp is not None:
+                return cp
+        if name == "recurrent_states":
+            rp = object.__getattribute__(self, "_rec_proxy")
+            if rp is not None:
+                return rp
+        if name == "has_previous_state":
+            hp = object.__getattribute__(self, "_hps_proxy")
+            if hp is not None:
+                return hp
+        return getattr(object.__getattribute__(self, "_base_layer"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(object.__getattribute__(self, "_base_layer"), name, value)
+
+
+class _ReplayCacheLayersList(list):  # type: ignore[type-arg]
+    """`list` subclass exposing `_ReplayCacheLayerProxy` wrappers so `isinstance(cache.layers, list)` stays True."""
+
+    def __init__(self, parent: _ReplayKVCacheProxy, base_layers: list[Any]) -> None:
+        super().__init__(_ReplayCacheLayerProxy(parent, lyr, i) for i, lyr in enumerate(base_layers))
+
+    def reset_snapshots(self) -> None:
+        for item in self:
+            if isinstance(item, _ReplayCacheLayerProxy):
+                item.reset_snapshot()
+
+
 class _ReplayKVCacheProxy:
-    """Wraps `past_key_values` so `update` injects live re-projected `(k_live, v_live)` out-of-place
-    and linear-attention conv/recurrent states are checkpoint-recomputation safe across HF 4.x & 5.x."""
+    """Wraps `past_key_values` / `cache` so `update` injects live re-projected `(k_live, v_live)`
+    out-of-place and linear-attention conv/recurrent states + `has_previous_state` are checkpoint-
+    recomputation safe across HF 4.x, HF 5.2-5.19, HF 5.20-5.24 (`cache.layers[i]`), HSSD, and Toy."""
 
     def __init__(
         self,
@@ -451,18 +844,109 @@ class _ReplayKVCacheProxy:
         object.__setattr__(self, "_raw_prefix_kv", {})
         object.__setattr__(self, "_conv_snap", {})
         object.__setattr__(self, "_rec_snap", {})
+        object.__setattr__(self, "_has_prev_snap", {})
+        object.__setattr__(self, "_has_prev_global", [None])
         conv = getattr(base_cache, "conv_states", None)
         rec = getattr(base_cache, "recurrent_states", None)
+        layers = getattr(base_cache, "layers", None)
         object.__setattr__(
-            self, "_conv_proxy", _SlotStateListProxy(conv) if isinstance(conv, list) else None
+            self,
+            "_conv_proxy",
+            _SlotStateListProxy(conv, zero_copy_hssd=False, readonly=bool(readonly_base))
+            if isinstance(conv, list)
+            else None,
         )
         object.__setattr__(
-            self, "_rec_proxy", _SlotStateListProxy(rec) if isinstance(rec, list) else None
+            self,
+            "_rec_proxy",
+            _SlotStateListProxy(rec, zero_copy_hssd=bool(zero_copy_hssd), readonly=bool(readonly_base))
+            if isinstance(rec, list)
+            else None,
+        )
+        object.__setattr__(
+            self,
+            "_layers_proxy",
+            _ReplayCacheLayersList(self, layers) if isinstance(layers, list) else None,
         )
 
     @property
     def base_cache(self) -> Any:
         return object.__getattribute__(self, "_base_cache")
+
+    @property
+    def is_initialized(self) -> bool:
+        fp8_pref: dict[int, tuple[Any, Any]] = object.__getattribute__(self, "_fp8_prefix_kv")
+        if fp8_pref:
+            return True
+        base = object.__getattribute__(self, "_base_cache")
+        return bool(getattr(base, "is_initialized", False))
+
+    @property
+    def has_previous_state(self) -> _ProxyHasPreviousState:
+        return _ProxyHasPreviousState(self)
+
+    def _query_has_previous_state_global(self) -> bool:
+        box: list[bool | None] = object.__getattribute__(self, "_has_prev_global")
+        if box[0] is not None:
+            return bool(box[0])
+        base = object.__getattribute__(self, "_base_cache")
+        hps = getattr(base, "has_previous_state", None)
+        if callable(hps):
+            try:
+                val = bool(hps())
+            except TypeError:
+                layers = getattr(base, "layers", None)
+                if isinstance(layers, list):
+                    val = any(_read_base_has_previous_state(base, i) for i in range(len(layers)))
+                else:
+                    val = False
+        elif hps is not None:
+            val = bool(hps)
+        else:
+            cs = getattr(base, "conv_states", None)
+            rs = getattr(base, "recurrent_states", None)
+            val = bool(
+                (isinstance(cs, list) and any(x is not None for x in cs))
+                or (isinstance(rs, list) and any(x is not None for x in rs))
+            )
+        if not _in_backward():
+            box[0] = val
+        return val
+
+    def _query_has_previous_state_layer(self, layer_idx: int, state_idx: int = 0) -> bool:
+        snap: dict[tuple[int, int], bool] = object.__getattribute__(self, "_has_prev_snap")
+        key = (int(layer_idx), int(state_idx))
+        if key in snap:
+            return snap[key]
+        base = object.__getattribute__(self, "_base_cache")
+        val = _read_base_has_previous_state(base, int(layer_idx), int(state_idx))
+        if not _in_backward():
+            snap[key] = val
+        return val
+
+    def _snapshot_has_prev_before_mutation(self, layer_idx: int, state_idx: int = 0) -> None:
+        if _in_backward():
+            return
+        snap: dict[tuple[int, int], bool] = object.__getattribute__(self, "_has_prev_snap")
+        key = (int(layer_idx), int(state_idx))
+        if key not in snap:
+            base = object.__getattribute__(self, "_base_cache")
+            snap[key] = _read_base_has_previous_state(base, int(layer_idx), int(state_idx))
+        box: list[bool | None] = object.__getattribute__(self, "_has_prev_global")
+        if box[0] is None:
+            self._query_has_previous_state_global()
+
+    def __len__(self) -> int:
+        base = object.__getattribute__(self, "_base_cache")
+        if hasattr(base, "__len__"):
+            return len(base)
+        layers = getattr(base, "layers", None)
+        if isinstance(layers, list):
+            return len(layers)
+        return 0
+
+    def __bool__(self) -> bool:
+        return True
 
     def get_seq_length(self, layer_idx: int | None = None) -> int:
         fp8_pref: dict[int, tuple[Any, Any]] = object.__getattribute__(self, "_fp8_prefix_kv")
@@ -482,6 +966,13 @@ class _ReplayKVCacheProxy:
                 return int(fn())
         return 0
 
+    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
+        fp8_pref: dict[int, tuple[Any, Any]] = object.__getattribute__(self, "_fp8_prefix_kv")
+        if fp8_pref:
+            return self.get_seq_length(layer_idx) + int(cache_position.shape[0]), 0
+        base = object.__getattribute__(self, "_base_cache")
+        return base.get_mask_sizes(cache_position, layer_idx)
+
     def reset_segment(self) -> None:
         object.__getattribute__(self, "_pending_replay").clear()
         object.__getattribute__(self, "_live_kv_for_seg").clear()
@@ -489,27 +980,36 @@ class _ReplayKVCacheProxy:
         object.__getattribute__(self, "_fp8_prefix_kv").clear()
         object.__getattribute__(self, "_conv_snap").clear()
         object.__getattribute__(self, "_rec_snap").clear()
+        object.__getattribute__(self, "_has_prev_snap").clear()
+        object.__getattribute__(self, "_has_prev_global")[0] = None
         cp = object.__getattribute__(self, "_conv_proxy")
         if cp is not None:
-            cp._snapshot.clear()
+            cp.reset_snapshot()
         rp = object.__getattribute__(self, "_rec_proxy")
         if rp is not None:
-            rp._snapshot.clear()
+            rp.reset_snapshot()
+        lp = object.__getattribute__(self, "_layers_proxy")
+        if lp is not None:
+            lp.reset_snapshots()
 
     def get_conv_state(self, layer_idx: int, state_idx: int = 0, **kwargs: Any) -> torch.Tensor | None:
+        del kwargs
         base = object.__getattribute__(self, "_base_cache")
         conv_snap: dict[tuple[int, int], tuple[bool, torch.Tensor | None]] = object.__getattribute__(
             self, "_conv_snap"
         )
         key = (int(layer_idx), int(state_idx))
         if _in_backward() and key in conv_snap:
-            return conv_snap[key][1]
+            val = conv_snap[key][1]
+            return val.clone() if isinstance(val, torch.Tensor) else val
         if not _in_backward() and key not in conv_snap:
-            val = base.get_conv_state(layer_idx, state_idx=state_idx, **kwargs)
-            conv_snap[key] = (val is not None, _clone_detached_state(val))
+            self._snapshot_has_prev_before_mutation(int(layer_idx), int(state_idx))
+            had_prev, val = _read_base_conv_state(base, int(layer_idx), int(state_idx))
+            conv_snap[key] = (had_prev, _clone_detached_state(val))
         if key in conv_snap:
             return conv_snap[key][1]
-        return base.get_conv_state(layer_idx, state_idx=state_idx, **kwargs)
+        _, val = _read_base_conv_state(base, int(layer_idx), int(state_idx))
+        return val
 
     def update_conv_state(
         self,
@@ -520,25 +1020,39 @@ class _ReplayKVCacheProxy:
         **kwargs: Any,
     ) -> torch.Tensor:
         base = object.__getattribute__(self, "_base_cache")
+        readonly_base: bool = object.__getattribute__(self, "_readonly_base")
         conv_snap: dict[tuple[int, int], tuple[bool, torch.Tensor | None]] = object.__getattribute__(
             self, "_conv_snap"
         )
         key = (int(layer_idx), int(state_idx))
         if not _in_backward():
+            self._snapshot_has_prev_before_mutation(int(layer_idx), int(state_idx))
             if key not in conv_snap:
-                prev = (
-                    base.get_conv_state(layer_idx, state_idx=state_idx)
-                    if hasattr(base, "get_conv_state")
-                    else None
-                )
-                conv_snap[key] = (prev is not None, _clone_detached_state(prev))
-            base.update_conv_state(
-                conv_states.detach(),
-                layer_idx,
-                state_idx=state_idx,
-                conv_kernel_size=conv_kernel_size,
-                **kwargs,
-            )
+                had_prev, prev = _read_base_conv_state(base, int(layer_idx), int(state_idx))
+                conv_snap[key] = (had_prev, _clone_detached_state(prev))
+            if not readonly_base:
+                upd_fn = getattr(base, "update_conv_state", None)
+                if callable(upd_fn):
+                    _call_cache_method(
+                        upd_fn,
+                        conv_states.detach(),
+                        int(layer_idx),
+                        state_idx=int(state_idx),
+                        conv_kernel_size=conv_kernel_size,
+                        **kwargs,
+                    )
+                else:
+                    layers = getattr(base, "layers", None)
+                    if isinstance(layers, list) and 0 <= int(layer_idx) < len(layers):
+                        lyr_upd = getattr(layers[int(layer_idx)], "update_conv_state", None)
+                        if callable(lyr_upd):
+                            _call_cache_method(
+                                lyr_upd,
+                                conv_states.detach(),
+                                state_idx=int(state_idx),
+                                conv_kernel_size=conv_kernel_size,
+                                **kwargs,
+                            )
         had_prev, prev_snap = conv_snap.get(key, (False, None))
         if had_prev and isinstance(prev_snap, torch.Tensor):
             return torch.cat([prev_snap.to(device=conv_states.device, dtype=conv_states.dtype), conv_states], dim=-1)
@@ -548,18 +1062,21 @@ class _ReplayKVCacheProxy:
         return full_conv
 
     def get_recurrent_state(self, layer_idx: int, state_idx: int = 0, **kwargs: Any) -> Any:
+        del kwargs
         base = object.__getattribute__(self, "_base_cache")
         zc_hssd: bool = object.__getattribute__(self, "_zero_copy_hssd")
         rec_snap: dict[tuple[int, int], Any] = object.__getattribute__(self, "_rec_snap")
         key = (int(layer_idx), int(state_idx))
         if _in_backward() and key in rec_snap:
-            return rec_snap[key]
+            val = rec_snap[key]
+            return val.clone() if isinstance(val, torch.Tensor) else val
         if not _in_backward() and key not in rec_snap:
-            val = base.get_recurrent_state(layer_idx, state_idx=state_idx, **kwargs)
+            self._snapshot_has_prev_before_mutation(int(layer_idx), int(state_idx))
+            val = _read_base_recurrent_state(base, int(layer_idx), int(state_idx))
             rec_snap[key] = _clone_detached_state(val, allow_zero_copy_hssd=zc_hssd)
         if key in rec_snap:
             return rec_snap[key]
-        return base.get_recurrent_state(layer_idx, state_idx=state_idx, **kwargs)
+        return _read_base_recurrent_state(base, int(layer_idx), int(state_idx))
 
     def update_recurrent_state(
         self,
@@ -571,18 +1088,32 @@ class _ReplayKVCacheProxy:
         if _in_backward():
             return recurrent_states
         base = object.__getattribute__(self, "_base_cache")
+        readonly_base: bool = object.__getattribute__(self, "_readonly_base")
         zc_hssd: bool = object.__getattribute__(self, "_zero_copy_hssd")
         rec_snap: dict[tuple[int, int], Any] = object.__getattribute__(self, "_rec_snap")
         key = (int(layer_idx), int(state_idx))
-        if key not in rec_snap and hasattr(base, "get_recurrent_state"):
-            prev = base.get_recurrent_state(layer_idx, state_idx=state_idx)
+        self._snapshot_has_prev_before_mutation(int(layer_idx), int(state_idx))
+        if key not in rec_snap:
+            prev = _read_base_recurrent_state(base, int(layer_idx), int(state_idx))
             rec_snap[key] = _clone_detached_state(prev, allow_zero_copy_hssd=zc_hssd)
-        return base.update_recurrent_state(
-            _clone_detached_state(recurrent_states, allow_zero_copy_hssd=zc_hssd),
-            layer_idx,
-            state_idx=state_idx,
-            **kwargs,
-        )
+        if readonly_base:
+            return recurrent_states
+        det_state = _clone_detached_state(recurrent_states, allow_zero_copy_hssd=zc_hssd)
+        upd_fn = getattr(base, "update_recurrent_state", None)
+        if callable(upd_fn):
+            return _call_cache_method(
+                upd_fn,
+                det_state,
+                int(layer_idx),
+                state_idx=int(state_idx),
+                **kwargs,
+            )
+        layers = getattr(base, "layers", None)
+        if isinstance(layers, list) and 0 <= int(layer_idx) < len(layers):
+            lyr_upd = getattr(layers[int(layer_idx)], "update_recurrent_state", None)
+            if callable(lyr_upd):
+                return _call_cache_method(lyr_upd, det_state, state_idx=int(state_idx), **kwargs)
+        return det_state
 
     def set_pending(
         self,
@@ -670,6 +1201,10 @@ class _ReplayKVCacheProxy:
             rp = object.__getattribute__(self, "_rec_proxy")
             if rp is not None:
                 return rp
+        if name == "layers":
+            lp = object.__getattribute__(self, "_layers_proxy")
+            if lp is not None:
+                return lp
         return getattr(object.__getattribute__(self, "_base_cache"), name)
 
     def __setattr__(self, name: str, value: Any) -> None:

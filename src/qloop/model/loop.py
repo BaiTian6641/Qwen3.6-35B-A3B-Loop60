@@ -730,16 +730,19 @@ class LoopController:
         return None
 
     def _sync_cache_last_linear(self, pkv: Any) -> None:
-        if pkv is None or not isinstance(getattr(pkv, "last_linear_layer", None), int):
+        if pkv is None:
+            return
+        base = getattr(pkv, "base_cache", pkv)
+        if not isinstance(getattr(base, "last_linear_layer", None), int):
             return
         n_virt = len(self.schedule)
         for attr in ("conv_states", "recurrent_states", "key_cache", "value_cache"):
-            slots = getattr(pkv, attr, None)
+            slots = getattr(base, attr, None)
             if isinstance(slots, list) and len(slots) < n_virt:
                 slots.extend([None] * (n_virt - len(slots)))
         last_lin = self._last_active_linear_vidx()
-        if last_lin is not None and pkv.last_linear_layer != last_lin:
-            pkv.last_linear_layer = last_lin
+        if last_lin is not None and base.last_linear_layer != last_lin:
+            base.last_linear_layer = last_lin
 
     def _register_hooks(self) -> None:
         spec = self.spec
@@ -1159,11 +1162,20 @@ class LoopController:
     def stats(self) -> dict[str, float]:
         s = dict(self.ctx.stats)
         with torch.no_grad():
+            bridge = self.adapters.bridge
             for i in range(self.spec.num_passes - 1):
                 s[f"loop/gate_abs_mean_p{i + 2}"] = float(self.adapters.gates[i].abs().mean())
-                w = self.adapters.bridge.weights(i)
+                w = bridge.weights(i)
                 for j, nm in enumerate(LoopBridge.STREAMS):
                     s[f"loop/bridge_w_{nm}_p{i + 2}"] = float(w[j])
+                if bridge.adapter_mode == "subspace" and bridge.rank > 0 and hasattr(bridge, "ups"):
+                    s[f"loop/bridge_subspace_up_abs_mean_p{i + 2}"] = float(
+                        bridge.ups[i].weight.detach().float().abs().mean()
+                    )
+                if bridge.step_emb is not None:
+                    s[f"loop/bridge_step_emb_norm_p{i + 2}"] = float(
+                        bridge.step_emb[i].detach().float().norm()
+                    )
                 if self.adapters.pass_attn is not None:
                     s[f"loop/attn_lora_abs_mean_p{i + 2}"] = self.adapters.pass_attn.up_abs_mean(i)
             if self.adapters.pass_router is not None:

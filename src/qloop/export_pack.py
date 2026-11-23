@@ -321,15 +321,9 @@ def _infer_gdn2_arch(src: _UnwrappedSource) -> dict[str, Any]:
             if first_ad is None:
                 first_ad = ad
     if first_ad is not None:
-        return {
-            "enabled": True,
-            "rank": int(first_ad.rank),
-            "layers": found_layers,
-            "chunk_size": 64,
-            "gate_logit_cap": float(first_ad.gate_logit_cap),
-            "decay_log_cap": float(first_ad.decay_log_cap),
-            "force_recurrent": False,
-        }
+        cfg_d = asdict(first_ad.cfg)
+        cfg_d["layers"] = found_layers
+        return {"enabled": True, **cfg_d}
     return {"enabled": False}
 
 

@@ -97,7 +97,9 @@ def _stack_with_ckpt(cfg: Cfg, ckpt: str | None):
             hub.pull_stage_checkpoint(ckpt_stage, run_root, prefer_promoted=True, include_optim=False)
             resolved_ckpt = resolve_run_path(ckpt, run_root=run_root)
 
-    st = build_stack(cfg)
+    ck: dict[str, Any] | None = None
+    smeta: dict[str, Any] = {}
+    build_cfg: Any = cfg
     if resolved_ckpt:
         path = resolved_ckpt
         if os.path.isdir(os.path.join(resolved_ckpt, "checkpoints")):
@@ -109,6 +111,33 @@ def _stack_with_ckpt(cfg: Cfg, ckpt: str | None):
         require(ck is not None, "failed to load checkpoint", path=path)
         assert ck is not None
         smeta = (ck.get("state") or {}).get("stack") or {}
+        saved = ck["params"]
+        has_saved_hssd = isinstance(smeta.get("hssd"), dict) or any("hssd_adapter." in k for k in saved)
+        has_saved_gdn2 = isinstance(smeta.get("gdn2"), dict) or any("gdn2_adapter." in k for k in saved)
+        if has_saved_gdn2 and not has_saved_hssd:
+            raw_cfg = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg)
+            cur_g = dict(raw_cfg.get("gdn2") or {})
+            prior_g = dict(smeta.get("gdn2") or {})
+            merged_g = {**cur_g, **prior_g, "enabled": True}
+            if "backend" in cur_g and cur_g.get("enabled"):
+                merged_g["backend"] = cur_g["backend"]
+            if "rank" not in prior_g:
+                for k, t in saved.items():
+                    if k.endswith("gdn2_adapter.down.weight") and t.ndim == 2:
+                        merged_g["rank"] = int(t.shape[0])
+                        break
+            if "qed_enabled" not in prior_g and any(k.endswith("gdn2_adapter.qed_lambda_raw") for k in saved):
+                merged_g["qed_enabled"] = True
+            if "neg_eigval_max_boost" not in prior_g and any(
+                k.endswith("gdn2_adapter.neg_gamma_raw") for k in saved
+            ):
+                merged_g["neg_eigval_max_boost"] = 0.5
+            raw_cfg["gdn2"] = merged_g
+            raw_cfg["hssd"] = {"enabled": False}
+            build_cfg = Cfg(raw_cfg)
+
+    st = build_stack(build_cfg)
+    if ck is not None:
         sc = float((smeta.get("expert_delta_scale")) or 1.0)
         st.restore_checkpoint(ck["params"], strict=False, expert_delta_scale=sc, prior_stack_meta=smeta)
     for p in st.named_trainable.values():
@@ -489,6 +518,25 @@ def _pipeline_stage_cmds(
         eval_extra = list(common)
         ov_keys = {ov.split("=", 1)[0].strip() for ov in overrides if "=" in ov}
         if is_v3_gdn_pipeline:
+            eval_ckpt_stage = "s4_v2_rl" if "s4_v2_rl" in all_stages else (
+                next((s for s in reversed(all_stages) if s in _V3_GDN_STAGE_SET), "s4_v2_rl")
+            )
+            eval_uses_gdn2 = eval_ckpt_stage in ("s2_v2_joint_bptt", "s4_v2_rl")
+            gdn2_eval_defaults: tuple[tuple[str, str], ...] = (
+                (
+                    ("gdn2.enabled", "true"),
+                    ("gdn2.rank", "64"),
+                    ("gdn2.chunk_size", "64"),
+                    ("gdn2.decay_log_min", "-3.0"),
+                    ("gdn2.decay_log_max", "0.5"),
+                    ("gdn2.qed_enabled", "true"),
+                    ("gdn2.qed_max_lambda", "0.35"),
+                    ("gdn2.neg_eigval_max_boost", "0.5"),
+                    ("gdn2.backend", "auto"),
+                )
+                if eval_uses_gdn2
+                else (("gdn2.enabled", "false"),)
+            )
             v3_gdn_eval_defaults = (
                 ("model.yarn_target_len", "1048576"),
                 ("loop.prelude_end", "12"),
@@ -500,7 +548,7 @@ def _pipeline_stage_cmds(
                 ("loop.bridge_rank", "256"),
                 ("loop.bridge_init", "[0.05,0.85,0.10]"),
                 ("loop.attn_adapter_rank", "64"),
-                ("gdn2.enabled", "false"),
+                *gdn2_eval_defaults,
                 ("hssd.enabled", "false"),
                 ("lsa.enabled", "true"),
                 ("lsa.mode", "sparse"),
@@ -510,9 +558,6 @@ def _pipeline_stage_cmds(
             for k, v in v3_gdn_eval_defaults:
                 if k not in ov_keys:
                     eval_extra.extend(["-s", f"{k}={v}"])
-            eval_ckpt_stage = "s4_v2_rl" if "s4_v2_rl" in all_stages else (
-                next((s for s in reversed(all_stages) if s in _V3_GDN_STAGE_SET), "s4_v2_rl")
-            )
             return [[*py, "eval", "-c", cpath, "--ckpt", os.path.join(run_root, eval_ckpt_stage), *eval_extra]]
         if is_v3_pipeline:
             v3_eval_defaults = (

@@ -104,12 +104,10 @@ def test_v2_gdn_stage_configs_and_zero_raw_fable51() -> None:
         assert cfg["run"]["name"] == name
         assert cfg["model"]["yarn_target_len"] == 1_048_576
         assert cfg["hssd"]["enabled"] is False
-        assert cfg["gdn2"]["enabled"] is False
         assert cfg["lsa"]["enabled"] is True
         assert cfg["train"]["optim"]["fused"] is False
         assert cfg["train"]["sha256_frozen_experts"] is True
         assert cfg["train"]["train_hssd"] is False
-        assert cfg["train"]["train_gdn2"] is False
         assert cfg["train"]["train_loop_adapters"] is True
         assert cfg["train"]["train_lsa"] is True
         # 88L Loop invariants
@@ -124,11 +122,14 @@ def test_v2_gdn_stage_configs_and_zero_raw_fable51() -> None:
         assert lp["per_pass_router"] is True
         assert lp["router_adapter_rank"] == 32
         assert "hssd_adapter" not in cfg["train"]["optim"]["lr_mult"]
-        assert "gdn2_adapter" not in cfg["train"]["optim"]["lr_mult"]
         assert "hssd_adapters" not in cfg["train"]["allowed_groups"]
 
-    # s3_v2_long_1m_lsa specifics
+    # s3_v2_long_1m_lsa specifics (native GDN untouched: gdn2.enabled=False)
     s3 = cfgs["s3_v2_long_1m_lsa"]
+    assert s3["gdn2"]["enabled"] is False
+    assert s3["train"]["train_gdn2"] is False
+    assert "gdn2_adapter" not in s3["train"]["optim"]["lr_mult"]
+    assert "gdn2_adapters" not in s3["train"]["allowed_groups"]
     assert s3["train"]["init_from"] == "runs/s1_loop_a6b"
     assert s3["train"]["steps"] == 600
     assert s3["train"]["micro_batch"] == 1
@@ -169,8 +170,19 @@ def test_v2_gdn_stage_configs_and_zero_raw_fable51() -> None:
     for src_name in s3_srcs:
         get_spec(src_name)
 
-    # s2_v2_joint_bptt specifics
+    # s2_v2_joint_bptt specifics (GDN-2-1M + Bounded QED + Soft Neg-Eigval enabled)
     s2 = cfgs["s2_v2_joint_bptt"]
+    assert s2["gdn2"]["enabled"] is True
+    assert s2["gdn2"]["rank"] == 64
+    assert s2["gdn2"]["chunk_size"] == 64
+    assert s2["gdn2"]["decay_log_min"] == pytest.approx(-3.0)
+    assert s2["gdn2"]["decay_log_max"] == pytest.approx(0.5)
+    assert s2["gdn2"]["qed_enabled"] is True
+    assert s2["gdn2"]["qed_max_lambda"] == pytest.approx(0.35)
+    assert s2["gdn2"]["neg_eigval_max_boost"] == pytest.approx(0.5)
+    assert s2["gdn2"]["backend"] == "auto"
+    assert s2["train"]["train_gdn2"] is True
+    assert "gdn2_adapters" in s2["train"]["allowed_groups"]
     assert s2["train"]["init_from"] == "runs/s3_v2_long_1m_lsa"
     assert s2["train"]["steps"] == 600
     assert s2["train"]["micro_batch"] == 1
@@ -188,7 +200,7 @@ def test_v2_gdn_stage_configs_and_zero_raw_fable51() -> None:
     assert dict(s2["train"]["aux_weights"]) == {"loop_aux": 1.0, "lsa_kl": 0.2}
     assert s2["train"]["optim"]["lr"] == pytest.approx(2.0e-5)
     assert s2["train"]["optim"]["warmup_steps"] == 50
-    assert dict(s2["train"]["optim"]["lr_mult"]) == {"loop_adapters": 10.0, "lsa_indexer": 5.0}
+    assert dict(s2["train"]["optim"]["lr_mult"]) == {"loop_adapters": 10.0, "gdn2_adapter": 5.0, "lsa_indexer": 5.0}
     assert s2["data"]["seq_len"] == 131_072
     assert s2["data"]["respect_doc_boundaries"] is True
     s2_srcs = {row["name"]: row["weight"] for row in s2["data"]["sources"]}
@@ -209,17 +221,29 @@ def test_v2_gdn_stage_configs_and_zero_raw_fable51() -> None:
     assert s2["data"]["decontaminate"]["enabled"] is True
     assert set(s2["data"]["decontaminate"]["groups"]).issubset(valid_groups)
 
-    # s4_v2_rl specifics
+    # s4_v2_rl specifics (GDN-2-1M + Bounded QED + Soft Neg-Eigval enabled; slap_target_groups untouched)
     s4 = cfgs["s4_v2_rl"]
     assert s4["stage_type"] == "rl"
+    assert s4["gdn2"]["enabled"] is True
+    assert s4["gdn2"]["rank"] == 64
+    assert s4["gdn2"]["chunk_size"] == 64
+    assert s4["gdn2"]["decay_log_min"] == pytest.approx(-3.0)
+    assert s4["gdn2"]["decay_log_max"] == pytest.approx(0.5)
+    assert s4["gdn2"]["qed_enabled"] is True
+    assert s4["gdn2"]["qed_max_lambda"] == pytest.approx(0.35)
+    assert s4["gdn2"]["neg_eigval_max_boost"] == pytest.approx(0.5)
+    assert s4["gdn2"]["backend"] == "auto"
+    assert s4["train"]["train_gdn2"] is True
     assert s4["train"]["init_from"] == "runs/s2_v2_joint_bptt"
     assert s4["loop"]["train_pass_probs"] == [0.10, 0.35, 0.55]
     assert s4["lsa"]["mode"] == "sparse"
     assert dict(s4["train"]["aux_weights"]) == {"loop_aux": 1.0}
     assert s4["train"]["optim"]["lr_mult"]["loop_adapters"] == 5.0
+    assert s4["train"]["optim"]["lr_mult"]["gdn2_adapter"] == 2.0
     assert s4["train"]["optim"]["lr_mult"]["lsa_indexer"] == 2.0
     assert s4["train"]["allowed_groups"] == [
         "loop_adapters",
+        "gdn2_adapters",
         "lsa_indexers",
         "router",
         "shared_expert",
@@ -419,7 +443,11 @@ def test_mhc_bridge_gates_router_attn_grads_and_telemetry(stage_name: str) -> No
     torch.manual_seed(42)
     cfg = _toy_v2_stack_cfg(stage_name, checkpoint=False)
     st = build_stack(cfg)
-    assert st.hssd is None and st.gdn2 is None
+    assert st.hssd is None
+    if stage_name == "s3_v2_long_1m_lsa":
+        assert st.gdn2 is None
+    else:
+        assert st.gdn2 is not None
     assert st.loop is not None and st.lsa is not None
 
     # Simulate healed s1_loop_a6b checkpoint init (non-zero gates, router/attn LoRA up weights, step_emb)
@@ -1329,11 +1357,11 @@ def test_trainer_and_grpo_smoke_without_hssd(tmp_path) -> None:
     s2_cfg["checkpoint"] = {"sync": {"enabled": False}}
     s2_dir = str(tmp_path / "s2_v2_joint_bptt")
     tr_s2 = LMTrainer(s2_cfg, s2_dir)
-    assert tr_s2.stack.hssd is None and tr_s2.stack.gdn2 is None and tr_s2.stack.lsa is not None
+    assert tr_s2.stack.hssd is None and tr_s2.stack.gdn2 is not None and tr_s2.stack.lsa is not None
     out_s2 = tr_s2.train()
     assert out_s2["step"] == 1
 
-    # GRPOTrainer smoke with s4_v2_rl config (init_from s2_v2, hssd=False, lsa=sparse)
+    # GRPOTrainer smoke with s4_v2_rl config (init_from s2_v2, hssd=False, gdn2=True, lsa=sparse)
     s4_cfg = _toy_v2_stack_cfg("s4_v2_rl", checkpoint=False)
     s4_cfg["train"].update({"init_from": s2_dir, "steps": 1, "ckpt_every": 1})
     s4_cfg["rl"] = {
@@ -1349,7 +1377,7 @@ def test_trainer_and_grpo_smoke_without_hssd(tmp_path) -> None:
     s4_cfg["checkpoint"] = {"sync": {"enabled": False}}
     s4_dir = str(tmp_path / "s4_v2_rl")
     rl_tr = GRPOTrainer(s4_cfg, s4_dir)
-    assert rl_tr.stack.hssd is None and rl_tr.stack.gdn2 is None and rl_tr.stack.lsa is not None
+    assert rl_tr.stack.hssd is None and rl_tr.stack.gdn2 is not None and rl_tr.stack.lsa is not None
     out_s4 = rl_tr.train()
     assert out_s4["step"] == 1
 

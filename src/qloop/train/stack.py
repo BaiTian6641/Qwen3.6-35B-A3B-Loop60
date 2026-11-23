@@ -190,7 +190,7 @@ class Stack:
             hssd_desc = dict(self.carried_hssd_cfg)
         return {
             "loop": None if self.loop is None else self.loop.spec.__dict__,
-            "gdn2": (self.gdn2.cfg.__dict__ if self.gdn2 is not None else self.carried_gdn2_cfg),
+            "gdn2": (asdict(self.gdn2.cfg) if self.gdn2 is not None else self.carried_gdn2_cfg),
             "hssd": hssd_desc,
             "lsa": (self.lsa.cfg.__dict__ if self.lsa is not None else self.carried_lsa_cfg),
             "hot_experts": None if self.hot_map is None else {str(k): v for k, v in self.hot_map.items()},

@@ -1381,15 +1381,46 @@ else:
 
     # ---------------------------------------------------------------- GDN-2
     class _StandaloneGDN2Adapter(nn.Module):
-        def __init__(self, hs: int, hv: int, dk: int, dv: int, rank: int, cap_g: float, cap_d: float) -> None:
+        def __init__(
+            self,
+            hs: int,
+            hv: int,
+            dk: int,
+            dv: int,
+            rank: int,
+            cap_g: float,
+            cap_d: float,
+            decay_log_min: float | None = None,
+            decay_log_max: float | None = None,
+            qed_enabled: bool = False,
+            qed_max_lambda: float = 0.35,
+            neg_eigval_max_boost: float = 0.0,
+        ) -> None:
             super().__init__()
             r = max(1, min(int(rank), int(hs)))
             self.hv, self.dk, self.dv = int(hv), int(dk), int(dv)
             self.cap_g, self.cap_d = float(cap_g), float(cap_d)
+            self.decay_log_min = None if decay_log_min is None else float(decay_log_min)
+            self.decay_log_max = None if decay_log_max is None else float(decay_log_max)
+            self.qed_max_lambda = float(qed_max_lambda)
+            self.neg_eigval_max_boost = float(neg_eigval_max_boost)
             self.down = nn.Linear(hs, r, bias=False)
             self.erase_up = nn.Linear(r, hv * dk, bias=False)
             self.write_up = nn.Linear(r, hv * dv, bias=False)
             self.decay_up = nn.Linear(r, hv * dk, bias=False)
+            if qed_enabled:
+                self.qed_lambda_raw: nn.Parameter | None = nn.Parameter(torch.zeros(self.hv))
+            else:
+                self.register_parameter("qed_lambda_raw", None)
+            if self.neg_eigval_max_boost > 0.0:
+                self.neg_gamma_raw: nn.Parameter | None = nn.Parameter(torch.zeros(self.hv))
+            else:
+                self.register_parameter("neg_gamma_raw", None)
+
+        def qed_lambda(self) -> torch.Tensor | None:
+            if self.qed_lambda_raw is None:
+                return None
+            return self.qed_max_lambda * torch.tanh(_upcast(self.qed_lambda_raw))
 
         def gates(self, x: torch.Tensor, g: torch.Tensor, beta: torch.Tensor):
             b, t, _ = x.shape
@@ -1397,9 +1428,25 @@ else:
             h = F.silu(F.linear(xf, _upcast(self.down.weight)))
             de = (self.cap_g * torch.tanh(F.linear(h, _upcast(self.erase_up.weight)))).view(b, t, self.hv, self.dk)
             dw = (self.cap_g * torch.tanh(F.linear(h, _upcast(self.write_up.weight)))).view(b, t, self.hv, self.dv)
-            dd = (self.cap_d * torch.tanh(F.linear(h, _upcast(self.decay_up.weight)))).view(b, t, self.hv, self.dk)
+            d_raw = F.linear(h, _upcast(self.decay_up.weight)).view(b, t, self.hv, self.dk)
+            if self.decay_log_min is not None or self.decay_log_max is not None:
+                c_min = self.decay_log_min if self.decay_log_min is not None else -self.cap_d
+                c_max = self.decay_log_max if self.decay_log_max is not None else self.cap_d
+                dd = torch.where(
+                    d_raw >= 0,
+                    c_max * torch.tanh(d_raw / c_max),
+                    (-c_min) * torch.tanh(d_raw / (-c_min)),
+                )
+            else:
+                dd = self.cap_d * torch.tanh(d_raw)
             bf = _upcast(beta).clamp(0.0, 1.0).unsqueeze(-1)
-            return _upcast(g).clamp(max=0.0).unsqueeze(-1) * dd.exp(), _logistic_shift(bf, de), _logistic_shift(bf, dw)
+            bg = _logistic_shift(bf, de)
+            if self.neg_gamma_raw is not None:
+                b_sc = (1.0 + self.neg_eigval_max_boost * torch.tanh(_upcast(self.neg_gamma_raw))).to(
+                    dtype=bg.dtype, device=bg.device
+                )
+                bg = bg * b_sc.view(1, 1, self.hv, 1)
+            return _upcast(g).clamp(max=0.0).unsqueeze(-1) * dd.exp(), bg, _logistic_shift(bf, dw)
 
     def _recurrent_gdn2(
         q: torch.Tensor,
@@ -1412,18 +1459,25 @@ else:
         out_final: bool,
         use_l2: bool,
         scale: float | None,
+        qed_lambda: torch.Tensor | None = None,
     ):
         dt = q.dtype
-        qf, kf, vf = _prepare_qkv(q, k, v, use_l2)
-        qf = qf * ((qf.shape[-1] ** -0.5) if scale is None else float(scale))
+        q_hat, kf, vf = _prepare_qkv(q, k, v, use_l2)
+        sc = (q_hat.shape[-1] ** -0.5) if scale is None else float(scale)
+        qf = q_hat * sc if sc != 1.0 else q_hat
         b, t, hv, dk = kf.shape
         dv = vf.shape[-1]
+        ef = bg * kf
+        if qed_lambda is not None:
+            lam = _upcast(qed_lambda).to(dtype=ef.dtype, device=ef.device).view(1, 1, hv, 1)
+            bq = bg * q_hat
+            ef = ef + lam * (bq - (kf * bq).sum(-1, keepdim=True) * kf)
         st = qf.new_zeros(b, hv, dk, dv) if init_st is None else _upcast(init_st).clone()
         outs = []
         for i in range(t):
             st = st * gv[:, i].exp().unsqueeze(-1)
             kt, vt = kf[:, i], vf[:, i]
-            mem = (st * (bg[:, i] * kt).unsqueeze(-1)).sum(-2)
+            mem = (st * ef[:, i].unsqueeze(-1)).sum(-2)
             st = st + kt.unsqueeze(-1) * ((wg[:, i] * vt) - mem).unsqueeze(-2)
             outs.append((st * qf[:, i].unsqueeze(-1)).sum(-2))
         return torch.stack(outs, dim=1).to(dt), (st if out_final else None)
@@ -7799,6 +7853,11 @@ else:
                 rank = int(gcfg.get("rank", 64))
                 cap_g = float(gcfg.get("gate_logit_cap", 8.0))
                 cap_d = float(gcfg.get("decay_log_cap", 1.0))
+                d_min = gcfg.get("decay_log_min")
+                d_max = gcfg.get("decay_log_max")
+                qed_on = bool(gcfg.get("qed_enabled", False))
+                qed_max = float(gcfg.get("qed_max_lambda", 0.35))
+                neg_boost = float(gcfg.get("neg_eigval_max_boost", 0.0))
                 patched_gmods: set[tuple[str, str]] = set()
                 active_gdn2: list[
                     tuple[_StandaloneGDN2Adapter, list[torch.Tensor], list[int], bool, bool]
@@ -7830,7 +7889,9 @@ else:
                         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
                         g, beta = g.transpose(1, 2), beta.transpose(1, 2)
                     gv, bg, wg = ad_r.gates(x_in, g, beta)
-                    out, fst = _recurrent_gdn2(q, k, v, gv, bg, wg, init_st, out_final, use_l2, scale)
+                    out, fst = _recurrent_gdn2(
+                        q, k, v, gv, bg, wg, init_st, out_final, use_l2, scale, qed_lambda=ad_r.qed_lambda()
+                    )
                     if hfirst:
                         out = out.transpose(1, 2)
                     return out, fst
@@ -7843,7 +7904,20 @@ else:
                     hv = int(getattr(attn, "num_v_heads", None) or attn.A_log.numel())
                     dv = int(getattr(attn, "head_v_dim", None) or (attn.out_proj.in_features // hv))
                     dk = int(getattr(attn, "head_k_dim", None) or dv)
-                    ad = _StandaloneGDN2Adapter(hs, hv, dk, dv, rank, cap_g, cap_d).to(dtype=ref_dt)
+                    ad = _StandaloneGDN2Adapter(
+                        hs,
+                        hv,
+                        dk,
+                        dv,
+                        rank,
+                        cap_g,
+                        cap_d,
+                        decay_log_min=d_min,
+                        decay_log_max=d_max,
+                        qed_enabled=qed_on,
+                        qed_max_lambda=qed_max,
+                        neg_eigval_max_boost=neg_boost,
+                    ).to(dtype=ref_dt)
                     attn.gdn2_adapter = ad
                     x_box: list[torch.Tensor] = []
                     in_g_box: list[int] = [0]

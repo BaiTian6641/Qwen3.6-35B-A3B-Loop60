@@ -790,14 +790,35 @@ class HubSyncManager:
             manifest.architecture["linear_attention"] = "hssd"
             manifest.architecture["hssd_rank"] = int(hssd_desc.get("rank", 64))
             manifest.architecture["hssd_pages"] = int(hssd_desc.get("num_pages", 8))
+            manifest.architecture.pop("gdn2_rank", None)
+            manifest.architecture.pop("gdn2_qed", None)
+            manifest.architecture.pop("gdn2_neg_eigval_max_boost", None)
+            manifest.architecture.pop("gdn2_decay_log_min", None)
+            manifest.architecture.pop("gdn2_decay_log_max", None)
         elif gdn2_desc is not None:
             manifest.architecture["linear_attention"] = "gdn2"
             manifest.architecture["gdn2_rank"] = int(gdn2_desc.get("rank", 64))
+            manifest.architecture["gdn2_qed"] = bool(gdn2_desc.get("qed_enabled", False))
+            manifest.architecture["gdn2_neg_eigval_max_boost"] = float(gdn2_desc.get("neg_eigval_max_boost", 0.0))
+            if gdn2_desc.get("decay_log_min") is not None:
+                manifest.architecture["gdn2_decay_log_min"] = float(gdn2_desc["decay_log_min"])
+            else:
+                manifest.architecture.pop("gdn2_decay_log_min", None)
+            if gdn2_desc.get("decay_log_max") is not None:
+                manifest.architecture["gdn2_decay_log_max"] = float(gdn2_desc["decay_log_max"])
+            else:
+                manifest.architecture.pop("gdn2_decay_log_max", None)
+            manifest.architecture.pop("hssd_rank", None)
+            manifest.architecture.pop("hssd_pages", None)
         elif stack_desc:
             manifest.architecture["linear_attention"] = "stock"
             manifest.architecture.pop("hssd_rank", None)
             manifest.architecture.pop("hssd_pages", None)
             manifest.architecture.pop("gdn2_rank", None)
+            manifest.architecture.pop("gdn2_qed", None)
+            manifest.architecture.pop("gdn2_neg_eigval_max_boost", None)
+            manifest.architecture.pop("gdn2_decay_log_min", None)
+            manifest.architecture.pop("gdn2_decay_log_max", None)
         if lsa_desc is not None:
             manifest.architecture["sparse_attention"] = "d-lsa"
 
@@ -1087,36 +1108,53 @@ def load_qloop_from_hub(
         if not mgr.download_file(wt_repo, wt_p):
             raise FileNotFoundError(f"{wt_repo} not found in hf://{repo_id}")
         saved = torch.load(wt_p, map_location="cpu")
+        stage_meta: dict[str, Any] = {}
+        if stage_name:
+            st_p = os.path.join(td, "stage_state.json")
+            if mgr.download_file(f"stages/{stage_name}/latest/state.json", st_p):
+                try:
+                    with open(st_p, encoding="utf-8") as f:
+                        stage_meta = json.load(f)
+                except Exception:
+                    stage_meta = {}
 
+    smeta = dict(stage_meta.get("stack") or meta.get("stack") or {})
     raw_cfg = dict(meta.get("config") or {})
     if not raw_cfg.get("model"):
         raw_cfg["model"] = {"name": meta.get("base_model", DEFAULT_BASE_MODEL), "dtype": "bfloat16",
                             "device_map": "auto", "attn_implementation": "sdpa"}
-    if not raw_cfg.get("loop") and (meta.get("stack") or {}).get("loop"):
-        raw_cfg["loop"] = {"enabled": True, **dict(meta["stack"]["loop"])}
+    if not raw_cfg.get("loop") and smeta.get("loop"):
+        raw_cfg["loop"] = {"enabled": True, **dict(smeta["loop"])}
     # At inference we fold any `expert_deltas` directly into float base weights via `restore_checkpoint`
     # (zero hook overhead during generation).
     raw_cfg["experts"] = {"enabled": False}
     if any("hssd_adapter." in k for k in saved):
-        prior_hssd = dict((meta.get("stack") or {}).get("hssd") or {})
+        prior_hssd = dict(smeta.get("hssd") or {})
         hcfg = {**dict(raw_cfg.get("hssd") or {}), **prior_hssd}
         hcfg["enabled"] = True
         raw_cfg["hssd"] = hcfg
         raw_cfg["gdn2"] = {"enabled": False}
     elif any("gdn2_adapter." in k for k in saved):
-        prior_gdn2 = dict((meta.get("stack") or {}).get("gdn2") or {})
+        prior_gdn2 = dict(smeta.get("gdn2") or {})
         gcfg = {**dict(raw_cfg.get("gdn2") or {}), **prior_gdn2}
         for k, t in saved.items():
             if k.endswith("gdn2_adapter.down.weight") and t.ndim == 2:
                 gcfg["rank"] = int(t.shape[0])
                 break
+        if "qed_enabled" not in prior_gdn2 and any(k.endswith("gdn2_adapter.qed_lambda_raw") for k in saved):
+            gcfg["qed_enabled"] = True
+        if "neg_eigval_max_boost" not in prior_gdn2 and any(
+            k.endswith("gdn2_adapter.neg_gamma_raw") for k in saved
+        ):
+            gcfg["neg_eigval_max_boost"] = 0.5
         gcfg["enabled"] = True
         raw_cfg["gdn2"] = gcfg
+        raw_cfg["hssd"] = {"enabled": False}
     else:
         raw_cfg["hssd"] = {"enabled": False}
         raw_cfg["gdn2"] = {"enabled": False}
     if enable_lsa_if_present and any("lsa_indexer." in k for k in saved):
-        prior_lsa = dict((meta.get("stack") or {}).get("lsa") or {})
+        prior_lsa = dict(smeta.get("lsa") or {})
         lcfg = {**dict(raw_cfg.get("lsa") or {}), **prior_lsa}
         for k, t in saved.items():
             if k.endswith("lsa_indexer.wk") and t.ndim == 3:
@@ -1129,7 +1167,6 @@ def load_qloop_from_hub(
     if overrides:
         apply_overrides(raw_cfg, overrides)
     st = build_stack(Cfg(raw_cfg))
-    smeta = meta.get("stack") or {}
     scale = float((smeta.get("expert_delta_scale")) or 1.0)
     st.restore_checkpoint(saved, strict=strict, expert_delta_scale=scale, prior_stack_meta=smeta)
     for p in st.named_trainable.values():

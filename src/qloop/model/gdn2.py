@@ -1,33 +1,45 @@
-"""NVIDIA Gated DeltaNet-2 (GDN-2) retrofit for Qwen3.6's 30 linear-attention layers.
+"""NVIDIA Gated DeltaNet-2 (GDN-2) + 1M Asymmetric Slow-Decay + Bounded QED + Soft Negative Eigenvalues.
 
 Reference:
     Ali Hatamizadeh, Yejin Choi, Jan Kautz (NVIDIA Research),
     "Gated DeltaNet-2: Decoupling Erase and Write in Linear Attention" (arXiv:2605.22791,
     `NVlabs/GatedDeltaNet-2`).
 
-Why GDN-2 upgrades stock Gated DeltaNet cleanly on Qwen3.6-35B-A3B:
+Why GDN-2-1M + Bounded QED + Soft Neg-Eigval upgrades stock Gated DeltaNet cleanly on Qwen3.6-35B-A3B:
   * Stock Gated DeltaNet ties memory erasure (key axis) and memory writing (value axis) to one
     shared scalar gate `beta_t in (0, 1)` per head alongside a scalar decay `g_t <= 0`:
         S_t = (I - beta_t k_t k_t^T) exp(g_t) S_{t-1} + beta_t k_t v_t^T
   * GDN-2 decouples these into three independent channel-wise vectors per head:
-      1. Channel-wise key-side erase gate   b_t in (0, 1)^{d_k}
+      1. Channel-wise key-side erase gate   b_t in (0, 1.5]^{d_k}  (soft negative eigenvalues via `b_scale`)
       2. Channel-wise value-side write gate w_t in (0, 1)^{d_v}
-      3. Channel-wise log-decay             g_t in (-inf, 0]^{d_k},  D_t = Diag(exp(g_t))
-    evolving the recurrent state via the Gated Delta Rule-2:
-        S_t = (I - k_t (b_t * k_t)^T) D_t S_{t-1} + k_t (w_t * v_t)^T,   o_t = S_t^T q_t
-  * Strict generalization & step-0 bit-identity:
-    GDN-2 collapses to stock Gated DeltaNet identically when `b_t = beta_t * 1_{d_k}`,
-    `w_t = beta_t * 1_{d_v}`, and `g_t = g_base_t * 1_{d_k}`. By parameterizing zero-initialized
-    low-rank residual projections (`erase_up = 0`, `write_up = 0`, `decay_up = 0`) composed via
-    the singularity-free logistic odds shift
-        sigma(logit(beta) + delta) == beta + 2*beta*(1 - beta)*tanh(delta/2) / (1 + (2*beta - 1)*tanh(delta/2))
-    and strictly non-positive decay scaling `g_t = g_base_t * exp(tanh(delta_g)) <= 0`, the
-    retrofitted Qwen3.6 model is **100% bit-identical at step 0** while unlocking full GDN-2
-    channel-selective memory editing during training and looped recurrence.
-  * Hardware-efficient training (`chunk_gdn2`) & O(1) decode (`recurrent_gdn2`):
-    `chunk_gdn2` implements the chunkwise WY representation (absorbing cumulative channel-wise
-    decays into asymmetric erase factors solved via batched unit-lower-triangular `trsm` on Tensor
-    Cores) with macro-segment activation checkpointing for 64K-1M long-context training.
+      3. Channel-wise log-decay             g_t in (-inf, 0]^{d_k}, D_t = Diag(exp(g_t))
+         with optional `C^1`-continuous asymmetric `tanh` bound `[decay_log_min, decay_log_max]`
+         (e.g. `[-3.0, +0.5]`, stretching memory horizon up to `exp(3) ~= 20.1x` for 1M contexts).
+  * Bounded Query-Enhanced Erasure Direction (QED):
+      With per-head bounded `lam_h = qed_max_lambda * tanh(qed_lambda_raw_h)` (`0.0` at step 0),
+      the rank-1 erase direction adds a key-orthogonal query projection using UNSCALED unit-norm
+      `(q_hat, k_hat)`:
+          e_t = b_t * k_hat + lam_h * (b_t * q_hat - <k_hat, b_t * q_hat> * k_hat)
+          S_t = (I - k_hat e_t^T) Diag(exp(g_t)) S_{t-1} + k_hat (w_t * v_t)^T
+          o_t = S_t^T (q_hat * scale)
+  * Strict generalization & 100% IEEE-754 step-0 bit-identity:
+      All residual projections (`erase_up`, `write_up`, `decay_up`) and per-head scalars
+      (`qed_lambda_raw`, `neg_gamma_raw`) start at exact zero, so at step 0 `b_t == beta_t`,
+      `w_t == beta_t`, `g_t == g_base_t`, `lam_h == 0`, `b_scale == 1.0`, matching stock
+      Qwen3.6 Gated DeltaNet bit-identically.
+  * Hardware-efficient Blackwell `sm_120` execution via `fla` DPLR / `fla.ops.gdn2` + Fused Triton Prep:
+      - `fla.ops.generalized_delta_rule.dplr.{chunk_dplr_delta_rule, fused_recurrent_dplr_delta_rule}`
+        implements `S_t = (Diag(exp(gk_t)) + b_t a_t^T) S_{t-1} + k_t v_t^T`, `o_t = S_t^T (q_t * scale)`
+        with exact 1-to-1 mapping:
+            q = q_hat, k = k_hat, v = w_t * v_raw, a = -(e_t * exp(g_t)), b = k_hat, gk = g_t,
+            scale = dk ** -0.5 (never double-scaling `q_hat`).
+        `fused_recurrent_dplr_delta_rule` is inference-only in `fla 0.6.0` (raises `NotImplementedError`
+        on backward), so it is dispatched ONLY when `T == 1` and `not torch.is_grad_enabled()`;
+        `chunk_dplr_delta_rule` handles all `T > 1` and grad-enabled calls.
+      - `fla.ops.gdn2.{chunk_gdn2, fused_recurrent_gdn2}` is dispatched for no-QED GDN-2 on CUDA.
+      - A fused single-pass Triton prep autograd kernel computes `(q_hat, k_hat, v_w, a, gk)` and
+        its exact analytical backward in minimal HBM passes (with clean PyTorch fallback on CPU,
+        `float64`, `torch.compile`, or when Triton/`fla` is unavailable).
 """
 from __future__ import annotations
 
@@ -48,12 +60,34 @@ from ..debug import require
 from ._dtype import upcast
 from .introspect import LINEAR, attention_module, inspect_model
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except Exception:  # pragma: no cover - CPU/macOS environments without Triton
+    triton = None  # type: ignore[assignment]
+    tl = None  # type: ignore[assignment]
+    _HAS_TRITON = False
+
 log = logging.getLogger("qloop")
+
+_VALID_BACKENDS = frozenset({"auto", "dplr", "fla_gdn2", "pytorch"})
 
 
 def _in_backward() -> bool:
     fn = getattr(torch._C, "_current_graph_task_id", None)
     return fn is not None and fn() != -1
+
+
+def _is_compiling() -> bool:
+    comp = getattr(torch, "compiler", None)
+    fn = getattr(comp, "is_compiling", None) if comp is not None else None
+    if callable(fn):
+        return bool(fn())
+    dyn = getattr(torch, "_dynamo", None)
+    fn2 = getattr(dyn, "is_compiling", None) if dyn is not None else None
+    return bool(fn2()) if callable(fn2) else False
 
 
 # ============================================================================ config
@@ -66,7 +100,13 @@ class GDN2Config:
     segment_chunks: int = 16         # 16 * 64 = 1024 tokens per checkpointable WY macro-segment
     checkpoint_segments: bool = True
     gate_logit_cap: float = 8.0      # smooth tanh bound on channel-wise erase/write logit shifts
-    decay_log_cap: float = 1.0       # smooth bound on log-decay multiplier exp(+-cap) in [0.37, 2.72]
+    decay_log_cap: float = 1.0       # symmetric fallback bound on log-decay multiplier exp(+-cap)
+    decay_log_min: float | None = None   # optional asymmetric min log-decay shift (< 0, e.g. -3.0 => 20.1x horizon)
+    decay_log_max: float | None = None   # optional asymmetric max log-decay shift (> 0, e.g. +0.5)
+    qed_enabled: bool = False        # bounded per-head Query-Enhanced Erasure Direction (QED)
+    qed_max_lambda: float = 0.35     # smooth tanh bound on per-head QED coupling `lam_h`
+    neg_eigval_max_boost: float = 0.0  # per-head erase scale `1 + boost*tanh(raw)` (0.5 => (0.5, 1.5))
+    backend: str = "auto"            # "auto" | "dplr" | "fla_gdn2" | "pytorch"
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> GDN2Config:
@@ -86,6 +126,16 @@ class GDN2Config:
             raise ValueError(f"gdn2.segment_chunks must be >= 1, got {self.segment_chunks}")
         if self.gate_logit_cap <= 0 or self.decay_log_cap <= 0:
             raise ValueError("gdn2.gate_logit_cap and gdn2.decay_log_cap must be > 0")
+        if self.decay_log_min is not None and float(self.decay_log_min) >= 0.0:
+            raise ValueError(f"gdn2.decay_log_min must be < 0, got {self.decay_log_min}")
+        if self.decay_log_max is not None and float(self.decay_log_max) <= 0.0:
+            raise ValueError(f"gdn2.decay_log_max must be > 0, got {self.decay_log_max}")
+        if float(self.qed_max_lambda) < 0.0:
+            raise ValueError(f"gdn2.qed_max_lambda must be >= 0, got {self.qed_max_lambda}")
+        if not (0.0 <= float(self.neg_eigval_max_boost) <= 1.0):
+            raise ValueError(f"gdn2.neg_eigval_max_boost must be in [0, 1], got {self.neg_eigval_max_boost}")
+        if self.backend not in _VALID_BACKENDS:
+            raise ValueError(f"gdn2.backend must be one of {sorted(_VALID_BACKENDS)}, got {self.backend!r}")
 
 
 # ============================================================================ math primitives
@@ -94,6 +144,23 @@ def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     """FLA / HF compatible L2 normalization accumulated in fp32/fp64."""
     xf = upcast(x)
     return xf * torch.rsqrt((xf * xf).sum(dim=dim, keepdim=True) + eps)
+
+
+def asymmetric_tanh_bound(x: torch.Tensor, cap_min: float, cap_max: float) -> torch.Tensor:
+    """`C^1`-continuous asymmetric `tanh` bound mapping `R -> (cap_min, cap_max)` (`cap_min < 0 < cap_max`).
+
+    Uses `torch.where(x >= 0, cap_max * tanh(x / cap_max), (-cap_min) * tanh(x / (-cap_min)))`:
+      * Bit-exact `0.0` at `x == 0.0` (step-0 identity).
+      * Continuous unit derivative `f'(0+) == f'(0-) == 1.0`.
+      * Stretches memory horizon up to `exp(-cap_min)` (e.g. `exp(3.0) ~= 20.1x` at `cap_min = -3.0`).
+    """
+    neg_span = -float(cap_min)
+    pos_span = float(cap_max)
+    return torch.where(
+        x >= 0,
+        pos_span * torch.tanh(x / pos_span),
+        neg_span * torch.tanh(x / neg_span),
+    )
 
 
 def logistic_shift(beta: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
@@ -110,12 +177,43 @@ def logistic_shift(beta: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
     return (beta + (2.0 * beta * (1.0 - beta) * s) / denom).clamp(0.0, 1.0)
 
 
-def _prepare_qkv(
+def _broadcast_qed_lambda(lam: torch.Tensor, hv: int) -> torch.Tensor:
+    if lam.ndim == 1:
+        require(lam.shape[0] == hv, "qed_lambda length must equal num_v_heads", lam=lam, hv=hv)
+        return lam.view(1, 1, hv, 1)
+    if lam.ndim == 4:
+        return lam
+    if lam.ndim == 3:
+        return lam.unsqueeze(-1)
+    if lam.ndim == 0:
+        return lam.view(1, 1, 1, 1)
+    raise ValueError(f"unsupported qed_lambda shape {tuple(lam.shape)}; expected [H_v] or broadcastable to [B,T,H_v,1]")
+
+
+def _compute_qed_erase(
+    q_hat: torch.Tensor,
+    k_hat: torch.Tensor,
+    b_gate: torch.Tensor,
+    qed_lambda: torch.Tensor | None,
+) -> torch.Tensor:
+    """Compute GDN-2 + QED erase vector `e_t = b_t * k_hat + lam * (b_t * q_hat - <k_hat, b_t * q_hat> * k_hat)`.
+
+    IMPORTANT: `q_hat` and `k_hat` MUST be unscaled unit-norm vectors (never pre-scaled by `dk ** -0.5`).
+    """
+    e_t = b_gate * k_hat
+    if qed_lambda is None:
+        return e_t
+    lam = _broadcast_qed_lambda(upcast(qed_lambda).to(dtype=e_t.dtype, device=e_t.device), k_hat.shape[2])
+    bq = b_gate * q_hat
+    dot = (k_hat * bq).sum(dim=-1, keepdim=True)
+    return e_t + lam * (bq - dot * k_hat)
+
+
+def _prepare_qkv_unscaled(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     use_qk_l2norm: bool,
-    scale: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = upcast(query), upcast(key), upcast(value)
     hv = v.shape[2]
@@ -128,10 +226,978 @@ def _prepare_qkv(
     if use_qk_l2norm:
         q = l2norm(q, dim=-1, eps=1e-6)
         k = l2norm(k, dim=-1, eps=1e-6)
-    sc = (q.shape[-1] ** -0.5) if scale is None else float(scale)
-    if sc != 1.0:
-        q = q * sc
     return q, k, v
+
+
+# ============================================================================ fused QED+DPLR prep (Triton + PyTorch)
+
+def qed_dplr_prep_pytorch(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g_vec: torch.Tensor,
+    b_gate: torch.Tensor,
+    w_gate: torch.Tensor,
+    qed_lambda: torch.Tensor | None = None,
+    *,
+    use_qk_l2norm: bool = False,
+    out_dtype: torch.dtype | None = None,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch reference for QED+DPLR prep: returns `(q_hat, k_hat, v_w, a, gk)`.
+
+    Maps GDN-2 + QED parameters onto `fla`'s DPLR recurrence
+        `S_t = (Diag(exp(gk_t)) + b_t a_t^T) S_{t-1} + k_t v_t^T`
+    with `b_t = k_hat`, `a_t = -(e_t * exp(gk_t))`, `v_w = w_t * v_raw`, `gk_t = clamp(g_vec, max=0.0)`,
+    and unscaled unit-norm `q_hat, k_hat` (do NOT pre-scale `q_hat`).
+    """
+    dst_dt = query.dtype if out_dtype is None else out_dtype
+    q_f, k_f, v_f = upcast(query), upcast(key), upcast(value)
+    hv = v_f.shape[2]
+    if q_f.shape[2] != hv:
+        require(hv % q_f.shape[2] == 0, "num_v_heads must be divisible by num_q_heads", q=q_f, v=v_f)
+        q_f = q_f.repeat_interleave(hv // q_f.shape[2], dim=2)
+    if k_f.shape[2] != hv:
+        require(hv % k_f.shape[2] == 0, "num_v_heads must be divisible by num_k_heads", k=k_f, v=v_f)
+        k_f = k_f.repeat_interleave(hv // k_f.shape[2], dim=2)
+    if use_qk_l2norm:
+        q_hat = q_f * torch.rsqrt((q_f * q_f).sum(dim=-1, keepdim=True) + eps)
+        k_hat = k_f * torch.rsqrt((k_f * k_f).sum(dim=-1, keepdim=True) + eps)
+    else:
+        q_hat = q_f
+        k_hat = k_f
+
+    gk = upcast(g_vec).clamp(max=0.0)
+    bf = upcast(b_gate)
+    wf = upcast(w_gate)
+    e_t = _compute_qed_erase(q_hat, k_hat, bf, qed_lambda)
+    a = -(e_t * gk.exp())
+    v_w = wf * v_f
+    gk_dt = torch.float64 if dst_dt == torch.float64 else torch.float32
+    return (
+        q_hat.to(dst_dt).contiguous(),
+        k_hat.to(dst_dt).contiguous(),
+        v_w.to(dst_dt).contiguous(),
+        a.to(dst_dt).contiguous(),
+        gk.to(gk_dt).contiguous(),
+    )
+
+
+def _qed_dplr_prep_bwd_math(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g_vec: torch.Tensor,
+    b_gate: torch.Tensor,
+    w_gate: torch.Tensor,
+    qed_lambda: torch.Tensor | None,
+    dq_hat: torch.Tensor | None,
+    dk_hat: torch.Tensor | None,
+    dv_w: torch.Tensor | None,
+    da: torch.Tensor | None,
+    dgk: torch.Tensor | None,
+    *,
+    use_qk_l2norm: bool = False,
+    eps: float = 1e-6,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+]:
+    """Exact analytical backward matching `_qed_dplr_prep_bwd_kernel` line-for-line (for CPU/fp64 verification)."""
+    q_f, k_f, v_f = upcast(query), upcast(key), upcast(value)
+    bsz, seq_len, hq, dk = q_f.shape
+    hk = k_f.shape[2]
+    hv = v_f.shape[2]
+    q_exp = q_f.repeat_interleave(hv // hq, dim=2) if hq != hv else q_f
+    k_exp = k_f.repeat_interleave(hv // hk, dim=2) if hk != hv else k_f
+    if use_qk_l2norm:
+        r_q = torch.rsqrt((q_exp * q_exp).sum(dim=-1, keepdim=True) + eps)
+        r_k = torch.rsqrt((k_exp * k_exp).sum(dim=-1, keepdim=True) + eps)
+        qh = q_exp * r_q
+        kh = k_exp * r_k
+    else:
+        r_q = None
+        r_k = None
+        qh = q_exp
+        kh = k_exp
+
+    gf = upcast(g_vec)
+    bf = upcast(b_gate)
+    wf = upcast(w_gate)
+
+    has_qed = qed_lambda is not None
+    if has_qed:
+        assert qed_lambda is not None
+        lam = _broadcast_qed_lambda(upcast(qed_lambda).to(dtype=qh.dtype, device=qh.device), hv)
+        u = bf * qh
+        c = (kh * u).sum(dim=-1, keepdim=True)
+        p = u - c * kh
+        e_val = bf * kh + lam * p
+    else:
+        lam = None
+        u = None
+        c = None
+        p = None
+        e_val = bf * kh
+
+    g_le0 = gf <= 0.0
+    g_clamped = torch.where(g_le0, gf, torch.zeros_like(gf))
+    gamma = g_clamped.exp()
+    a_val = -(e_val * gamma)
+
+    dqh_in = torch.zeros_like(qh) if dq_hat is None else upcast(dq_hat)
+    dkh_in = torch.zeros_like(kh) if dk_hat is None else upcast(dk_hat)
+    da_in = torch.zeros_like(a_val) if da is None else upcast(da)
+    dgk_in = torch.zeros_like(g_clamped) if dgk is None else upcast(dgk)
+    dvw_in = torch.zeros_like(v_f) if dv_w is None else upcast(dv_w)
+
+    de = -da_in * gamma
+    dg_clamped = dgk_in + da_in * a_val
+    dg = torch.where(g_le0, dg_clamped, torch.zeros_like(dg_clamped))
+
+    if has_qed:
+        assert lam is not None and u is not None and c is not None and p is not None and qed_lambda is not None
+        dp = lam * de
+        dc = -(dp * kh).sum(dim=-1, keepdim=True)
+        du = dp + dc * kh
+        db = de * kh + du * qh
+        dkh_tot = dkh_in + de * bf - c * dp + dc * u
+        dqh_tot = dqh_in + du * bf
+        dlam_tok = (de * p).sum(dim=-1)  # [B, T, H_v]
+        if qed_lambda.ndim == 1:
+            dlam: torch.Tensor | None = dlam_tok.sum(dim=(0, 1)).to(qed_lambda.dtype)
+        elif qed_lambda.ndim == 0:
+            dlam = dlam_tok.sum().to(qed_lambda.dtype)
+        else:
+            dlam_4d = dlam_tok.unsqueeze(-1)
+            reduce_dims = tuple(i for i, s in enumerate(qed_lambda.shape) if s == 1)
+            dlam = (dlam_4d.sum(dim=reduce_dims, keepdim=True) if reduce_dims else dlam_4d).to(qed_lambda.dtype)
+    else:
+        db = de * kh
+        dkh_tot = dkh_in + de * bf
+        dqh_tot = dqh_in
+        dlam = None
+
+    if use_qk_l2norm:
+        assert r_q is not None and r_k is not None
+        dq_hv = r_q * (dqh_tot - (dqh_tot * qh).sum(dim=-1, keepdim=True) * qh)
+        dk_hv = r_k * (dkh_tot - (dkh_tot * kh).sum(dim=-1, keepdim=True) * kh)
+    else:
+        dq_hv = dqh_tot
+        dk_hv = dkh_tot
+
+    dq = dq_hv.view(bsz, seq_len, hq, hv // hq, dk).sum(dim=3) if hq != hv else dq_hv
+    dk_out = dk_hv.view(bsz, seq_len, hk, hv // hk, dk).sum(dim=3) if hk != hv else dk_hv
+    dv = dvw_in * wf
+    dw = dvw_in * v_f
+    return (
+        dq.to(query.dtype),
+        dk_out.to(key.dtype),
+        dv.to(value.dtype),
+        dg.to(g_vec.dtype),
+        db.to(b_gate.dtype),
+        dw.to(w_gate.dtype),
+        dlam,
+    )
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _qed_dplr_prep_fwd_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        G_ptr,
+        B_ptr,
+        W_ptr,
+        LAM_ptr,
+        QH_ptr,
+        KH_ptr,
+        VW_ptr,
+        A_ptr,
+        GK_ptr,
+        EPS,
+        H_Q: tl.constexpr,
+        H_K: tl.constexpr,
+        H_V: tl.constexpr,
+        Q_GROUP: tl.constexpr,
+        K_GROUP: tl.constexpr,
+        DK: tl.constexpr,
+        DV: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+        USE_QK_L2NORM: tl.constexpr,
+        HAS_QED: tl.constexpr,
+    ):
+        pid_bt = tl.program_id(0).to(tl.int64)
+        pid_h = tl.program_id(1).to(tl.int64)
+
+        hq = pid_h // Q_GROUP
+        hk = pid_h // K_GROUP
+
+        offs_k = tl.arange(0, BLOCK_K).to(tl.int64)
+        mask_k = offs_k < DK
+
+        base_q = (pid_bt * H_Q + hq) * DK
+        base_k = (pid_bt * H_K + hk) * DK
+        base_hv_k = (pid_bt * H_V + pid_h) * DK
+        base_hv_v = (pid_bt * H_V + pid_h) * DV
+
+        q_val = tl.load(Q_ptr + base_q + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+        k_val = tl.load(K_ptr + base_k + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+        g_val = tl.load(G_ptr + base_hv_k + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+        b_val = tl.load(B_ptr + base_hv_k + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+
+        if USE_QK_L2NORM:
+            r_q = tl.rsqrt(tl.sum(q_val * q_val, axis=0) + EPS)
+            r_k = tl.rsqrt(tl.sum(k_val * k_val, axis=0) + EPS)
+            qh = q_val * r_q
+            kh = k_val * r_k
+        else:
+            qh = q_val
+            kh = k_val
+
+        if HAS_QED:
+            lam = tl.load(LAM_ptr + pid_h).to(tl.float32)
+            bq = b_val * qh
+            dot_kbq = tl.sum(kh * bq, axis=0)
+            e_val = b_val * kh + lam * (bq - dot_kbq * kh)
+        else:
+            e_val = b_val * kh
+
+        g_clamped = tl.minimum(g_val, 0.0)
+        a_val = -(e_val * tl.exp(g_clamped))
+
+        tl.store(QH_ptr + base_hv_k + offs_k, qh.to(QH_ptr.dtype.element_ty), mask=mask_k)
+        tl.store(KH_ptr + base_hv_k + offs_k, kh.to(KH_ptr.dtype.element_ty), mask=mask_k)
+        tl.store(A_ptr + base_hv_k + offs_k, a_val.to(A_ptr.dtype.element_ty), mask=mask_k)
+        tl.store(GK_ptr + base_hv_k + offs_k, g_clamped.to(GK_ptr.dtype.element_ty), mask=mask_k)
+
+        offs_v = tl.arange(0, BLOCK_V).to(tl.int64)
+        mask_v = offs_v < DV
+        v_val = tl.load(V_ptr + base_hv_v + offs_v, mask=mask_v, other=0.0).to(tl.float32)
+        w_val = tl.load(W_ptr + base_hv_v + offs_v, mask=mask_v, other=0.0).to(tl.float32)
+        vw_val = w_val * v_val
+        tl.store(VW_ptr + base_hv_v + offs_v, vw_val.to(VW_ptr.dtype.element_ty), mask=mask_v)
+
+    @triton.jit
+    def _qed_dplr_prep_bwd_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        G_ptr,
+        B_ptr,
+        W_ptr,
+        LAM_ptr,
+        DQH_ptr,
+        DKH_ptr,
+        DVW_ptr,
+        DA_ptr,
+        DGK_ptr,
+        DQ_ptr,
+        DK_ptr,
+        DV_ptr,
+        DG_ptr,
+        DB_ptr,
+        DW_ptr,
+        DLAM_BUF_ptr,
+        EPS,
+        H_Q: tl.constexpr,
+        H_K: tl.constexpr,
+        H_V: tl.constexpr,
+        Q_GROUP: tl.constexpr,
+        K_GROUP: tl.constexpr,
+        DK: tl.constexpr,
+        DV: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+        USE_QK_L2NORM: tl.constexpr,
+        HAS_QED: tl.constexpr,
+        HAS_DQH: tl.constexpr,
+        HAS_DKH: tl.constexpr,
+        HAS_DVW: tl.constexpr,
+        HAS_DA: tl.constexpr,
+        HAS_DGK: tl.constexpr,
+        NEED_DQ: tl.constexpr,
+        NEED_DK: tl.constexpr,
+        NEED_DV: tl.constexpr,
+        NEED_DG: tl.constexpr,
+        NEED_DB: tl.constexpr,
+        NEED_DW: tl.constexpr,
+        NEED_DLAM: tl.constexpr,
+    ):
+        pid_bt = tl.program_id(0).to(tl.int64)
+        pid_h = tl.program_id(1).to(tl.int64)
+
+        hq = pid_h // Q_GROUP
+        hk = pid_h // K_GROUP
+
+        offs_k = tl.arange(0, BLOCK_K).to(tl.int64)
+        mask_k = offs_k < DK
+
+        base_q = (pid_bt * H_Q + hq) * DK
+        base_k = (pid_bt * H_K + hk) * DK
+        base_hv_k = (pid_bt * H_V + pid_h) * DK
+        base_hv_v = (pid_bt * H_V + pid_h) * DV
+
+        q_val = tl.load(Q_ptr + base_q + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+        k_val = tl.load(K_ptr + base_k + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+        g_val = tl.load(G_ptr + base_hv_k + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+        b_val = tl.load(B_ptr + base_hv_k + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+
+        if USE_QK_L2NORM:
+            r_q = tl.rsqrt(tl.sum(q_val * q_val, axis=0) + EPS)
+            r_k = tl.rsqrt(tl.sum(k_val * k_val, axis=0) + EPS)
+            qh = q_val * r_q
+            kh = k_val * r_k
+        else:
+            r_q = 1.0
+            r_k = 1.0
+            qh = q_val
+            kh = k_val
+
+        if HAS_QED:
+            lam = tl.load(LAM_ptr + pid_h).to(tl.float32)
+            u = b_val * qh
+            c = tl.sum(kh * u, axis=0)
+            p = u - c * kh
+            e_val = b_val * kh + lam * p
+        else:
+            lam = 0.0
+            u = tl.zeros([BLOCK_K], dtype=tl.float32)
+            c = 0.0
+            p = tl.zeros([BLOCK_K], dtype=tl.float32)
+            e_val = b_val * kh
+
+        g_le0 = g_val <= 0.0
+        g_clamped = tl.where(g_le0, g_val, 0.0)
+        gamma = tl.exp(g_clamped)
+        a_val = -(e_val * gamma)
+
+        if HAS_DQH:
+            dqh = tl.load(DQH_ptr + base_hv_k + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+        else:
+            dqh = tl.zeros([BLOCK_K], dtype=tl.float32)
+        if HAS_DKH:
+            dkh = tl.load(DKH_ptr + base_hv_k + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+        else:
+            dkh = tl.zeros([BLOCK_K], dtype=tl.float32)
+        if HAS_DA:
+            da = tl.load(DA_ptr + base_hv_k + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+        else:
+            da = tl.zeros([BLOCK_K], dtype=tl.float32)
+        if HAS_DGK:
+            dgk = tl.load(DGK_ptr + base_hv_k + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+        else:
+            dgk = tl.zeros([BLOCK_K], dtype=tl.float32)
+
+        de = -da * gamma
+        dg_clamped = dgk + da * a_val
+        dg = tl.where(g_le0, dg_clamped, 0.0)
+
+        if HAS_QED:
+            dp = lam * de
+            dc = -tl.sum(dp * kh, axis=0)
+            du = dp + dc * kh
+            db = de * kh + du * qh
+            dkh_tot = dkh + de * b_val - c * dp + dc * u
+            dqh_tot = dqh + du * b_val
+            if NEED_DLAM:
+                dlam_tok = tl.sum(de * p, axis=0)
+                tl.store(DLAM_BUF_ptr + pid_bt * H_V + pid_h, dlam_tok)
+        else:
+            db = de * kh
+            dkh_tot = dkh + de * b_val
+            dqh_tot = dqh
+
+        if USE_QK_L2NORM:
+            dq = r_q * (dqh_tot - tl.sum(dqh_tot * qh, axis=0) * qh)
+            dk = r_k * (dkh_tot - tl.sum(dkh_tot * kh, axis=0) * kh)
+        else:
+            dq = dqh_tot
+            dk = dkh_tot
+
+        if NEED_DQ:
+            tl.store(DQ_ptr + base_hv_k + offs_k, dq.to(DQ_ptr.dtype.element_ty), mask=mask_k)
+        if NEED_DK:
+            tl.store(DK_ptr + base_hv_k + offs_k, dk.to(DK_ptr.dtype.element_ty), mask=mask_k)
+        if NEED_DG:
+            tl.store(DG_ptr + base_hv_k + offs_k, dg.to(DG_ptr.dtype.element_ty), mask=mask_k)
+        if NEED_DB:
+            tl.store(DB_ptr + base_hv_k + offs_k, db.to(DB_ptr.dtype.element_ty), mask=mask_k)
+
+        if NEED_DV or NEED_DW:
+            offs_v = tl.arange(0, BLOCK_V).to(tl.int64)
+            mask_v = offs_v < DV
+            if HAS_DVW:
+                dvw = tl.load(DVW_ptr + base_hv_v + offs_v, mask=mask_v, other=0.0).to(tl.float32)
+            else:
+                dvw = tl.zeros([BLOCK_V], dtype=tl.float32)
+            if NEED_DV:
+                w_val = tl.load(W_ptr + base_hv_v + offs_v, mask=mask_v, other=0.0).to(tl.float32)
+                tl.store(DV_ptr + base_hv_v + offs_v, (dvw * w_val).to(DV_ptr.dtype.element_ty), mask=mask_v)
+            if NEED_DW:
+                v_val = tl.load(V_ptr + base_hv_v + offs_v, mask=mask_v, other=0.0).to(tl.float32)
+                tl.store(DW_ptr + base_hv_v + offs_v, (dvw * v_val).to(DW_ptr.dtype.element_ty), mask=mask_v)
+
+    def _launch_qed_dplr_prep_fwd(
+        q_c: torch.Tensor,
+        k_c: torch.Tensor,
+        v_c: torch.Tensor,
+        g_c: torch.Tensor,
+        b_c: torch.Tensor,
+        w_c: torch.Tensor,
+        lam_1d: torch.Tensor | None,
+        *,
+        use_qk_l2norm: bool,
+        out_dtype: torch.dtype,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz, seq_len, hq, dk = q_c.shape
+        hk = k_c.shape[2]
+        hv, dv = v_c.shape[2], v_c.shape[3]
+        has_qed = lam_1d is not None
+        lam_arg = lam_1d.to(torch.float32).contiguous() if has_qed else q_c.new_empty(1, dtype=torch.float32)
+
+        q_hat = torch.empty((bsz, seq_len, hv, dk), device=q_c.device, dtype=out_dtype)
+        k_hat = torch.empty((bsz, seq_len, hv, dk), device=q_c.device, dtype=out_dtype)
+        v_w = torch.empty((bsz, seq_len, hv, dv), device=q_c.device, dtype=out_dtype)
+        a_out = torch.empty((bsz, seq_len, hv, dk), device=q_c.device, dtype=out_dtype)
+        gk_out = torch.empty((bsz, seq_len, hv, dk), device=q_c.device, dtype=torch.float32)
+
+        block_k = max(16, triton.next_power_of_2(dk))
+        block_v = max(16, triton.next_power_of_2(dv))
+        num_warps = 4 if max(block_k, block_v) <= 256 else 8
+        _qed_dplr_prep_fwd_kernel[(bsz * seq_len, hv)](
+            q_c,
+            k_c,
+            v_c,
+            g_c,
+            b_c,
+            w_c,
+            lam_arg,
+            q_hat,
+            k_hat,
+            v_w,
+            a_out,
+            gk_out,
+            float(eps),
+            H_Q=hq,
+            H_K=hk,
+            H_V=hv,
+            Q_GROUP=hv // hq,
+            K_GROUP=hv // hk,
+            DK=dk,
+            DV=dv,
+            BLOCK_K=block_k,
+            BLOCK_V=block_v,
+            USE_QK_L2NORM=use_qk_l2norm,
+            HAS_QED=has_qed,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+        return q_hat, k_hat, v_w, a_out, gk_out
+
+    class _TritonQEDDPLRPrepFn(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx: Any,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            g_vec: torch.Tensor,
+            b_gate: torch.Tensor,
+            w_gate: torch.Tensor,
+            qed_lambda: torch.Tensor | None,
+            use_qk_l2norm: bool,
+            out_dtype: torch.dtype,
+            eps: float,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            ctx.set_materialize_grads(False)
+            q_c = q.contiguous()
+            k_c = k.contiguous()
+            v_c = v.contiguous()
+            g_c = g_vec.contiguous()
+            b_c = b_gate.contiguous()
+            w_c = w_gate.contiguous()
+            lam_1d = qed_lambda.reshape(v_c.shape[2]).contiguous() if qed_lambda is not None else None
+            q_hat, k_hat, v_w, a_out, gk_out = _launch_qed_dplr_prep_fwd(
+                q_c,
+                k_c,
+                v_c,
+                g_c,
+                b_c,
+                w_c,
+                lam_1d,
+                use_qk_l2norm=use_qk_l2norm,
+                out_dtype=out_dtype,
+                eps=eps,
+            )
+            ctx.save_for_backward(q_c, k_c, v_c, g_c, b_c, w_c, lam_1d)
+            ctx.use_qk_l2norm = bool(use_qk_l2norm)
+            ctx.eps = float(eps)
+            ctx.lam_shape = None if qed_lambda is None else tuple(qed_lambda.shape)
+            ctx.lam_dtype = None if qed_lambda is None else qed_lambda.dtype
+            return q_hat, k_hat, v_w, a_out, gk_out
+
+        @staticmethod
+        def backward(
+            ctx: Any,
+            dq_hat: torch.Tensor | None,
+            dk_hat: torch.Tensor | None,
+            dv_w: torch.Tensor | None,
+            da: torch.Tensor | None,
+            dgk: torch.Tensor | None,
+        ) -> tuple[Any, ...]:
+            need_dq, need_dk, need_dv, need_dg, need_db, need_dw, need_dlam = ctx.needs_input_grad[:7]
+            if not any((need_dq, need_dk, need_dv, need_dg, need_db, need_dw, need_dlam)):
+                return (None,) * 10
+
+            q_c, k_c, v_c, g_c, b_c, w_c, lam_1d = ctx.saved_tensors
+            bsz, seq_len, hq, dk = q_c.shape
+            hk = k_c.shape[2]
+            hv, dv = v_c.shape[2], v_c.shape[3]
+            has_qed = lam_1d is not None
+            need_dlam = bool(need_dlam and has_qed)
+
+            dummy = q_c.new_empty(1, dtype=torch.float32)
+            lam_arg = lam_1d.to(torch.float32).contiguous() if has_qed else dummy
+            dqh_c = dq_hat.contiguous() if dq_hat is not None else dummy
+            dkh_c = dk_hat.contiguous() if dk_hat is not None else dummy
+            dvw_c = dv_w.contiguous() if dv_w is not None else dummy
+            da_c = da.contiguous() if da is not None else dummy
+            dgk_c = dgk.contiguous() if dgk is not None else dummy
+
+            if need_dq:
+                dq_buf = torch.empty(
+                    (bsz, seq_len, hv, dk),
+                    device=q_c.device,
+                    dtype=torch.float32 if hq != hv else q_c.dtype,
+                )
+            else:
+                dq_buf = dummy
+            if need_dk:
+                dk_buf = torch.empty(
+                    (bsz, seq_len, hv, dk),
+                    device=k_c.device,
+                    dtype=torch.float32 if hk != hv else k_c.dtype,
+                )
+            else:
+                dk_buf = dummy
+            dv_out = torch.empty_like(v_c) if need_dv else dummy
+            dg_out = torch.empty_like(g_c) if need_dg else dummy
+            db_out = torch.empty_like(b_c) if need_db else dummy
+            dw_out = torch.empty_like(w_c) if need_dw else dummy
+            dlam_buf = torch.empty((bsz, seq_len, hv), device=q_c.device, dtype=torch.float32) if need_dlam else dummy
+
+            block_k = max(16, triton.next_power_of_2(dk))
+            block_v = max(16, triton.next_power_of_2(dv))
+            num_warps = 4 if max(block_k, block_v) <= 256 else 8
+            _qed_dplr_prep_bwd_kernel[(bsz * seq_len, hv)](
+                q_c,
+                k_c,
+                v_c,
+                g_c,
+                b_c,
+                w_c,
+                lam_arg,
+                dqh_c,
+                dkh_c,
+                dvw_c,
+                da_c,
+                dgk_c,
+                dq_buf,
+                dk_buf,
+                dv_out,
+                dg_out,
+                db_out,
+                dw_out,
+                dlam_buf,
+                float(ctx.eps),
+                H_Q=hq,
+                H_K=hk,
+                H_V=hv,
+                Q_GROUP=hv // hq,
+                K_GROUP=hv // hk,
+                DK=dk,
+                DV=dv,
+                BLOCK_K=block_k,
+                BLOCK_V=block_v,
+                USE_QK_L2NORM=ctx.use_qk_l2norm,
+                HAS_QED=has_qed,
+                HAS_DQH=dq_hat is not None,
+                HAS_DKH=dk_hat is not None,
+                HAS_DVW=dv_w is not None,
+                HAS_DA=da is not None,
+                HAS_DGK=dgk is not None,
+                NEED_DQ=need_dq,
+                NEED_DK=need_dk,
+                NEED_DV=need_dv,
+                NEED_DG=need_dg,
+                NEED_DB=need_db,
+                NEED_DW=need_dw,
+                NEED_DLAM=need_dlam,
+                num_warps=num_warps,
+                num_stages=1,
+            )
+
+            dq_res: torch.Tensor | None = None
+            if need_dq:
+                dq_res = dq_buf.view(bsz, seq_len, hq, hv // hq, dk).sum(dim=3).to(q_c.dtype) if hq != hv else dq_buf
+            dk_res: torch.Tensor | None = None
+            if need_dk:
+                dk_res = dk_buf.view(bsz, seq_len, hk, hv // hk, dk).sum(dim=3).to(k_c.dtype) if hk != hv else dk_buf
+            dlam_res: torch.Tensor | None = None
+            if need_dlam:
+                assert ctx.lam_shape is not None and ctx.lam_dtype is not None
+                dlam_res = dlam_buf.sum(dim=(0, 1)).to(ctx.lam_dtype).reshape(ctx.lam_shape)
+            return (
+                dq_res,
+                dk_res,
+                dv_out if need_dv else None,
+                dg_out if need_dg else None,
+                db_out if need_db else None,
+                dw_out if need_dw else None,
+                dlam_res,
+                None,
+                None,
+                None,
+            )
+
+
+def _can_use_triton_prep(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g_vec: torch.Tensor,
+    b_gate: torch.Tensor,
+    w_gate: torch.Tensor,
+    qed_lambda: torch.Tensor | None,
+    out_dtype: torch.dtype,
+) -> bool:
+    if not _HAS_TRITON or _is_compiling() or not query.is_cuda:
+        return False
+    ok_dts = (torch.bfloat16, torch.float16, torch.float32)
+    if out_dtype not in ok_dts:
+        return False
+    for t in (query, key, value, g_vec, b_gate, w_gate):
+        if not t.is_cuda or t.dtype not in ok_dts:
+            return False
+    bsz, seq_len, hq, dk = query.shape
+    hk = key.shape[2]
+    hv, dv = value.shape[2], value.shape[3]
+    if bsz * seq_len == 0 or dk > 1024 or dv > 1024 or hv % hq != 0 or hv % hk != 0:
+        return False
+    if g_vec.shape != (bsz, seq_len, hv, dk) or b_gate.shape != (bsz, seq_len, hv, dk):
+        return False
+    if w_gate.shape != (bsz, seq_len, hv, dv):
+        return False
+    return not (
+        qed_lambda is not None
+        and (qed_lambda.numel() != hv or not qed_lambda.is_cuda or qed_lambda.dtype not in ok_dts)
+    )
+
+
+def qed_dplr_prep(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g_vec: torch.Tensor,
+    b_gate: torch.Tensor,
+    w_gate: torch.Tensor,
+    qed_lambda: torch.Tensor | None = None,
+    *,
+    use_qk_l2norm: bool = False,
+    out_dtype: torch.dtype | None = None,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused QED+DPLR prep returning `(q_hat, k_hat, v_w, a, gk)` via Triton on CUDA or PyTorch fallback."""
+    dst_dt = query.dtype if out_dtype is None else out_dtype
+    if _can_use_triton_prep(query, key, value, g_vec, b_gate, w_gate, qed_lambda, dst_dt):
+        if not torch.is_grad_enabled():
+            lam_1d = qed_lambda.reshape(value.shape[2]).contiguous() if qed_lambda is not None else None
+            return _launch_qed_dplr_prep_fwd(
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+                g_vec.contiguous(),
+                b_gate.contiguous(),
+                w_gate.contiguous(),
+                lam_1d,
+                use_qk_l2norm=use_qk_l2norm,
+                out_dtype=dst_dt,
+                eps=eps,
+            )
+        return _TritonQEDDPLRPrepFn.apply(
+            query,
+            key,
+            value,
+            g_vec,
+            b_gate,
+            w_gate,
+            qed_lambda,
+            bool(use_qk_l2norm),
+            dst_dt,
+            float(eps),
+        )
+    return qed_dplr_prep_pytorch(
+        query,
+        key,
+        value,
+        g_vec,
+        b_gate,
+        w_gate,
+        qed_lambda,
+        use_qk_l2norm=use_qk_l2norm,
+        out_dtype=dst_dt,
+        eps=eps,
+    )
+
+
+# ============================================================================ FLA backend resolution & dispatch
+
+_FLA_DPLR_CACHE: tuple[bool, Any, Any] | None = None
+_FLA_GDN2_CACHE: tuple[bool, Any, Any] | None = None
+
+
+def _get_fla_dplr_ops() -> tuple[Callable[..., Any], Callable[..., Any]] | None:
+    global _FLA_DPLR_CACHE
+    if _FLA_DPLR_CACHE is None:
+        try:
+            from fla.ops.generalized_delta_rule.dplr import (  # type: ignore[import-not-found]
+                chunk_dplr_delta_rule,
+                fused_recurrent_dplr_delta_rule,
+            )
+
+            _FLA_DPLR_CACHE = (True, chunk_dplr_delta_rule, fused_recurrent_dplr_delta_rule)
+        except Exception:
+            _FLA_DPLR_CACHE = (False, None, None)
+    ok, chunk_fn, rec_fn = _FLA_DPLR_CACHE
+    return (chunk_fn, rec_fn) if ok else None
+
+
+def _get_fla_gdn2_ops() -> tuple[Callable[..., Any], Callable[..., Any]] | None:
+    global _FLA_GDN2_CACHE
+    if _FLA_GDN2_CACHE is None:
+        try:
+            from fla.ops.gdn2 import (  # type: ignore[import-not-found]
+                chunk_gdn2 as fla_chunk_gdn2,
+            )
+            from fla.ops.gdn2 import (
+                fused_recurrent_gdn2 as fla_fused_recurrent_gdn2,
+            )
+
+            _FLA_GDN2_CACHE = (True, fla_chunk_gdn2, fla_fused_recurrent_gdn2)
+        except Exception:
+            _FLA_GDN2_CACHE = (False, None, None)
+    ok, chunk_fn, rec_fn = _FLA_GDN2_CACHE
+    return (chunk_fn, rec_fn) if ok else None
+
+
+def _is_fla_eligible_tensor(q: torch.Tensor) -> bool:
+    return bool(q.is_cuda and q.dtype in (torch.bfloat16, torch.float16, torch.float32))
+
+
+def _resolve_backend(backend: str, has_qed: bool, query: torch.Tensor) -> str:
+    if backend not in _VALID_BACKENDS:
+        raise ValueError(f"gdn2.backend must be one of {sorted(_VALID_BACKENDS)}, got {backend!r}")
+    if backend == "pytorch" or not _is_fla_eligible_tensor(query):
+        return "pytorch"
+    if backend == "dplr":
+        return "dplr" if _get_fla_dplr_ops() is not None else "pytorch"
+    if backend == "fla_gdn2":
+        if has_qed:
+            return "dplr" if _get_fla_dplr_ops() is not None else "pytorch"
+        if _get_fla_gdn2_ops() is not None:
+            return "fla_gdn2"
+        if _get_fla_dplr_ops() is not None:
+            return "dplr"
+        return "pytorch"
+    # backend == "auto"
+    if has_qed:
+        return "dplr" if _get_fla_dplr_ops() is not None else "pytorch"
+    if _get_fla_gdn2_ops() is not None:
+        return "fla_gdn2"
+    if _get_fla_dplr_ops() is not None:
+        return "dplr"
+    return "pytorch"
+
+
+def _run_fla_dplr(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g_vec: torch.Tensor,
+    b_gate: torch.Tensor,
+    w_gate: torch.Tensor,
+    qed_lambda: torch.Tensor | None,
+    *,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    use_qk_l2norm_in_kernel: bool,
+    scale: float | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ops = _get_fla_dplr_ops()
+    assert ops is not None
+    chunk_dplr, rec_dplr = ops
+    init_dtype = query.dtype
+    seq_len = int(query.shape[1])
+    dk = int(query.shape[-1])
+    sc = (dk ** -0.5) if scale is None else float(scale)
+
+    q_hat, k_hat, v_w, a, gk = qed_dplr_prep(
+        query,
+        key,
+        value,
+        g_vec,
+        b_gate,
+        w_gate,
+        qed_lambda,
+        use_qk_l2norm=use_qk_l2norm_in_kernel,
+        out_dtype=init_dtype,
+    )
+    init_st = initial_state.to(torch.float32).contiguous() if initial_state is not None else None
+    # `fused_recurrent_dplr_delta_rule` is inference-only in fla 0.6.0 (raises NotImplementedError on backward).
+    if seq_len == 1 and not torch.is_grad_enabled():
+        out, final_state = rec_dplr(
+            q=q_hat,
+            k=k_hat,
+            v=v_w,
+            a=a,
+            b=k_hat,
+            gk=gk,
+            scale=sc,
+            initial_state=init_st,
+            output_final_state=output_final_state,
+        )
+    else:
+        out, final_state = chunk_dplr(
+            q=q_hat,
+            k=k_hat,
+            v=v_w,
+            a=a,
+            b=k_hat,
+            gk=gk,
+            scale=sc,
+            initial_state=init_st,
+            output_final_state=output_final_state,
+        )
+    return out.to(init_dtype), (final_state if output_final_state else None)
+
+
+def _run_fla_gdn2(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g_vec: torch.Tensor,
+    b_gate: torch.Tensor,
+    w_gate: torch.Tensor,
+    *,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    use_qk_l2norm_in_kernel: bool,
+    scale: float | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ops = _get_fla_gdn2_ops()
+    assert ops is not None
+    fla_chunk, fla_rec = ops
+    init_dtype = query.dtype
+    seq_len = int(query.shape[1])
+    hv = int(value.shape[2])
+    dk = int(query.shape[-1])
+    sc = (dk ** -0.5) if scale is None else float(scale)
+
+    q = query
+    k = key
+    if q.shape[2] != hv:
+        require(hv % q.shape[2] == 0, "num_v_heads must be divisible by num_q_heads", q=q, v=value)
+        q = q.repeat_interleave(hv // q.shape[2], dim=2)
+    if k.shape[2] != hv:
+        require(hv % k.shape[2] == 0, "num_v_heads must be divisible by num_k_heads", k=k, v=value)
+        k = k.repeat_interleave(hv // k.shape[2], dim=2)
+
+    q_c = q.to(init_dtype).contiguous()
+    k_c = k.to(init_dtype).contiguous()
+    v_c = value.to(init_dtype).contiguous()
+    g_c = g_vec.clamp(max=0.0).to(torch.float32).contiguous()
+    b_c = b_gate.to(init_dtype).contiguous()
+    w_c = w_gate.to(init_dtype).contiguous()
+    init_st = initial_state.to(torch.float32).contiguous() if initial_state is not None else None
+
+    if seq_len == 1 and not torch.is_grad_enabled():
+        out, final_state = fla_rec(
+            q=q_c,
+            k=k_c,
+            v=v_c,
+            g=g_c,
+            b=b_c,
+            w=w_c,
+            scale=sc,
+            initial_state=init_st,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+    else:
+        out, final_state = fla_chunk(
+            q=q_c,
+            k=k_c,
+            v=v_c,
+            g=g_c,
+            b=b_c,
+            w=w_c,
+            scale=sc,
+            initial_state=init_st,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+    return out.to(init_dtype), (final_state if output_final_state else None)
+
+
+# ============================================================================ pure-PyTorch & public kernels
+
+def _recurrent_gdn2_pytorch(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g_vec: torch.Tensor,
+    b_gate: torch.Tensor,
+    w_gate: torch.Tensor,
+    *,
+    qed_lambda: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    init_dtype = query.dtype
+    q_hat, k_hat, v = _prepare_qkv_unscaled(query, key, value, use_qk_l2norm_in_kernel)
+    sc = (k_hat.shape[-1] ** -0.5) if scale is None else float(scale)
+    q_read = q_hat * sc if sc != 1.0 else q_hat
+    gf = upcast(g_vec).clamp(max=0.0)
+    bf, wf = upcast(b_gate), upcast(w_gate)
+    ef = _compute_qed_erase(q_hat, k_hat, bf, qed_lambda)
+    bsz, seq_len, hv, dk = k_hat.shape
+    dv = v.shape[-1]
+    state = q_hat.new_zeros(bsz, hv, dk, dv) if initial_state is None else upcast(initial_state).clone()
+    outs = []
+    for i in range(seq_len):
+        d_t = gf[:, i].exp()                                  # [B, H_v, d_k]
+        state = state * d_t.unsqueeze(-1)                     # Diag(exp(g_t)) S_{t-1}
+        k_t, v_t = k_hat[:, i], v[:, i]
+        e_t = ef[:, i]                                        # [B, H_v, d_k]
+        z_t = wf[:, i] * v_t                                  # [B, H_v, d_v]
+        mem = (state * e_t.unsqueeze(-1)).sum(dim=-2)         # [B, H_v, d_v]
+        u_t = z_t - mem
+        state = state + k_t.unsqueeze(-1) * u_t.unsqueeze(-2)
+        outs.append((state * q_read[:, i].unsqueeze(-1)).sum(dim=-2))
+    out = torch.stack(outs, dim=1).to(init_dtype)
+    return out, (state if output_final_state else None)
 
 
 def recurrent_gdn2(
@@ -142,40 +1208,64 @@ def recurrent_gdn2(
     b_gate: torch.Tensor,
     w_gate: torch.Tensor,
     *,
+    qed_lambda: torch.Tensor | None = None,
+    backend: str = "auto",
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Sequential O(1)-state Gated Delta Rule-2 kernel (autoregressive decode & exact reference).
+    """Sequential O(1)-state Gated Delta Rule-2 (+ optional QED) kernel (decode & exact reference).
 
     Shapes:
         query, key: [B, T, H_k_or_v, d_k]
         value:      [B, T, H_v, d_v]
         g_vec:      [B, T, H_v, d_k]  (channel-wise log-decay <= 0)
-        b_gate:     [B, T, H_v, d_k]  (channel-wise erase gate in [0, 1])
+        b_gate:     [B, T, H_v, d_k]  (channel-wise erase gate in [0, 2])
         w_gate:     [B, T, H_v, d_v]  (channel-wise write gate in [0, 1])
+        qed_lambda: optional [H_v]    (bounded per-head QED coupling)
     """
-    init_dtype = query.dtype
-    q, k, v = _prepare_qkv(query, key, value, use_qk_l2norm_in_kernel, scale)
-    gf = upcast(g_vec).clamp(max=0.0)
-    bf, wf = upcast(b_gate), upcast(w_gate)
-    bsz, seq_len, hv, dk = k.shape
-    dv = v.shape[-1]
-    state = q.new_zeros(bsz, hv, dk, dv) if initial_state is None else upcast(initial_state).clone()
-    outs = []
-    for i in range(seq_len):
-        d_t = gf[:, i].exp()                                  # [B, H_v, d_k]
-        state = state * d_t.unsqueeze(-1)                     # Diag(exp(g_t)) S_{t-1}
-        k_t, v_t = k[:, i], v[:, i]
-        e_t = bf[:, i] * k_t                                  # [B, H_v, d_k]
-        z_t = wf[:, i] * v_t                                  # [B, H_v, d_v]
-        mem = (state * e_t.unsqueeze(-1)).sum(dim=-2)         # [B, H_v, d_v]
-        u_t = z_t - mem
-        state = state + k_t.unsqueeze(-1) * u_t.unsqueeze(-2)
-        outs.append((state * q[:, i].unsqueeze(-1)).sum(dim=-2))
-    out = torch.stack(outs, dim=1).to(init_dtype)
-    return out, (state if output_final_state else None)
+    resolved = _resolve_backend(backend, qed_lambda is not None, query)
+    if resolved == "dplr":
+        return _run_fla_dplr(
+            query,
+            key,
+            value,
+            g_vec,
+            b_gate,
+            w_gate,
+            qed_lambda,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+        )
+    if resolved == "fla_gdn2":
+        return _run_fla_gdn2(
+            query,
+            key,
+            value,
+            g_vec,
+            b_gate,
+            w_gate,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+        )
+    return _recurrent_gdn2_pytorch(
+        query,
+        key,
+        value,
+        g_vec,
+        b_gate,
+        w_gate,
+        qed_lambda=qed_lambda,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        scale=scale,
+    )
 
 
 def _decayed_gram_fallback(
@@ -199,31 +1289,39 @@ def _decayed_gram_fallback(
 
 
 def _wy_segment(
-    q: torch.Tensor,
-    k: torch.Tensor,
+    q_hat: torch.Tensor,
+    k_hat: torch.Tensor,
     v: torch.Tensor,
     gf: torch.Tensor,
     bf: torch.Tensor,
     wf: torch.Tensor,
     state: torch.Tensor,
     chunk_size: int,
+    qed_lambda: torch.Tensor | None = None,
+    scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Chunkwise WY GDN-2 forward over one padded macro-segment (`T_seg = n_chunks * chunk_size`)."""
-    bsz, t_seg, hv, dk = k.shape
+    """Chunkwise WY GDN-2 (+ QED) forward over one padded macro-segment (`T_seg = n_chunks * chunk_size`).
+
+    `q_hat` and `k_hat` are UNSCALED unit-norm vectors; `scale` is applied only to the readout query.
+    Works identically for any erase direction `e_t` (including QED) and any `b_gate` in `[0, 2]`.
+    """
+    bsz, t_seg, hv, dk = k_hat.shape
     dv = v.shape[-1]
     nc = t_seg // chunk_size
     c = chunk_size
 
+    ef = _compute_qed_erase(q_hat, k_hat, bf, qed_lambda)
+    q_read = q_hat * scale if scale != 1.0 else q_hat
+
     # Reshape to [B, H_v, N_c, C, D] for batched Tensor-Core matmuls
-    qc = q.transpose(1, 2).reshape(bsz, hv, nc, c, dk)
-    kc = k.transpose(1, 2).reshape(bsz, hv, nc, c, dk)
+    qc = q_read.transpose(1, 2).reshape(bsz, hv, nc, c, dk)
+    kc = k_hat.transpose(1, 2).reshape(bsz, hv, nc, c, dk)
     vc = v.transpose(1, 2).reshape(bsz, hv, nc, c, dv)
     gc = gf.transpose(1, 2).reshape(bsz, hv, nc, c, dk)
-    bc = bf.transpose(1, 2).reshape(bsz, hv, nc, c, dk)
+    ec = ef.transpose(1, 2).reshape(bsz, hv, nc, c, dk)
     wc = wf.transpose(1, 2).reshape(bsz, hv, nc, c, dv)
 
     gamma = gc.cumsum(dim=-2)                                 # [B, H_v, N_c, C, d_k], <= 0
-    ec = bc * kc                                              # asymmetric erase keys
     zc = wc * vc                                              # gated write values
     exp_gamma = gamma.exp()
     e_bar = ec * exp_gamma
@@ -243,7 +1341,7 @@ def _wy_segment(
         l_mat = _decayed_gram_fallback(ec, kc, gamma, strict_lower=True)
         m_mat = _decayed_gram_fallback(qc, kc, gamma, strict_lower=False)
 
-    eye = torch.eye(c, device=q.device, dtype=q.dtype)
+    eye = torch.eye(c, device=q_hat.device, dtype=q_hat.dtype)
     rhs = torch.cat([e_bar, zc], dim=-1)                      # [B, H_v, N_c, C, d_k + d_v]
     wu = torch.linalg.solve_triangular(eye + l_mat, rhs, upper=False, unitriangular=True)
     w_wy, u_wy = wu.split([dk, dv], dim=-1)
@@ -271,6 +1369,8 @@ def chunk_gdn2(
     b_gate: torch.Tensor,
     w_gate: torch.Tensor,
     *,
+    qed_lambda: torch.Tensor | None = None,
+    backend: str = "auto",
     chunk_size: int = 64,
     segment_chunks: int = 16,
     checkpoint_segments: bool = True,
@@ -279,11 +1379,24 @@ def chunk_gdn2(
     use_qk_l2norm_in_kernel: bool = False,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Parallel chunkwise WY Gated DeltaNet-2 kernel (`O(T)` prefill & training)."""
-    init_dtype = query.dtype
-    seq_len = query.shape[1]
-    if seq_len == 1:
-        return recurrent_gdn2(
+    """Parallel chunkwise Gated DeltaNet-2 (+ QED) kernel (`fla` DPLR / `fla.ops.gdn2` / PyTorch WY)."""
+    resolved = _resolve_backend(backend, qed_lambda is not None, query)
+    if resolved == "dplr":
+        return _run_fla_dplr(
+            query,
+            key,
+            value,
+            g_vec,
+            b_gate,
+            w_gate,
+            qed_lambda,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+        )
+    if resolved == "fla_gdn2":
+        return _run_fla_gdn2(
             query,
             key,
             value,
@@ -296,7 +1409,25 @@ def chunk_gdn2(
             scale=scale,
         )
 
-    q, k, v = _prepare_qkv(query, key, value, use_qk_l2norm_in_kernel, scale)
+    init_dtype = query.dtype
+    seq_len = int(query.shape[1])
+    if seq_len == 1:
+        return _recurrent_gdn2_pytorch(
+            query,
+            key,
+            value,
+            g_vec,
+            b_gate,
+            w_gate,
+            qed_lambda=qed_lambda,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+        )
+
+    q_hat, k_hat, v = _prepare_qkv_unscaled(query, key, value, use_qk_l2norm_in_kernel)
+    sc = (k_hat.shape[-1] ** -0.5) if scale is None else float(scale)
     gf = upcast(g_vec).clamp(max=0.0)
     bf, wf = upcast(b_gate), upcast(w_gate)
 
@@ -304,34 +1435,47 @@ def chunk_gdn2(
     pad = (c - (seq_len % c)) % c
     if pad:
         # Zero-padding (q=0, k=0, v=0, g=0, b=0, w=0) leaves the recurrent state S_t invariant
-        # for t >= seq_len: S_t = (I - 0) * Diag(exp(0)) * S_{t-1} + 0 = S_{t-1}.
-        q = F.pad(q, (0, 0, 0, 0, 0, pad))
-        k = F.pad(k, (0, 0, 0, 0, 0, pad))
+        # for t >= seq_len even with non-zero qed_lambda: e_t = 0, k_t = 0, g_t = 0 => S_t = S_{t-1}.
+        q_hat = F.pad(q_hat, (0, 0, 0, 0, 0, pad))
+        k_hat = F.pad(k_hat, (0, 0, 0, 0, 0, pad))
         v = F.pad(v, (0, 0, 0, 0, 0, pad))
         gf = F.pad(gf, (0, 0, 0, 0, 0, pad))
         bf = F.pad(bf, (0, 0, 0, 0, 0, pad))
         wf = F.pad(wf, (0, 0, 0, 0, 0, pad))
 
-    bsz, t_pad, hv, dk = k.shape
+    bsz, t_pad, hv, dk = k_hat.shape
     dv = v.shape[-1]
-    state = q.new_zeros(bsz, hv, dk, dv) if initial_state is None else upcast(initial_state).clone()
+    state = q_hat.new_zeros(bsz, hv, dk, dv) if initial_state is None else upcast(initial_state).clone()
 
     seg_len = max(c, int(segment_chunks) * c)
-    need_grad = any(t.requires_grad for t in (q, k, v, gf, bf, wf, state))
+    grad_tensors = (q_hat, k_hat, v, gf, bf, wf, state) + ((qed_lambda,) if qed_lambda is not None else ())
+    need_grad = any(t.requires_grad for t in grad_tensors)
     use_ckpt = bool(checkpoint_segments and torch.is_grad_enabled() and need_grad and t_pad > seg_len)
 
     seg_outs = []
     for s0 in range(0, t_pad, seg_len):
         s1 = min(t_pad, s0 + seg_len)
-        args = (q[:, s0:s1], k[:, s0:s1], v[:, s0:s1], gf[:, s0:s1], bf[:, s0:s1], wf[:, s0:s1], state)
+        base_args = (q_hat[:, s0:s1], k_hat[:, s0:s1], v[:, s0:s1], gf[:, s0:s1], bf[:, s0:s1], wf[:, s0:s1], state)
         if use_ckpt:
-            o_seg, state = checkpoint(
-                lambda qc, kc, vc, gc, bc, wc, st, cs=c: _wy_segment(qc, kc, vc, gc, bc, wc, st, cs),
-                *args,
-                use_reentrant=False,
-            )
+            if qed_lambda is not None:
+                o_seg, state = checkpoint(
+                    lambda qc, kc, vc, gc, bc, wc, st, lam, cs=c, s=sc: _wy_segment(
+                        qc, kc, vc, gc, bc, wc, st, cs, qed_lambda=lam, scale=s
+                    ),
+                    *base_args,
+                    qed_lambda,
+                    use_reentrant=False,
+                )
+            else:
+                o_seg, state = checkpoint(
+                    lambda qc, kc, vc, gc, bc, wc, st, cs=c, s=sc: _wy_segment(
+                        qc, kc, vc, gc, bc, wc, st, cs, qed_lambda=None, scale=s
+                    ),
+                    *base_args,
+                    use_reentrant=False,
+                )
         else:
-            o_seg, state = _wy_segment(*args, chunk_size=c)
+            o_seg, state = _wy_segment(*base_args, chunk_size=c, qed_lambda=qed_lambda, scale=sc)
         seg_outs.append(o_seg)
 
     out = (seg_outs[0] if len(seg_outs) == 1 else torch.cat(seg_outs, dim=1))[:, :seq_len].to(init_dtype)
@@ -341,7 +1485,7 @@ def chunk_gdn2(
 # ============================================================================ adapter & retrofit
 
 class GDN2Adapter(nn.Module):
-    """Zero-initialized low-rank channel-wise Erase / Write / Decay projector for one GDN layer."""
+    """Zero-initialized low-rank channel-wise Erase / Write / Decay (+ QED + soft neg-eigval) projector."""
 
     def __init__(
         self,
@@ -368,17 +1512,59 @@ class GDN2Adapter(nn.Module):
         self.write_up = nn.Linear(eff_rank, self.num_v_heads * self.head_v_dim, bias=False)
         self.decay_up = nn.Linear(eff_rank, self.num_v_heads * self.head_k_dim, bias=False)
 
+        if cfg.qed_enabled:
+            self.qed_lambda_raw: nn.Parameter | None = nn.Parameter(torch.zeros(self.num_v_heads))
+        else:
+            self.register_parameter("qed_lambda_raw", None)
+
+        if float(cfg.neg_eigval_max_boost) > 0.0:
+            self.neg_gamma_raw: nn.Parameter | None = nn.Parameter(torch.zeros(self.num_v_heads))
+        else:
+            self.register_parameter("neg_gamma_raw", None)
+
         nn.init.normal_(self.down.weight, mean=0.0, std=1.0 / math.sqrt(self.hidden_size))
         nn.init.zeros_(self.erase_up.weight)
         nn.init.zeros_(self.write_up.weight)
         nn.init.zeros_(self.decay_up.weight)
-        self.last_stats: dict[str, float] = {}
+        self._last_stats: dict[str, float] = {}
+        self._pending_stat_tensors: dict[str, torch.Tensor] = {}
+
+    @property
+    def last_stats(self) -> dict[str, float]:
+        if self._pending_stat_tensors:
+            for k, t in self._pending_stat_tensors.items():
+                self._last_stats[k] = float(t)
+            self._pending_stat_tensors.clear()
+        return self._last_stats
+
+    @last_stats.setter
+    def last_stats(self, value: dict[str, float]) -> None:
+        self._pending_stat_tensors.clear()
+        self._last_stats = dict(value)
+
+    def _set_zero_stats(self) -> None:
+        self._pending_stat_tensors.clear()
+        self._last_stats["erase_write_l1"] = 0.0
+        self._last_stats["decay_spread"] = 0.0
+        self._last_stats["decay_horizon_mult_max"] = 1.0
 
     def is_zero(self) -> bool:
         with torch.no_grad():
-            return not bool(
-                self.erase_up.weight.any() or self.write_up.weight.any() or self.decay_up.weight.any()
-            )
+            if self.erase_up.weight.any() or self.write_up.weight.any() or self.decay_up.weight.any():
+                return False
+            if self.qed_lambda_raw is not None and self.qed_lambda_raw.any():
+                return False
+            return not (self.neg_gamma_raw is not None and self.neg_gamma_raw.any())
+
+    def qed_lambda(self) -> torch.Tensor | None:
+        if self.qed_lambda_raw is None:
+            return None
+        return float(self.cfg.qed_max_lambda) * torch.tanh(upcast(self.qed_lambda_raw))
+
+    def neg_eigval_scale(self) -> torch.Tensor | None:
+        if self.neg_gamma_raw is None:
+            return None
+        return 1.0 + float(self.cfg.neg_eigval_max_boost) * torch.tanh(upcast(self.neg_gamma_raw))
 
     def compute_gates(
         self,
@@ -392,26 +1578,47 @@ class GDN2Adapter(nn.Module):
         xf = upcast(x_in)
         h = F.silu(F.linear(xf, upcast(self.down.weight)))
         cap_g = float(self.cfg.gate_logit_cap)
-        cap_d = float(self.cfg.decay_log_cap)
 
         d_erase = (cap_g * torch.tanh(F.linear(h, upcast(self.erase_up.weight)))).view(bsz, seq_len, hv, dk)
         d_write = (cap_g * torch.tanh(F.linear(h, upcast(self.write_up.weight)))).view(bsz, seq_len, hv, dv)
-        d_decay = (cap_d * torch.tanh(F.linear(h, upcast(self.decay_up.weight)))).view(bsz, seq_len, hv, dk)
+        d_raw = F.linear(h, upcast(self.decay_up.weight)).view(bsz, seq_len, hv, dk)
+        if self.cfg.decay_log_min is not None or self.cfg.decay_log_max is not None:
+            cap_min = (
+                float(self.cfg.decay_log_min)
+                if self.cfg.decay_log_min is not None
+                else -float(self.cfg.decay_log_cap)
+            )
+            cap_max = (
+                float(self.cfg.decay_log_max)
+                if self.cfg.decay_log_max is not None
+                else float(self.cfg.decay_log_cap)
+            )
+            d_decay = asymmetric_tanh_bound(d_raw, cap_min, cap_max)
+        else:
+            d_decay = float(self.cfg.decay_log_cap) * torch.tanh(d_raw)
 
         beta_f = upcast(beta_base).clamp(0.0, 1.0).unsqueeze(-1)
         b_gate = logistic_shift(beta_f, d_erase)
+        b_scale = self.neg_eigval_scale()
+        if b_scale is not None:
+            b_gate = b_gate * b_scale.to(dtype=b_gate.dtype, device=b_gate.device).view(1, 1, hv, 1)
         w_gate = logistic_shift(beta_f, d_write)
         g_vec = upcast(g_base).clamp(max=0.0).unsqueeze(-1) * d_decay.exp()
 
-        if not _in_backward():
+        # Defer host syncs until `stats()` is read; skip extra stat kernels on no-grad T=1 decode.
+        if not _in_backward() and (seq_len > 1 or torch.is_grad_enabled()):
             with torch.no_grad():
                 if dk == dv:
-                    ew_diff = float((b_gate.detach() - w_gate.detach()).abs().mean())
+                    ew_diff = (b_gate.detach() - w_gate.detach()).abs().mean()
                 else:
-                    ew_diff = float((b_gate.detach().mean(-1) - w_gate.detach().mean(-1)).abs().mean())
-                d_std = float(g_vec.detach().exp().std(dim=-1, unbiased=False).mean())
-                self.last_stats["erase_write_l1"] = ew_diff
-                self.last_stats["decay_spread"] = d_std
+                    ew_diff = (b_gate.detach().mean(-1) - w_gate.detach().mean(-1)).abs().mean()
+                d_std = g_vec.detach().exp().std(dim=-1, unbiased=False).mean()
+                h_mult_max = (-d_decay.detach().min()).exp()
+                self._pending_stat_tensors = {
+                    "erase_write_l1": ew_diff,
+                    "decay_spread": d_std,
+                    "decay_horizon_mult_max": h_mult_max,
+                }
         return g_vec, b_gate, w_gate
 
 
@@ -491,23 +1698,48 @@ class GDN2Manager:
     def stats(self) -> dict[str, float]:
         if not self.adapters:
             return {}
-        ew_vals = [
-            ad.last_stats["erase_write_l1"] for ad in self.adapters.values() if "erase_write_l1" in ad.last_stats
-        ]
-        ds_vals = [ad.last_stats["decay_spread"] for ad in self.adapters.values() if "decay_spread" in ad.last_stats]
+        ew_vals: list[float] = []
+        ds_vals: list[float] = []
+        hm_vals: list[float] = []
+        qed_abs_vals: list[float] = []
+        neg_scale_vals: list[float] = []
+        norms: list[float] = []
         with torch.no_grad():
-            norms = [
-                float(
-                    (
-                        ad.erase_up.weight.float().norm()
-                        + ad.write_up.weight.float().norm()
-                        + ad.decay_up.weight.float().norm()
-                    )
-                    / 3.0
-                )
-                for ad in self.adapters.values()
-            ]
-        out: dict[str, float] = {"gdn2/adapter_norm": sum(norms) / len(norms)}
+            for ad in self.adapters.values():
+                ls = ad.last_stats
+                if "erase_write_l1" in ls:
+                    ew_vals.append(ls["erase_write_l1"])
+                if "decay_spread" in ls:
+                    ds_vals.append(ls["decay_spread"])
+                if "decay_horizon_mult_max" in ls:
+                    hm_vals.append(ls["decay_horizon_mult_max"])
+
+                norm_parts = [
+                    ad.erase_up.weight.float().norm(),
+                    ad.write_up.weight.float().norm(),
+                    ad.decay_up.weight.float().norm(),
+                ]
+                if ad.qed_lambda_raw is not None:
+                    norm_parts.append(ad.qed_lambda_raw.float().norm())
+                    lam_eff = float(ad.cfg.qed_max_lambda) * torch.tanh(ad.qed_lambda_raw.float())
+                    qed_abs_vals.append(float(lam_eff.abs().mean()))
+                else:
+                    qed_abs_vals.append(0.0)
+                if ad.neg_gamma_raw is not None:
+                    norm_parts.append(ad.neg_gamma_raw.float().norm())
+                    b_sc = 1.0 + float(ad.cfg.neg_eigval_max_boost) * torch.tanh(ad.neg_gamma_raw.float())
+                    neg_scale_vals.append(float(b_sc.mean()))
+                else:
+                    neg_scale_vals.append(1.0)
+                norms.append(float(sum(norm_parts) / len(norm_parts)))
+
+        n = float(len(self.adapters))
+        out: dict[str, float] = {
+            "gdn2/adapter_norm": sum(norms) / n,
+            "gdn2/qed_lambda_abs_mean": sum(qed_abs_vals) / n,
+            "gdn2/neg_eigval_scale_mean": sum(neg_scale_vals) / n,
+            "gdn2/decay_horizon_mult_max": max(hm_vals) if hm_vals else 1.0,
+        }
         if ew_vals:
             out["gdn2/erase_write_l1"] = sum(ew_vals) / len(ew_vals)
         if ds_vals:
@@ -550,8 +1782,7 @@ def _make_rule_wrapper(
             # Fast bit-exact passthrough in eval mode (or when frozen/no_grad) while zero-initialized
             need_ad_grad = torch.is_grad_enabled() and any(p.requires_grad for p in adapter.parameters())
             if (not attn.training or not need_ad_grad) and adapter.is_zero():
-                adapter.last_stats["erase_write_l1"] = 0.0
-                adapter.last_stats["decay_spread"] = 0.0
+                adapter._set_zero_stats()
                 return orig_fn(query, key, value, *args, **kwargs)
 
             require(bool(x_stack), f"GDN-2 layer {adapter.layer_id}: missing captured input hidden_states")
@@ -573,7 +1804,9 @@ def _make_rule_wrapper(
             )
 
             g_vec, b_gate, w_gate = adapter.compute_gates(x_in, g, beta)
-            if recurrent_only or seq_len == 1:
+            qed_lam = adapter.qed_lambda()
+            backend = adapter.cfg.backend
+            if (recurrent_only or seq_len == 1) and not torch.is_grad_enabled():
                 out, final_state = recurrent_gdn2(
                     query,
                     key,
@@ -581,6 +1814,8 @@ def _make_rule_wrapper(
                     g_vec,
                     b_gate,
                     w_gate,
+                    qed_lambda=qed_lam,
+                    backend=backend,
                     initial_state=init_st,
                     output_final_state=out_final,
                     use_qk_l2norm_in_kernel=use_l2,
@@ -594,6 +1829,8 @@ def _make_rule_wrapper(
                     g_vec,
                     b_gate,
                     w_gate,
+                    qed_lambda=qed_lam,
+                    backend=backend,
                     chunk_size=csize,
                     segment_chunks=adapter.cfg.segment_chunks,
                     checkpoint_segments=adapter.cfg.checkpoint_segments,
@@ -613,7 +1850,7 @@ def _make_rule_wrapper(
 
 
 def install_gdn2(model: nn.Module, cfg: GDN2Config | dict[str, Any] | None = None) -> GDN2Manager:
-    """Upgrade Qwen3.6 / Toy Gated DeltaNet layers in-place to NVIDIA Gated DeltaNet-2 (GDN-2).
+    """Upgrade Qwen3.6 / Toy Gated DeltaNet layers in-place to NVIDIA Gated DeltaNet-2 (GDN-2-1M + QED).
 
     Install BEFORE `stable_names(model)` and `apply_loop(model, ...)` so `gdn2_adapter` parameters
     receive loop-invariant stable checkpoint names and share physical modules across core passes.
@@ -800,10 +2037,16 @@ def install_gdn2(model: nn.Module, cfg: GDN2Config | dict[str, Any] | None = Non
 
     n_params = sum(p.numel() for p in (p for ad in adapters.values() for p in ad.parameters()))
     log.info(
-        "GDN-2 installed on %d linear-attention layers (rank=%d, chunk=%d, params=%.2fM, step-0 bit-identical)",
+        "GDN-2 installed on %d linear-attention layers (rank=%d, chunk=%d, decay=[%s,%s], qed=%s, "
+        "neg_boost=%.2f, backend=%s, params=%.2fM, step-0 bit-identical)",
         len(adapters),
         cfg.rank,
         cfg.chunk_size,
+        cfg.decay_log_min if cfg.decay_log_min is not None else -cfg.decay_log_cap,
+        cfg.decay_log_max if cfg.decay_log_max is not None else cfg.decay_log_cap,
+        cfg.qed_enabled,
+        cfg.neg_eigval_max_boost,
+        cfg.backend,
         n_params / 1e6,
     )
     return GDN2Manager(model, cfg, adapters, hooks, restorers)
@@ -813,9 +2056,12 @@ __all__ = [
     "GDN2Adapter",
     "GDN2Config",
     "GDN2Manager",
+    "asymmetric_tanh_bound",
     "chunk_gdn2",
     "install_gdn2",
     "l2norm",
     "logistic_shift",
+    "qed_dplr_prep",
+    "qed_dplr_prep_pytorch",
     "recurrent_gdn2",
 ]

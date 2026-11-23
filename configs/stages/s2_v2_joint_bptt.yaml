@@ -1,7 +1,8 @@
-# Gate 3 (S2 v2 Native-GDN) - Joint 128K High-Density CoT SFT + 4x32K Differentiable K/V-Replay Truncated BPTT.
-# Architecture: [0,12) x1 + [12,36) xR + [36,40) x1 = 88L (Native Qwen3.6 Gated DeltaNet + 88L Loop + D-LSA + 1M YaRN).
-# Clean v2 pipeline (`hssd.enabled: false`, `gdn2.enabled: false`):
-#   * Splits 128K sequences into `4 x 32,768` segments carrying live Native-GDN conv/recurrent states across segments
+# Gate 3 (S2 v2 GDN-2-1M + QED) - Joint 128K High-Density CoT SFT + 4x32K Differentiable K/V-Replay Truncated BPTT.
+# Architecture: [0,12) x1 + [12,36) xR + [36,40) x1 = 88L (GDN-2-1M + Bounded QED + Soft Neg-Eigval + 88L Loop + D-LSA + 1M YaRN).
+# Clean v2 pipeline (`hssd.enabled: false`, `gdn2.enabled: true` via Blackwell-verified `fla` DPLR backend):
+#   * Initializes cleanly from `runs/s3_v2_long_1m_lsa` (no `gdn2_adapter` keys) with 100% IEEE-754 Step-0 bit-identity
+#   * Splits 128K sequences into `4 x 32,768` segments carrying live GDN-2 conv/recurrent states across segments
 #   * Caches compact pre-attention hidden states and re-projects ONLY the D-LSA selected Top-2,048 prior-segment
 #     keys/values with `requires_grad=True`, restoring cross-segment retrieval gradients into `k_proj`, `v_proj`, `W_k_idx`
 #   * Emphasizes R=3 (55% of steps) so Pass-2/Pass-3 mHC ReEntryBridge, gates, pass_router, and pass_attn receive
@@ -39,10 +40,18 @@ loop:
   train_pass_probs: [0.10, 0.35, 0.55]  # R=3 emphasis for Pass-2/3 mHC bridge, gates, pass_router, and pass_attn
 
 gdn2:
-  enabled: false
+  enabled: true
+  rank: 64
+  chunk_size: 64
+  decay_log_min: -3.0
+  decay_log_max: 0.5
+  qed_enabled: true
+  qed_max_lambda: 0.35
+  neg_eigval_max_boost: 0.5
+  backend: auto
 
 hssd:
-  enabled: false                        # Native Qwen3.6 Gated DeltaNet (30 linear layers untouched)
+  enabled: false                        # GDN-2-1M + Bounded QED + Soft Neg-Eigval (no HSSD)
 
 lsa:
   enabled: true
@@ -88,12 +97,12 @@ train:
   sha256_frozen_experts: true
   train_loop_adapters: true
   train_hssd: false
-  train_gdn2: false
+  train_gdn2: true
   train_lsa: true
   trainable:
     - "self_attn\\.(k_proj|v_proj|o_proj|q_norm|k_norm)"
     - "input_layernorm|post_attention_layernorm"
-  allowed_groups: [loop_adapters, lsa_indexers, attention, norms, expert_deltas]
+  allowed_groups: [loop_adapters, gdn2_adapters, lsa_indexers, attention, norms, expert_deltas]
   aux_weights:
     _replace_: true
     loop_aux: 1.0
@@ -106,6 +115,7 @@ train:
     lr_mult:
       _replace_: true
       loop_adapters: 10.0
+      gdn2_adapter: 5.0
       lsa_indexer: 5.0
 
 data:

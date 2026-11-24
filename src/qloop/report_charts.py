@@ -985,9 +985,9 @@ def render_dplr_gdn2_kernel_bench_svg(bundle: dict[str, Any]) -> str:
         spacing=16.0,
     )
 
-    # Top-Left Panel A: T=32K fwd+bwd (log10 x-axis: 5 ms .. 1500 ms)
+    # Top-Left Panel A: T=32K fwd+bwd (log10 x-axis: 5 ms .. 2400 ms)
     lx, py, lw, ph = 205.0, 108.0, 405.0, 340.0
-    log_lo, log_hi = math.log10(5.0), math.log10(1500.0)
+    log_lo, log_hi = math.log10(5.0), math.log10(2400.0)
     x_ticks_a = [10.0, 30.0, 100.0, 300.0, 1000.0]
 
     svg.rect(lx, py, lw, ph, fill=C_PANEL, stroke=C_BORDER, stroke_width=1.0, rx=4.0)

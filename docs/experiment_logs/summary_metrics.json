@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-11-24T19:14:50Z",
+  "generated_at_utc": "2026-11-24T19:50:59Z",
   "repo": "TassP0lar/Qwen3.6-35B-A3B-Loop64",
   "dataset_repo": "TassP0lar/Loop64-Fable-SIRSI-v1",
   "base_model": "unsloth/Qwen3.6-35B-A3B-NVFP4",
@@ -22,11 +22,11 @@
     "v2_smoke_part_a_h": 0.15,
     "s3_v2_native_gdn_h": 15.02,
     "s3v2_gate123_h": 0.3,
-    "s2_v2_gdn2_h": 6.97,
+    "s2_v2_gdn2_h": 7.56,
     "supervisor_v1_active_h": 145.02,
     "supervisor_v2_active_h": 15.02,
-    "supervisor_s2v2_active_h": 6.97,
-    "supervisor_total_active_h": 167.01
+    "supervisor_s2v2_active_h": 7.56,
+    "supervisor_total_active_h": 167.6
   },
   "stages": {
     "s1_loop_a6b": {
@@ -288,15 +288,15 @@
     },
     "s2_v2_joint_bptt": {
       "status": "in_progress",
-      "latest_step": 100,
+      "latest_step": 110,
       "latest_hub_step": 100,
       "target_steps": 600,
       "latest_commit_sha": "d0a1d1d0",
       "n_params": 156941238,
       "pct_of_34_661b": 0.453,
-      "n_rows": 9,
+      "n_rows": 10,
       "tokens_seen": 26214400,
-      "tok_per_s_mean": 1051.4,
+      "tok_per_s_mean": 1060.2,
       "tok_per_s_min": 849.0,
       "tok_per_s_max": 1173.3,
       "mem_peak_max_gib": 67.8,
@@ -886,20 +886,20 @@
     {
       "stage": "s2_v2_joint_bptt",
       "head": "574898d",
-      "n_samples": 5,
+      "n_samples": 6,
       "min_step": 1,
-      "max_step": 90,
+      "max_step": 110,
       "tok_per_s_min": 849.0,
-      "tok_per_s_max": 1119.0,
-      "tok_per_s_mean": 1027.2,
+      "tok_per_s_max": 1139.0,
+      "tok_per_s_mean": 1045.8,
       "alloc_min_gib": 27.5,
       "alloc_max_gib": 27.6,
       "peak_min_gib": 67.2,
       "peak_max_gib": 67.8,
-      "power_mean_w": 400.5,
-      "util_mean_pct": 99.0,
-      "observed_span_hours": 5.97,
-      "active_gpu_hours": 6.97
+      "power_mean_w": 399.5,
+      "util_mean_pct": 98.7,
+      "observed_span_hours": 7.31,
+      "active_gpu_hours": 7.56
     }
   ],
   "tf524_slowdown_window": {

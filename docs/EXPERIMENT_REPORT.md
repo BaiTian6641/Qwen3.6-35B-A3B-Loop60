@@ -3,11 +3,11 @@
 **Author:** TassP0lar (Independent Open-Weights Research)  
 **Artifacts:** Model Hub [`TassP0lar/Qwen3.6-35B-A3B-Loop64`](https://huggingface.co/TassP0lar/Qwen3.6-35B-A3B-Loop64) · Dataset Hub [`TassP0lar/Loop64-Fable-SIRSI-v1`](https://huggingface.co/datasets/TassP0lar/Loop64-Fable-SIRSI-v1) (`v1.2`, CC-BY-4.0)  
 **Backbone & Hardware:** `unsloth/Qwen3.6-35B-A3B-NVFP4` (`34.661B` decoder; `32.212B` routed MoE experts 100% frozen, SHA-256 verified) · `1× NVIDIA RTX PRO 6000 Blackwell Server Edition` (`GB202`, `sm_120`, `96 GB GDDR7 ECC` [`94.97 GiB` usable], `512-bit`, `1,597 GB/s`, `24,064` CUDA cores, `600 W` TDP)  
-**Telemetry Snapshot:** `2026-11-24T19:14:50Z` · **`202` HF Hub commits** · `167.01` active supervisor GPU-hours (`v1` `145.02` h + `s3_v2` `15.02` h + `s2_v2` `6.97` h) across `627.56M` tokens
+**Telemetry Snapshot:** `2026-11-24T19:50:59Z` · **`202` HF Hub commits** · `167.60` active supervisor GPU-hours (`v1` `145.02` h + `s3_v2` `15.02` h + `s2_v2` `7.56` h) across `627.56M` tokens
 
 ## Abstract
 
-We investigate whether a quantized 35B hybrid Mixture-of-Experts (MoE) language model (`unsloth/Qwen3.6-35B-A3B-NVFP4`) can be retrofitted into an 88-virtual-layer looped reasoner supporting `1,048,576`-token (`1M`) context on a single `96 GB GDDR7 ECC` GPU while keeping all `32.212B` routed MoE experts 100% frozen and training fewer than `0.6%` of parameters. Enabled by low-rank APOLLO optimization inside `FusedStepOptimizer`, our architecture integrates three orthogonal axes: (i) a calibrated `[12, 36)` sandwich recurrence with manifold-constrained `LoopBridge` connections scaling depth dynamically across `40L`, `64L`, and `88L` via cross-pass expert re-routing; (ii) Step-0 IEEE-754 bit-identical Gated DeltaNet-2 with Bounded Query-Dependent Erasure (`GDN-2-1M + QED`) and checkpointed `4×8K` macro-segmenting mapped onto `fla 0.6.0` DPLR kernels; and (iii) pure `4.0×` YaRN `FP8 1.0× SharedKV` with untied per-pass Latent Sparse Attention (`D-LSA`), confining `1M`-context state to `10.65 GiB` (`3.02×` smaller than Inkling 2 Mini's `32.16 GiB`). We report both a decisive negative ablation—where adversarial Phase-A forensics and a 4-stage causal swap proved custom HSSD v3.2 caused an irreversible `+0.79`-nat shock, dead vault pages (`vault_duty = 3.26e-05`), `18K` needle failure, and `5.6×` decode slowdown—and the clean v2 recovery. Completed `s3_v2_long_1m_lsa` (`600/600` steps, `24.56M` params, `0` skips) improves held-out `64K` `d=3` NLL by `-0.5941` nats (`44.8%` lower perplexity) over HSSD `s3@600`, raises `512K–1M` D-LSA Top-64 recall to `0.6514` peak, runs `2.25×` faster at `69.96 GiB` peak VRAM, and passes `12/12` Gate 2 generative checks with `100%` (`7/7`) `18K`/`64K` needle hits and `0` loops or tool poisoning. Commit `574898d` cuts `T=32K` `GDN2Adapter` peak VRAM delta `3.28×` (`23.051 → 7.032 GiB`), passes `38/38` CUDA tests and Gate 3 (`4×32K`, `d=3`, `67.194 GiB` peak), and drives live `s2_v2_joint_bptt` (step `100/600`) at `1,040–1,173 tok/s` (`67.77 GiB` peak, `0` skips) with smooth organic GDN-2 wake-up. All metrics trace strictly to public Hub commits and archived logs; no unmeasured downstream 2026 benchmarks are claimed.
+We investigate whether a quantized 35B hybrid Mixture-of-Experts (MoE) language model (`unsloth/Qwen3.6-35B-A3B-NVFP4`) can be retrofitted into an 88-virtual-layer looped reasoner supporting `1,048,576`-token (`1M`) context on a single `96 GB GDDR7 ECC` GPU while keeping all `32.212B` routed MoE experts 100% frozen and training fewer than `0.6%` of parameters. Enabled by low-rank APOLLO optimization inside `FusedStepOptimizer`, our architecture integrates three orthogonal axes: (i) a calibrated `[12, 36)` sandwich recurrence with manifold-constrained `LoopBridge` connections scaling depth dynamically across `40L`, `64L`, and `88L` via cross-pass expert re-routing; (ii) Step-0 IEEE-754 bit-identical Gated DeltaNet-2 with Bounded Query-Dependent Erasure (`GDN-2-1M + QED`) and checkpointed `4×8K` macro-segmenting mapped onto `fla 0.6.0` DPLR kernels; and (iii) pure `4.0×` YaRN `FP8 1.0× SharedKV` with untied per-pass Latent Sparse Attention (`D-LSA`), confining `1M`-context state to `10.65 GiB` (`3.02×` smaller than Inkling 2 Mini's `32.16 GiB`). We report both a decisive negative ablation—where adversarial Phase-A forensics and a 4-stage causal swap proved custom HSSD v3.2 caused an irreversible `+0.79`-nat shock, dead vault pages (`vault_duty = 3.26e-05`), `18K` needle failure, and `5.6×` decode slowdown—and the clean v2 recovery. Completed `s3_v2_long_1m_lsa` (`600/600` steps, `24.56M` params, `0` skips) improves held-out `64K` `d=3` NLL by `-0.5941` nats (`44.8%` lower perplexity) over HSSD `s3@600`, raises `512K–1M` D-LSA Top-64 recall to `0.6514` peak, runs `2.25×` faster at `69.96 GiB` peak VRAM, and passes `12/12` Gate 2 generative checks with `100%` (`7/7`) `18K`/`64K` needle hits and `0` loops or tool poisoning. Commit `574898d` cuts `T=32K` `GDN2Adapter` peak VRAM delta `3.28×` (`23.051 → 7.032 GiB`), passes `38/38` CUDA tests and Gate 3 (`4×32K`, `d=3`, `67.194 GiB` peak), and drives live `s2_v2_joint_bptt` (step `110/600`) at `1,040–1,173 tok/s` (`67.77 GiB` peak, `0` skips) with smooth organic GDN-2 wake-up. All metrics trace strictly to public Hub commits and archived logs; no unmeasured downstream 2026 benchmarks are claimed.
 
 **Index Terms**—Looped transformers, hybrid linear attention, Gated DeltaNet-2, query-dependent erasure, latent sparse attention, parameter-efficient retrofitting, NVFP4 quantization, single-GPU Blackwell systems.
 
@@ -20,7 +20,7 @@ We investigate whether a quantized 35B hybrid Mixture-of-Experts (MoE) language 
 
 Scaling test-time reasoning via long chains of thought alone encounters severe KV-cache capacity limits and serial-token latency bottlenecks, whereas pretraining looped or million-token hybrid architectures from scratch demands multi-node industrial clusters. This paper investigates a parameter-efficient alternative: retrofitting a frozen `35B` (`A3B`) NVFP4 hybrid Mixture-of-Experts backbone (`unsloth/Qwen3.6-35B-A3B-NVFP4` [1], comprising `30` Gated DeltaNet [2] linear layers and `10` gated full-attention layers, with `32.212B` routed expert weights 100% frozen and SHA-256 verified) into a runtime-scalable `88`-virtual-layer looped reasoner supporting `1,048,576`-token (`1M`) context on a **single rented Google Colab NVIDIA RTX PRO 6000 Blackwell Server Edition** (`GB202`, `sm_120`, `96 GB GDDR7 ECC` [`94.97 GiB` CUDA-usable], `512-bit` bus, `1,597 GB/s` peak bandwidth, `24,064` CUDA cores, `600 W` TDP).
 
-Grounded in low-rank APOLLO optimization [3] inside `FusedStepOptimizer`, our clean v2 design unifies three orthogonal mechanisms: (1) a calibrated `[12, 36)` sandwich recurrence with manifold-constrained hyper-connection (`mHC`) `LoopBridge` transitions [4] inspired by adaptive recursive depth [5], expanding compute from `40L` (`R=1`) to `88L` (`R=3`) via cross-pass expert re-routing; (2) Step-0 bit-identical Gated DeltaNet-2 (`GDN-2`) [6] augmented with Bounded Query-Dependent Erasure (`QED`) [7], asymmetric `1M` slow decay, and soft negative eigenvalues [8] dispatched onto production `fla 0.6.0` `DPLR` Triton kernels [9] with checkpointed `4×8K` macro-segmenting (`574898d`); and (3) pure `4.0×` YaRN [10] `FP8 1.0× SharedKV` with untied per-pass Latent Sparse Attention (`D-LSA`) [11]. Across `167.01` active single-GPU supervisor hours (`627.56M` tokens), we release all open checkpoints [12], an audited `v1.2` reasoning corpus [13], negative ablation forensics, and custom Blackwell Triton kernels. Table I-A summarizes our verified results.
+Grounded in low-rank APOLLO optimization [3] inside `FusedStepOptimizer`, our clean v2 design unifies three orthogonal mechanisms: (1) a calibrated `[12, 36)` sandwich recurrence with manifold-constrained hyper-connection (`mHC`) `LoopBridge` transitions [4] inspired by adaptive recursive depth [5], expanding compute from `40L` (`R=1`) to `88L` (`R=3`) via cross-pass expert re-routing; (2) Step-0 bit-identical Gated DeltaNet-2 (`GDN-2`) [6] augmented with Bounded Query-Dependent Erasure (`QED`) [7], asymmetric `1M` slow decay, and soft negative eigenvalues [8] dispatched onto production `fla 0.6.0` `DPLR` Triton kernels [9] with checkpointed `4×8K` macro-segmenting (`574898d`); and (3) pure `4.0×` YaRN [10] `FP8 1.0× SharedKV` with untied per-pass Latent Sparse Attention (`D-LSA`) [11]. Across `167.60` active single-GPU supervisor hours (`627.56M` tokens), we release all open checkpoints [12], an audited `v1.2` reasoning corpus [13], negative ablation forensics, and custom Blackwell Triton kernels. Table I-A summarizes our verified results.
 
 #### Table I-A — Headline Verified Findings (`Measured` Telemetry vs. `Derived Formula`)
 
@@ -31,7 +31,7 @@ Grounded in low-rank APOLLO optimization [3] inside `FusedStepOptimizer`, our cl
 | **v1 Negative Ablation (HSSD v3.2)** | `Measured` | 4-stage causal swap proved `top1=1.0000` decode parity & D-LSA innocence, isolating HSSD (`+0.79` nat shock, dead `vault_duty=3.26e-05`, failed `18K` needle even at `LSA=dense`, `+5.17 GiB` 1M state, `3.41 tok/s` `5.6×` slower decode) + raw `fable51` redacted-tool poisoning | `truth_check_summary.json`, Hub `e050a4b8` |
 | **Completed `s3_v2@600` & Gate 2** | `Measured` | Completed `600/600` (`120.11M` tok, `0` skips): `64K` NLL **`1.3689 → 1.2996 → 1.2816`** (`dg=+0.0873`, **`-0.5941` nats / `44.8%` lower PPL** vs HSSD `s3@600`); `512K–1M` recall `0.6514` pk; `2365 tok/s` (`2.25×`); Gate 2 **`12/12` sharp, `7/7` (`100%`) `18K/64K` needles**, `0` loops/poison | Hub `6b521f47`, `s3v2_gate_summary.json` |
 | **`GDN-2-1M+QED` & `4×8K` VRAM Cut** | `Measured` | `27.53M` params (`0.079%`), `0.0` Step-0 diff, `0` extra state bytes; Gate 1 `38/38` CUDA pytest; fused Triton prep **`53.55 ms`** (`2.00×` vs PyTorch `106.93 ms`) & `T=1` `0.0787 ms` (`2.41×`); **`574898d` `4×8K` cut `3.28×`** (`23.05 → 7.032 GiB`); Gate 3 `4×32K d=3` **`67.194 GiB`** peak | `s3v2_gate_summary.json`, `574898d` |
-| **Live `s2_v2_joint_bptt` (`GDN-2+QED`)** | `Measured` | Live through Hub `s100` (`d0a1d1d0`/600): `lm 6.6937 → 5.8075`, `849–1,173 tok/s`, `67.80 GiB` peak (`27.6 GiB` flat alloc, `0` skips); organic wake-up (`adapter_norm 0.3884`, horizon `1.544×`) | Hub `39c29a6d..3e42161d`, `colab_supervisor_s2v2.log` |
+| **Live `s2_v2_joint_bptt` (`GDN-2+QED`)** | `Measured` | Live through Hub `s100` (`d0a1d1d0`, sup `s110`/600): `lm 6.6937 → 5.8075`, `849–1,173 tok/s`, `67.77 GiB` Hub peak (`67.8` sup., `27.6 GiB` flat alloc, `0` skips); organic wake-up (`adapter_norm 0.3884`, horizon `1.544×`) | Hub `39c29a6d..d0a1d1d0`, `colab_supervisor_s2v2.log` |
 | **1M State & Audited Corpus (`v1.2`)** | `Formula` + `Measured` | `1M` FP8 SharedKV state **`10.65 GiB`** (`3.02×` smaller than Inkling 2 Mini; `5.96–6.28 GiB` Hadamard INT4; `+1.04 GiB` eager `BucketIndex` compactable to `~0.04 GiB`). Corpus `v1.2`: `4,081` `sft_core`, `429` prefs, `1,889,432` 2026 13-grams (`31` leaks blocked), `197/197` (`100%`) notebook CoT | `lsa.py`, `audit_summary.json`, `dc7a14e` |
 | **Blackwell `sm_120` Kernel Stack** | `Measured` | `18.99×` NVFP4 E2M1 (`1,148 GB/s = 71.9%` of `1,597 GB/s` GDDR7 ECC), `9.32×/12.99×` D-LSA FlashAttn (`-70 TB/step`), `5.83×` 2-pass KL (`-90K` syncs), `54.03×` BPTT auto-DMA, `2.06×` E2E BPTT speedup, `-7.0 GiB` leak fix, `10.6×` TF 5.24 recovery; `760+` tests (`0` ruff/AST errors) | `PERF_PROFILE_S2.md`, `574898d` |
 
@@ -101,7 +101,7 @@ All experiments ran on a single **NVIDIA RTX PRO 6000 Blackwell Server Edition**
 | `88` activation-checkpoint boundaries + `3` prior-seg KV + `128K` `BucketIndex` | `Formula` | **`13.05`** | `11.00 GiB` (`88×[1,32K,2048] bf16`) + `1.88 GiB` prior KV + `0.17 GiB` `BucketIndex` |
 | `u_seg` cached pre-attn hidden (`3×10L`) + `66L` GDN-2 state snapshots | `Formula` | **`~4.25`** | `3.75 GiB` `u_seg` (`bptt_offload_to_cpu=0.0`, 100% GDDR7-resident) + `~0.50 GiB` GDN-2 |
 | Single-layer `T=32K` `GDN2Adapter` transient (`4×8K` macro-seg `574898d`) | `Measured` | **`7.03`** | Gate 1 **`7.032 GiB`** delta (**`3.28×` cut** vs unsegmented `23.051 GiB`) |
-| **Measured Live `s2_v2` Peak (`4×32K`, `d=3`, `88L`)** | **`Measured`** | **`67.19–67.77`** | Gate 3 **`67.194 GiB`** (`71.4 GiB` res.); live `s1–s100` **`67.80 GiB`** (`27.17 GiB` headroom) |
+| **Measured Live `s2_v2` Peak (`4×32K`, `d=3`, `88L`)** | **`Measured`** | **`67.19–67.77`** | Gate 3 **`67.194 GiB`** (`71.4 GiB` res.); live `s1–s110` **`67.77 GiB`** Hub exact (`67.8 GiB` sup. rounded; `27.20 GiB` headroom) |
 
 ---
 
@@ -118,7 +118,7 @@ All experiments ran on a single **NVIDIA RTX PRO 6000 Blackwell Server Edition**
 | `s3_long_1m_lsa` (64K/1M) | v1 HSSD | `completed` (`600/600`) | `83.06M` (`0.240%`) | `120.78M` | `1049.8` | `81.23` |
 | `s2_joint_bptt` (131K) | v1 HSSD | `halted@500` (`500/1200`) | `187.92M` (`0.542%`) | `131.07M` | `454→936` (`2.06×`) | `78.42` |
 | **`s3_v2_long_1m_lsa` (64K/1M)** | **Clean v2** | `completed` (`600/600`) | `24.56M` (`0.071%`) | `120.11M` | `2365.1` | `69.96` |
-| **`s2_v2_joint_bptt` (131K)** | **Clean v2** | `in_progress` (`100/600`) | `156.94M` (`0.453%`) | `26.21M` | `1051.4` | `67.80` |
+| **`s2_v2_joint_bptt` (131K)** | **Clean v2** | `in_progress` (`110/600`) | `156.94M` (`0.453%`) | `26.21M` | `1060.2` | `67.80` |
 
 #### Table III-B — Cross-Stage Held-Out Quality and Virtual Depth Scaling (`0` Post-Fix Skips)
 
@@ -142,8 +142,8 @@ All experiments ran on a single **NVIDIA RTX PRO 6000 Blackwell Server Edition**
 | `s3_long_1m_lsa` (v1 HSSD, `600` steps) | `513879f`, `4f09463` | `33.37` | `0` skips; 2 Colab sessions with auto-rollover |
 | `s2_joint_bptt` (v1 HSSD, `0–500`) | `2e37bf6..2f5a6ba` | `53.01` | Pre-opt `6.39`, leak `1.59`, `5a82677` `21.23`, TF5.24 `9.54`+`14.26` |
 | **`s3_v2_long_1m_lsa` (v2, `600/600`)** | `28b88e4` | **`15.02`** | Completed `600/600` (`0` skips, `~2,263 tok/s` sup. mean); + `0.30 h` Gate 1/2/3 |
-| **`s2_v2_joint_bptt` (v2 live `s100`)** | `574898d` | **`6.97`** | Live `GDN-2-1M+QED` (`0` skips, `~1,027–1,173 tok/s`, `67.80 GiB` peak) |
-| **Total Supervisor Active Single-GPU Time** | `colab_supervisor*.log` | **`167.01 h`** | `v1` `145.02 h` + `s3_v2` `15.02 h` + `s2_v2` `6.97 h` (excl. ~`1.6 h` standalone gates) |
+| **`s2_v2_joint_bptt` (v2 live `s110`)** | `574898d` | **`7.56`** | Live `GDN-2-1M+QED` (`0` skips, `~1,027–1,173 tok/s`, `67.80 GiB` peak) |
+| **Total Supervisor Active Single-GPU Time** | `colab_supervisor*.log` | **`167.60 h`** | `v1` `145.02 h` + `s3_v2` `15.02 h` + `s2_v2` `7.56 h` (excl. ~`1.6 h` standalone gates) |
 
 ### B. Zero-Training Diagnostic Calibration (`s0_probe`)
 
@@ -339,6 +339,7 @@ Gate 3 validated full `4×32K = 131K` `d=3` (`88L`) K/V-replay BPTT with `GDN-2-
 | **`s50`** (`0eaa682f`) | **`5.5156`** | `1173.3` | `67.75` | `0.1527` | `1.63e-04 / 0.0146` | **`1.139×`** / `0` |
 | **`s75`** (`3e42161d`) | **`4.0224`** | `1071.9` | `67.76` | `0.2665` | `2.47e-04 / 0.0226` | **`1.368×`** / `0` |
 | **`s100`** (`d0a1d1d0`) | **`5.8075`** | `1040.2` | `67.77` | `0.3884` | `3.55e-04 / 0.0294` | **`1.544×`** / `0` |
+| `s110` *(live sup)* | `4.2897` | `1139.0` | `67.80` | *(next ckpt)* | *(next ckpt)* | `d=2 / 0` |
 
 ---
 
@@ -398,9 +399,9 @@ Profiling baseline `s2_joint_bptt` (`2e37bf6`, `453.5 tok/s`, `324.2 W` = `54%` 
 
 ## VII. Limitations, Roadmap, and Compute Allocation Summary
 
-**Honest Scientific Limitations:** (1) *Zero Downstream 2026 Frontier Benchmarks Claimed Yet:* Current results cover held-out NLL (`8K–131K`), `s0_probe`, Gate 1/2/3 CUDA/needle/smoke checks, live `s2_v2` telemetry, and dataset audits; `HLE`, `AIME 2026`, `GPQA`, `MRCR 1M`, `ARC-AGI-2`, `KernelBench`, and `SWE-bench Pro` will only be reported after `s2_v2` and `s4_v2_rl` complete our 13-gram-decontaminated `d ∈ {1, 2, 3}` sweep. (2) *`512K–1M` D-LSA Recall (`0.6514` Peak / `0.5715` Final):* Although `s3_v2@600` passed `100%` (`7/7`) of `18K/64K` sparse needles, `512K–1M` Top-64 recall remains below our `0.70` auto-switch threshold and continues co-training inside `s2_v2`. (3) *`s2_v2` Mid-Run & `s4_v2_rl` Queued:* `s2_v2_joint_bptt` is live at `s100` (`sup s100`)/`600`; final `600`-step convergence and `s4_v2_rl` gains are not yet measured. (4) *Single-GPU Rollout Bottleneck:* Online `d=3` (`88L`) GRPO/SI-RSI rollouts and 16-benchmark sweeps are throughput-bound on a single card.
+**Honest Scientific Limitations:** (1) *Zero Downstream 2026 Frontier Benchmarks Claimed Yet:* Current results cover held-out NLL (`8K–131K`), `s0_probe`, Gate 1/2/3 CUDA/needle/smoke checks, live `s2_v2` telemetry, and dataset audits; `HLE`, `AIME 2026`, `GPQA`, `MRCR 1M`, `ARC-AGI-2`, `KernelBench`, and `SWE-bench Pro` will only be reported after `s2_v2` and `s4_v2_rl` complete our 13-gram-decontaminated `d ∈ {1, 2, 3}` sweep. (2) *`512K–1M` D-LSA Recall (`0.6514` Peak / `0.5715` Final):* Although `s3_v2@600` passed `100%` (`7/7`) of `18K/64K` sparse needles, `512K–1M` Top-64 recall remains below our `0.70` auto-switch threshold and continues co-training inside `s2_v2`. (3) *`s2_v2` Mid-Run & `s4_v2_rl` Queued:* `s2_v2_joint_bptt` is live at `s100` (`sup s110`)/`600`; final `600`-step convergence and `s4_v2_rl` gains are not yet measured. (4) *Single-GPU Rollout Bottleneck:* Online `d=3` (`88L`) GRPO/SI-RSI rollouts and 16-benchmark sweeps are throughput-bound on a single card.
 
-**Immediate Roadmap & Compute Allocation (`docs/COMPUTE_GRANT_PROPOSAL.md`):** (1) Complete `s2_v2_joint_bptt` (`s100 → 600`) and run Gate 2 `18K–256K` needle/coherence verification; (2) execute `s4_v2_rl` (`400` steps verifiable GRPO/DAPO + surgical SI-RSI); and (3) publish the FLOP-matched `d ∈ {1, 2, 3}` 16-benchmark sweep and full `safetensors` Whole Model Pack [12]. With `167.01` single-GPU hours already invested to de-risk every architectural and kernel component, a targeted `1× 8×H200/B200` allocation (`~2,500` GPU-hours, Tier 2 primary request; scalable `400 / 2,500 / 6,000` GPU-h) unlocks controlled `GDN-2-1M+QED` vs. Native-GDN ablations, `s4_v2_rl`, and the full 2026 sweep.
+**Immediate Roadmap & Compute Allocation (`docs/COMPUTE_GRANT_PROPOSAL.md`):** (1) Complete `s2_v2_joint_bptt` (`s110 → 600`) and run Gate 2 `18K–256K` needle/coherence verification; (2) execute `s4_v2_rl` (`400` steps verifiable GRPO/DAPO + surgical SI-RSI); and (3) publish the FLOP-matched `d ∈ {1, 2, 3}` 16-benchmark sweep and full `safetensors` Whole Model Pack [12]. With `167.60` single-GPU hours already invested to de-risk every architectural and kernel component, a targeted `1× 8×H200/B200` allocation (`~2,500` GPU-hours, Tier 2 primary request; scalable `400 / 2,500 / 6,000` GPU-h) unlocks controlled `GDN-2-1M+QED` vs. Native-GDN ablations, `s4_v2_rl`, and the full 2026 sweep.
 
 **Reproducibility:** Regenerate all archived CSV/JSON telemetry, 7 pure-SVG figures, and both EN/ZH reports:
 
@@ -421,7 +422,7 @@ PYTHONPATH=src python scripts/export_experiment_report.py \
 
 [3] H. Zhu, Z. Zhang, W. Cong, X. Liu, S. Park, V. Chandra, B. Long, D. Z. Pan, Z. Wang, and J. Lee, "APOLLO: SGD-like Memory, AdamW-level Performance," *arXiv preprint arXiv:2412.05270*, Dec. 2024.
 
-[4] Z. Xie, Y. Wei, H. Cao, W. Liang, *et al.* (DeepSeek-AI), "mHC: Manifold-Constrained Hyper-Connections," *arXiv preprint arXiv:2512.24880*, Dec. 2025.
+[4] Z. Xie *et al.* (DeepSeek-AI), "mHC: Manifold-Constrained Hyper-Connections," *arXiv preprint arXiv:2512.24880*, Dec. 2025.
 
 [5] S. Bae, Y. Kim, R. Bayat, S. Kim, J. Ha, T. Schuster, A. Fisch, H. Harutyunyan, Z. Ji, A. Courville, and S.-Y. Yun, "Mixture-of-Recursions: Learning Dynamic Recursive Depths for Adaptive Token-Level Computation," *arXiv preprint arXiv:2507.10524*, Jul. 2025.
 
@@ -429,9 +430,9 @@ PYTHONPATH=src python scripts/export_experiment_report.py \
 
 [7] D. Gupta, A. Das, and D. Gupta, "The Query Knows What to Forget: A Second Erase Direction for Linear Attention," *arXiv preprint arXiv:2608.13668*, Aug. 2026.
 
-[8] R. Grazzi, J. Siems, A. Zela, J. K. H. Franke, F. Hutter, and M. Pontil, "Unlocking State-Tracking in Linear RNNs Through Negative Eigenvalues," *arXiv preprint arXiv:2411.12537*, Nov. 2024.
+[8] R. Grazzi, J. Siems, A. Zela, J. K. H. Franke, F. Hutter, and M. Pontil, "Unlocking State-Tracking in Linear RNNs Through Negative Eigenvalues," in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2025, arXiv:2411.12537.
 
-[9] S. Yang and Y. Zhang, "FLA: A Triton-Based Library for Hardware-Efficient Implementations of Linear Attention Mechanisms," GitHub Repository (`fla-org/flash-linear-attention`, v0.6.0), 2024–2026.
+[9] S. Yang and Y. Zhang, "FLA: A Triton-Based Library for Hardware-Efficient Implementations of Linear Attention Mechanisms," GitHub Repository (fla-org/flash-linear-attention, v0.6.0), 2024–2026.
 
 [10] B. Peng, J. Quesnelle, H. Fan, and E. Shippole, "YaRN: Efficient Context Window Extension of Large Language Models," in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2024, arXiv:2309.00071.
 
@@ -443,20 +444,20 @@ PYTHONPATH=src python scripts/export_experiment_report.py \
 
 [14] Thinking Machines Lab, "Inkling 2 Mini," Technical Release, Nov. 20, 2026. [Online]. Available: https://thinkingmachines.ai
 
-[15] A. Zandieh, M. Daliri, M. Hadian, and V. Mirrokni, "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate," in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2026.
+[15] A. Zandieh, M. Daliri, M. Hadian, and V. Mirrokni, "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate," in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2026, arXiv:2504.19874.
 
-[16] G. Penedo, H. Kydlíček, L. Ben Allal, A. Lozhkov, M. Mitchell, C. Raffel, L. Von Werra, and T. Wolf, "The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale," *arXiv preprint arXiv:2406.17557*, Jun. 2024.
+[16] G. Penedo, H. Kydlíček, L. Ben Allal, A. Lozhkov, M. Mitchell, C. Raffel, L. von Werra, and T. Wolf, "The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale," *arXiv preprint arXiv:2406.17557*, Jun. 2024.
 
 [17] B. Peng, R. Zhang, D. Goldstein, E. Alcaide, *et al.*, "RWKV-7 'Goose' with Expressive Dynamic State Evolution," *arXiv preprint arXiv:2503.14456*, Mar. 2025.
 
-[18] E. Guha, R. Marten, S. Keh, N. Raoof, G. Smyrnis, H. Bansal, M. Nezhurina, J. Mercat, T. Vu, Z. Sprague, A. G. Dimakis, and L. Schmidt, "OpenThoughts: Data Recipes for Reasoning Models," *arXiv preprint arXiv:2506.04178*, Jun. 2025.
+[18] E. Guha *et al.*, "OpenThoughts: Data Recipes for Reasoning Models," *arXiv preprint arXiv:2506.04178*, Jun. 2025.
 
-[19] A. Bercovich, I. Levy, I. Golan, M. Dabbah, R. El-Yaniv, B. Ginsburg, J. Cohen, and B. Catanzaro, "Llama-Nemotron: Efficient Reasoning Models," *arXiv preprint arXiv:2505.00949*, May 2025.
+[19] A. Bercovich *et al.*, "Llama-Nemotron: Efficient Reasoning Models," *arXiv preprint arXiv:2505.00949*, May 2025.
 
-[20] F. Chollet, M. Knoop, G. Kamradt, and B. Landers, "ARC-AGI-2: A New Challenge for Frontier AI Reasoning Systems," GitHub Repository (`arcprize/ARC-AGI-2`), 2025.
+[20] F. Chollet, M. Knoop, G. Kamradt, B. Landers, and H. Pinkard, "ARC-AGI-2: A New Challenge for Frontier AI Reasoning Systems," *arXiv preprint arXiv:2505.11831*, May 2025.
 
-[21] Z. Shao, P. Wang, Q. Zhu, R. Xu, J. Song, M. Zhang, Y. K. Li, Y. Wu, and D. Guo, "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models," *arXiv preprint arXiv:2402.03300*, Feb. 2024.
+[21] Z. Shao, P. Wang, Q. Zhu, R. Xu, J. Song, X. Bi, H. Zhang, M. Zhang, Y. K. Li, Y. Wu, and D. Guo, "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models," *arXiv preprint arXiv:2402.03300*, Feb. 2024.
 
 [22] Q. Yu, Z. Zhang, R. Zhu, Y. Yuan, *et al.*, "DAPO: An Open-Source LLM Reinforcement Learning System at Scale," *arXiv preprint arXiv:2503.14476*, Mar. 2025.
 
-[23] E. Wijmans *et al.*, "Cut Your Losses in Large-Vocabulary Language Models," in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2025, arXiv:2411.09009.
+[23] E. Wijmans, B. Huval, A. Hertzberg, V. Koltun, and P. Krähenbühl, "Cut Your Losses in Large-Vocabulary Language Models," in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2025, arXiv:2411.09009.

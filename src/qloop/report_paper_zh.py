@@ -277,13 +277,15 @@ def render_experiment_report_zh_md(
         s2v2_lm = _fmt_f(s2v2_last_hub.get("loss_lm"), 4)
         s2v2_tps_lo = min(s2v2_tps_vals) if s2v2_tps_vals else 1041.0
         s2v2_tps_hi = max(s2v2_tps_vals) if s2v2_tps_vals else 1173.3
+        s2v2_first_sha = str(s2v2_hub_rows[0].get("commit_sha") or "39c29a6d")
+        s2v2_last_sha = str(s2v2.get("latest_commit_sha") or s2v2_last_hub.get("commit_sha") or "d0a1d1d0")
         a(
             "| **在线 `s2_v2_joint_bptt` 进展** | `实测` | "
-            f"已推进至 Hub `s{s2v2_hub_step}`（`{s2v2.get('latest_commit_sha') or '3e42161d'}`"
+            f"已推进至 Hub `s{s2v2_hub_step}`（`{s2v2_last_sha}`"
             + (f"，监控 `s{s2v2_latest_step}`" if s2v2_latest_step > s2v2_hub_step else "")
-            + f"/{s2v2_target}）：`lm 6.6937 → {s2v2_lm}`，`{s2v2_tps_lo:,.0f}–{s2v2_tps_hi:,.0f} tok/s`，峰值 `{s2v2_pk_max:.2f} GiB`"
-            f"（步后 `27.6 GiB` 持平，`0` 跳过）；GDN-2 自然激活（`adapter_norm {s2v2_an}`，视界 `{s2v2_dh}×`） | "
-            "Hub `39c29a6d..3e42161d`, `sup_s2v2.log` |"
+            + f"/{s2v2_target}）：`lm 6.6937 → {s2v2_lm}`，`{s2v2_tps_lo:,.0f}–{s2v2_tps_hi:,.0f} tok/s`，Hub 峰值 `{s2v2_hub_pk_max:.2f} GiB`"
+            f"（监控 `{s2v2_pk_max:.1f}`，步后 `27.6 GiB` 持平，`0` 跳过）；GDN-2 自然激活（`adapter_norm {s2v2_an}`，视界 `{s2v2_dh}×`） | "
+            f"Hub `{s2v2_first_sha}..{s2v2_last_sha}`, `sup_s2v2.log` |"
         )
     a(
         "| **1M 状态与去污染语料（`v1.2`）** | `推导`+`实测` | "
@@ -442,7 +444,8 @@ def render_experiment_report_zh_md(
     )
     a(
         f"| **`s2_v2` 在线实测峰值（`4×32K`, `d=3`, `88L`）** | **`实测`** | **`{g3_peak_gib:.2f}–{s2v2_hub_pk_max:.2f}`** | "
-        f"Gate 3 **`{g3_peak_gib:.3f} GiB`**（预留 `71.4 GiB`）；在线 `s1–s{max(s2v2_latest_step, 75)}` 稳定于 **`{s2v2_pk_max:.2f} GiB`**（余量 `{94.97 - s2v2_pk_max:.2f} GiB`） |"
+        f"Gate 3 **`{g3_peak_gib:.3f} GiB`**（预留 `71.4 GiB`）；在线 `s1–s{max(s2v2_latest_step, 75)}` Hub 实测 **`{s2v2_hub_pk_max:.2f} GiB`**"
+        f"（监控四舍五入 `{s2v2_pk_max:.1f} GiB`；余量 `{94.97 - s2v2_hub_pk_max:.2f} GiB`） |"
     )
     a("")
     a("---")
@@ -924,7 +927,7 @@ def render_experiment_report_zh_md(
     a(f"| `GDN2Adapter` 完整封装（`seg0`） | `45.37` | `91.07` | `136.43 ms` | `{g1_wrp0_gib:.3f} GiB` | `0.4193` | 含 `compute_gates` 全链路 |")
     a(
         f"| **`GDN2Adapter` 完整封装（`4×8K`）** | `45.79` | `140.85` | `186.62 ms` | **`{g1_wrp8_gib:.3f} GiB`** | `—` | "
-        f"**显存直降 `{g1_wrp0_gib/g1_wrp8_gib:.2f}×`（`-`{g1_wrp0_gib - g1_wrp8_gib:.2f} GiB）** |"
+        f"**显存直降 `{g1_wrp0_gib/g1_wrp8_gib:.2f}×`（`-{g1_wrp0_gib - g1_wrp8_gib:.2f} GiB`）** |"
     )
     a(f"| PyTorch 分块 GDN-2 参考实现 | `{py_f:.2f}` | `{py_b:.2f}` | `{py_t:.1f} ms` | `—` | `{py_1:.4f}` | 参考实现（`T=4096 bf16` `0` NaN） |")
     a("")
@@ -1086,7 +1089,9 @@ def render_experiment_report_zh_md(
         "`KernelBench` 与 `SWE-bench Pro` 将仅在 `s2_v2` 与 `s4_v2_rl` 完成 13-gram 去污染 `d ∈ {1, 2, 3}` 评测后公布。"
         "（2）*`512K–1M` D-LSA 召回率（峰值 `0.6514` / 终值 `0.5715`）：* 虽已助力 `s3_v2@600` 在 `18K/64K` 检索达成 `100%`（`7/7`）"
         "命中，但仍低于 `0.70` 自动切换阈值，现于 `s2_v2` 中联合微调。（3）*`s2_v2` 训练中且 `s4_v2_rl` 排队待启：* `s2_v2` "
-        f"当前处于 `s{s2v2_hub_step}`（监控 `s{s2v2_latest_step}`）/`{s2v2_target}`，最终收敛与 RL 增益尚待测量。（4）*单卡自回归采样瓶颈：* "
+        f"当前处于 `s{s2v2_hub_step}`"
+        + (f"（监控 `s{s2v2_latest_step}`）" if s2v2_latest_step > s2v2_hub_step else "")
+        + f"/`{s2v2_target}`，最终收敛与 RL 增益尚待测量。（4）*单卡自回归采样瓶颈：* "
         "在线 `d=3`（`88L`）GRPO/SI-RSI 采样与 16 基准全深度扫描受单卡吞吐制约。"
     )
     a("")

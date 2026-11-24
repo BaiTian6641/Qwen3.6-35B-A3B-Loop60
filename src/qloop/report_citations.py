@@ -30,7 +30,7 @@ IEEE_REFERENCES: dict[str, str] = {
     "neg_eig": (
         "R. Grazzi, J. Siems, A. Zela, J. K. H. Franke, F. Hutter, and M. Pontil, "
         '"Unlocking State-Tracking in Linear RNNs Through Negative Eigenvalues," '
-        "*arXiv preprint arXiv:2411.12537*, Nov. 2024."
+        "in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2025, arXiv:2411.12537."
     ),
     "apollo": (
         "H. Zhu, Z. Zhang, W. Cong, X. Liu, S. Park, V. Chandra, B. Long, D. Z. Pan, "
@@ -38,7 +38,7 @@ IEEE_REFERENCES: dict[str, str] = {
         "*arXiv preprint arXiv:2412.05270*, Dec. 2024."
     ),
     "mhc": (
-        'Z. Xie, Y. Wei, H. Cao, W. Liang, *et al.* (DeepSeek-AI), "mHC: Manifold-Constrained '
+        'Z. Xie *et al.* (DeepSeek-AI), "mHC: Manifold-Constrained '
         'Hyper-Connections," *arXiv preprint arXiv:2512.24880*, Dec. 2025.'
     ),
     "lsa": (
@@ -70,14 +70,16 @@ IEEE_REFERENCES: dict[str, str] = {
     "fla": (
         'S. Yang and Y. Zhang, "FLA: A Triton-Based Library for Hardware-Efficient '
         'Implementations of Linear Attention Mechanisms," GitHub Repository '
-        "(`fla-org/flash-linear-attention`, v0.6.0), 2024–2026."
+        "(fla-org/flash-linear-attention, v0.6.0), 2024–2026."
     ),
     "cce": (
-        'E. Wijmans *et al.*, "Cut Your Losses in Large-Vocabulary Language Models," '
+        'E. Wijmans, B. Huval, A. Hertzberg, V. Koltun, and P. Krähenbühl, '
+        '"Cut Your Losses in Large-Vocabulary Language Models," '
         "in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2025, arXiv:2411.09009."
     ),
     "deepseekmath": (
-        "Z. Shao, P. Wang, Q. Zhu, R. Xu, J. Song, M. Zhang, Y. K. Li, Y. Wu, and D. Guo, "
+        "Z. Shao, P. Wang, Q. Zhu, R. Xu, J. Song, X. Bi, H. Zhang, M. Zhang, "
+        "Y. K. Li, Y. Wu, and D. Guo, "
         '"DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models," '
         "*arXiv preprint arXiv:2402.03300*, Feb. 2024."
     ),
@@ -88,26 +90,24 @@ IEEE_REFERENCES: dict[str, str] = {
     "turboquant": (
         'A. Zandieh, M. Daliri, M. Hadian, and V. Mirrokni, "TurboQuant: Online Vector '
         'Quantization with Near-optimal Distortion Rate," in *Proc. Int. Conf. Learn. Represent. '
-        "(ICLR)*, 2026."
+        "(ICLR)*, 2026, arXiv:2504.19874."
     ),
     "openthoughts3": (
-        "E. Guha, R. Marten, S. Keh, N. Raoof, G. Smyrnis, H. Bansal, M. Nezhurina, J. Mercat, "
-        "T. Vu, Z. Sprague, A. G. Dimakis, and L. Schmidt, "
-        '"OpenThoughts: Data Recipes for Reasoning Models," '
+        'E. Guha *et al.*, "OpenThoughts: Data Recipes for Reasoning Models," '
         "*arXiv preprint arXiv:2506.04178*, Jun. 2025."
     ),
     "nemotron": (
-        "A. Bercovich, I. Levy, I. Golan, M. Dabbah, R. El-Yaniv, B. Ginsburg, J. Cohen, and "
-        'B. Catanzaro, "Llama-Nemotron: Efficient Reasoning Models," '
+        'A. Bercovich *et al.*, "Llama-Nemotron: Efficient Reasoning Models," '
         "*arXiv preprint arXiv:2505.00949*, May 2025."
     ),
     "arcagi2": (
-        'F. Chollet, M. Knoop, G. Kamradt, and B. Landers, "ARC-AGI-2: A New Challenge for '
-        'Frontier AI Reasoning Systems," GitHub Repository (`arcprize/ARC-AGI-2`), 2025.'
+        'F. Chollet, M. Knoop, G. Kamradt, B. Landers, and H. Pinkard, "ARC-AGI-2: A New '
+        'Challenge for Frontier AI Reasoning Systems," *arXiv preprint arXiv:2505.11831*, '
+        "May 2025."
     ),
     "fineweb": (
         "G. Penedo, H. Kydlíček, L. Ben Allal, A. Lozhkov, M. Mitchell, C. Raffel, "
-        "L. Von Werra, and T. Wolf, "
+        "L. von Werra, and T. Wolf, "
         '"The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale," '
         "*arXiv preprint arXiv:2406.17557*, Jun. 2024."
     ),

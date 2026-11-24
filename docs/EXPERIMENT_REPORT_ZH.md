@@ -3,11 +3,11 @@
 **作者：** TassP0lar（独立开源权重研究）  
 **开源仓库：** 模型 [`TassP0lar/Qwen3.6-35B-A3B-Loop64`](https://huggingface.co/TassP0lar/Qwen3.6-35B-A3B-Loop64) · 数据集 [`TassP0lar/Loop64-Fable-SIRSI-v1`](https://huggingface.co/datasets/TassP0lar/Loop64-Fable-SIRSI-v1)（`v1.2`，CC-BY-4.0）  
 **基座与硬件：** `unsloth/Qwen3.6-35B-A3B-NVFP4`（`34.661B` 解码器；`32.212B` 路由 MoE 专家 100% 冻结，SHA-256 校验） · `1× NVIDIA RTX PRO 6000 Blackwell Server Edition`（`GB202`，`sm_120`，`96 GB GDDR7 ECC` [`94.97 GiB` 可用]，`512-bit`，`1,597 GB/s`，`24,064` CUDA 核心，`600 W` TDP）  
-**遥测快照：** `2026-11-24T19:14:50Z` · **`202` 次 HF Hub 提交** · `167.01` 单卡有效监控 GPU 小时（`v1` `145.02` h + `s3_v2` `15.02` h + `s2_v2` `6.97` h），累计训练 `627.56M` 词元
+**遥测快照：** `2026-11-24T19:50:59Z` · **`202` 次 HF Hub 提交** · `167.60` 单卡有效监控 GPU 小时（`v1` `145.02` h + `s3_v2` `15.02` h + `s2_v2` `7.56` h），累计训练 `627.56M` 词元
 
 ## 摘要
 
-本文探讨在单张 `96 GB GDDR7 ECC` 商用 GPU 上，能否在 100% 冻结 `32.212B` 路由混合专家（MoE）权重且仅训练 `< 0.6%` 参数的前提下，将量化 `35B` 混合架构基座模型（`unsloth/Qwen3.6-35B-A3B-NVFP4`）改造为支持 `1,048,576`（`1M`）上下文的 88 虚拟层循环推理模型。依托集成于 `FusedStepOptimizer` 的低秩 APOLLO 优化器，本方案沿三个正交维度展开设计：（1）经标定的 `[12, 36)` 三明治递归核心与流形约束超连接 `LoopBridge`，通过跨轮专家重路由将有效推理深度在 `40L`、`64L` 与 `88L` 间动态扩展；（2）第 0 步 IEEE-754 位级恒等的门控 DeltaNet-2 与有界查询擦除机制（`GDN-2-1M + QED`），结合提交 `574898d` 的 `4×8K` 检查点宏分段技术并 1-to-1 映射至 `fla 0.6.0` `DPLR` 核函数；（3）纯 `4.0×` YaRN `FP8 1.0× SharedKV` 与每轮独立查询索引的潜在稀疏注意力（`D-LSA`），将 `1M` 上下文状态显存压缩至 `10.65 GiB`（较 Inkling 2 Mini 的 `32.16 GiB` 缩减 `3.02×`）。本文如实报告了关键负面消融实验与洁净 v2 架构的全面突破：通过阶段 A 对抗检验与四阶段因果组件置换，我们定位自定义 HSSD v3.2 引发了不可逆的 `+0.79` nat 分布冲击、长程记忆槽失效（`vault_duty = 3.26e-05`）、`18K` 大海捞针检索失败及 `5.6×` 解码降速。剔除 HSSD 后，已完成的 `s3_v2_long_1m_lsa` （`600/600` 步，`24.56M` 参数，`0` 跳过）在留出 `64K` `d=3` 负对数似然上较 HSSD `s3@600` 降低 `-0.5941` nat（困惑度下降 `44.8%`），`512K–1M` Top-64 召回峰值升至 `0.6514`，训练吞吐提升 `2.25×` 且峰值显存降至 `69.96 GiB`；Gate 2 对抗评测达成 `12/12` 全部清晰输出、`7/7`（`100%`）`18K`/`64K` 大海捞针精准命中及零复读/零工具注入。提交 `574898d` 将 `T=32K` 下 `GDN2Adapter` 峰值显存增量压缩 `3.28×`（`23.051 → 7.032 GiB`），通过 `38/38` CUDA 测试与 Gate 3（`4×32K`、`d=3` 峰值 `67.194 GiB`），并驱动在线 `s2_v2_joint_bptt`（第 `100/600` 步）以 `1,040–1,173 tok/s`（`67.77 GiB` 峰值，`0` 跳过）稳定收敛且实现 GDN-2 各门控机制的自然激活。全文数据严格溯源至公开提交与归档日志，不宣称任何未测下游 2026 基准得分。
+本文探讨在单张 `96 GB GDDR7 ECC` 商用 GPU 上，能否在 100% 冻结 `32.212B` 路由混合专家（MoE）权重且仅训练 `< 0.6%` 参数的前提下，将量化 `35B` 混合架构基座模型（`unsloth/Qwen3.6-35B-A3B-NVFP4`）改造为支持 `1,048,576`（`1M`）上下文的 88 虚拟层循环推理模型。依托集成于 `FusedStepOptimizer` 的低秩 APOLLO 优化器，本方案沿三个正交维度展开设计：（1）经标定的 `[12, 36)` 三明治递归核心与流形约束超连接 `LoopBridge`，通过跨轮专家重路由将有效推理深度在 `40L`、`64L` 与 `88L` 间动态扩展；（2）第 0 步 IEEE-754 位级恒等的门控 DeltaNet-2 与有界查询擦除机制（`GDN-2-1M + QED`），结合提交 `574898d` 的 `4×8K` 检查点宏分段技术并 1-to-1 映射至 `fla 0.6.0` `DPLR` 核函数；（3）纯 `4.0×` YaRN `FP8 1.0× SharedKV` 与每轮独立查询索引的潜在稀疏注意力（`D-LSA`），将 `1M` 上下文状态显存压缩至 `10.65 GiB`（较 Inkling 2 Mini 的 `32.16 GiB` 缩减 `3.02×`）。本文如实报告了关键负面消融实验与洁净 v2 架构的全面突破：通过阶段 A 对抗检验与四阶段因果组件置换，我们定位自定义 HSSD v3.2 引发了不可逆的 `+0.79` nat 分布冲击、长程记忆槽失效（`vault_duty = 3.26e-05`）、`18K` 大海捞针检索失败及 `5.6×` 解码降速。剔除 HSSD 后，已完成的 `s3_v2_long_1m_lsa` （`600/600` 步，`24.56M` 参数，`0` 跳过）在留出 `64K` `d=3` 负对数似然上较 HSSD `s3@600` 降低 `-0.5941` nat（困惑度下降 `44.8%`），`512K–1M` Top-64 召回峰值升至 `0.6514`，训练吞吐提升 `2.25×` 且峰值显存降至 `69.96 GiB`；Gate 2 对抗评测达成 `12/12` 全部清晰输出、`7/7`（`100%`）`18K`/`64K` 大海捞针精准命中及零复读/零工具注入。提交 `574898d` 将 `T=32K` 下 `GDN2Adapter` 峰值显存增量压缩 `3.28×`（`23.051 → 7.032 GiB`），通过 `38/38` CUDA 测试与 Gate 3（`4×32K`、`d=3` 峰值 `67.194 GiB`），并驱动在线 `s2_v2_joint_bptt`（第 `110/600` 步）以 `1,040–1,173 tok/s`（`67.77 GiB` 峰值，`0` 跳过）稳定收敛且实现 GDN-2 各门控机制的自然激活。全文数据严格溯源至公开提交与归档日志，不宣称任何未测下游 2026 基准得分。
 
 **关键词：** 循环 Transformer；混合线性注意力；Gated DeltaNet-2；查询驱动擦除；潜在稀疏注意力；参数高效改造；NVFP4 量化；单卡 Blackwell 系统优化。
 
@@ -20,7 +20,7 @@
 
 仅依靠拉长思维链（CoT）扩展测试时推理算力，会迅速受限于 KV 缓存容量墙与串行词元解码延迟；而从零预训练循环架构或百万上下文混合大模型则需要工业级多机集群预算。本文验证一条高度参数高效的替代路径：在**单张租用 Google Colab NVIDIA RTX PRO 6000 Blackwell Server Edition**（`GB202`，`sm_120`，`96 GB GDDR7 ECC` [`94.97 GiB` 可用]，`512-bit` 总线，`1,597 GB/s` 峰值带宽，`24,064` CUDA 核心，`600 W` TDP）上，保持 `unsloth/Qwen3.6-35B-A3B-NVFP4` [1]（由 `30` 层门控 DeltaNet [2] 线性注意力与 `10` 层门控全局注意力交替构成）的 `32.212B` 路由 MoE 专家权重 100% 冻结（SHA-256 校验），仅训练 `< 0.6%` 参数将其改造为支持 `1,048,576`（`1M`）上下文的 88 虚拟层循环混合推理模型。
 
-依托集成于 `FusedStepOptimizer` 的低秩 APOLLO 优化器 [3]，我们的洁净 v2 架构融合三项正交设计：（1）经标定的 `[12, 36)` 三明治循环核心与流形约束超连接（`mHC`）`LoopBridge` [4]，借鉴自适应递归深度思想 [5]，通过跨轮专家重路由将计算深度从 `40L`（`R=1`）动态扩展至 `88L`（`R=3`）；（2）第 0 步位级恒等的 Gated DeltaNet-2（`GDN-2`）[6] 叠加有界查询驱动擦除（`QED`）[7]、`1M` 非对称慢衰减与软负特征值 [8]，并映射至 `fla 0.6.0` `DPLR` Triton 核函数 [9] 与 `4×8K` 检查点宏分段（`574898d`）；（3）纯 `4.0×` YaRN [10] `FP8 1.0× SharedKV` 与每轮解耦查询的潜在稀疏注意力（`D-LSA`）[11]。历经 `167.01` 单卡有效监控 GPU 小时（`627.56M` 词元），我们开源全部检查点 [12]、经 13-gram 去污染的 `v1.2` 推理语料 [13]、负面消融取证记录及定制 Blackwell Triton 核函数。表 I-A 汇总核心实证结果。
+依托集成于 `FusedStepOptimizer` 的低秩 APOLLO 优化器 [3]，我们的洁净 v2 架构融合三项正交设计：（1）经标定的 `[12, 36)` 三明治循环核心与流形约束超连接（`mHC`）`LoopBridge` [4]，借鉴自适应递归深度思想 [5]，通过跨轮专家重路由将计算深度从 `40L`（`R=1`）动态扩展至 `88L`（`R=3`）；（2）第 0 步位级恒等的 Gated DeltaNet-2（`GDN-2`）[6] 叠加有界查询驱动擦除（`QED`）[7]、`1M` 非对称慢衰减与软负特征值 [8]，并映射至 `fla 0.6.0` `DPLR` Triton 核函数 [9] 与 `4×8K` 检查点宏分段（`574898d`）；（3）纯 `4.0×` YaRN [10] `FP8 1.0× SharedKV` 与每轮解耦查询的潜在稀疏注意力（`D-LSA`）[11]。历经 `167.60` 单卡有效监控 GPU 小时（`627.56M` 词元），我们开源全部检查点 [12]、经 13-gram 去污染的 `v1.2` 推理语料 [13]、负面消融取证记录及定制 Blackwell Triton 核函数。表 I-A 汇总核心实证结果。
 
 #### 表 I-A — 核心验证结果汇总（`实测` 遥测与 `闭式推导` 严格区分）
 
@@ -31,7 +31,7 @@
 | **v1 负面消融（HSSD v3.2 复盘）** | `实测` | 四阶段因果置换验证解码 `top1=1.0000` 一致且 D-LSA 无罪，锁定 HSSD 根因（`+0.79` nat 冲击、`vault_duty=3.26e-05` 死槽、`LSA=dense` 下 `18K` 检索仍失败、`+5.17 GiB` 1M 状态、`3.41 tok/s` 慢 `5.6×`）及原始 `fable51` 占位符毒化 | `truth_check_summary.json`, Hub `e050a4b8` |
 | **已完成 `s3_v2@600` 与 Gate 2** | `实测` | `600/600` 完工（`120.11M` 词元，`0` 跳过）：`64K` NLL **`1.3689 → 1.2996 → 1.2816`**（`dg=+0.0873`，较 HSSD `s3@600` **`-0.5941` nat / PPL 降 `44.8%`**）；`512K–1M` 召回峰值 `0.6514`；`2365 tok/s`（`2.25×`）；Gate 2 **`12/12` 清晰、`7/7`（`100%`）`18K/64K` 针命中**，零循环/零毒化 | Hub `6b521f47`, `s3v2_gate_summary.json` |
 | **`GDN-2-1M+QED` 与 `4×8K` 降显存** | `实测` | `27.53M` 参数（`0.079%`），第 0 步误差 `0.0`，零额外状态字节；Gate 1 `38/38` CUDA 测试全绿；融合 Triton 预处理 **`53.55 ms`**（较 PyTorch `106.93 ms` 快 `2.00×`），`T=1` `0.0787 ms`（快 `2.41×`）；**`574898d` `4×8K` 显存削减 `3.28×`**（`23.05 → 7.032 GiB`）；Gate 3 `4×32K d=3` 峰值 **`67.194 GiB`** | `s3v2_gate_summary.json`, `574898d` |
-| **在线 `s2_v2_joint_bptt` 进展** | `实测` | 已推进至 Hub `s100`（`d0a1d1d0`/600）：`lm 6.6937 → 5.8075`，`849–1,173 tok/s`，峰值 `67.80 GiB`（步后 `27.6 GiB` 持平，`0` 跳过）；GDN-2 自然激活（`adapter_norm 0.3884`，视界 `1.544×`） | Hub `39c29a6d..3e42161d`, `sup_s2v2.log` |
+| **在线 `s2_v2_joint_bptt` 进展** | `实测` | 已推进至 Hub `s100`（`d0a1d1d0`，监控 `s110`/600）：`lm 6.6937 → 5.8075`，`849–1,173 tok/s`，Hub 峰值 `67.77 GiB`（监控 `67.8`，步后 `27.6 GiB` 持平，`0` 跳过）；GDN-2 自然激活（`adapter_norm 0.3884`，视界 `1.544×`） | Hub `39c29a6d..d0a1d1d0`, `sup_s2v2.log` |
 | **1M 状态与去污染语料（`v1.2`）** | `推导`+`实测` | `1M` FP8 SharedKV 状态 **`10.65 GiB`**（较 Inkling 2 Mini 省 `3.02×`；Hadamard INT4 `5.96–6.28 GiB`；`BucketIndex` 审计 `+1.04 GiB` 可压至 `~0.04 GiB`）。语料 `v1.2`：`4,081` `sft_core`、`429` 偏好对、`1,889,432` 条 2026 13-gram（拦 `31` 泄漏）、`197/197` 笔记式 CoT | `lsa.py`, `audit_summary.json`, `dc7a14e` |
 | **Blackwell `sm_120` 加速栈** | `实测` | `18.99×` NVFP4 E2M1（`1,148 GB/s = 71.9%` GDDR7 峰值）、`9.32×/12.99×` D-LSA FlashAttn（`-70 TB/步`）、`5.83×` 两遍 KL（`-90K` 同步）、`54.03×` BPTT 自动 DMA、`2.06×` BPTT 端到端提速、`-7.0 GiB` 泄漏修复、`10.6×` TF 5.24 恢复；`760+` 测试（零 lint/AST 错误） | `PERF_PROFILE_S2.md`, `574898d` |
 
@@ -101,7 +101,7 @@
 | `88` 层激活检查点边界 + `3` 历史段 KV + `128K` `BucketIndex` | `推导` | **`13.05`** | `11.00 GiB`（`88×[1,32K,2048] bf16`）+ `1.88 GiB` 历史 KV + `0.17 GiB` 索引 |
 | 历史注意力前隐态 `u_seg`（`3×10L`）+ `66L` GDN-2 状态快照 | `推导` | **`~4.25`** | `3.75 GiB` `u_seg`（`bptt_offload_to_cpu=0.0`，全程常驻 GDDR7）+ `~0.50 GiB` GDN-2 |
 | 单层 `T=32K` `GDN2Adapter` 瞬态显存（`574898d` `4×8K` 分段） | `实测` | **`7.03`** | Gate 1 实测 **`7.032 GiB`** 增量（较未分段 `23.051 GiB` **缩减 `3.28×`**） |
-| **`s2_v2` 在线实测峰值（`4×32K`, `d=3`, `88L`）** | **`实测`** | **`67.19–67.77`** | Gate 3 **`67.194 GiB`**（预留 `71.4 GiB`）；在线 `s1–s100` 稳定于 **`67.80 GiB`**（余量 `27.17 GiB`） |
+| **`s2_v2` 在线实测峰值（`4×32K`, `d=3`, `88L`）** | **`实测`** | **`67.19–67.77`** | Gate 3 **`67.194 GiB`**（预留 `71.4 GiB`）；在线 `s1–s110` Hub 实测 **`67.77 GiB`**（监控四舍五入 `67.8 GiB`；余量 `27.20 GiB`） |
 
 ---
 
@@ -118,7 +118,7 @@
 | `s3_long_1m_lsa` (64K/1M) | v1 HSSD | `已完成` (`600/600`) | `83.06M` (`0.240%`) | `120.78M` | `1049.8` | `81.23` |
 | `s2_joint_bptt` (131K) | v1 HSSD | `500步中止` (`500/1200`) | `187.92M` (`0.542%`) | `131.07M` | `454→936` (`2.06×`) | `78.42` |
 | **`s3_v2_long_1m_lsa` (64K/1M)** | **洁净 v2** | `已完成` (`600/600`) | `24.56M` (`0.071%`) | `120.11M` | `2365.1` | `69.96` |
-| **`s2_v2_joint_bptt` (131K)** | **洁净 v2** | `运行中` (`100/600`) | `156.94M` (`0.453%`) | `26.21M` | `1051.4` | `67.80` |
+| **`s2_v2_joint_bptt` (131K)** | **洁净 v2** | `运行中` (`110/600`) | `156.94M` (`0.453%`) | `26.21M` | `1060.2` | `67.80` |
 
 #### 表 III-B — 跨阶段留出验证集质量与虚拟深度增益（修复后均为 `0` 跳过）
 
@@ -142,8 +142,8 @@
 | `s3_long_1m_lsa`（v1 HSSD, `600` 步） | `513879f`, `4f09463` | `33.37` | `0` 跳过；两次 Colab 会话无缝接续 |
 | `s2_joint_bptt`（v1 HSSD, `0–500`） | `2e37bf6..2f5a6ba` | `53.01` | 基线 `6.39`、泄漏 `1.59`、`5a82677` `21.23`、TF5.24 `9.54`+`14.26` |
 | **`s3_v2_long_1m_lsa`（v2, `600/600`）** | `28b88e4` | **`15.02`** | `600/600` 完工（`0` 跳过，监控均速 `~2,263 tok/s`）；另含 Gate 1/2/3 `0.30 h` |
-| **`s2_v2_joint_bptt`（v2 在线 `s100`）** | `574898d` | **`6.97`** | 在线 `GDN-2-1M+QED`（`0` 跳过，`~1,027–1,173 tok/s`，峰值 `67.80 GiB`） |
-| **监控累计单卡有效训练时长** | `colab_supervisor*.log` | **`167.01 h`** | `v1` `145.02 h` + `s3_v2` `15.02 h` + `s2_v2` `6.97 h`（不含约 `1.6 h` 独立门禁） |
+| **`s2_v2_joint_bptt`（v2 在线 `s110`）** | `574898d` | **`7.56`** | 在线 `GDN-2-1M+QED`（`0` 跳过，`~1,027–1,173 tok/s`，峰值 `67.80 GiB`） |
+| **监控累计单卡有效训练时长** | `colab_supervisor*.log` | **`167.60 h`** | `v1` `145.02 h` + `s3_v2` `15.02 h` + `s2_v2` `7.56 h`（不含约 `1.6 h` 独立门禁） |
 
 ### B. 零训练诊断与架构标定（`s0_probe`）
 
@@ -323,7 +323,7 @@ $$
 | **`GDN-2+QED` Triton（`4×8K`）** | `15.08` | `77.20` | `92.30 ms` | **`5.914 GiB`** | `—` | 较 `seg0` **降显存 `2.22×`** |
 | `GDN-2+QED` PyTorch 预处理（`seg0`） | `31.36` | `75.55` | `106.93 ms` | `17.637 GiB` | `0.1895` | 未融合对照基线 |
 | `GDN2Adapter` 完整封装（`seg0`） | `45.37` | `91.07` | `136.43 ms` | `23.051 GiB` | `0.4193` | 含 `compute_gates` 全链路 |
-| **`GDN2Adapter` 完整封装（`4×8K`）** | `45.79` | `140.85` | `186.62 ms` | **`7.032 GiB`** | `—` | **显存直降 `3.28×`（`-`16.02 GiB）** |
+| **`GDN2Adapter` 完整封装（`4×8K`）** | `45.79` | `140.85` | `186.62 ms` | **`7.032 GiB`** | `—` | **显存直降 `3.28×`（`-16.02 GiB`）** |
 | PyTorch 分块 GDN-2 参考实现 | `92.56` | `565.20` | `657.3 ms` | `—` | `0.1279` | 参考实现（`T=4096 bf16` `0` NaN） |
 
 ### C. Gate 3（`67.194 GiB` 峰值）与在线 `s2_v2_joint_bptt` 收敛态势
@@ -339,6 +339,7 @@ Gate 3 在 `574898d` 上通过了完整 `4×32K = 131K` `d=3`（`88L`）`GDN-2-1
 | **`s50`** (`0eaa682f`) | **`5.5156`** | `1173.3` | `67.75` | `0.1527` | `1.63e-04 / 0.0146` | **`1.139×`** / `0` |
 | **`s75`** (`3e42161d`) | **`4.0224`** | `1071.9` | `67.76` | `0.2665` | `2.47e-04 / 0.0226` | **`1.368×`** / `0` |
 | **`s100`** (`d0a1d1d0`) | **`5.8075`** | `1040.2` | `67.77` | `0.3884` | `3.55e-04 / 0.0294` | **`1.544×`** / `0` |
+| `s110` *（在线监控）* | `4.2897` | `1139.0` | `67.80` | *（待同步）* | *（待同步）* | `d=2 / 0` |
 
 ---
 
@@ -398,9 +399,9 @@ Gate 3 在 `574898d` 上通过了完整 `4×32K = 131K` `d=3`（`88L`）`GDN-2-1
 
 ## VII. 局限性、后续路线图与算力申请摘要
 
-**诚实科学局限：**（1）*尚未宣称下游 2026 前沿基准得分：* 目前实证仅涵盖留出语言建模 NLL（`8K–131K`）、`s0_probe`、Gate 1/2/3 CUDA/检索/冒烟校验、在线 `s2_v2` 遥测与语料审计；`HLE`、`AIME 2026`、`GPQA`、`MRCR 1M`、`ARC-AGI-2`、`KernelBench` 与 `SWE-bench Pro` 将仅在 `s2_v2` 与 `s4_v2_rl` 完成 13-gram 去污染 `d ∈ {1, 2, 3}` 评测后公布。（2）*`512K–1M` D-LSA 召回率（峰值 `0.6514` / 终值 `0.5715`）：* 虽已助力 `s3_v2@600` 在 `18K/64K` 检索达成 `100%`（`7/7`）命中，但仍低于 `0.70` 自动切换阈值，现于 `s2_v2` 中联合微调。（3）*`s2_v2` 训练中且 `s4_v2_rl` 排队待启：* `s2_v2` 当前处于 `s100`（监控 `s100`）/`600`，最终收敛与 RL 增益尚待测量。（4）*单卡自回归采样瓶颈：* 在线 `d=3`（`88L`）GRPO/SI-RSI 采样与 16 基准全深度扫描受单卡吞吐制约。
+**诚实科学局限：**（1）*尚未宣称下游 2026 前沿基准得分：* 目前实证仅涵盖留出语言建模 NLL（`8K–131K`）、`s0_probe`、Gate 1/2/3 CUDA/检索/冒烟校验、在线 `s2_v2` 遥测与语料审计；`HLE`、`AIME 2026`、`GPQA`、`MRCR 1M`、`ARC-AGI-2`、`KernelBench` 与 `SWE-bench Pro` 将仅在 `s2_v2` 与 `s4_v2_rl` 完成 13-gram 去污染 `d ∈ {1, 2, 3}` 评测后公布。（2）*`512K–1M` D-LSA 召回率（峰值 `0.6514` / 终值 `0.5715`）：* 虽已助力 `s3_v2@600` 在 `18K/64K` 检索达成 `100%`（`7/7`）命中，但仍低于 `0.70` 自动切换阈值，现于 `s2_v2` 中联合微调。（3）*`s2_v2` 训练中且 `s4_v2_rl` 排队待启：* `s2_v2` 当前处于 `s100`（监控 `s110`）/`600`，最终收敛与 RL 增益尚待测量。（4）*单卡自回归采样瓶颈：* 在线 `d=3`（`88L`）GRPO/SI-RSI 采样与 16 基准全深度扫描受单卡吞吐制约。
 
-**后续路线图与算力申请摘要（详见 `docs/COMPUTE_GRANT_PROPOSAL.md`）：**（1）完成 `s2_v2_joint_bptt` （`s100 → 600`）并通过 Gate 2 `18K–256K` 检索/一致性门禁；（2）执行 `s4_v2_rl`（`400` 步可验证 GRPO/DAPO + 精准 SI-RSI）；（3）发布等 FLOP `d ∈ {1, 2, 3}` 16 基准完整评测及全量 `safetensors` 权重包 [12]。在已投入 `167.01` 单卡 GPU 小时完成全部架构、数据与核函数去风险的前提下，申请 `1× 8×H200/B200` 节点两周（约 `2,500` GPU 小时，二级核心方案；弹性支持 `400 / 2,500 / 6,000` GPU 小时）即可完成 `GDN-2-1M+QED` 对照原生 GDN 消融、`s4_v2_rl` 及全量 2026 评测。
+**后续路线图与算力申请摘要（详见 `docs/COMPUTE_GRANT_PROPOSAL.md`）：**（1）完成 `s2_v2_joint_bptt` （`s110 → 600`）并通过 Gate 2 `18K–256K` 检索/一致性门禁；（2）执行 `s4_v2_rl`（`400` 步可验证 GRPO/DAPO + 精准 SI-RSI）；（3）发布等 FLOP `d ∈ {1, 2, 3}` 16 基准完整评测及全量 `safetensors` 权重包 [12]。在已投入 `167.60` 单卡 GPU 小时完成全部架构、数据与核函数去风险的前提下，申请 `1× 8×H200/B200` 节点两周（约 `2,500` GPU 小时，二级核心方案；弹性支持 `400 / 2,500 / 6,000` GPU 小时）即可完成 `GDN-2-1M+QED` 对照原生 GDN 消融、`s4_v2_rl` 及全量 2026 评测。
 
 **可复现性：** 运行下述命令即可从公开 HF Hub 与本地日志无扰动重建全部 CSV/JSON 归档、7 张矢量 SVG 图表及中英文报告：
 
@@ -421,7 +422,7 @@ PYTHONPATH=src python scripts/export_experiment_report.py \
 
 [3] H. Zhu, Z. Zhang, W. Cong, X. Liu, S. Park, V. Chandra, B. Long, D. Z. Pan, Z. Wang, and J. Lee, "APOLLO: SGD-like Memory, AdamW-level Performance," *arXiv preprint arXiv:2412.05270*, Dec. 2024.
 
-[4] Z. Xie, Y. Wei, H. Cao, W. Liang, *et al.* (DeepSeek-AI), "mHC: Manifold-Constrained Hyper-Connections," *arXiv preprint arXiv:2512.24880*, Dec. 2025.
+[4] Z. Xie *et al.* (DeepSeek-AI), "mHC: Manifold-Constrained Hyper-Connections," *arXiv preprint arXiv:2512.24880*, Dec. 2025.
 
 [5] S. Bae, Y. Kim, R. Bayat, S. Kim, J. Ha, T. Schuster, A. Fisch, H. Harutyunyan, Z. Ji, A. Courville, and S.-Y. Yun, "Mixture-of-Recursions: Learning Dynamic Recursive Depths for Adaptive Token-Level Computation," *arXiv preprint arXiv:2507.10524*, Jul. 2025.
 
@@ -429,9 +430,9 @@ PYTHONPATH=src python scripts/export_experiment_report.py \
 
 [7] D. Gupta, A. Das, and D. Gupta, "The Query Knows What to Forget: A Second Erase Direction for Linear Attention," *arXiv preprint arXiv:2608.13668*, Aug. 2026.
 
-[8] R. Grazzi, J. Siems, A. Zela, J. K. H. Franke, F. Hutter, and M. Pontil, "Unlocking State-Tracking in Linear RNNs Through Negative Eigenvalues," *arXiv preprint arXiv:2411.12537*, Nov. 2024.
+[8] R. Grazzi, J. Siems, A. Zela, J. K. H. Franke, F. Hutter, and M. Pontil, "Unlocking State-Tracking in Linear RNNs Through Negative Eigenvalues," in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2025, arXiv:2411.12537.
 
-[9] S. Yang and Y. Zhang, "FLA: A Triton-Based Library for Hardware-Efficient Implementations of Linear Attention Mechanisms," GitHub Repository (`fla-org/flash-linear-attention`, v0.6.0), 2024–2026.
+[9] S. Yang and Y. Zhang, "FLA: A Triton-Based Library for Hardware-Efficient Implementations of Linear Attention Mechanisms," GitHub Repository (fla-org/flash-linear-attention, v0.6.0), 2024–2026.
 
 [10] B. Peng, J. Quesnelle, H. Fan, and E. Shippole, "YaRN: Efficient Context Window Extension of Large Language Models," in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2024, arXiv:2309.00071.
 
@@ -443,20 +444,20 @@ PYTHONPATH=src python scripts/export_experiment_report.py \
 
 [14] Thinking Machines Lab, "Inkling 2 Mini," Technical Release, Nov. 20, 2026. [Online]. Available: https://thinkingmachines.ai
 
-[15] A. Zandieh, M. Daliri, M. Hadian, and V. Mirrokni, "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate," in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2026.
+[15] A. Zandieh, M. Daliri, M. Hadian, and V. Mirrokni, "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate," in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2026, arXiv:2504.19874.
 
-[16] G. Penedo, H. Kydlíček, L. Ben Allal, A. Lozhkov, M. Mitchell, C. Raffel, L. Von Werra, and T. Wolf, "The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale," *arXiv preprint arXiv:2406.17557*, Jun. 2024.
+[16] G. Penedo, H. Kydlíček, L. Ben Allal, A. Lozhkov, M. Mitchell, C. Raffel, L. von Werra, and T. Wolf, "The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale," *arXiv preprint arXiv:2406.17557*, Jun. 2024.
 
 [17] B. Peng, R. Zhang, D. Goldstein, E. Alcaide, *et al.*, "RWKV-7 'Goose' with Expressive Dynamic State Evolution," *arXiv preprint arXiv:2503.14456*, Mar. 2025.
 
-[18] E. Guha, R. Marten, S. Keh, N. Raoof, G. Smyrnis, H. Bansal, M. Nezhurina, J. Mercat, T. Vu, Z. Sprague, A. G. Dimakis, and L. Schmidt, "OpenThoughts: Data Recipes for Reasoning Models," *arXiv preprint arXiv:2506.04178*, Jun. 2025.
+[18] E. Guha *et al.*, "OpenThoughts: Data Recipes for Reasoning Models," *arXiv preprint arXiv:2506.04178*, Jun. 2025.
 
-[19] A. Bercovich, I. Levy, I. Golan, M. Dabbah, R. El-Yaniv, B. Ginsburg, J. Cohen, and B. Catanzaro, "Llama-Nemotron: Efficient Reasoning Models," *arXiv preprint arXiv:2505.00949*, May 2025.
+[19] A. Bercovich *et al.*, "Llama-Nemotron: Efficient Reasoning Models," *arXiv preprint arXiv:2505.00949*, May 2025.
 
-[20] F. Chollet, M. Knoop, G. Kamradt, and B. Landers, "ARC-AGI-2: A New Challenge for Frontier AI Reasoning Systems," GitHub Repository (`arcprize/ARC-AGI-2`), 2025.
+[20] F. Chollet, M. Knoop, G. Kamradt, B. Landers, and H. Pinkard, "ARC-AGI-2: A New Challenge for Frontier AI Reasoning Systems," *arXiv preprint arXiv:2505.11831*, May 2025.
 
-[21] Z. Shao, P. Wang, Q. Zhu, R. Xu, J. Song, M. Zhang, Y. K. Li, Y. Wu, and D. Guo, "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models," *arXiv preprint arXiv:2402.03300*, Feb. 2024.
+[21] Z. Shao, P. Wang, Q. Zhu, R. Xu, J. Song, X. Bi, H. Zhang, M. Zhang, Y. K. Li, Y. Wu, and D. Guo, "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models," *arXiv preprint arXiv:2402.03300*, Feb. 2024.
 
 [22] Q. Yu, Z. Zhang, R. Zhu, Y. Yuan, *et al.*, "DAPO: An Open-Source LLM Reinforcement Learning System at Scale," *arXiv preprint arXiv:2503.14476*, Mar. 2025.
 
-[23] E. Wijmans *et al.*, "Cut Your Losses in Large-Vocabulary Language Models," in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2025, arXiv:2411.09009.
+[23] E. Wijmans, B. Huval, A. Hertzberg, V. Koltun, and P. Krähenbühl, "Cut Your Losses in Large-Vocabulary Language Models," in *Proc. Int. Conf. Learn. Represent. (ICLR)*, 2025, arXiv:2411.09009.

@@ -326,14 +326,16 @@ def render_experiment_report_md_with_order(
         s2v2_lm = _fmt_f(s2v2_last_hub.get("loss_lm"), 4)
         s2v2_tps_lo = min(s2v2_tps_vals) if s2v2_tps_vals else 1041.0
         s2v2_tps_hi = max(s2v2_tps_vals) if s2v2_tps_vals else 1173.3
+        s2v2_first_sha = str(s2v2_hub_rows[0].get("commit_sha") or "39c29a6d")
+        s2v2_last_sha = str(s2v2.get("latest_commit_sha") or s2v2_last_hub.get("commit_sha") or "d0a1d1d0")
         a(
             "| **Live `s2_v2_joint_bptt` (`GDN-2+QED`)** | `Measured` | "
-            f"Live through Hub `s{s2v2_hub_step}` (`{s2v2.get('latest_commit_sha') or '3e42161d'}`"
+            f"Live through Hub `s{s2v2_hub_step}` (`{s2v2_last_sha}`"
             + (f", sup `s{s2v2_latest_step}`" if s2v2_latest_step > s2v2_hub_step else "")
             + f"/{s2v2_target}): `lm 6.6937 → {s2v2_lm}`, `{s2v2_tps_lo:,.0f}–{s2v2_tps_hi:,.0f} tok/s`, "
-            f"`{s2v2_pk_max:.2f} GiB` peak (`27.6 GiB` flat alloc, `0` skips); organic wake-up "
-            f"(`adapter_norm {s2v2_an}`, horizon `{s2v2_dh}×`) | "
-            "Hub `39c29a6d..3e42161d`, `colab_supervisor_s2v2.log` |"
+            f"`{s2v2_hub_pk_max:.2f} GiB` Hub peak (`{s2v2_pk_max:.1f}` sup., `27.6 GiB` flat alloc, `0` skips); "
+            f"organic wake-up (`adapter_norm {s2v2_an}`, horizon `{s2v2_dh}×`) | "
+            f"Hub `{s2v2_first_sha}..{s2v2_last_sha}`, `colab_supervisor_s2v2.log` |"
         )
     a(
         "| **1M State & Audited Corpus (`v1.2`)** | `Formula` + `Measured` | "
@@ -522,8 +524,8 @@ def render_experiment_report_md_with_order(
     )
     a(
         f"| **Measured Live `s2_v2` Peak (`4×32K`, `d=3`, `88L`)** | **`Measured`** | **`{g3_peak_gib:.2f}–{s2v2_hub_pk_max:.2f}`** | "
-        f"Gate 3 **`{g3_peak_gib:.3f} GiB`** (`71.4 GiB` res.); live `s1–s{max(s2v2_latest_step, 75)}` **`{s2v2_pk_max:.2f} GiB`** "
-        f"(`{94.97 - s2v2_pk_max:.2f} GiB` headroom) |"
+        f"Gate 3 **`{g3_peak_gib:.3f} GiB`** (`71.4 GiB` res.); live `s1–s{max(s2v2_latest_step, 75)}` **`{s2v2_hub_pk_max:.2f} GiB`** Hub exact "
+        f"(`{s2v2_pk_max:.1f} GiB` sup. rounded; `{94.97 - s2v2_hub_pk_max:.2f} GiB` headroom) |"
     )
     a("")
     a("---")
@@ -1186,7 +1188,9 @@ def render_experiment_report_md_with_order(
         "`d ∈ {1, 2, 3}` sweep. (2) *`512K–1M` D-LSA Recall (`0.6514` Peak / `0.5715` Final):* Although `s3_v2@600` "
         "passed `100%` (`7/7`) of `18K/64K` sparse needles, `512K–1M` Top-64 recall remains below our `0.70` "
         "auto-switch threshold and continues co-training inside `s2_v2`. (3) *`s2_v2` Mid-Run & `s4_v2_rl` Queued:* "
-        f"`s2_v2_joint_bptt` is live at `s{s2v2_hub_step}` (`sup s{s2v2_latest_step}`)/`{s2v2_target}`; final `600`-step "
+        f"`s2_v2_joint_bptt` is live at `s{s2v2_hub_step}`"
+        + (f" (`sup s{s2v2_latest_step}`)" if s2v2_latest_step > s2v2_hub_step else "")
+        + f"/`{s2v2_target}`; final `600`-step "
         "convergence and `s4_v2_rl` gains are not yet measured. (4) *Single-GPU Rollout Bottleneck:* Online `d=3` "
         "(`88L`) GRPO/SI-RSI rollouts and 16-benchmark sweeps are throughput-bound on a single card."
     )

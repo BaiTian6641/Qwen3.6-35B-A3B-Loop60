@@ -2,14 +2,16 @@
 
 Collects verified experimental evidence across:
   1. Full commit-by-commit Hugging Face Hub `manifest.json` history + probe/quality artifacts,
-  2. Local `runs/colab_supervisor.log` (v1) & `runs/colab_supervisor_v2.log` (clean v2),
+  2. Local `runs/colab_supervisor.log` (v1), `runs/colab_supervisor_v2.log` (`s3_v2`), &
+     `runs/colab_supervisor_s2v2.log` (`s2_v2`),
   3. Optional local stage `metrics.jsonl` files & verified local JSON artifacts
      (`truth_check_summary.json`, `bench_v2_smoke_dplr/summary.json`,
-     `Loop64-Fable-SIRSI-v1/audit_summary.json`),
+     `Loop64-Fable-SIRSI-v1/audit_summary.json`, `eval_s3v2_step600_gate/summary.json`),
   4. Optional read-only Colab session snapshot (disabled by default to avoid disturbing live runs),
 
 sanitizes all outputs to guarantee zero credential/token leakage, exports structured
-JSON/CSV archives + 7 pure-SVG vector charts, and generates `docs/EXPERIMENT_REPORT.md`.
+JSON/CSV archives + 7 pure-SVG vector charts, and generates IEEE-formatted academic reports
+in English (`docs/EXPERIMENT_REPORT.md`) and Simplified Chinese (`docs/EXPERIMENT_REPORT_ZH.md`).
 """
 from __future__ import annotations
 
@@ -25,6 +27,12 @@ import subprocess
 from typing import Any
 
 from qloop.report_charts import ALL_CHART_RENDERERS
+from qloop.report_citations import validate_ieee_citations
+from qloop.report_paper_en import (
+    render_experiment_report_md,  # noqa: F401
+    render_experiment_report_md_with_order,
+)
+from qloop.report_paper_zh import render_experiment_report_zh_md
 
 DEFAULT_REPO = "TassP0lar/Qwen3.6-35B-A3B-Loop64"
 DEFAULT_DATASET_REPO = "TassP0lar/Loop64-Fable-SIRSI-v1"
@@ -36,6 +44,7 @@ STAGES: tuple[str, ...] = (
     "s3_long_1m_lsa",
     "s2_joint_bptt",
     "s3_v2_long_1m_lsa",
+    "s2_v2_joint_bptt",
 )
 
 # Regexes for secret / private tunnel redaction
@@ -150,8 +159,14 @@ VERIFIED_SYSTEMS_MILESTONES: list[dict[str, str]] = [
     {
         "component": "GDN-2-1M+QED Triton Prep & fla 0.6.0 DPLR",
         "commit": "919f2b8 / 2c78ffc",
-        "measurement": "T=32K: 35.55–43.64 ms vs 657.32 ms ref; T=1: 0.0430 ms vs 0.0421 ms native GDN",
-        "impact": "15.1×–18.5× train speedup, 1.02× native decode, 0.0 Step-0 diff, zero-sync is_zero() cache",
+        "measurement": "T=32K: 53.55 ms fused Triton vs 106.93 ms PyTorch prep; T=1: 0.0787 vs 0.1895 ms",
+        "impact": "2.00× T=32K & 2.41× T=1 prep speedup (12.3×–18.5× vs ref), 0.0 Step-0 diff, zero-sync is_zero()",
+    },
+    {
+        "component": "GDN-2 Checkpointed 4×8K Macro-Segmenting & need_grad Gate",
+        "commit": "cd0580b / 574898d",
+        "measurement": "T=32K wrapper VRAM delta 23.051 → 7.032 GiB; Gate 3 4×32K d=3 peak 67.194 GiB",
+        "impact": "3.28× wrapper VRAM cut (-16.02 GiB/layer), 38/38 CUDA pytest green, 0 NaNs, 27.8 GiB headroom",
     },
 ]
 
@@ -654,7 +669,7 @@ def parse_supervisor_log(log_path: str | None, stage_override: str | None = None
             if ms:
                 step, target, lm, depth, tps, alloc_g, res_g, peak_g = ms.groups()
                 tgt_i = int(target)
-                if cur_run_dir_stage in ("s3_long_1m_lsa", "s3_v2_long_1m_lsa") and tgt_i == 600:
+                if cur_run_dir_stage in ("s3_long_1m_lsa", "s3_v2_long_1m_lsa", "s2_v2_joint_bptt") and tgt_i == 600:
                     stage = cur_run_dir_stage
                 else:
                     stage = _TARGET_TO_STAGE.get(tgt_i, cur_run_dir_stage or f"target_{target}")
@@ -768,33 +783,47 @@ def parse_supervisor_log(log_path: str | None, stage_override: str | None = None
     }
 
 
-def _merge_supervisor_logs(sup_v1: dict[str, Any], sup_v2: dict[str, Any]) -> dict[str, Any]:
-    """Combine v1 and v2 supervisor log parses cleanly without dropping either."""
-    if not sup_v2.get("present"):
+def _merge_supervisor_logs(
+    sup_v1: dict[str, Any],
+    sup_v2: dict[str, Any],
+    sup_s2v2: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Combine v1, v2 (s3_v2), and s2_v2 supervisor log parses cleanly without dropping any."""
+    sups = [s for s in (sup_v1, sup_v2, sup_s2v2) if s and s.get("present")]
+    if not sups:
         return sup_v1
-    if not sup_v1.get("present"):
-        return sup_v2
-    merged_hours = dict(sup_v1.get("active_gpu_hours_by_head") or {})
-    for k, v in (sup_v2.get("active_gpu_hours_by_head") or {}).items():
-        merged_hours[k] = round(merged_hours.get(k, 0.0) + float(v), 2)
+    merged_hours: dict[str, float] = {}
+    boots: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    step_samples: list[dict[str, Any]] = []
+    stage_head_summary: list[dict[str, Any]] = []
+    for s in sups:
+        for k, v in (s.get("active_gpu_hours_by_head") or {}).items():
+            merged_hours[k] = round(merged_hours.get(k, 0.0) + float(v), 2)
+        boots.extend(s.get("boots") or [])
+        failures.extend(s.get("failures") or [])
+        step_samples.extend(s.get("step_samples") or [])
+        stage_head_summary.extend(s.get("stage_head_summary") or [])
+
+    h_v1 = round(float(sup_v1.get("active_gpu_hours_total") or 0.0), 2) if sup_v1.get("present") else 0.0
+    h_v2 = round(float(sup_v2.get("active_gpu_hours_total") or 0.0), 2) if sup_v2.get("present") else 0.0
+    h_s2v2 = (
+        round(float((sup_s2v2 or {}).get("active_gpu_hours_total") or 0.0), 2)
+        if (sup_s2v2 or {}).get("present")
+        else 0.0
+    )
     return {
         "present": True,
-        "boots": [*(sup_v1.get("boots") or []), *(sup_v2.get("boots") or [])],
-        "failures": [*(sup_v1.get("failures") or []), *(sup_v2.get("failures") or [])],
-        "step_samples": [*(sup_v1.get("step_samples") or []), *(sup_v2.get("step_samples") or [])],
-        "stage_head_summary": [
-            *(sup_v1.get("stage_head_summary") or []),
-            *(sup_v2.get("stage_head_summary") or []),
-        ],
+        "boots": boots,
+        "failures": failures,
+        "step_samples": step_samples,
+        "stage_head_summary": stage_head_summary,
         "s2_regimes": dict(sup_v1.get("s2_regimes") or {}),
         "active_gpu_hours_by_head": merged_hours,
-        "active_gpu_hours_total": round(
-            float(sup_v1.get("active_gpu_hours_total") or 0.0)
-            + float(sup_v2.get("active_gpu_hours_total") or 0.0),
-            2,
-        ),
-        "active_gpu_hours_v1": round(float(sup_v1.get("active_gpu_hours_total") or 0.0), 2),
-        "active_gpu_hours_v2": round(float(sup_v2.get("active_gpu_hours_total") or 0.0), 2),
+        "active_gpu_hours_total": round(h_v1 + h_v2 + h_s2v2, 2),
+        "active_gpu_hours_v1": h_v1,
+        "active_gpu_hours_v2": h_v2,
+        "active_gpu_hours_s2v2": h_s2v2,
         "tf524_slowdown_window": sup_v1.get("tf524_slowdown_window"),
     }
 
@@ -957,6 +986,56 @@ def load_dataset_audit_summary(path: str | None) -> dict[str, Any] | None:
     return sanitize_obj(compact)
 
 
+def load_s3v2_gate_summary(path: str | None) -> dict[str, Any] | None:
+    """Load and sanitize compact Gate 1/2/3 summary from runs/eval_s3v2_step600_gate/summary.json."""
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+
+    g1 = raw.get("gate1_cuda_gdn2") or {}
+    g2 = raw.get("gate2_s3v2_step600_truth_check") or {}
+    g3 = raw.get("gate3_s2v2_4x32k_d3_smoke") or {}
+
+    compact_runs: list[dict[str, Any]] = []
+    for r in g2.get("runs") or []:
+        if not isinstance(r, dict):
+            continue
+        compact_runs.append(
+            {
+                k: v
+                for k, v in r.items()
+                if k not in ("text", "first_240")
+            }
+        )
+
+    compact = {
+        "timestamp_utc": raw.get("timestamp_utc"),
+        "all_gates_passed": raw.get("all_gates_passed"),
+        "verdict": raw.get("verdict"),
+        "environment": raw.get("environment"),
+        "gate1_cuda_gdn2": {
+            "gate1_passed": g1.get("gate1_passed"),
+            "elapsed_sec": g1.get("elapsed_sec"),
+            "pytest": g1.get("pytest"),
+            "benchmarks": g1.get("benchmarks"),
+        },
+        "gate2_s3v2_step600_truth_check": {
+            "gate2_passed": g2.get("gate2_passed"),
+            "elapsed_sec": g2.get("elapsed_sec"),
+            "checkpoint": g2.get("checkpoint"),
+            "checks": g2.get("checks"),
+            "runs": compact_runs,
+        },
+        "gate3_s2v2_4x32k_d3_smoke": {
+            k: v
+            for k, v in g3.items()
+            if k not in ("log_tail", "step_log_lines")
+        },
+    }
+    return sanitize_obj(compact)
+
+
 # ---------------------------------------------------------------------------
 # Normalization, Rollback Classification & Deduplication
 # ---------------------------------------------------------------------------
@@ -1023,6 +1102,12 @@ def _extract_metrics_row(
         "calib_prefix_len": _safe_int(met.get("loss/calib_prefix_len")),
         "bptt_replayed_tokens": _safe_int(met.get("loss/bptt_replayed_tokens")),
         "bptt_offload_to_cpu": _safe_float(met.get("loss/bptt_offload_to_cpu")),
+        "gdn2_adapter_norm": _safe_float(met.get("gdn2/adapter_norm")),
+        "gdn2_qed_lambda_abs_mean": _safe_float(met.get("gdn2/qed_lambda_abs_mean")),
+        "gdn2_neg_eigval_scale_mean": _safe_float(met.get("gdn2/neg_eigval_scale_mean")),
+        "gdn2_decay_horizon_mult_max": _safe_float(met.get("gdn2/decay_horizon_mult_max")),
+        "gdn2_erase_write_l1": _safe_float(met.get("gdn2/erase_write_l1")),
+        "gdn2_decay_spread": _safe_float(met.get("gdn2/decay_spread")),
     }
     return row
 
@@ -1039,6 +1124,7 @@ def normalize_experiment_data(
     truth_check: dict[str, Any] | None = None,
     dplr_bench: dict[str, Any] | None = None,
     dataset_audit: dict[str, Any] | None = None,
+    s3v2_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Classify rollbacks, deduplicate by (stage, step), merge live/supervisor/artifact telemetry."""
     s1_reset_idx: int | None = None
@@ -1248,7 +1334,7 @@ def normalize_experiment_data(
                 existing["mem_alloc_gib"] = srow["mem_alloc_gib"]
             if existing.get("mem_peak_gib") is None:
                 existing["mem_peak_gib"] = srow["mem_peak_gib"]
-        elif st == "s2_joint_bptt":
+        elif st in ("s2_joint_bptt", "s2_v2_joint_bptt"):
             dedup_rows[st][step_v] = {
                 "stage": st,
                 "step": step_v,
@@ -1258,7 +1344,7 @@ def normalize_experiment_data(
                 "source": "supervisor_log",
                 "depth": srow["depth"],
                 "loss_lm": srow["loss_lm"],
-                "tokens_seen": step_v * 262_144,
+                "tokens_seen": step_v * 262_144 if st == "s2_joint_bptt" else None,
                 "tok_per_s": srow["tok_per_s"],
                 "lr_factor": None,
                 "grad_norm": None,
@@ -1293,7 +1379,13 @@ def normalize_experiment_data(
                 "lsa_min_head_recall": None,
                 "calib_prefix_len": None,
                 "bptt_replayed_tokens": 2048,
-                "bptt_offload_to_cpu": 0.0 if head in ("5a82677", "8409b6e") else None,
+                "bptt_offload_to_cpu": 0.0 if head in ("5a82677", "8409b6e", "574898d") else None,
+                "gdn2_adapter_norm": None,
+                "gdn2_qed_lambda_abs_mean": None,
+                "gdn2_neg_eigval_scale_mean": None,
+                "gdn2_decay_horizon_mult_max": None,
+                "gdn2_erase_write_l1": None,
+                "gdn2_decay_spread": None,
             }
 
     # Pass 5: verified step-0 launch anchors (only for canonical repo when missing)
@@ -1411,6 +1503,11 @@ def normalize_experiment_data(
     smoke_s3_s = float((part_a_sm.get("smoke_s3v2") or {}).get("elapsed_sec") or 0.0)
     smoke_s2_s = float((part_a_sm.get("smoke_s2v2") or {}).get("elapsed_sec") or 0.0)
     smoke_h = round((smoke_s3_s + smoke_s2_s) / 3600.0, 2)
+    gate_sec = (
+        float(((s3v2_gate or {}).get("gate1_cuda_gdn2") or {}).get("elapsed_sec") or 0.0)
+        + float(((s3v2_gate or {}).get("gate2_s3v2_step600_truth_check") or {}).get("elapsed_sec") or 0.0)
+        + float(((s3v2_gate or {}).get("gate3_s2v2_4x32k_d3_smoke") or {}).get("elapsed_sec") or 0.0)
+    )
     gpu_hours = {
         "s0_probe_h": probe_h,
         "s1_loop_a6b_h": round(float(by_head.get("c22bf62", 0.0)), 2),
@@ -1426,10 +1523,13 @@ def normalize_experiment_data(
         "s2_hssd_2f5a6ba_post_fix_h": (supervisor_data.get("tf524_slowdown_window") or {}).get("post_fix_hours"),
         "v2_smoke_part_a_h": smoke_h,
         "s3_v2_native_gdn_h": round(float(by_head.get("28b88e4", 0.0)), 2),
+        "s3v2_gate123_h": round(gate_sec / 3600.0, 2),
+        "s2_v2_gdn2_h": round(float(by_head.get("574898d", 0.0)), 2),
         "supervisor_v1_active_h": round(
             float(supervisor_data.get("active_gpu_hours_v1") or supervisor_data.get("active_gpu_hours_total") or 0.0), 2
         ),
         "supervisor_v2_active_h": round(float(supervisor_data.get("active_gpu_hours_v2") or 0.0), 2),
+        "supervisor_s2v2_active_h": round(float(supervisor_data.get("active_gpu_hours_s2v2") or 0.0), 2),
         "supervisor_total_active_h": round(float(supervisor_data.get("active_gpu_hours_total") or 0.0), 2),
     }
 
@@ -1457,6 +1557,7 @@ def normalize_experiment_data(
         "truth_check": truth_check,
         "dplr_bench": dplr_bench,
         "dataset_audit": dataset_audit,
+        "s3v2_gate": s3v2_gate,
         "systems_milestones": VERIFIED_SYSTEMS_MILESTONES,
     }
 
@@ -1477,6 +1578,7 @@ def normalize_experiment_data(
         "truth_check": truth_check,
         "dplr_bench": dplr_bench,
         "dataset_audit": dataset_audit,
+        "s3v2_gate": s3v2_gate,
         "kv_memory_1m": kv_memory_1m,
     }
 
@@ -1519,6 +1621,16 @@ STAGE_CSV_COLUMNS: dict[str, list[str]] = {
         "bridge_subspace_up_abs_mean_p3", "bridge_step_emb_norm_p3",
         "eval_loss_d1", "eval_loss_d2", "eval_loss_d3", "eval_depth_gain",
     ],
+    "s2_v2_joint_bptt": [
+        "step", "status", "commit_sha", "ts", "source", "depth", "loss_lm", "lsa_kl_mean",
+        "bptt_replayed_tokens", "bptt_offload_to_cpu", "tokens_seen", "tok_per_s", "lr_factor",
+        "grad_norm", "skipped_total", "mem_alloc_gib", "mem_peak_gib", "reroute_rate",
+        "unique_experts_core", "effective_expert_mult",
+        "gate_abs_mean_p2", "gate_abs_mean_p3", "bridge_w_anchor_p3",
+        "gdn2_adapter_norm", "gdn2_qed_lambda_abs_mean", "gdn2_neg_eigval_scale_mean",
+        "gdn2_decay_horizon_mult_max", "gdn2_erase_write_l1", "gdn2_decay_spread",
+        "eval_loss_d1", "eval_loss_d2", "eval_loss_d3", "eval_depth_gain",
+    ],
 }
 
 
@@ -1554,1772 +1666,9 @@ def _fmt_i(val: Any) -> str:
     return f"{i:,}" if i is not None else "—"
 
 
-def render_experiment_report_md(
-    bundle: dict[str, Any],
-    chart_rel_dir: str = "experiment_logs/charts",
-) -> str:
-    """Render unified scholarly v1 -> Forensics -> v2 + GDN-2-1M+QED report from verified data."""
-    sm = bundle["summary_metrics"]
-    stages = sm["stages"]
-    evals = bundle["eval_curves"]
-    rb = sm["rollback_summary"]
-    s2_reg = sm["supervisor_s2_regimes"]
-    tf524 = sm.get("tf524_slowdown_window") or {}
-    gh = sm.get("gpu_hours") or {}
-    probe = bundle.get("probe_report") or {}
-    qc = bundle.get("quality_check") or {}
-    tc = bundle.get("truth_check") or {}
-    db = bundle.get("dplr_bench") or {}
-    da = bundle.get("dataset_audit") or {}
-    kv_rows = bundle["kv_memory_1m"]
-
-    s1 = stages["s1_loop_a6b"]
-    s3 = stages["s3_long_1m_lsa"]
-    s2 = stages["s2_joint_bptt"]
-    s3v2 = stages["s3_v2_long_1m_lsa"]
-
-    s1b_rows = bundle["stage_tables"]["s1b_hssd_distill"]
-    s3_rows = bundle["stage_tables"]["s3_long_1m_lsa"]
-    s2_rows = bundle["stage_tables"]["s2_joint_bptt"]
-    s3v2_rows = bundle["stage_tables"]["s3_v2_long_1m_lsa"]
-
-    tot_tok_m = sm["total_tokens_trained"] / 1e6
-    s2_latest_step = s2.get("latest_step") or 0
-    s3v2_latest_step = s3v2.get("latest_step") or 0
-    s3v2_target = s3v2.get("target_steps") or 600
-    sup_tot_h = float(gh.get("supervisor_total_active_h") or 0.0)
-    sup_v1_h = float(gh.get("supervisor_v1_active_h") or 0.0)
-    sup_v2_h = float(gh.get("supervisor_v2_active_h") or 0.0)
-
-    def _uniq_tok_seen(rows_in: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        out_r: list[dict[str, Any]] = []
-        seen_t: set[int] = set()
-        for r in rows_in:
-            ts_k = r.get("tokens_seen")
-            if isinstance(ts_k, int) and ts_k > 0:
-                if ts_k in seen_t:
-                    continue
-                seen_t.add(ts_k)
-            out_r.append(r)
-        return out_r
-
-    s2_post = _uniq_tok_seen([r for r in s2_rows if int(r["step"]) >= 50 and r.get("tok_per_s") is not None])
-    s2_post_tps = [float(r["tok_per_s"]) for r in s2_post]
-    s2_pre = _uniq_tok_seen([r for r in s2_rows if int(r["step"]) <= 43 and r.get("tok_per_s") is not None])
-    s2_pre_tps = [float(r["tok_per_s"]) for r in s2_pre]
-    s2_pre_mean = _mean(s2_pre_tps)
-    s2_post_mean = _mean(s2_post_tps)
-    s2_speedup = (s2_post_mean / s2_pre_mean) if (s2_pre_mean and s2_post_mean) else None
-
-    s2_vd_vals = [float(r["hssd_vault_duty"]) for r in s2_rows if r.get("hssd_vault_duty") is not None]
-    s3_rec_vals = [float(r["lsa_recall"]) for r in s3_rows if r.get("lsa_recall") is not None]
-    s3_max_pfx = max([int(r["calib_prefix_len"]) for r in s3_rows if r.get("calib_prefix_len")] or [0])
-
-    s3v2_rec_vals = [float(r["lsa_recall"]) for r in s3v2_rows if r.get("lsa_recall") is not None]
-    s3v2_mrec_vals = [float(r["lsa_min_head_recall"]) for r in s3v2_rows if r.get("lsa_min_head_recall") is not None]
-    s3v2_max_pfx = max([int(r["calib_prefix_len"]) for r in s3v2_rows if r.get("calib_prefix_len")] or [0])
-    s3v2_gp2 = [float(r["gate_abs_mean_p2"]) for r in s3v2_rows if r.get("gate_abs_mean_p2") is not None]
-    s3v2_gp3 = [float(r["gate_abs_mean_p3"]) for r in s3v2_rows if r.get("gate_abs_mean_p3") is not None]
-    s3v2_wa3 = [float(r["bridge_w_anchor_p3"]) for r in s3v2_rows if r.get("bridge_w_anchor_p3") is not None]
-
-    s1b_p2 = [r for r in s1b_rows if int(r["step"]) > 400]
-    s1b_stand = [r for r in s1b_p2 if (r.get("hssd_blend") or 0.0) >= 0.999 and r.get("loss_lm") is not None]
-
-    s1_ev_last = s1.get("eval_last") or {}
-    s3_ev_first = s3.get("eval_first") or {}
-    s3_ev_last = s3.get("eval_last") or {}
-    s2_ev_first = s2.get("eval_first") or {}
-    s2_ev_last = s2.get("eval_last") or {}
-    s3v2_ev_last = s3v2.get("eval_last") or {}
-
-    v2_row = next((r for r in kv_rows if r.get("highlight")), kv_rows[0])
-    v2_tot_gib = float(v2_row["total_gib"])
-
-    lines: list[str] = []
-    a = lines.append
-
-    a("# `Qwen3.6-35B-A6B-Loop64` — Empirical Research, Negative Ablation & Systems Report (v1 → Forensics → v2)")
-    a("")
-    a(
-        f"> **Model Hub:** [`{sm['repo']}`](https://huggingface.co/{sm['repo']}) · "
-        f"**Dataset Hub:** [`{sm['dataset_repo']}`](https://huggingface.co/datasets/{sm['dataset_repo']}) (`v1.2`)  "
-    )
-    a(
-        f"> **Base Backbone:** `{sm['base_model']}` (`34.661B` text decoder; `32.212B` routed MoE experts "
-        "**100% frozen**, SHA-256 verified)  "
-    )
-    a(f"> **Hardware:** `{sm['hardware']}` (single rented Google Colab G4 VM, zero multi-node cluster)  ")
-    a(
-        f"> **Telemetry Snapshot:** `{sm['generated_at_utc']}` · "
-        f"**`{sm['total_hub_commits']}` Hugging Face Hub commits** + local `colab_supervisor.log` (`{sup_v1_h:.2f}` h) "
-        f"+ `colab_supervisor_v2.log` (`{sup_v2_h:.2f}` h) + verified local JSON artifacts"
-    )
-    a("")
-    a("> [!IMPORTANT]")
-    a(
-        "> **Strict Empirical Grounding & Provenance Policy:** Every metric, commit SHA, loss, recall, "
-        "throughput, VRAM, GPU-hour, dataset count, and latency figure in this report traces directly to "
-        "live Hugging Face Hub `manifest.json` commits, `runs/colab_supervisor.log`, `runs/colab_supervisor_v2.log`, "
-        "`runs/eval_truth_check_s2_step500/truth_check_summary.json`, `runs/bench_v2_smoke_dplr/summary.json`, "
-        "`runs/datasets/Loop64-Fable-SIRSI-v1/audit_summary.json`, `docs/PERF_PROFILE_S2.md`, or an explicitly "
-        "labeled closed-form analytical tensor-shape formula. Unmeasured downstream benchmarks (`HLE`, `AIME 2026`, "
-        "`MRCR 1M`, etc.) and queued stages (`s2_v2`, `s4_v2_rl`) are **never** claimed."
-    )
-    a("")
-    a("---")
-    a("")
-
-    # ------------------------------------------------------------------
-    # Section 1: Executive Summary
-    # ------------------------------------------------------------------
-    a("## 1. Executive Summary")
-    a("")
-    a(
-        "On a **single rented Google Colab NVIDIA RTX PRO 6000 Blackwell Server Edition (`GB202`, `sm_120`, "
-        "`96 GB GDDR7 with ECC` [`94.97 GiB` CUDA-usable], `512-bit` bus, `1,597 GB/s` peak Server Edition "
-        "bandwidth [vs. `1,792 GB/s` Workstation Edition], `24,064` CUDA cores, `600 W` configurable max TDP, "
-        f"passive server cooling; `{sup_tot_h:.2f}` measured active supervisor GPU-hours across `{tot_tok_m:.2f}M` "
-        "total tokens)**, we developed an open, parameter-efficient (`< 0.6%` trainable) 88-virtual-layer looped "
-        "hybrid reasoning & `1M`-context retrofit of `unsloth/Qwen3.6-35B-A3B-NVFP4` while keeping all `32.212B` "
-        "routed MoE experts **100% frozen (SHA-256 verified)**. Grounded in **APOLLO (`arXiv:2412.05270`) + "
-        "`FusedStepOptimizer`** for single-card `96 GB` training, our empirical record documents both a decisive "
-        "**negative architectural ablation (v1 HSSD v3.2)** — caught early by an adversarial Phase-A truth-check "
-        "& 4-stage causal component swap before wasting full RL/eval compute — and the resulting **clean v2 "
-        "breakthrough (`Native-GDN / GDN-2-1M + Bounded QED + 88L Loop + FP8 1.0× SharedKV + D-LSA`)**:"
-    )
-    a("")
-    a("### Headline Verified Results (`Measured` Telemetry vs. `Derived Formula`)")
-    a("")
-    a("| Dimension | Class | Verified Finding | Ground-Truth Provenance |")
-    a("| :--- | :---: | :--- | :--- |")
-    a(
-        "| **Single-GPU Optimizer (`APOLLO` + `FusedStepOptimizer`)** | `Measured` + `Derived Formula` | "
-        "`rank=256` channel-wise APOLLO (`apollo_torch`) routes all `30` large 2D `k/v/o` matrices (`104.86M` "
-        "params in `s2*`: `5.0×` moments / `4.2×` net incl. proj, `8.0×` / `6.4×` on `o_proj`) and `o_proj + "
-        "shared_expert` (`209.72M` in `s4_v2_rl`: `2.86×` moments / `2.50×` net, `-0.94 GiB` net); `fused=True` "
-        "in-backward `.grad` release in `s1`, atomic `fused=False` guard (`3a17c0d`) with `_foreach_norm` "
-        "(`897 → ~4` launches, `0.0` error) in `s1b/s3/s2/s4` | "
-        "`configs/base.yaml:89-97`, `src/qloop/train/optim.py:382-421`, `docs/PERF_PROFILE_S2.md:59`, "
-        "`runs/s1_loop_a6b_run.log:57-60` |"
-    )
-    a(
-        "| **88L Loop Healing (`s1_loop_a6b`)** | `Measured` | "
-        "`18.41M` params (`0.053%`) healed `40L → 64L → 88L` "
-        f"(`depth_gain = {_fmt_f(s1_ev_last.get('depth_gain'), 4, True)}`), "
-        "`82.3%` Pass-2 expert re-routing (`17.36` unique core experts/tok), "
-        "`100%` `d=1/2/3` cache parity & `16K` needle pass; `54.24 GiB` peak VRAM | "
-        "Hub `32eb565e`, `s1_quality_check.json`, `truth_check_summary.json` |"
-    )
-    vd_s500 = s2_vd_vals[-1] if s2_vd_vals else 3.26e-5
-    a(
-        "| **v1 Negative Ablation (HSSD v3.2 Post-Mortem)** | `Measured` | "
-        "4-stage causal swap proved `top1 = 1.0000` decode parity & D-LSA innocence, isolating HSSD v3.2 as the "
-        f"root failure (`+0.79` nat `s1b` shock `0.919 → 1.705`, dead `vault_duty = {vd_s500:.2e}`, failed `18K` "
-        "needle under `LSA=dense`, `+5.17 GiB` 1M state, `3.41 tok/s` `5.6×` slower decode) + raw `fable51` "
-        "`100%` redacted tool-arg poisoning | "
-        "`runs/eval_truth_check_s2_step500/truth_check_summary.json`, Hub `e050a4b8` |"
-    )
-    if s3v2_ev_last and s3v2_rec_vals:
-        ev_st = int(s3v2_ev_last.get("step") or 200)
-        s3_match = next((e for e in evals["s3_long_1m_lsa"] if int(e["step"]) == ev_st), None) or next(
-            (e for e in evals["s3_long_1m_lsa"] if int(e["step"]) == 200), None
-        )
-        s3v2_d3 = float(s3v2_ev_last["d3"])
-        cmp_str = ""
-        if s3_match and s3_match.get("d3") is not None:
-            diff_n = s3v2_d3 - float(s3_match["d3"])
-            ppl_v2 = math.exp(s3v2_d3)
-            ppl_v1 = math.exp(float(s3_match["d3"]))
-            cmp_str = (
-                f" (**`{diff_n:+.3f}` nats / `{(1.0 - ppl_v2/ppl_v1)*100:.1f}%` lower PPL** "
-                f"vs HSSD `s3@s{int(s3_match['step'])}`)"
-            )
-        v2_tps_h = s3v2.get("tok_per_s_mean")
-        v1_tps_h = s3.get("tok_per_s_mean")
-        v2_sp_str = f"`{v2_tps_h / v1_tps_h:.2f}×` faster" if (v2_tps_h and v1_tps_h) else "`2.26×` faster"
-        a(
-            "| **Clean v2 A/B Win (`s3_v2_long_1m_lsa`)** | `Measured` | "
-            f"Held-out `64K` NLL **`{_fmt_f(s3v2_ev_last.get('d1'), 3)} → {_fmt_f(s3v2_ev_last.get('d2'), 3)} → "
-            f"{_fmt_f(s3v2_d3, 3)}`** (`depth_gain = {_fmt_f(s3v2_ev_last.get('depth_gain'), 4, True)}`){cmp_str}; "
-            f"`512K–1M` recall **`{max(s3v2_rec_vals):.3f}`** peak (vs `0.485` HSSD); "
-            f"**`{_fmt_f(v2_tps_h, 0)} tok/s`** ({v2_sp_str}); "
-            f"peak **`{_fmt_f(s3v2.get('mem_peak_max_gib'), 2)} GiB`** (`-11.3 GiB`) | "
-            f"Hub `{s3v2.get('latest_commit_sha') or '—'}` "
-            f"(`s{s3v2_latest_step}/{s3v2_target}`), `colab_supervisor_v2.log` |"
-        )
-    if db.get("T32768_fwd_bwd") and db.get("T1_decode"):
-        t32_d = db["T32768_fwd_bwd"]
-        t1_d = db["T1_decode"]
-        py_m = float((t32_d.get("pytorch_chunk_gdn2") or {}).get("total", {}).get("median_ms") or 657.32)
-        dplr_m = float((t32_d.get("fla_chunk_dplr_raw") or {}).get("total", {}).get("median_ms") or 43.64)
-        gdn2_m = float((t32_d.get("fla_ops_gdn2_chunk_gdn2") or {}).get("total", {}).get("median_ms") or 35.55)
-        t1_nat = float((t1_d.get("native_fused_recurrent_gated_delta_rule") or {}).get("median_ms") or 0.0421)
-        t1_dplr = float((t1_d.get("fla_fused_recurrent_dplr_raw") or {}).get("median_ms") or 0.0430)
-        a(
-            "| **GDN-2-1M (`arXiv:2605.22791`) + QED (`arXiv:2608.13668`)** | `Measured` | "
-            "`27.53M` params (`0.079%`, `47.1%` of HSSD), `0.0` IEEE-754 Step-0 identity, `0` extra state bytes; "
-            f"`T=32K` fwd+bwd **`{gdn2_m:.2f}–{dplr_m:.2f} ms`** "
-            f"(**`{py_m/dplr_m:.1f}×–{py_m/gdn2_m:.1f}×`** vs PyTorch `{py_m:.1f} ms`, `11.63 GiB` DPLR delta); "
-            f"`T=1` decode **`{t1_dplr:.4f} ms = {t1_dplr/t1_nat:.2f}×`** native GDN | "
-            "`runs/bench_v2_smoke_dplr/summary.json`, `919f2b8`, `2c78ffc` |"
-        )
-    a(
-        "| **1M Inference & Single-Card Training VRAM Ledger** | `Derived Formula` + `Measured` | "
-        f"1M Inference state: **`{v2_tot_gib:.2f} GiB`** (`10.45 GiB` w/ raw `0.133 GiB` GDN; **`3.02×` smaller** "
-        "than Inkling 2 Mini `32.16 GiB`; `5.96–6.28 GiB` Hadamard INT4); honest `BucketIndex` audit adds "
-        "`+1.04 GiB` eager `int64` (`~33.54 GiB` total w/ `21.85 GiB` NVFP4+adapters, compactable to `~0.04 GiB` "
-        "→ `~32.5 GiB`). Training fits `96 GB` GDDR7 ECC across all stages (`54.24–81.23 GiB` measured; `s2_v2` "
-        "est. `~62–68 GiB` alloc envelope as-is, `~47–53 GiB` w/ `8,192`-tok sub-segmenting) | "
-        "`src/qloop/model/lsa.py:743-768`, `report.py`, live `1M` pass (`69.52 GiB` @ `ec34f825`) |"
-    )
-    if da.get("output_counts"):
-        oc = da["output_counts"]
-        dec_idx = int((da.get("decontam") or {}).get("index_size") or 0)
-        dec_hits = sum(int(v) for v in ((da.get("decontam") or {}).get("hits") or {}).values())
-        a(
-            "| **Open Audited Dataset (`v1.2`) & SI-RSI** | `Measured` | "
-            f"`{oc.get('sft_core', 0):,}` `sft_core` + `{oc.get('sirsi_preferences', 0):,}` pref pairs + "
-            f"`{oc.get('salvage_queue', 0):,}` salvage; **`{dec_idx:,}`** 2026 13-grams (`{dec_hits}` leaks dropped); "
-            "decoupled `working_notebook` CoT raised pass rate **`4.1% → 100.0%`** (`197/197`, `0` defects) | "
-            "`Loop64-Fable-SIRSI-v1/audit_summary.json`, `def3624`, `dc7a14e` |"
-        )
-    s2_sp_txt = f"{s2_speedup:.2f}×" if s2_speedup else "2.06×"
-    a(
-        "| **Blackwell `sm_120` Speedup & Hardening Stack** | `Measured` | "
-        f"7 profiled optimizations + 4 hardening commits: `18.99×` NVFP4 E2M1 (`1,148 GB/s = 71.9%` of peak "
-        f"`1,597 GB/s` GDDR7 ECC), `9.32×/12.99×` D-LSA FlashAttn (`-70 TB/step`), `5.83×` 2-pass KL (`-90K` "
-        f"syncs), `54.03×` BPTT offload/CCE, `{s2_sp_txt}` E2E BPTT speedup, `-7.0 GiB` leak fix (`25.3 GiB` "
-        "flat), `10.6×` TF 5.24 recovery; **`709` passing CPU tests** (`749` total) | "
-        "`docs/PERF_PROFILE_S2.md`, `colab_supervisor*.log`, `origin/main` `2c78ffc` |"
-    )
-    a("")
-    a("---")
-    a("")
-
-    # ------------------------------------------------------------------
-    # Section 2: Methodology, Architecture & Full VRAM Footprint Ledger
-    # ------------------------------------------------------------------
-    a("## 2. Methodology, Architecture & Full VRAM Footprint Ledger")
-    a("")
-
-    # 2.1 APOLLO Optimizer + FusedStepOptimizer (Foundational Enabler)
-    a("### 2.1 Foundational Single-GPU Enabler: APOLLO Optimizer (`arXiv:2412.05270`) & `FusedStepOptimizer`")
-    a("")
-    a(
-        "Training a `34.661B`-parameter looped hybrid MoE up to `131K–1M` tokens on a **single `96 GB GDDR7 ECC` "
-        "card** (`94.97 GiB` CUDA-usable) requires strict control over both **gradient/optimizer state memory** "
-        "and **kernel launch overhead**. Rather than relying on ZeRO/FSDP multi-GPU sharding or sacrificing "
-        "AdamW-level convergence on large 2D projections, our training stack is grounded in "
-        "**APOLLO (`arXiv:2412.05270`: SGD-like memory, AdamW-level performance)** integrated inside "
-        "**`FusedStepOptimizer`** (`configs/base.yaml:89-97`, `src/qloop/train/optim.py:382-421`):"
-    )
-    a("")
-    a(
-        "1. **Exact Parameter Routing Rule (`configs/base.yaml:89-97`, `src/qloop/train/optim.py:382-421`):** "
-        "Configured with `apollo: {enabled: true, rank: 256, scale_type: channel, scale: 1.0, "
-        "update_proj_gap: 200, min_dim: 128}` and `impl: auto` (`apollo_torch.APOLLOAdamW` when installed, "
-        "falling back to our built-in faithful `ApolloAdamWFallback` implementing Algorithm 1 + Fira norm-growth "
-        "limiter $\\gamma=1.01$). `build_param_groups()` routes **every large 2D trainable weight matrix "
-        "(`p.dim() == 2` and `min(shape) >= 128`)** not in `adamw_patterns` to low-rank `rank=256` channel-wise "
-        "APOLLO (storing $2 \\cdot r \\cdot \\max(m, n)$ fp32 moments instead of $2 m n$), while 1D norms, "
-        "scalars, and narrow `<128`-dim adapters (`loop_adapters`, `hssd_adapter.`, `lsa_indexer.`, "
-        "`gdn2_adapter.`, `mlp.gate.weight$`) use exact `AdamW` / `AdamWLite` (with fp32 master copies for "
-        "`bf16` weights)."
-    )
-    a(
-        "2. **Blackwell `sm_120` Optimizer Vectorization (`src/qloop/train/optim.py:893-1088`):** "
-        "In non-fused mode (`fused=False`), `_batched_grad_norms()` computes per-parameter L2 norms via "
-        "`torch._foreach_norm(grads, 2.0, dtype=torch.float32)` (`float64` for fp64), collapsing `897` kernel "
-        "launches into `~4` multi-tensor launches with **`0.0` max error** (avoiding PyTorch's default bf16 "
-        "`_foreach_norm` `0.24` rounding error), reuses `_step_gnorm_sq` directly via `torch._foreach_mul_` to "
-        "eliminate the redundant full-model `clip_grad_norm_` pass, batches all `100` bf16 master-weight "
-        "`AdamWLite` tensors into `_step_batched_adamw_lite` (`_foreach_*`), and transfers `ApolloAdamWFallback` "
-        "projections via pinned `non_blocking=True` DMA — all while preserving exact atomic whole-step "
-        "non-finite abort semantics."
-    )
-    a("")
-    a("#### Stage-by-Stage Verified Optimizer Runtime Behavior *(100% Grounded in Logs & Configs)*")
-    a("")
-    a(
-        "| Stage | Mode (`fused`) | Verified Runtime Optimizer Mix | Active APOLLO Coverage & Memory Savings | "
-        "Provenance |"
-    )
-    a("| :--- | :---: | :--- | :--- | :--- |")
-    a(
-        "| **`s1_loop_a6b`** (`18.41M`, `137` tensors) | `fused=True` | "
-        "`adamw:AdamWLite x137` (in-backward hook steps & frees `.grad` immediately) | "
-        "`0` APOLLO tensors (all `100` norms are 1D & `37` loop adapters have `min_dim < 128` / excluded) | "
-        "`Measured` (`runs/s1_loop_a6b_run.log:57-60`) |"
-    )
-    a(
-        "| **`s1b_hssd_distill`** (`76.92M`, `807` tensors) | `True` (P1) → **`False`** (`3a17c0d`) | "
-        "Switched to `fused=False` at `3a17c0d` for atomic whole-step non-finite guard + true global "
-        "`clip_grad_norm_(1.0)` | "
-        "`0` APOLLO tensors (`hssd_adapter.`, `loop_adapters`, 1D norms excluded); `apollo.enabled: true` kept | "
-        "`Measured` (`s1b_hssd_distill_run.log:66`, `3a17c0d`) |"
-    )
-    a(
-        "| **`s3_long_1m_lsa` / `s3_v2_long_1m_lsa`** (`24.56M` v2) | `fused=False` | "
-        "Fused CUDA `torch.optim.AdamW` + batched `AdamWLite` (`max_grad_norm=1.0`, atomic guard) | "
-        "`0` APOLLO tensors (narrow `lsa_indexer`, `loop_adapters`, `q_norm`/`k_norm` only) | "
-        "`Measured` (`configs/stages/s3*_long_1m_lsa.yaml`) |"
-    )
-    a(
-        "| **`s2_joint_bptt`** (`187.92M` total / `897` tensors: `104.86M` 2D attn + `83.06M` prior bundle) | "
-        "`fused=False` | "
-        "**`apollo_torch` `APOLLOAdamW` (`30` tensors)** + `767` fp32 fused `AdamW` + `100` bf16 `AdamWLite` | "
-        "**Active APOLLO (`rank=256`, channel-wise)** on all `30` large 2D full-attn weights (`k_proj` `[512,2048]`, "
-        "`v_proj` `[512,2048]`, `o_proj` `[2048,4096]` × `10L`): vs `0.781 GiB` AdamW, moments-only **`0.156 GiB` "
-        "(`5.0×`, `-0.625 GiB`; `o_proj` `8.0×`)** or **`0.186 GiB` incl. `+0.029 GiB` fp32 proj (`4.2×` net, "
-        "`-0.60 GiB` net; `o_proj` `6.4×` net)** | "
-        "`Measured` (`docs/PERF_PROFILE_S2.md:59`) + `Derived Formula` |"
-    )
-    a(
-        "| **`s2_v2_joint_bptt`** (`156.94M` trainable, queued) | `fused=False` | "
-        "**`APOLLOAdamW` (`30` tensors)** + fused `AdamW` / `AdamWLite` (`gdn2_adapter`, `loop`, `lsa`, `norms`) | "
-        "Identical active APOLLO coverage on all `30` large 2D `k/v/o` matrices (`104.86M` params: `-0.625 GiB` "
-        "moments-only / **`-0.60 GiB` net** after `+0.029 GiB` fp32 proj) | "
-        "`Derived Formula` (`configs/stages/s2_v2_joint_bptt.yaml`) |"
-    )
-    a(
-        "| **`s4_v2_rl`** (`SI-RSI`, queued) | `fused=False` | "
-        "**`APOLLOAdamW` (`130` tensors)** + fused `AdamW` / `AdamWLite` (`max_grad_norm=0.5`, atomic guard) | "
-        "APOLLO covers **`10` `o_proj` (`83.89M`) + `120` `shared_expert` 2D matrices (`40L × {gate,up,down}`, "
-        "`125.83M`)** = `209.72M` 2D weights: vs `1.563 GiB` AdamW, moments-only **`0.547 GiB` (`2.86×`, "
-        "`-1.02 GiB`)** or **`0.625 GiB` incl. `+0.078 GiB` fp32 proj (`2.50×` net, `-0.94 GiB` net)** | "
-        "`Derived Formula` (`configs/stages/s4_v2_rl.yaml`) |"
-    )
-    a("")
-
-    # 2.2 Hardware Spec & Three-Axis Architecture
-    a("### 2.2 Verified Blackwell Hardware Spec (`GDDR7 ECC`) & Three-Axis Looped Hybrid Architecture")
-    a("")
-    a(
-        "> [!NOTE]\n"
-        "> **Verified Hardware Specification (NVIDIA RTX PRO 6000 Blackwell Server Edition, `GB202`, `sm_120`):** "
-        "Official NVIDIA server-card specification: **`96 GB GDDR7 with ECC`** (`94.97 GiB` CUDA-usable) over a "
-        "**`512-bit` memory bus** at **`1,597 GB/s`** peak Server Edition bandwidth (vs. `1,792 GB/s` on the "
-        "active-cooled Workstation Edition), with **`24,064` CUDA cores**, **`600 W` configurable max TDP**, and "
-        "**passive server cooling**. Against this true `1,597 GB/s` GDDR7 ECC ceiling, our fused Triton NVFP4 "
-        "E2M1 dequantization kernel achieves **`1,144–1,148 GB/s` = `71.9%` of peak memory bandwidth** (Section 6)."
-    )
-    a("")
-    a(
-        "`Qwen3.6-35B-A6B-Loop64` retrofits `unsloth/Qwen3.6-35B-A3B-NVFP4` (`40` physical layers = "
-        "`10 × [3 Gated DeltaNet + 1 Gated Full Attention]`, `256` routed experts/layer, Top-8 active, "
-        "`2` GQA KV heads × `256` head dim split into `64-d` mRoPE + `192-d` NoPE) along three orthogonal "
-        "axes while keeping all `32.212B` routed MoE expert weights 100% frozen:"
-    )
-    a("")
-    a(
-        "1. **Calibrated 88-Layer ETD Sandwich Loop + mHC `LoopBridge` (`[0,12)×1 + [12,36)×R + [36,40)×1`):** "
-        "Scales inference depth at runtime across `R=1` (`40L`, `~2.95B` active), `R=2` (`64L`, `~4.46B` active), "
-        "and `R=3` (`88L`, `~5.97B` effective active compute via cross-pass expert re-routing). Calibrated by "
-        "`s0_probe`, the 24-layer core loops via a rank-256 subspace `ReEntryBridge` (`w_anchor = 0.85`), "
-        "zero-initialized `PassExitGate` (`torch.equal` step-0 identity), rank-64 per-pass Q/O LoRAs, and "
-        "rank-32 `PassRouterAdapters` (`82.3%` Pass-2 re-routing, `17.36` unique core experts/token)."
-    )
-    a(
-        "2. **Clean v2 Linear-Attention Backbone — Native Qwen3.6 GDN → Step-0 Bit-Identical `GDN-2-1M + Bounded QED` "
-        "(Replacing HSSD v3.2):** Following our Phase-A forensics and HSSD post-mortem (Section 3.7), clean v2 "
-        "**removes HSSD v3.2** (saving `5.17 GiB` of 1M decode state, eliminating the `+0.79` nat non-identity "
-        "shock, and restoring native Blackwell decode latency). `s3_v2_long_1m_lsa` trains on 100% Native Qwen3.6 "
-        "GDN (`0.33 GiB` budget across `66` virtual linear passes); `s2_v2_joint_bptt` and `s4_v2_rl` enable "
-        "**NVIDIA GDN-2 (`arXiv:2605.22791`) + Bounded QED (`arXiv:2608.13668`) + 1M Asymmetric Slow-Decay + Soft "
-        "Neg-Eigval** (`27.53M` params, `0.0` Step-0 diff, `0` extra recurrent state bytes; Section 4)."
-    )
-    a(
-        "3. **`1M` (`1,048,576`) `FP8` `1.0×` `SharedKV` + Per-Pass `D-LSA` (`10` Physical / `22` Virtual "
-        "Full-Attention Layers):** Pure `4.0×` YaRN (`262,144 → 1,048,576`, `s0_probe` Gate `0p-3` winner) shares "
-        "Pass-1 K/V across Passes 2–3 (`kv_share = True`, `1.0×` memory) while untied per-pass query indexers "
-        "$W_{q\\text{-idx}}^{(r)}$ (`d_idx = 64` on `192-d` NoPE) re-query Ward-clustered buckets (`Top-64` buckets "
-        "+ `512` local window + `64` sinks, `<= 768` packed remote keys/query)."
-    )
-    a("")
-
-    # 2.3 Inference 1M-Context VRAM Footprint Ledger & Honest BucketIndex Audit
-    a("### 2.3 Inference `1M`-Context (`88L @ R=3`, `batch=1`) VRAM Footprint Ledger & `BucketIndex` Code Audit")
-    a("")
-    a(f"![1M Context Memory Breakdown vs Inkling 2 Mini]({chart_rel_dir}/kv_memory_vs_inkling.svg)")
-    a("")
-    a(
-        "| Architecture | Virtual Depth | Stored Global KV Layers | KV Precision | Global KV (GiB) | "
-        "Linear / HSSD / SWA (GiB) | D-LSA Centroids (GiB) | **Total 1M State (GiB)** | Ratio vs. Clean v2 |"
-    )
-    a("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
-    for row in kv_rows:
-        ratio = row["total_gib"] / v2_tot_gib if v2_tot_gib else 1.0
-        bold = "**" if row.get("highlight") else ""
-        a(
-            f"| {bold}{row['name']}{bold} | `{row['virtual_layers']}L` | "
-            f"`{row['global_kv_layers_stored']}` | `{row['kv_dtype']}` | "
-            f"`{row['kv_gib']:.2f}` | `{row['linear_or_swa_gib']:.2f}` | `{row['indexer_gib']:.2f}` | "
-            f"{bold}`{row['total_gib']:.2f} GiB`{bold} | `{ratio:.2f}×` |"
-        )
-    a("")
-    a(
-        "*Exact `Derived Formula` provenance & honest `src/qloop/model/lsa.py:743-768` "
-        "code audit (zero hidden costs):*\n"
-        "- **Clean v2 FP8 SharedKV (`10.65 GiB` budget / `10.45 GiB` exact raw GDN):** "
-        "`10 × 2(K,V) × 2 KV heads × 256 dim × 1 B × 1,048,576 = 10.00 GiB` + `0.33 GiB` "
-        "(`66/30 × 0.15 GiB` stock GDN recurrent+conv budget; exact raw fp32+conv "
-        "`66 × [32×128×128×4 B + 8192×4×2 B] = 0.133 GiB` → `10.45 GiB`) + `0.32 GiB` (`0.3125 GiB` bf16) D-LSA "
-        "Ward centroids = **`10.65 GiB`** (**`3.02×` smaller** than Inkling 2 Mini's `32.16 GiB`, **`5.17 GiB` "
-        "smaller** than HSSD v1's `15.82 GiB`).\n"
-        "- **Block-64 Walsh-Hadamard INT4 Serving Projection (`5.96–6.28 GiB` on `0.33 GiB` GDN budget / "
-        "`5.77–6.08 GiB` raw GDN):** Implemented in `src/qloop/infer/engine.py` (`_HadamardINT4Slot`: symmetric "
-        "`34/64 = 0.53125 B/scalar` → `5.31 GiB` KV + `0.33` + `0.32` = **`5.96 GiB`**) and "
-        "`src/qloop/model/offload.py` (`Block64HadamardINT4Cache`: asymmetric `36/64 = 0.5625 B/scalar` → "
-        "`5.625 GiB` KV + `0.33` + `0.32` = **`6.28 GiB`**; `53.64 GiB` Host-DDR5 at `10M` tokens).\n"
-        "- **Honest Code Audit of Current Eager `BucketIndex` (`src/qloop/model/lsa.py:743-768`):** Across `10` "
-        "full-attention layers at `1M` tokens (`nb = 2,048` blocks, `spb = 64` compacted slots/block, "
-        "`s_total = 131,072` slots), eager `_assemble()` currently retains `int64` index tables totaling "
-        "**`+1.04 GiB`** (`members` `[1,2,131072,32]` `0.625 GiB` + `key2slot` `[1,2,1048576]` `0.156 GiB` + "
-        "cached `unit_members` `[1,2,2048,64,8]` `0.156 GiB` + `labels`/`slot_labels` `2×[1,2,2048,128]` "
-        "`0.078 GiB` + `slot_counts`/`active`/misc `~0.025 GiB`, or `+1.08 GiB` incl. `counts`/`slot_end`/"
-        "`block_id`; plus eager `key_latent` upcasts centroids to `fp32` `+0.31 GiB` until cast to `bf16` at "
-        "inference). Including `~21.8 GiB` pure NVFP4 base weights + `~0.05 GiB` clean-v2 bf16 adapters "
-        "(`21.85 GiB`), current eager `1M` serving totals **`~33.54 GiB`** (`21.85 + 10.65 + 1.04 GiB`, or "
-        "`~35.8 GiB` on the live-loaded `24.09 GiB` mixed-precision `32` NVFP4 + `8` FP8 HF checkpoint, "
-        "`s1_loop_a6b_run.log:22-29`). Storing `unit_members`/`labels`/`slot_counts` in `int8` (`~0.03–0.04 GiB`), "
-        "dropping training-only `key2slot`, and materializing `members` on-the-fly for the selected `Top-64` "
-        "buckets compacts the `+1.04 GiB` overhead down to **`~0.04 GiB`** → **`~32.5 GiB`** total (`34%` of a "
-        "single `96 GB` GDDR7 ECC card)!\n"
-        "- **Inkling 2 Mini (`32.16 GiB`, `Derived Formula`):** Thinking Machines Lab (`24L → 48L`, `R=3`, `5:1` "
-        "SWA:global, `8` KV heads × `128` dim, unshared per-pass F16 KV across `8` logical global layers) "
-        "= `8 × 2 × 8 × 128 × 2 B × 1,048,576 = 32.00 GiB` + `0.16 GiB` across `40` `1,024`-window SWA layers."
-    )
-    a("")
-
-    # 2.4 Single-Card Training VRAM Footprint Ledger (96 GB GDDR7 ECC)
-    a("### 2.4 Single-Card Training VRAM Footprint Ledger (`96 GB GDDR7 ECC` / `94.97 GiB` Usable)")
-    a("")
-    a(
-        "To demonstrate exact memory headroom with zero hidden allocator surprises, Table 2.4A lists **measured "
-        "live VRAM peaks & post-step allocations** across all executed stages, and Table 2.4B decomposes the exact "
-        "component budget for queued `s2_v2_joint_bptt` (`GDN-2-1M + QED + D-LSA`, `4×32K`, `d=3` `88L`):"
-    )
-    a("")
-    a("#### Table 2.4A — Measured Training VRAM Across All Executed Stages (`Measured`)")
-    a("")
-    a(
-        "| Stage | Context / Batch | Post-Step Alloc (`GiB`) | Peak VRAM (`GiB`) | "
-        "Free Headroom (`94.97 GiB`) | Source |"
-    )
-    a("| :--- | :---: | :---: | :---: | :---: | :--- |")
-    a(
-        "| `s1_loop_a6b` (Native-GDN, `fused=True`) | `8K`, `mb=4` (`d=1..3`) | `28.0–28.4` | **`54.24`** | "
-        "`40.73 GiB` | `s1_loop_a6b_metrics.jsonl`, `colab_supervisor.log` |"
-    )
-    a(
-        "| `s1b_hssd_distill` (HSSD v3.2, Phase 1 / Phase 2) | `16K`, `mb=1` | `25.2–27.0` | "
-        "`48.41` / **`68.97`** | `26.00 GiB` | Hub `0ff9b537`, `2fb912db`, `colab_supervisor.log` |"
-    )
-    a(
-        "| `s3_long_1m_lsa` (v1 HSSD, `64K` + `1M` FP8) | `64K` / `1,048,576` | `24.9` | "
-        "**`81.23`** (`78.60` @ `1M`) | `13.74 GiB` | Hub `55c7a680`, `ad3542a6`, `colab_supervisor.log` |"
-    )
-    a(
-        "| `s2_joint_bptt` (v1 HSSD, `4×32K` BPTT) | `131K` (`4×32K`) | "
-        "`32.6` → `52.0` (leak) → **`25.3`** flat | **`70.1`** (`5a82677`) / **`78.42`** (TF5.24) | "
-        "`16.55–24.87 GiB` | Hub `91215ce1`, `colab_supervisor.log` |"
-    )
-    s3v2_sha_t24 = s3v2.get("latest_commit_sha") or "4bdaed40"
-    a(
-        f"| **`s3_v2_long_1m_lsa` (Clean v2 Native-GDN)** | `64K` / `934K–1M` FP8 | **`24.8`** | "
-        f"**`{_fmt_f(s3v2.get('mem_peak_max_gib'), 2)}`** (`69.52` @ `1M`) | **`25.01 GiB`** | "
-        f"Hub `ec34f825`, `{s3v2_sha_t24}`, `colab_supervisor_v2.log` |"
-    )
-    a(
-        "| `s2_v2_joint_bptt` Live Smoke (`2×16K`, `d=3`) | `32K` (`2×16K`) | `25.4` (`45.0` res.) | "
-        "**`43.13`** | `51.84 GiB` | `runs/bench_v2_smoke_dplr/summary.json` |"
-    )
-    a("")
-    a(
-        "#### Table 2.4B — Exact Component Breakdown for Queued `s2_v2_joint_bptt` "
-        "(`GDN-2-1M + QED + D-LSA`, `4×32K`, `d=3` `88L`)"
-    )
-    a("")
-    a("| Memory Component | Class | Size (`GiB`) | Exact Formula / Measurement Basis |")
-    a("| :--- | :---: | :---: | :--- |")
-    a(
-        "| Resident base weights (`24.09 GiB`) + adapters + APOLLO/AdamW states + grads | "
-        "`Measured` + `Derived Formula` | **`~25.50`** | "
-        "`24.09 GiB` loaded mixed NVFP4/FP8 base (`s1_loop_a6b_run.log:22-29`, `:25`) + `156.94M` adapters/attn + "
-        "APOLLO `rank=256` on `30` `k/v/o` matrices (`0.156 GiB` moments / `0.186 GiB` incl. proj vs `0.781 GiB` "
-        "AdamW, saving `-0.60 GiB` net) |"
-    )
-    a(
-        "| `88` activation-checkpoint boundary tensors | `Derived Formula` | **`11.00`** | "
-        "`88 × [1, 32768, 2048] × 2 B` (`bf16`, exact `128 MiB/layer`) |"
-    )
-    a(
-        "| Prior-segment KV cache (`3` prior segs, `10` full-attn layers) | `Derived Formula` | **`1.88`** | "
-        "`10 × 2(K,V) × 2 heads × 256 dim × 98,304 tok × 2 B` (`1.875 GiB` bf16) |"
-    )
-    a(
-        "| D-LSA `128K` `BucketIndex` (`10` full-attn layers) | `Derived Formula` | **`0.17`** | "
-        "`1/8` of `1M` eager index footprint (`1.39 GiB / 8 = 0.174 GiB`) |"
-    )
-    a(
-        "| `u_seg` cached pre-attention hidden states (`3` prior segs × `10L`) | `Derived Formula` | **`3.75`** | "
-        "`3 × 10 × [1, 32768, 2048] × 2 B`; `offload_prior_hidden: auto` (`bptt.py:81-92`) keeps `u_seg` "
-        "resident at step start on `96 GB` (`bptt_offload_to_cpu = 0.0` in `s2` & `smoke_s2v2`), spilling to "
-        "pinned CPU RAM via async DMA if free headroom `< 8 GiB` |"
-    )
-    a(
-        "| `66L` GDN-2 recurrent + conv states & segment snapshots | `Derived Formula` | **`~0.50`** | "
-        "GDN-2 adds `0` extra state bytes over Native GDN (`0.133 GiB` raw + checkpoint boundary copies) |"
-    )
-    a(
-        "| Single-layer un-segmented `T=32K` `GDN-2 + DPLR` transient | `Measured` + `Derived Formula` | "
-        "**`~19.5–20.5`** | **`11.63 GiB`** live-measured `chunk_dplr_delta_rule` delta (`11,904 MiB`, "
-        "`bench_v2_smoke_dplr/summary.json:1257`) + `~5.5–6.5 GiB` fp32 `compute_gates` (`gdn2.py:1602-1655`, "
-        "`11–13 × 0.50 GiB`) + `~2.5 GiB` `_TritonQEDDPLRPrepFn` fwd+bwd buffers |"
-    )
-    a(
-        "| **Total `s2_v2` Peak As-Is (`T=32K` un-segmented `GDN-2+DPLR`)** | "
-        "`Estimated (derived from measured rates)` | **`~62–68` alloc** (`~75–84` res.) | "
-        "Spilled-to-resident envelope (`39.05` spilled / `42.80` resident + `19.5–20.5` transient + `3–5` "
-        "CCE/MoE/LSA workspace = **`~62–65` spilled / `~65–68` resident**); fits `94.97 GiB` usable "
-        "(`96 GB` GDDR7 ECC) |"
-    )
-    a(
-        "| **With Clean `8,192`-Token Sub-Segmenting (`4×` Transient Cut)** | "
-        "`Estimated (derived from measured rates)` | **`~47–53` alloc** | "
-        "Sub-segmenting `GDN-2 + DPLR` into `4 × 8,192`-tok sub-segments per `32K` chunk cuts the "
-        "`~19.5–20.5 GiB` transient **`4×` → `~4.9–5.1 GiB`** (**`~47–49` spilled / `~51–53` resident**), "
-        "freeing `> 41 GiB` single-card headroom |"
-    )
-    a("")
-    a("---")
-    a("")
-
-    # ------------------------------------------------------------------
-    # Section 3: Full Stage-by-Stage Empirical Results
-    # ------------------------------------------------------------------
-    a("## 3. Full Stage-by-Stage Empirical Results")
-    a("")
-    a("### 3.1 Cross-Stage Overview & Measured Single-GPU Hours Ledger")
-    a("")
-    a(
-        "| Stage | Pipeline | Status | Steps | Latest Hub SHA | Bundle Params (`% 34.661B`) | "
-        "Tokens Trained | Mean `tok/s` | Peak VRAM (`GiB`) | Post-Fix Skips | "
-        "Held-Out `d=1 → d=3` NLL | `depth_gain` |"
-    )
-    a("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
-    for st_key, label, pipe in (
-        ("s1_loop_a6b", "`s1_loop_a6b` (8K)", "Shared Base"),
-        ("s1b_hssd_distill", "`s1b_hssd_distill` (16K)", "v1 HSSD"),
-        ("s3_long_1m_lsa", "`s3_long_1m_lsa` (64K/1M)", "v1 HSSD"),
-        ("s2_joint_bptt", "`s2_joint_bptt` (131K)", "v1 HSSD"),
-        ("s3_v2_long_1m_lsa", "**`s3_v2_long_1m_lsa` (64K/1M)**", "**Clean v2**"),
-    ):
-        st_s = stages[st_key]
-        ev_l = st_s.get("eval_last") or {}
-        p_str = (
-            f"`{st_s['n_params']/1e6:.2f}M` (`{st_s['pct_of_34_661b']:.3f}%`)"
-            if st_s.get("n_params")
-            else "—"
-        )
-        t_str = f"`{st_s['tokens_seen']/1e6:.2f}M`" if st_s.get("tokens_seen") else "—"
-        st_step = f"`{st_s.get('latest_step')}/{st_s.get('target_steps') or '—'}`"
-        d_str = f"`{_fmt_f(ev_l.get('d1'))} → {_fmt_f(ev_l.get('d3'))}`" if ev_l else "—"
-        dg_str = f"**`{_fmt_f(ev_l.get('depth_gain'), 4, True)}`**" if ev_l else "—"
-        sk_str = f"`{int(st_s['post_fix_skipped_max'])}`" if st_s.get("post_fix_skipped_max") is not None else "—"
-        if st_key == "s2_joint_bptt" and s2_pre_mean and s2_post_mean and s2_speedup:
-            tps_cell = f"`{s2_pre_mean:.1f} → {s2_post_mean:.1f}` (`{s2_speedup:.2f}×`)"
-        else:
-            tps_cell = f"`{_fmt_f(st_s.get('tok_per_s_mean'), 1)}`"
-        sha_cell = f"`{st_s.get('latest_commit_sha') or '—'}`"
-        hub_st = st_s.get("latest_hub_step")
-        if hub_st and st_s.get("latest_step") and int(st_s["latest_step"]) > int(hub_st):
-            sha_cell = f"`{st_s.get('latest_commit_sha') or '—'}` (`@s{hub_st}`)"
-        is_s2_halted = (
-            st_key == "s2_joint_bptt"
-            and st_s.get("status") == "in_progress"
-            and (st_s.get("latest_step") or 0) >= 500
-        )
-        status_disp = "halted@500" if is_s2_halted else str(st_s["status"])
-        a(
-            f"| {label} | {pipe} | `{status_disp}` | {st_step} | {sha_cell} | "
-            f"{p_str} | {t_str} | {tps_cell} | `{_fmt_f(st_s.get('mem_peak_max_gib'), 2)}` | "
-            f"{sk_str} | {d_str} | {dg_str} |"
-        )
-    a("")
-    a(f"![Held-Out Evaluation Depth Curves Across Stages]({chart_rel_dir}/eval_depth_curves.svg)")
-    a("")
-    if sup_tot_h > 0:
-        a("#### Exact Active Single-GPU Hours Ledger *(Computed Directly from Local Supervisor & Eval Timestamps)*")
-        a("")
-        a("| Run / Stage | Git HEAD(s) | Measured Active GPU-Hours | Notes |")
-        a("| :--- | :---: | :---: | :--- |")
-        a(
-            f"| `s0_probe` (`probe_report.json`) | `058b4ad3` | `{gh.get('s0_probe_h', 0.0):.2f} h` | "
-            "`177.44 s` zero-training diagnostic suite (`5/5` passed) |"
-        )
-        a(
-            f"| `s1_loop_a6b` (1,000 steps) + `quality_check` | `c22bf62` | "
-            f"`{gh.get('s1_loop_a6b_h', 0.0):.2f} h` + `{gh.get('s1_quality_check_h', 0.0):.2f} h` | "
-            "Clean 88L Native-GDN loop foundation (`0` skips) |"
-        )
-        a(
-            f"| `s1b_hssd_distill` Phase 1 + Pre-Fix Explosion | `fbd7a35` | "
-            f"`{gh.get('s1b_hssd_p1_and_prefix_h', 0.0):.2f} h` | "
-            "Phase 1 (`~4.9 h`) + rolled-back Jacobian explosion (`dd5093d3`) |"
-        )
-        a(
-            f"| `s1b_hssd_distill` Post-Fix Phase 2 (1,100 steps) | `3a17c0d` | "
-            f"`{gh.get('s1b_hssd_p2_clean_h', 0.0):.2f} h` | `0 / 1,100` skips; v1 HSSD negative ablation |"
-        )
-        a(
-            f"| `s3_long_1m_lsa` (v1 HSSD, 600 steps) | `513879f`, `4f09463` | "
-            f"`{gh.get('s3_hssd_h', 0.0):.2f} h` | `0` skips; 2 Colab sessions with clean auto-rollover |"
-        )
-        s2_tf_slow = gh.get("s2_hssd_tf524_slowdown_h")
-        s2_tf_post = gh.get("s2_hssd_2f5a6ba_post_fix_h")
-        s2_tot_h = (
-            float(gh.get("s2_hssd_preopt_h", 0.0))
-            + float(gh.get("s2_hssd_leaky_h", 0.0))
-            + float(gh.get("s2_hssd_5a82677_h", 0.0))
-            + float(gh.get("s2_hssd_8409b6e_total_h", 0.0))
-        )
-        s2_note = (
-            f"Pre-opt `{gh.get('s2_hssd_preopt_h', 0.0):.2f} h` + leaky OOM `{gh.get('s2_hssd_leaky_h', 0.0):.2f} h` + "
-            f"`5a82677` `{gh.get('s2_hssd_5a82677_h', 0.0):.2f} h` + TF 5.24 slowdown `{s2_tf_slow or 0.0:.2f} h` + "
-            f"`2f5a6ba` recovery `{s2_tf_post or 0.0:.2f} h`"
-        )
-        a(f"| `s2_joint_bptt` (v1 HSSD, steps 0–500) | `2e37bf6..2f5a6ba` | `{s2_tot_h:.2f} h` | {s2_note} |")
-        a(
-            f"| `bench_v2_smoke_dplr` (Part A smoke + Part B DPLR) | `28b88e4` | "
-            f"`{gh.get('v2_smoke_part_a_h', 0.0):.2f} h` (+ Part B) | "
-            "Live `s3_v2`/`s2_v2` smoke + `fla 0.6.0` parity/latency bench |"
-        )
-        s3v2_sup_h = next(
-            (x for x in (sm.get("supervisor_stage_head_summary") or []) if x.get("stage") == "s3_v2_long_1m_lsa"),
-            None,
-        )
-        s3v2_sup_tps_s = (
-            f"`~{s3v2_sup_h['tok_per_s_mean']:,.0f} tok/s` sup. mean"
-            if (s3v2_sup_h and s3v2_sup_h.get("tok_per_s_mean"))
-            else "`~2,200 tok/s` sup. mean"
-        )
-        a(
-            f"| **`s3_v2_long_1m_lsa` (Clean v2, live through `s{s3v2_latest_step}`)** | `28b88e4` | "
-            f"**`{gh.get('s3_v2_native_gdn_h', 0.0):.2f} h`** | "
-            f"Live in progress (`0` skips, {s3v2_sup_tps_s}) |"
-        )
-        a(
-            f"| **Total Measured Supervisor Active Single-GPU Time** | `colab_supervisor*.log` | "
-            f"**`{sup_tot_h:.2f} h`** | "
-            f"`v1`: `{sup_v1_h:.2f} h` + `v2`: `{sup_v2_h:.2f} h` "
-            "(supervisor `pid_alive=True` wall time; `c22bf62` includes `0.59 h` post-done idle before VM teardown; "
-            "excl. ~`1.3 h` standalone probe/eval) |"
-        )
-        a("")
-
-    # 3.2 s0_probe
-    a("### 3.2 `s0_probe` — Zero-Training Diagnostic & Calibration Gates (`5/5` Passed)")
-    a("")
-    ps = probe.get("summary") or {}
-    pg = probe.get("gates") or {}
-    pp = probe.get("probes") or {}
-    if ps:
-        eh = pp.get("expert_headroom") or {}
-        ra = pp.get("reentry_anchors") or {}
-        pe = pp.get("positional_extrapolation") or {}
-        pe_modes = pe.get("modes") or {}
-        sha_pfx = str(ps.get("frozen_experts_sha256") or "")[:16]
-        a(
-            f"Completed in **`{_fmt_f(ps.get('total_seconds'), 2)} s`** "
-            "(`artifacts/probes/probe_report.json`, Hub commits `107dd287..058b4ad3`), passing "
-            f"**`{ps.get('num_gates_passed')}/{ps.get('num_gates_total')}`** critical gates with "
-            f"frozen expert SHA-256 `{sha_pfx}...`:"
-        )
-        a("")
-        a("| Gate | Metric | Verified Value | Outcome & Architectural Calibration Decision |")
-        a("| :--- | :--- | :---: | :--- |")
-        a(
-            f"| **`0a_backward`** | `input_grad_norm` | "
-            f"`{_fmt_f((pg.get('0a_backward') or {}).get('value'), 2)}` | "
-            "**PASS** — NVFP4/FP8 `quant_autograd` backward bridge verified finite |"
-        )
-        a(
-            "| **`0a_surgery`** | Step-0 identity / cache parity | `passed=True` | "
-            "**PASS** — Zero-init `PassExitGate` preserves exact step-0 base graph |"
-        )
-        eh_imp = (eh.get("improved_hard_token_frac") or 0.0) * 100.0
-        a(
-            "| **`0p-1` Expert Headroom** | `hard_token_headroom_nats` (`75th` pct, `2,047` hard tok) | "
-            f"**`{_fmt_f(eh.get('hard_token_headroom_nats'), 4)} nats`** (`{_fmt_f(eh_imp, 2)}%` improved) | "
-            "**PASS** (`>= 0.08` nats) — Confirms untapped capacity in frozen `256`-expert pool "
-            f"via router re-routing (`mean_router_jaccard={_fmt_f(eh.get('mean_router_jaccard'), 4)}`) |"
-        )
-        a(
-            "| **`0p-2` Re-Entry Anchors** | `procrustes_cosine` / `explained_variance` / `w_anchor=0.85` | "
-            f"`cos={_fmt_f(ra.get('procrustes_cosine'), 4)}` · "
-            f"`R²={_fmt_f(ra.get('procrustes_explained_variance'), 4)}` | "
-            "**PASS** — Calibrated `bridge_init=[0.05, 0.85, 0.10]` (`manifold_cosine=0.9921`, "
-            "`zero_shot_nll_increase=+0.0276` nats) |"
-        )
-        yarn_m = pe_modes.get("yarn") or {}
-        rerope_m = pe_modes.get("rerope") or {}
-        nat_m = pe_modes.get("native") or {}
-        a(
-            "| **`0p-3` Positional Extrap (`4.0× → 1M`)** | `yarn` vs `rerope` vs `native` NLL & passkey margin | "
-            f"`yarn` **`{_fmt_f(yarn_m.get('extrapolated_nll'), 4)}`** "
-            f"(`+{_fmt_f(yarn_m.get('passkey_logit_margin'), 4)}`) vs "
-            f"`rerope` `{_fmt_f(rerope_m.get('extrapolated_nll'), 4)}` vs "
-            f"`native` `{_fmt_f(nat_m.get('extrapolated_nll'), 4)}` | "
-            "**PASS** — Selected pure `YaRN 4.0×` (`needle_acc=100%`, "
-            f"`lm_passkey_margin=+{_fmt_f(yarn_m.get('lm_passkey_margin'), 2)}`, "
-            "beats in-domain NLL `2.7683` by `-0.1223` nats) |"
-        )
-        cr = probe.get("core_ranges") or []
-        c_12_36 = next((x for x in cr if x.get("prelude_end") == 12 and x.get("core_end") == 36), None)
-        c_8_32 = next((x for x in cr if x.get("prelude_end") == 8 and x.get("core_end") == 32), None)
-        if c_12_36 and c_8_32:
-            a(
-                "| **`core_ranges` Sweep (24L Core)** | Zero-shot `loss_increase` (`[12,36)` vs `[8,32)`) | "
-                f"**`+{_fmt_f(c_12_36.get('loss_increase'), 4)}`** vs "
-                f"`+{_fmt_f(c_8_32.get('loss_increase'), 4)}` nats | "
-                "**LOCKED `[12,36)`** (`3.26×` smaller zero-shot re-entry shock than `[8,32)`, "
-                "scaling `40L → 64L → 88L`) |"
-            )
-    else:
-        a("Probe report (`artifacts/probes/probe_report.json`) not present in this offline snapshot.")
-    a("")
-
-    # 3.3 s1_loop_a6b
-    a("### 3.3 `s1_loop_a6b` — Shared Native-GDN 88L Loop Foundation (`1,000` Steps, `131.07M` Tokens)")
-    a("")
-    s1_tps_str = f"`{_fmt_f(s1.get('tok_per_s_mean'), 1)} tok/s`"
-    s1_sup = next(
-        (x for x in (sm.get("supervisor_stage_head_summary") or []) if x.get("stage") == "s1_loop_a6b"),
-        None,
-    )
-    if s1_sup and s1_sup.get("tok_per_s_mean"):
-        s1_tps_str += (
-            f" (Hub ckpts; `{s1_sup['tok_per_s_mean']:.1f} tok/s` across "
-            f"`{s1_sup['n_samples']}` supervisor samples)"
-        )
-    a(
-        "After purging an initial poisoned run (`d1d92064`, `step=100, loss=9.6577`) via reset commit "
-        "`ad646651` when locking `unsloth/Qwen3.6-35B-A3B-NVFP4`, clean `s1_loop_a6b` completed "
-        f"**`1,000/1,000` steps** (`10486e72 → 32eb565e`, `{gh.get('s1_loop_a6b_h', 18.25):.2f} h` active "
-        f"single-GPU time) training **`18.41M` parameters (`0.053%`)** at {s1_tps_str} mean "
-        f"(`{_fmt_f(s1.get('mem_peak_max_gib'), 2)} GiB` peak VRAM, **`0` skipped updates**). "
-        "This checkpoint serves as the **shared Native-GDN foundation** for both the v1 HSSD ablation and clean v2."
-    )
-    a("")
-    a(
-        "| Step | Hub SHA | `eval/loss_d1` (`40L`) | `eval/loss_d2` (`64L`) | "
-        "`eval/loss_d3` (`88L`) | `eval/depth_gain` (`d1−d3`) | Source |"
-    )
-    a("| ---: | :---: | :---: | :---: | :---: | :---: | :--- |")
-    for ev in evals["s1_loop_a6b"]:
-        a(
-            f"| `{ev['step']}` | `{ev.get('commit_sha') or '—'}` | `{_fmt_f(ev.get('d1'))}` | "
-            f"`{_fmt_f(ev.get('d2'))}` | `{_fmt_f(ev.get('d3'))}` | "
-            f"**`{_fmt_f(ev.get('depth_gain'), 4, True)}`** | `{ev.get('source', '')}` |"
-        )
-    a("")
-    if qc:
-        agg = (qc.get("held_out_nll_and_routing") or {}).get("aggregate_by_depth") or {}
-        icp = qc.get("incremental_cache_parity") or {}
-        d3_agg = agg.get("d3") or {}
-        d3_icp = icp.get("d3") or {}
-        rr_p2 = (d3_agg.get("reroute_rate_p2") or 0.0) * 100.0
-        rr_p3 = (d3_agg.get("reroute_rate_p3") or 0.0) * 100.0
-        a(
-            "- **Live GPU Quality Audit (`s1_quality_check.json`, Hub `43ecae24`, "
-            f"`{_fmt_f(qc.get('total_eval_wall_sec'), 1)} s`):** Incremental KV-cache decode parity passed at "
-            f"`d=1/2/3` (`9/9 = 100%` greedy token match, `d=3` mean cosine `{_fmt_f(d3_icp.get('cosine_mean'), 6)}`, "
-            "`0` NaNs). Cross-pass expert specialization emerged spontaneously (`router_diversity_weight=0.0`): "
-            f"Pass-2 reroute **`{_fmt_f(rr_p2, 2)}%`**, Pass-3 reroute **`{_fmt_f(rr_p3, 2)}%`**, "
-            f"**`{_fmt_f(d3_agg.get('unique_experts_core'), 2)}`** unique core experts/token "
-            f"(`{_fmt_f(d3_agg.get('effective_expert_mult'), 3)}×` breadth). Generation smoke suite: `5/5` at `d=1/2`, "
-            "`4/5` at `d=3`; in Section 3.7 forensics, `s1_loop_a6b` also passed the `16K` needle test (`True`) "
-            "at both `d=1` and `d=3`."
-        )
-        a("")
-
-    # 3.4 s1b_hssd_distill (v1 ablation)
-    a("### 3.4 `s1b_hssd_distill` *(v1 HSSD Negative Ablation)* — Jacobian Stability Fix & Residual `+0.79` Nat Shock")
-    a("")
-    a(
-        "In our v1 pipeline, `s1b_hssd_distill` replaced all `30` physical (`66` virtual) stock GDN layers with "
-        "**HSSD v3.2** (`76.92M` cumulative params, `0.222%`). Phase 1 (`steps 0 → 400`, `0ff9b537`, `48.41 GiB` peak) "
-        "warmed up HSSD via online layerwise MSE (`3.77e-3 → 7.39e-5`), keeping held-out `d=3` NLL at `1.0657`."
-    )
-    a("")
-    if rb.get("s1b_phase2_explosion_commits"):
-        sr = rb["s1b_explosion_step_range"]
-        a(
-            "> [!WARNING]\n"
-            "> **Engineering Stability Incident & Fix (`dd5093d3` → `a0877a3`):** The initial Phase-2 attempt "
-            f"(`{rb['s1b_phase2_explosion_commits']}` Hub commits `7a2d590a..6df29172`, steps `{sr[0]}–{sr[1]}`) "
-            f"hit an $O(T)$ cumulative-phase backward Jacobian explosion (`global_grad_norm` up to "
-            f"**`{rb['s1b_explosion_max_grad_norm']:.2e}`**, **`{_fmt_i(rb['s1b_explosion_max_skipped'])}`** "
-            f"skipped updates, loss peak **`{_fmt_f(rb['s1b_explosion_peak_loss'], 4)}`**, `s600` eval NLL `7.1876`). "
-            "Scaling cumulative-phase backward by `chunk_size/T` (`a0877a3` / `3a17c0d`) plus live blend and atomic "
-            "non-finite guards fixed numerical stability completely (**`0 / 1,100` skips** post-rollback)."
-        )
-        a("")
-    stand_start = s1b_stand[0] if s1b_stand else {}
-    stand_end = s1b_stand[-1] if s1b_stand else {}
-    a(
-        "While post-fix Phase 2 (`e0e5fcae → 2fb912db`, `28.41 h`, `68.97 GiB` peak) converged cleanly in training "
-        f"loss (`{_fmt_f(stand_start.get('loss_lm'))}` → **`{_fmt_f(stand_end.get('loss_lm'))}`**, `0` skips), "
-        "held-out `16K` `d=3` NLL **never fully recovered from non-identity replacement**: it rose from `1.0657` "
-        "(Phase-1 stock GDN) to `2.6591` (`s800`, `λ=1.0`) and finished at **`1.7052`** (`s1500`) — a **`+0.64` nat "
-        "shock vs Phase-1 (`+0.79` nats vs `s1_loop_a6b` `0.9191`)** that persisted downstream."
-    )
-    a("")
-    a(f"![s1b HSSD v3.2 Phase-2 Convergence and Grad Norm Stability]({chart_rel_dir}/s1b_hssd_convergence.svg)")
-    a("")
-    a("| Step | Phase / Blend (`λ`) | Hub SHA | `eval/loss_d1` | `eval/loss_d2` | `eval/loss_d3` | `eval/depth_gain` |")
-    a("| ---: | :---: | :---: | :---: | :---: | :---: | :---: |")
-    for ev in evals["s1b_hssd_distill"]:
-        st_i = int(ev["step"])
-        ph_lbl = (
-            "Phase 1 (Stock+MSE)" if st_i <= 400
-            else ("Phase 2 Ramp (`λ=0.80`)" if st_i == 600 else "Phase 2 Standalone (`λ=1.0`)")
-        )
-        a(
-            f"| `{st_i}` | {ph_lbl} | `{ev.get('commit_sha') or '—'}` | `{_fmt_f(ev.get('d1'))}` | "
-            f"`{_fmt_f(ev.get('d2'))}` | `{_fmt_f(ev.get('d3'))}` | **`{_fmt_f(ev.get('depth_gain'), 4, True)}`** |"
-        )
-    a("")
-
-    # 3.5 s3_long_1m_lsa (v1 ablation)
-    a("### 3.5 `s3_long_1m_lsa` *(v1 HSSD Ablation)* — 1M FP8 SharedKV & D-LSA Calibration (`600` Steps)")
-    a("")
-    s3_dg0 = _fmt_f(s3_ev_first.get("depth_gain"), 4, True)
-    s3_dg1 = _fmt_f(s3_ev_last.get("depth_gain"), 4, True)
-    s3_h_hssd = gh.get("s3_hssd_h", 33.37)
-    a(
-        f"Running `600` steps (`540 × 64K` hybrid + `60 × 512K–1M` FP8 calibration, `{s3_h_hssd:.2f} h`, "
-        f"`120.78M` tokens, **`0` skips**, peak **`{_fmt_f(s3.get('mem_peak_max_gib'), 2)} GiB`**, live "
-        f"`{s3_max_pfx:,} + 32,768 = {s3_max_pfx + 32768:,}` tokens @ `s125` `ad3542a6`) on top of the HSSD v3.2 "
-        "backbone proved single-GPU `1M` FP8 calibration and nearly doubled `depth_gain` "
-        f"(`{s3_dg0} → {s3_dg1}`, `+88.5%`), "
-        f"but inherited HSSD's degraded `64K` NLL floor (`{_fmt_f(s3_ev_last.get('d3'))}`) and capped `512K–1M` "
-        f"Top-64 bucket recall at **`{_fmt_f(max(s3_rec_vals) if s3_rec_vals else None, 4)}`** peak / "
-        f"**`{_fmt_f(s3_rec_vals[-1] if s3_rec_vals else None, 4)}`** final."
-    )
-    a("")
-    a(f"![s3 Long 1M D-LSA KL, Recall, and Held-Out 64K Depth Gain]({chart_rel_dir}/s3_long_1m_dlsa.svg)")
-    a("")
-
-    # 3.6 s2_joint_bptt (v1 ablation through step 500 + TF 5.24 10.6x recovery)
-    a(
-        f"### 3.6 `s2_joint_bptt` *(v1 HSSD Ablation, Steps `0 → {s2_latest_step}`)* — "
-        "Speedup, Leak Fix & TF `5.24.0` Recovery"
-    )
-    a("")
-    s2_d3_delta = (s2_ev_last.get("d3") or 0.0) - (s2_ev_first.get("d3") or 0.0)
-    s2_sha = s2.get("latest_commit_sha") or "e050a4b8"
-    s2_body = (
-        f"Joint `4×32K = 131K` K/V-replay BPTT ran through **`step {s2_latest_step}`** (`{s2_sha}`, "
-        f"`{s2['tokens_seen']/1e6:.2f}M` tokens, **`0` skips**), reducing held-out `131K` `d=3` NLL by "
-        f"**`{_fmt_f(s2_d3_delta, 4, True)}`** nats "
-        f"(`{_fmt_f(s2_ev_first.get('d3'))} → {_fmt_f(s2_ev_last.get('d3'))}`) "
-        "and validating our Blackwell `sm_120` Triton stack and leak fixes across multi-day rollovers. "
-    )
-    if s2_vd_vals:
-        s2_body += (
-            "However, HSSD's long-horizon vault pages remained effectively dead "
-            f"(`hssd/vault_duty` = **`{min(s2_vd_vals):.2e}–{max(s2_vd_vals):.2e}`**, "
-            f"`{vd_s500:.2e}` at step 500, `~2` dead pages), motivating the Phase-A truth-check stop at step 500."
-        )
-    a(s2_body)
-    a("")
-    a(
-        "![s2 Joint BPTT Held-Out NLL, Blackwell Speedup, and VRAM Leak Fix]"
-        f"({chart_rel_dir}/s2_bptt_throughput_vram.svg)"
-    )
-    a("")
-    a("#### Held-Out `131K` Evaluation Trajectory (`2 × 131,072 = 262,144` tokens/depth)")
-    a("")
-    a(
-        "| Step | Hub SHA | `eval/loss_d1` (`40L`) | `eval/loss_d2` (`64L`) | "
-        "`eval/loss_d3` (`88L`) | `eval/depth_gain` (`d1−d3`) | Δ `d=3` vs. Step 0 |"
-    )
-    a("| ---: | :---: | :---: | :---: | :---: | :---: | :---: |")
-    s2_d3_0 = s2_ev_first.get("d3")
-    for ev in evals["s2_joint_bptt"]:
-        delta0 = (
-            float(ev["d3"]) - float(s2_d3_0)
-            if (ev.get("d3") is not None and s2_d3_0 is not None)
-            else None
-        )
-        a(
-            f"| `{ev['step']}` | `{ev.get('commit_sha') or '—'}` | `{_fmt_f(ev.get('d1'))}` | "
-            f"`{_fmt_f(ev.get('d2'))}` | **`{_fmt_f(ev.get('d3'))}`** | "
-            f"`{_fmt_f(ev.get('depth_gain'), 4, True)}` | `{_fmt_f(delta0, 4, True)}` |"
-        )
-    a("")
-    a("#### `s2_joint_bptt` Systems Regimes (`runs/colab_supervisor.log`, incl. `transformers 5.24.0` Recovery)")
-    a("")
-    a(
-        "| Code Regime (Git HEAD) | Observed Steps | Throughput (`tok/s`) | "
-        "Post-Step Alloc (`GiB`) | Peak VRAM (`GiB`) | Mean Power / Util | Outcome |"
-    )
-    a("| :--- | :---: | :---: | :---: | :---: | :---: | :--- |")
-    pre_rg = s2_reg.get("pre_opt_2e37bf6") or {}
-    post_rg = s2_reg.get("post_leak_fix_5a82677") or {}
-    sup_sp = (
-        post_rg["tok_per_s_mean"] / pre_rg["tok_per_s_mean"]
-        if (pre_rg.get("tok_per_s_mean") and post_rg.get("tok_per_s_mean"))
-        else None
-    )
-    sup_sp_lbl = f"{sup_sp:.2f}×" if sup_sp else "~2.0×"
-    regime_defs = (
-        ("pre_opt_2e37bf6", "Pre-Opt Baseline (`2e37bf6`)", "Healthy baseline; GDDR7/sync-starved (~580 s/step)"),
-        (
-            "post_opt_leaky_b2c5513",
-            "Post-Opt Pre-Leak-Fix (`b2c5513`)",
-            "~2× speedup, **OOM crash** at step 60+ (zero-label C++ cycle)",
-        ),
-        (
-            "post_leak_fix_5a82677",
-            "Post-Leak-Fix Production (`5a82677`)",
-            f"**{sup_sp_lbl} speed, `-7.0 GiB` alloc vs baseline, `21.2 h` flat, 0 OOMs**",
-        ),
-    )
-    for reg_key, reg_lbl, outcome in regime_defs:
-        rg = s2_reg.get(reg_key)
-        if not rg:
-            continue
-        a(
-            f"| {reg_lbl} | `{rg['min_step']}–{rg['max_step']}` (`n={rg['n_samples']}`) | "
-            f"`{rg['tok_per_s_min']:.0f}–{rg['tok_per_s_max']:.0f}` (**avg `{rg['tok_per_s_mean']:.1f}`**) | "
-            f"**`{rg['alloc_min_gib']:.1f}–{rg['alloc_max_gib']:.1f}`** | "
-            f"`{rg['peak_min_gib']:.1f}–{rg['peak_max_gib']:.1f}` | "
-            f"`{rg['power_mean_w']:.1f} W` / `{rg['util_mean_pct']:.1f}%` | {outcome} |"
-        )
-    if tf524 and tf524.get("slowdown_hours"):
-        a(
-            f"| TF `5.24.0` Kwarg Regression (`8409b6e`, pre-fix) | `326–329` (`{tf524['slowdown_hours']:.2f} h`) | "
-            "`~89` (**11× slowdown**) | `—` | `82.7` (`91.4K MiB` drv) | "
-            f"`{tf524['slowdown_mean_power_w']:.1f} W` | "
-            "`cache_params → cache` rename skipped `_chunk_hssd_triton_fast` |"
-        )
-    tf_rg = s2_reg.get("post_tf524_fix_2f5a6ba")
-    if tf_rg:
-        rec_x = tf_rg["tok_per_s_mean"] / 89.0
-        a(
-            f"| **TF `5.24.0` Fix Recovery (`5aaf55d` / `2f5a6ba`)** | "
-            f"`{tf_rg['min_step']}–{tf_rg['max_step']}` (`n={tf_rg['n_samples']}`) | "
-            f"`{tf_rg['tok_per_s_min']:.0f}–{tf_rg['tok_per_s_max']:.0f}` (**avg `{tf_rg['tok_per_s_mean']:.1f}`**) | "
-            f"**`{tf_rg['alloc_min_gib']:.1f}–{tf_rg['alloc_max_gib']:.1f}`** | "
-            f"`{tf_rg['peak_min_gib']:.1f}–{tf_rg['peak_max_gib']:.1f}` | "
-            f"`{tf_rg['power_mean_w']:.1f} W` / `{tf_rg['util_mean_pct']:.1f}%` | "
-            f"**`{rec_x:.1f}×` recovery (`>10.3×` immediate), `25.3 GiB` flat through step 500** |"
-        )
-    a("")
-
-    # 3.7 Phase-A Truth-Check & 4-Stage Causal Swap Forensics
-    a("### 3.7 Phase-A Truth-Check & 4-Stage Causal Swap Forensics (`s2_joint_bptt@500`)")
-    a("")
-    if tc:
-        dbc = tc.get("decode_bug_check") or {}
-        pa = tc.get("phase_a") or {}
-        st_m = ((pa.get("stock") or {}).get("sanity_math") or {})
-        d1_m = ((pa.get("loop64_d1") or {}).get("sanity_math") or {})
-        d3_m = ((pa.get("loop64_d3") or {}).get("sanity_math") or {})
-        a(
-            "Before committing multi-day RL compute, we executed an adversarial Phase-A generation, `18K`-token "
-            "needle retrieval, and decode-parity audit on `s2_joint_bptt@500` (`e050a4b8`) on a dedicated Blackwell "
-            "VM (`runs/eval_truth_check_s2_step500/truth_check_summary.json`). `s2_joint_bptt@500` **failed the "
-            "Phase-A gate** (`16K` needle = `False` at `d=1` & `d=3`; low diversity / looping on math & code; "
-            f"`d=3` eager HSSD decode = **`{_fmt_f(d3_m.get('decode_tok_s'), 2)} tok/s`** vs stock "
-            f"**`{_fmt_f(st_m.get('decode_tok_s'), 2)} tok/s`**, `5.6×` slower, vs `d=1` "
-            f"`{_fmt_f(d1_m.get('decode_tok_s'), 2)} tok/s`)."
-        )
-        a("")
-        l650_d1 = _fmt_f(dbc.get("prefill_vs_decode_L650_sparse_top1_d1"), 4)
-        l650_m1 = _fmt_f(dbc.get("prefill_vs_decode_L650_sparse_mean_diff_d1"), 4)
-        l650_d3 = _fmt_f(dbc.get("prefill_vs_decode_L650_sparse_top1_d3"), 4)
-        l650_m3 = _fmt_f(dbc.get("prefill_vs_decode_L650_sparse_mean_diff_d3"), 4)
-        ora_rep = dbc.get("uncached_oracle_reproduces_degradation")
-        a(
-            "1. **Decode-Bug Ruled Out (`top1 = 1.0000`):** Prefill-vs-incremental-decode parity matched **100%** "
-            f"across `L=70` (`d=1` `{_fmt_f(dbc.get('prefill_vs_decode_L70_top1_d1'), 4)}`, "
-            f"`d=3` `{_fmt_f(dbc.get('prefill_vs_decode_L70_top1_d3'), 4)}`) and `L=650` sparse "
-            f"(`d=1` `{l650_d1}`, mean diff `{l650_m1}`; `d=3` `{l650_d3}`, mean diff `{l650_m3}`), "
-            "and an uncached full-recompute oracle reproduced the exact degradation "
-            f"(`uncached_oracle_reproduces_degradation = {ora_rep}`)."
-        )
-        a(
-            "2. **4-Stage Causal Swap Isolated HSSD v3.2 + Raw `fable51` Poisoning (and Exonerated D-LSA & 88L Loop):**"
-        )
-        a("")
-        a(
-            "| Causal Checkpoint / Component Swap | Depth | `16K` Needle | Math Rep-Loop | "
-            "Code Rep-Loop | Math `d3` | Code `d3` | Causal Diagnosis |"
-        )
-        a("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |")
-        diag_notes = {
-            ("stock_plus_yarn1m", None): "Clean baseline; YaRN `4.0×` preserves `16K` needle & reasoning",
-            ("s1_loop_a6b", 1): "**PASS** — Native-GDN + 88L Loop (`d=1`) clean & needle-intact",
-            ("s1_loop_a6b", 3): "**PASS** — Native-GDN + 88L Loop (`d=3`) clean & needle-intact",
-            ("pristine_loop_hssd_lsa_init", 1): "**FAIL** — Uninitialized non-identity HSSD breaks model at step 0",
-            ("s1b_hssd_distill_lsa_dense", 1): (
-                "**FAIL** — Post-distill HSSD still collapses (`d=1` `\\frac{1}{2}` / `<code>` loops)"
-            ),
-            ("s1b_hssd_distill_lsa_dense", 3): (
-                "**FAIL + POISON** — Emits literal raw `fable51` `{\"query\": \"<search_query>\"}` loop!"
-            ),
-            ("s3_long_1m_lsa_sparse", 1): "**FAIL** — Inherits HSSD collapse (`\\boxed` loop)",
-            ("s3_long_1m_lsa_sparse", 3): "**FAIL** — Identical HSSD collapse under sparse D-LSA",
-            ("s3_long_1m_lsa_dense", 3): "**D-LSA INNOCENT** — Turning D-LSA dense yields identical collapse",
-            ("s2_with_s3_attn_norms", 3): "Coherent math/code (`0.85`/`0.91`), still misses `16K` needle under HSSD",
-            ("s2_with_s3_hssd", 3): "**HSSD GUILTY** — Swapping in `s3` HSSD destroys `code_d3` (`0.91 → 0.15`)",
-            ("s2_with_pristine_attn_norms_lsadense", 3): (
-                "Attention/norms & D-LSA innocent; HSSD linear layers block `16K` recall"
-            ),
-        }
-        for row in tc.get("forensics") or []:
-            lbl = str(row.get("label") or "")
-            dep = row.get("depth")
-            d_str = f"`d={dep}`" if dep is not None else "`stock`"
-            n16 = "**PASS**" if row.get("needle16k") else "FAIL"
-            note = diag_notes.get((lbl, dep), "—")
-            a(
-                f"| `{lbl}` | {d_str} | {n16} | `{row.get('math_rep_loop')}` | "
-                f"`{row.get('code_rep_loop')}` | `{_fmt_f(row.get('math_d3'), 4)}` | "
-                f"`{_fmt_f(row.get('code_d3'), 4)}` | {note} |"
-            )
-        a("")
-        a(
-            "**Four Actionable Engineering Conclusions:** (1) Drop HSSD v3.2; branch clean v2 directly from healed "
-            "Native-GDN `s1_loop_a6b@1000`. (2) Keep `88L` ETD Loop + mHC `LoopBridge` + `1M` YaRN + per-pass `D-LSA` "
-            "(all exonerated). (3) Ban raw upstream `fable51` completely and train exclusively on our audited `v1.2` "
-            "`TassP0lar/Loop64-Fable-SIRSI-v1` dataset. (4) Only upgrade linear attention via **100% IEEE-754 Step-0 "
-            "bit-identical `GDN-2-1M + Bounded QED`** on fused `fla 0.6.0` kernels (Section 4)."
-        )
-        a("")
-    else:
-        a("Truth-check summary (`truth_check_summary.json`) not present in this offline snapshot.")
-        a("")
-
-    # Deep HSSD v3.2 Experimental Post-Mortem + Knowledge Gained -> Why GDN-2 Is the Principled Move
-    a("#### 3.7.1 Deep HSSD v3.2 Experimental Post-Mortem & Why `GDN-2` Is the Principled Move")
-    a("")
-    a(
-        "**(a) Why We Originally Built Custom HSSD v3.2 (`configs/stages/s1b_hssd_distill.yaml`):** "
-        "Stock Qwen3.6 Gated DeltaNet ties memory erasure and writing to a single scalar gate $\\beta_t \\in (0, 1)$ "
-        "with scalar exponential decay $g_t \\le 0$. We hypothesized that replacing all `30` physical (`66` virtual) "
-        "linear-attention layers with a bespoke **Horizon-Split Surprise-Gated Delta Memory (HSSD v3.2)** — "
-        "combining an exact disjoint `[513, 576]`-token local SWA window (`k_far = max(0, n - 8)`), `M = 8` "
-        "log-spaced multi-timescale vault pages with `Top-2` STE surprise-gated writes (`k_pages = 2`, "
-        "`write_mode = full`), and a low-rank 2D complex phase (`theta_low_rank = true`, `58.51M` params across "
-        "`30L`) — would overcome exponential memory decay across `1M`-token horizons."
-    )
-    a("")
-    a("**(b) Exhaustive Failure-Mode Audit (Every Exact Failure Observed in Authoritative Logs):**")
-    a("")
-    a(
-        "1. **$O(T)$ Cumulative-Phase Backward Jacobian Blowup (`s1b` steps `425–775`, `7a2d590a..6df29172`):** "
-        "In unscaled Phase-2 distillation (`15` Hub commits), cumulative phase differentiation produced an $O(T)$ "
-        "Jacobian explosion reaching peak **`global_grad_norm = 6.12e+19`** (`a93bcaef` @ `s475`), peak loss "
-        "**`12.0742`** (`dc7c4ad8` @ `s650`, `121,740` skips; `s600` eval NLL `7.1876`), and **`194,510` total "
-        "skipped parameter updates** by `s775` (`6df29172`). Scaling cumulative-phase backward by `chunk_size / T` "
-        "+ live blend + atomic `fused=False` guard (`a0877a3` / `3a17c0d`) fully resolved numerical stability "
-        "(`0 / 1,100` skips), proving the remaining failures below were **architectural**, not numerical."
-    )
-    a(
-        "2. **Irreversible `+0.79` Nat Non-Identity Representation Shock (`s1b` → `s3`):** Even with `0` skips and "
-        "`distill_kl` falling `6.16 → 0.718`, swapping stock GDN for a structurally non-identical linear mechanism "
-        "under `< 0.3%` trainable params inflicted a permanent `+0.64` nat shock vs Phase-1 (`1.0657 → 1.7052`) "
-        "and **`+0.79` nats vs `s1_loop_a6b` (`0.9191 → 1.7052`)**. Downstream `s3_long_1m_lsa` never escaped "
-        "this degraded `1.8757` `64K` NLL floor and topped out at `0.4848` `512K–1M` D-LSA recall."
-    )
-    a(
-        "3. **Dead Long-Horizon Vault Pages (`hssd/vault_duty` Collapse):** From `1.81e-4` at `s1b` `s400`, across "
-        "`500` steps of `131K` `s2_joint_bptt`, `hssd/vault_duty` peaked at **`1.28e-4` (`s43`)**, dropped to a "
-        "minimum of **`1.14e-6` (`s425`)**, and finished at **`3.26e-5` (`s500`, `~2` dead pages)** despite "
-        "`budget_weight = 1.0` and `distill_kl = 0.72` — meaning the STE `Top-2` surprise router effectively "
-        "abandoned long-horizon pages and degenerated into a noisy local-window approximation."
-    )
-    a(
-        "4. **Generative & `18K` Needle Failure Even Under `LSA = dense`:** In `truth_check_summary.json`, EVERY "
-        "HSSD checkpoint (`s1b`, `s3`, `s2@500`) failed the `16K/18K` needle retrieval gate (`needle16k = False`) "
-        "even when D-LSA was forced **100% dense** (`s3_long_1m_lsa_dense`, "
-        "`s2_with_pristine_attn_norms_lsadense`). Swapping `s3` HSSD into `s2` collapsed `code_d3` from `0.9133` "
-        "to `0.1494`, whereas `s1_loop_a6b` (Native-GDN) passed `16K` needle (`True`) at both `d=1` and `d=3`."
-    )
-    a(
-        "5. **`+5.17 GiB` 1M State Overhead & `5.6×` Decode Speed Regression:** Storing `M = 8` lagged-replay "
-        "bf16 pages inflated `66L` linear state from `0.33 GiB` to **`~5.50 GiB` (`+5.17 GiB` at `1M`)**, and "
-        "eager `d=3` decode plunged to **`3.41 tok/s`** vs stock **`19.22 tok/s`** (**`5.6×` slower**), making "
-        "RL rollouts and full benchmark sweeps `~18–35 h` instead of `~1 h`."
-    )
-    a(
-        "6. **Compounded by Upstream `fable51` `100%` Redacted Tool-Argument Poisoning:** Raw `fable51` had "
-        "`100%` placeholder-redacted `tool_calls` (`<bash_command>` `6,098×`, `<file_path>` `5,972×`, "
-        "`<search_query>` `2,441×`), directly inducing `s1b` `d=3`'s literal `{\"query\": \"<search_query>\"}` "
-        "generation loops (fixed in `TassP0lar/Loop64-Fable-SIRSI-v1` `v1.2`, Section 5)."
-    )
-    a("")
-    a("**(c) Four Core Scientific & Engineering Lessons Gained:**")
-    a("")
-    a(
-        "1. **Step-0 IEEE-754 Bit-Identity Is Non-Negotiable:** Under `< 1%` parameter budgets, replacing a "
-        "pretrained recurrent layer's representation manifold creates a shock that distillation cannot erase; "
-        "every architectural extension MUST initialize at exact `0.0` Step-0 diff (`torch.equal`).\n"
-        "2. **Held-Out NLL Cannot Substitute for Generative & Needle Truth-Checks:** `s2_joint_bptt` lowered "
-        "`131K` held-out NLL (`1.3508 → 1.1872`) while failing `18K` needle and looping in greedy generation; "
-        "adversarial Phase-A generation + needle + parity gates before RL saved hundreds of GPU-hours.\n"
-        "3. **Audit Every Upstream Dataset Before Mixing:** Even popular public CoT corpora hide `100%` "
-        "redacted tool arguments and `85.7%` cross-repo duplication; deterministic streaming audits and live "
-        "13-gram decontam must precede training.\n"
-        "4. **Build on Mature Pretrained Linear Manifolds + Production Kernels:** Reinventing bespoke routed "
-        "linear-attention kernels from scratch creates severe optimization, state-footprint, and decode-latency "
-        "debt compared to strictly generalizing native DeltaNet onto production `fla` Triton kernels."
-    )
-    a("")
-    a(
-        "**(d) Why Upgrading Native GDN via NVIDIA GDN-2 (`arXiv:2605.22791`) + Bounded QED (`arXiv:2608.13668`) "
-        "+ 1M Asymmetric Slow-Decay (`20.1×`) + Soft Neg-Eigval on `fla 0.6.0` `DPLR` Is the Obvious, Principled "
-        "Move:**"
-    )
-    a("")
-    a(
-        "| Design & Systems Axis | Custom HSSD v3.2 *(v1 Negative Ablation)* | "
-        "**GDN-2-1M + Bounded QED (`fla` `DPLR`)** |"
-    )
-    a("| :--- | :---: | :---: |")
-    a(
-        "| **Step-0 Compatibility vs. Native GDN** | Non-identity (`+0.79` nat `s1b` shock) | "
-        "**`0.0` IEEE-754 bit-exact** (`torch.equal`) |"
-    )
-    a(
-        "| **Extra 1M Recurrent State VRAM (`66L`)** | `+5.17 GiB` (`5.50 GiB` lagged pages) | "
-        "**`0` extra bytes** (`0.33 GiB` budget / `0.133 GiB` raw) |"
-    )
-    a(
-        "| **Adapter Params (`30` Linear Layers)** | `58.51M` (`0.169%`) | "
-        "**`27.53M`** (`0.079%` — **`47.1%` of HSSD**) |"
-    )
-    a(
-        "| **`T=1` Autoregressive Decode Latency** | `3.41 tok/s` `d=3` (**`5.6×` slower** than stock) | "
-        "**`0.0430 ms = 1.02×`** native GDN (`0.0421 ms`) |"
-    )
-    a(
-        "| **Long-Horizon Mechanism** | STE `Top-2` vault pages (collapsed to `3.26e-5`) | "
-        "Smooth channel-wise `[-3.0, +0.5]` decay (**`20.1×`** horizon) + QED + soft neg-eigval |"
-    )
-    a(
-        "| **Kernel Ecosystem & Training Speed** | Bespoke custom Triton WY + ring compaction | "
-        "Production `fla 0.6.0` `DPLR`/`gdn2` (**`15.1×–18.5×`** vs PyTorch) + fused `tl.int64` Triton prep |"
-    )
-    a("")
-
-    # 3.8 Controlled A/B Win: Clean s3_v2_long_1m_lsa
-    a(
-        f"### 3.8 Controlled A/B Win: Clean Native-GDN `s3_v2_long_1m_lsa` "
-        f"(Live Through Step `{s3v2_latest_step}/{s3v2_target}`)"
-    )
-    a("")
-    if s3v2_rows:
-        s3_s200 = next((e for e in evals["s3_long_1m_lsa"] if int(e["step"]) == 200), None)
-        v2_s200 = next((e for e in evals["s3_v2_long_1m_lsa"] if int(e["step"]) == 200), None)
-        s3v2_sup = next(
-            (x for x in (sm.get("supervisor_stage_head_summary") or []) if x.get("stage") == "s3_v2_long_1m_lsa"),
-            None,
-        )
-        v2_tps_hub = s3v2.get("tok_per_s_mean")
-        v1_tps_hub = s3.get("tok_per_s_mean")
-        tps_x = (v2_tps_hub / v1_tps_hub) if (v2_tps_hub and v1_tps_hub) else None
-        a(
-            "Starting directly from `s1_loop_a6b@1000` with **Native Qwen3.6 GDN** (`hssd.enabled=false`), "
-            "`24.56M` cumulative params (`0.071%` of `34.661B`), gentle mHC protection (`loop_adapters lr_mult=2.0`), "
-            "and audited `loop64_fable_sirsi` (`15%` mix, zero raw `fable51`), clean `s3_v2_long_1m_lsa` is beating "
-            "v1 HSSD `s3_long_1m_lsa` decisively on **every measured axis** with **`0` skipped updates**:"
-        )
-        a("")
-        a(f"![Controlled A/B: HSSD s3 vs Clean Native-GDN s3_v2]({chart_rel_dir}/s3_hssd_vs_v2_gdn_ab.svg)")
-        a("")
-        a(
-            "| Metric (Controlled 64K / 1M Calibration A/B) | v1 HSSD (`s3_long_1m_lsa`) | "
-            "**Clean v2 Native-GDN (`s3_v2_long_1m_lsa`)** | Measured Delta |"
-        )
-        a("| :--- | :---: | :---: | :---: |")
-        if s3_s200 and v2_s200:
-            d3_v1 = float(s3_s200["d3"])
-            d3_v2 = float(v2_s200["d3"])
-            ppl_v1, ppl_v2 = math.exp(d3_v1), math.exp(d3_v2)
-            a(
-                f"| **Held-Out `64K` `d=1 / d=2 / d=3` NLL @ Step 200** | "
-                f"`{float(s3_s200['d1']):.4f} / {float(s3_s200['d2']):.4f} / {d3_v1:.4f}` (PPL `{ppl_v1:.2f}`) | "
-                f"**`{float(v2_s200['d1']):.4f} / {float(v2_s200['d2']):.4f} / {d3_v2:.4f}`** "
-                f"(PPL **`{ppl_v2:.2f}`**) | "
-                f"**`{d3_v2 - d3_v1:+.4f}` nats (`{(1.0 - ppl_v2/ppl_v1)*100:.1f}%` lower PPL)** |"
-            )
-            a(
-                f"| **Held-Out `64K` `depth_gain` (`d1−d3`) @ Step 200** | "
-                f"`{float(s3_s200['depth_gain']):+.4f}` | **`{float(v2_s200['depth_gain']):+.4f}`** | "
-                "Strong positive monotonic depth gain (`40L → 64L → 88L`) |"
-            )
-        if len(evals["s3_v2_long_1m_lsa"]) >= 2:
-            ev_latest = evals["s3_v2_long_1m_lsa"][-1]
-            v1_match_l = next(
-                (e for e in evals["s3_long_1m_lsa"] if int(e["step"]) == int(ev_latest["step"])),
-                s3_ev_last,
-            )
-            v1_l_d3 = float(v1_match_l.get("d3") or 1.8757)
-            v2_l_d3 = float(ev_latest["d3"])
-            ppl_l1, ppl_l2 = math.exp(v1_l_d3), math.exp(v2_l_d3)
-            a(
-                f"| **Held-Out `64K` `d=1 / d=2 / d=3` NLL @ Step {ev_latest['step']}** | "
-                f"`{_fmt_f(v1_match_l.get('d1'))} / {_fmt_f(v1_match_l.get('d2'))} / {v1_l_d3:.4f}` "
-                f"(PPL `{ppl_l1:.2f}`) | "
-                f"**`{_fmt_f(ev_latest.get('d1'))} / {_fmt_f(ev_latest.get('d2'))} / {v2_l_d3:.4f}`** "
-                f"(PPL **`{ppl_l2:.2f}`**, `dg={_fmt_f(ev_latest.get('depth_gain'), 4, True)}`) | "
-                f"**`{v2_l_d3 - v1_l_d3:+.4f}` nats (`{(1.0 - ppl_l2/ppl_l1)*100:.1f}%` lower PPL)** |"
-            )
-        if s3_rec_vals and s3v2_rec_vals:
-            a(
-                f"| **`512K–1M` D-LSA Top-64 Recall (Peak / Latest)** | "
-                f"`{max(s3_rec_vals):.4f}` / `{s3_rec_vals[-1]:.4f}` | "
-                f"**`{max(s3v2_rec_vals):.4f}`** / **`{s3v2_rec_vals[-1]:.4f}`** | "
-                f"**`{max(s3v2_rec_vals) - max(s3_rec_vals):+.4f}` peak recall** |"
-            )
-        if s3v2_mrec_vals:
-            s3_mr = [float(r["lsa_min_head_recall"]) for r in s3_rows if r.get("lsa_min_head_recall") is not None]
-            s3_mr_pk = max(s3_mr) if s3_mr else 0.0
-            a(
-                f"| **`512K–1M` Min-Head Recall (Peak / Latest)** | "
-                f"`{s3_mr_pk:.4f}` | **`{max(s3v2_mrec_vals):.4f}`** / `{s3v2_mrec_vals[-1]:.4f}` | "
-                f"**`{max(s3v2_mrec_vals) - s3_mr_pk:+.4f}` worst-head lift** |"
-            )
-        v2_sup_tps = f" (`{s3v2_sup['tok_per_s_mean']:.1f}` sup. mean)" if s3v2_sup else ""
-        tps_delta = f"**`{tps_x:.2f}×` faster**" if tps_x else "—"
-        a(
-            f"| **Mean Throughput (`tok/s`)** | `{_fmt_f(v1_tps_hub, 1)}` | "
-            f"**`{_fmt_f(v2_tps_hub, 1)}`**{v2_sup_tps} | {tps_delta} |"
-        )
-        v1_pk = float(s3.get("mem_peak_max_gib") or 0.0)
-        v2_pk = float(s3v2.get("mem_peak_max_gib") or 0.0)
-        a(
-            f"| **Peak Training VRAM (incl. `1,048,576`-tok pass)** | `{v1_pk:.2f} GiB` (`78.60 GiB` @ 1M) | "
-            f"**`{v2_pk:.2f} GiB`** (`69.52 GiB` @ 1M `s125`) | **`{v2_pk - v1_pk:+.2f} GiB`** |"
-        )
-        a(
-            f"| **Cumulative Trainable Bundle Params** | `83.06M` (`0.240%`) | "
-            f"**`{(s3v2.get('n_params') or 0)/1e6:.2f}M` (`{s3v2.get('pct_of_34_661b') or 0:.3f}%`)** | "
-            "**`3.38×` fewer adapter params** |"
-        )
-        a(
-            "| **1M Context-State Footprint *(Formula)*** | `15.82 GiB` | "
-            "**`10.65 GiB`** | **`-5.17 GiB` (`-32.7%`)** |"
-        )
-        if s3v2_gp3 and s3v2_gp2:
-            pct_g3 = 100.0 * (s3v2_gp3[-1] - s3v2_gp3[0]) / max(s3v2_gp3[0], 1e-9)
-            a(
-                "| **mHC `LoopBridge` Health (`gate_abs_mean_p3`)** | *(not tracked in `s3` v1)* | "
-                f"**`{s3v2_gp3[0]:.4f} → {s3v2_gp3[-1]:.4f}` (`{pct_g3:+.1f}%`)** · "
-                f"`w_anchor_p3 ≈ {s3v2_wa3[-1]:.3f}` | "
-                "Organic monotonic Pass-3 growth, zero bridge collapse |"
-            )
-        a("")
-        if s3v2_max_pfx >= 1_000_000:
-            a(
-                f"- **Verified Live `1,048,576`-Token Clean v2 Pass:** At `step 125` (`ec34f825`), `s3_v2_long_1m_lsa` "
-                f"streamed **`{s3v2_max_pfx:,}` prefix + `32,768` suffix = `{s3v2_max_pfx + 32768:,}` tokens** at "
-                "**`69.52 GiB` peak VRAM** (`25.45 GiB` headroom on a single `96 GB` GDDR7 ECC card) "
-                "and `0` non-finite steps."
-            )
-            a("")
-    else:
-        a("Clean v2 `s3_v2_long_1m_lsa` rows not present in this offline snapshot.")
-        a("")
-
-    a("---")
-    a("")
-
-    # ------------------------------------------------------------------
-    # Section 4: GDN-2-1M + Bounded QED + Soft Neg-Eigval via fla 0.6.0 DPLR
-    # ------------------------------------------------------------------
-    a(
-        "## 4. GDN-2-1M (`arXiv:2605.22791`) + Bounded QED (`arXiv:2608.13668`) + "
-        "Soft Neg-Eigval via `fla 0.6.0` `DPLR`"
-    )
-    a("")
-    a(
-        "To upgrade Qwen3.6's stock scalar-gated DeltaNet linear layers **without repeating HSSD's non-identity "
-        "shock or decode bottleneck**, commits **`919f2b8`** and **`2c78ffc`** implement NVIDIA **Gated DeltaNet-2 "
-        "(`arXiv:2605.22791`)** extended with **1M Asymmetric Slow-Decay + Bounded QED (`arXiv:2608.13668`) + "
-        "Soft Negative Eigenvalues** (`src/qloop/model/gdn2.py`, enabled cleanly in `s2_v2_joint_bptt` and "
-        "`s4_v2_rl`, `917,568` params/layer × `30` physical linear layers = **`27.53M` params**, `0.079%` of "
-        "`34.661B` — `47.1%` of HSSD's `58.51M` overhead, adding **`0` bytes** to the recurrent state):"
-    )
-    a("")
-    a(
-        "1. **Decoupled Channel-Wise Erase/Write/Decay + Bounded QED (`arXiv:2608.13668`) + Soft Neg-Eigval:** "
-        "Using unscaled unit-norm $(\\hat{\\mathbf{q}}_t, \\hat{\\mathbf{k}}_t)$, channel-wise erase "
-        "$\\mathbf{b}_t \\in (0, 1.5)^{d_k}$ (`neg_eigval_max_boost = 0.5` enabling soft Householder reflection), "
-        "write $\\mathbf{w}_t \\in (0, 1)^{d_v}$, $C^1$-continuous asymmetric `tanh` log-decay shift in "
-        "`[-3.0, +0.5]` (stretching memory horizon up to $e^3 \\approx 20.1\\times$ for `1M` context), and "
-        "per-head bounded QED coupling $\\lambda_h = 0.35 \\tanh(\\lambda_{\\text{raw},h})$:"
-    )
-    a("")
-    a("$$")
-    a(
-        r"\mathbf{e}_t = \mathbf{b}_t \odot \hat{\mathbf{k}}_t + \lambda_h "
-        r"\left(\mathbf{b}_t \odot \hat{\mathbf{q}}_t - \langle \hat{\mathbf{k}}_t, "
-        r"\mathbf{b}_t \odot \hat{\mathbf{q}}_t \rangle \hat{\mathbf{k}}_t\right)"
-    )
-    a("$$")
-    a("$$")
-    a(
-        r"\mathbf{S}_t = \left(\mathbf{I} - \hat{\mathbf{k}}_t \mathbf{e}_t^\top\right)"
-        r"\operatorname{Diag}\!\left(e^{\mathbf{g}_t}\right)\mathbf{S}_{t-1} + "
-        r"\hat{\mathbf{k}}_t (\mathbf{w}_t \odot \mathbf{v}_t)^\top, \qquad "
-        r"\mathbf{o}_t = \mathbf{S}_t^\top (\hat{\mathbf{q}}_t \cdot d_k^{-1/2})"
-    )
-    a("$$")
-    a("")
-    a(
-        "2. **100% IEEE-754 Step-0 Bit-Identity (`max_diff = 0.0`):** Every residual projection "
-        "(`erase_up`, `write_up`, `decay_up`) and scalar (`qed_lambda_raw`, `neg_gamma_raw`) initializes at "
-        "exact `0.0`, and channel shifts use singularity-free `logistic_shift(beta, delta)`. Loading "
-        "`s3_v2_long_1m_lsa` into `s2_v2_joint_bptt` with `gdn2.enabled = true` preserves the healed Native-GDN "
-        "forward graph **bit-identically at step 0**."
-    )
-    a(
-        "3. **Exact Algebraic Mapping onto `fla 0.6.0` `DPLR` + Fused `tl.int64` Triton Prep Kernel "
-        "(`919f2b8`, `2c78ffc`):** `fla.ops.generalized_delta_rule.dplr.{chunk_dplr_delta_rule, "
-        "fused_recurrent_dplr_delta_rule}` evaluates "
-        "$\\mathbf{S}_t = (\\operatorname{Diag}(e^{\\mathbf{g}_{k,t}}) + "
-        "\\mathbf{b}^{\\text{dplr}}_t (\\mathbf{a}^{\\text{dplr}}_t)^\\top)\\mathbf{S}_{t-1} + "
-        "\\mathbf{k}_t \\mathbf{v}_t^\\top$. Setting $\\mathbf{q} = \\hat{\\mathbf{q}}_t$, "
-        "$\\mathbf{k} = \\hat{\\mathbf{k}}_t$, $\\mathbf{v} = \\mathbf{w}_t \\odot \\mathbf{v}_t$, "
-        "$\\mathbf{b}^{\\text{dplr}}_t = \\hat{\\mathbf{k}}_t$, "
-        "$\\mathbf{a}^{\\text{dplr}}_t = -(\\mathbf{e}_t \\odot e^{\\mathbf{g}_t})$, "
-        "$\\mathbf{g}_{k,t} = \\mathbf{g}_t \\le 0$, and `scale = d_k^-0.5` maps GDN-2-1M+QED **1-to-1** "
-        "onto `fla` DPLR (dispatching `fused_recurrent_dplr_delta_rule` strictly for `T=1` no-grad inference "
-        "and `chunk_dplr_delta_rule` for all `T>1` / grad-enabled calls). Commit `919f2b8` fuses L2-norm + "
-        "QED + DPLR prep and its exact analytical VJP (`torch.autograd.gradcheck` verified across all 4 "
-        "`(use_l2, has_qed)` modes) into a single `tl.int64` Triton kernel; commit `2c78ffc` caches "
-        "`GDN2Adapter.is_zero()` by tensor `_version` tuples, eliminating repeat GPU->CPU `.any()` host syncs "
-        "during `T=1` decode."
-    )
-    a("")
-    a(f"![Live Blackwell sm_120 fla 0.6.0 DPLR and GDN-2 Kernel Benchmark]({chart_rel_dir}/dplr_gdn2_kernel_bench.svg)")
-    a("")
-    if db.get("T32768_fwd_bwd") and db.get("T1_decode"):
-        t32_d = db["T32768_fwd_bwd"]
-        t1_d = db["T1_decode"]
-        ps_d = db.get("parity_summary") or {}
-        py_m = float((t32_d.get("pytorch_chunk_gdn2") or {}).get("total", {}).get("median_ms") or 657.32)
-        nat_t1 = float((t1_d.get("native_fused_recurrent_gated_delta_rule") or {}).get("median_ms") or 0.0421)
-        a("#### Live Blackwell `sm_120` (`fla 0.6.0`, `B=1, H=32, K=V=128, bf16`) Latency & Parity Ledger")
-        a("")
-        a(
-            "| Kernel Path (`runs/bench_v2_smoke_dplr/summary.json`) | `T=32K` Fwd (`ms`) | `T=32K` Bwd (`ms`) | "
-            "**`T=32K` Total (`ms`)** | Speedup vs PyTorch | **`T=1` Decode (`ms`)** | Decode vs Native | "
-            "Live `sm_120` Parity |"
-        )
-        a("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |")
-        gdn2_o_cos = _fmt_f((ps_d.get("bf16_fla_chunk_gdn2_o") or {}).get("cosine"), 6)
-        gdn2_g_cos = _fmt_f(ps_d.get("bf16_fla_chunk_gdn2_min_grad_cos"), 6)
-        t1_fp32_md = (ps_d.get("fp32_T1_decode_o") or {}).get("max_abs_diff") or 0
-        e2e_o_cos = _fmt_f((ps_d.get("bf16_chunk_dplr_e2e_o") or {}).get("cosine"), 6)
-        e2e_g_cos = _fmt_f(ps_d.get("bf16_chunk_dplr_e2e_min_grad_cos"), 6)
-        bench_rows = [
-            (
-                "Native GDN (`chunk_gated_delta_rule`)",
-                "native_chunk_gated_delta_rule",
-                "native_fused_recurrent_gated_delta_rule",
-                "Stock Qwen3.6 baseline",
-            ),
-            (
-                "**`fla.ops.gdn2` (no-QED GDN-2)**",
-                "fla_ops_gdn2_chunk_gdn2",
-                "fla_ops_gdn2_fused_recurrent_gdn2",
-                f"bf16 `cos={gdn2_o_cos}`, min grad `{gdn2_g_cos}`",
-            ),
-            (
-                "**`fla` DPLR core (GDN-2+QED)**",
-                "fla_chunk_dplr_raw",
-                "fla_fused_recurrent_dplr_raw",
-                f"fp32 `T=1 max_diff={t1_fp32_md:.2e}` (`cos=1.0`)",
-            ),
-            (
-                "`fla` DPLR + unfused PyTorch prep*",
-                "fla_chunk_dplr_gdn2_qed_e2e",
-                "fla_fused_recurrent_dplr_gdn2_qed_e2e",
-                f"bf16 e2e `cos={e2e_o_cos}`, min grad `{e2e_g_cos}`",
-            ),
-            (
-                "PyTorch Chunk/Recurrent GDN-2 Ref",
-                "pytorch_chunk_gdn2",
-                "pytorch_recurrent_gdn2",
-                "Reference (`T=4096` `bf16` stability: `0` NaNs)",
-            ),
-        ]
-        for lbl, k32, k1, pnote in bench_rows:
-            r32 = t32_d.get(k32) or {}
-            r1 = t1_d.get(k1) or {}
-            f_ms = (r32.get("fwd") or {}).get("median_ms")
-            b_ms = (r32.get("bwd") or {}).get("median_ms")
-            tot_ms = (r32.get("total") or {}).get("median_ms")
-            dec_ms = r1.get("median_ms")
-            sp_s = f"**`{py_m / float(tot_ms):.1f}×`**" if tot_ms else "—"
-            dr_s = f"**`{float(dec_ms) / nat_t1:.2f}×`**" if (dec_ms and nat_t1) else "—"
-            a(
-                f"| {lbl} | `{_fmt_f(f_ms, 2)}` | `{_fmt_f(b_ms, 2)}` | **`{_fmt_f(tot_ms, 2)}`** | "
-                f"{sp_s} | **`{_fmt_f(dec_ms, 4)}`** | {dr_s} | {pnote} |"
-            )
-        a("")
-        a(
-            "*Note:* Unfused eager prep added `26.20 ms` (`T=32K`) and `0.108 ms` (`T=1`) in the pre-`919f2b8` "
-            "benchmark; our fused `tl.int64` Triton QED+DPLR prep kernel (`919f2b8` / `2c78ffc`) eliminates those "
-            "eager launches directly inside `GDN2Adapter`. Live `T=4096, H=32` `bf16` stress-test passed with "
-            "`o_finite=True, s_finite=True, grads_finite=True` (`o_abs_max=0.1167, s_abs_max=1.7049`)."
-        )
-        a("")
-
-    a("---")
-    a("")
-
-    # ------------------------------------------------------------------
-    # Section 5: Open Audited Dataset (v1.2) & Stage 4 SI-RSI
-    # ------------------------------------------------------------------
-    ds_url = f"https://huggingface.co/datasets/{sm['dataset_repo']}"
-    a(f"## 5. Open Audited Dataset ([`{sm['dataset_repo']}`]({ds_url}) @ `v1.2`) & Stage 4 SI-RSI")
-    a("")
-    if da:
-        oc = da.get("output_counts") or {}
-        ded = da.get("dedup") or {}
-        dec = da.get("decontam") or {}
-        v11 = da.get("v11_fable_upgrade") or {}
-        v12 = da.get("v12_fable_notebook") or {}
-        lic = da.get("licenses") or {}
-        n_inc = sum(1 for v in lic.values() if isinstance(v, dict) and v.get("included"))
-        n_exc = sum(1 for v in lic.values() if isinstance(v, dict) and not v.get("included"))
-        dec_hits = sum(int(v) for v in (dec.get("hits") or {}).values())
-        v11_mc = v11.get("mode_counts") or {}
-        v11_acc = int(v11_mc.get("fable_rewrite:accepted", 0)) + int(v11_mc.get("fable_original:accepted", 0))
-        v11_tot = sum(int(v) for v in v11_mc.values())
-        v11_rate = (100.0 * v11_acc / v11_tot) if v11_tot else 0.0
-        v12_mc = v12.get("mode_counts") or {}
-        v12_acc = int(v12_mc.get("orig_notebook:accepted", 0)) + int(v12_mc.get("rw_notebook:accepted", 0))
-        v12_tot = sum(int(v) for v in v12_mc.values())
-        v12_rate = (100.0 * v12_acc / v12_tot) if v12_tot else 0.0
-        v12_w = v12.get("v12_thinking_words") or {}
-        a(
-            "To eliminate upstream contamination, truncation, and tool-call poisoning, we built and published "
-            f"**[`{da.get('repo_id') or sm['dataset_repo']}`]({ds_url})** "
-            f"(release **`{da.get('release_version') or 'v1.2'}`**, `cc-by-4.0`, verified in `audit_summary.json` & "
-            "`docs/DATASET_AUDIT_REPORT.md`):"
-        )
-        a("")
-        a("| Audit Pillar | Verified Metric (`audit_summary.json`) | Key Engineering Takeaway |")
-        a("| :--- | :--- | :--- |")
-        a(
-            f"| **Published Parquet Splits** | **`{oc.get('sft_core', 0):,}`** `sft_core` · "
-            f"**`{oc.get('sirsi_preferences', 0):,}`** `sirsi_preferences` · "
-            f"`{oc.get('salvage_queue', 0):,}` `salvage_queue` | `18` author-original golden seeds + "
-            f"`{oc.get('track_b_sft', 0):,}` verified Track B SFT + "
-            f"`{oc.get('v12_fable_sft', 0):,}` `v1.2` working-notebook traces |"
-        )
-        a(
-            f"| **Live License Audit** | `{n_inc}` permissive repos included (`74.4%` Apache-2.0 / `25.6%` CC-BY-4.0 "
-            f"in `sft_core`); `{n_exc}` excluded (`agpl-3.0`, `unknown`) | "
-            "Zero copyleft or unlicensed rows; full per-row provenance & BibTeX attribution |"
-        )
-        dup_tot = sum((ded.get("dup_counts") or {}).values())
-        a(
-            f"| **Cross-Source Dedup** | `{ded.get('unique_indexed', 0):,}` unique pairs indexed; "
-            f"**`{dup_tot:,}`** duplicates removed | `opus46_3300x` overlapped `opus46_3000x` by `85.7%` "
-            "(`1,028/1,200`); `fable51` had `948/1,200` internal prompt repeats |"
-        )
-        a(
-            f"| **Live 2026 13-Gram Decontam** | **`{dec.get('index_size', 0):,}`** unique 13-grams across "
-            f"`12` accessible 2026 eval suites; **`{dec_hits}`** leaks removed | "
-            "Blocked `18` HLE, `9` SuperGPQA, `2` SWE-bench Pro, `2` ARC-AGI-2 leaks; zero leaks in published splits |"
-        )
-        a(
-            "| **Raw `fable51` Poison Discovery** | `100%` of sampled `tool_calls` had redacted placeholders "
-            "(`<bash_command>` `6,098×`, `<file_path>` `5,972×`, `<search_query>` `2,441×`) | "
-            "Quarantined `252` unique rows (`247` unrecoverable dropped); "
-            "prevented tool-call collapse proven in Section 3.7 |"
-        )
-        a(
-            "| **`v1.1 → v1.2` Decoupled `working_notebook` CoT** | Pass rate jumped "
-            f"**`{v11_acc}/{v11_tot}` (`{v11_rate:.1f}%`) → `{v12_acc}/{v12_tot}` (`{v12_rate:.1f}%`)** | "
-            "Decoupling scratchpad synthesis eliminated 75-word future-tense outlines: "
-            f"`{v12_w.get('min', 0)}–{v12_w.get('max', 0)}` words (median `{v12_w.get('median', 0)}`), "
-            f"`mean_slop = {_fmt_f(v12.get('mean_slop_v12'), 1)}`, "
-            f"`mean_3beat = {_fmt_f(v12.get('mean_3beat_v12'), 4)}`, "
-            "`0` rubric headers / spoilers / stubs / outlines |"
-        )
-        a("")
-    else:
-        a("Dataset audit summary (`audit_summary.json`) not present in this offline snapshot.")
-        a("")
-
-    a(
-        "- **Stage 4 — Verifiable GRPO/DAPO + Supervised Instructed RSI (`SI-RSI`, commit `def3624`, "
-        "`src/qloop/train/sirsi.py`, `configs/stages/s4_v2_rl.yaml`):** Ready for post-`s2_v2` launch on "
-        "verifiable math (`DAPO-Math-17k`) and Triton/CUDA kernel synthesis (`KernelBench`). Combines (1) "
-        "**Tier-1 local pathology detection** (`LOOP_DEGENERATION` with exact `loop_onset_char` span mapping, "
-        "`UNCLOSED_THINK`, `PREMATURE_EXIT`) feeding bounded token-level unlikelihood (`-log(1 - p)`) routed "
-        "**surgically to `[loop_adapters, router]`** (zero slap gradients on attention/GDN/norms/base), "
-        "(2) bounded final-answer-only anti-slop tie-breaking (`anti_slop_weight = 0.05`, never overriding "
-        "verifier correctness), (3) optional Tier-2 guided recovery & Tier-3 13-gram-decontaminated "
-        "curriculum sculpting, and (4) strict holdout promotion/rollback gates."
-    )
-    a("")
-    a("---")
-    a("")
-
-    # ------------------------------------------------------------------
-    # Section 6: Blackwell sm_120 Speedup Chronology & Kernel Engineering Ledger
-    # ------------------------------------------------------------------
-    a("## 6. Blackwell `sm_120` Speedup Chronology & Kernel Engineering Ledger")
-    a("")
-    a(
-        "Every diagnosis, Triton kernel, cache proxy, and stability fix below was mined directly from "
-        "`docs/PERF_PROFILE_S2.md`, `git log`, and `runs/colab_supervisor*.log` on our single "
-        "**NVIDIA RTX PRO 6000 Blackwell Server Edition (`GB202`, `sm_120`, `96 GB GDDR7 ECC`, `1,597 GB/s`, "
-        "`600 W` TDP; `PyTorch 2.14.1+cu130`, `Triton 3.8.0`, `transformers 5.24.0`, `fla 0.6.0`)** and locked "
-        "behind **`709` passing CPU unit/parity tests** (`749` total incl. `40` CUDA-only tests on `origin/main` "
-        "`2c78ffc`, `0` `ruff` errors, `0` Python 3.9 AST errors across `143` sources)."
-    )
-    a("")
-    a("### 6.1 Root-Cause Diagnosis: Why `s2_joint_bptt` Initially Starved at `280–360 W` (`~53%` TDP) & `453.5 tok/s`")
-    a("")
-    a(
-        "Live profiling of baseline `s2_joint_bptt` (`2e37bf6`, `~580 s/step` avg at `d=2.2`, `427–481 tok/s`, "
-        "`324.2 W` mean power — barely **`~53%` of `600 W` TDP**) proved that `131K` BPTT was **not** Tensor-Core "
-        "compute bound (`docs/PERF_PROFILE_S2.md:28-32`). Instead, three systems bottlenecks starved the GPU:"
-    )
-    a("")
-    a(
-        "1. **`~129 TB/step` Unfused GDDR7 Gather/Scatter & Dequant Thrashing (`< 300 GB/s` Effective = `< 19%` "
-        "of Peak `1,597 GB/s` GDDR7 ECC):** Nested checkpoint recomputation in D-LSA `_sparse_chunk` materialized "
-        "`402.6 MiB/chunk` (`~71 TB/step` GDDR7), while eager NVFP4 `dequantize_nvfp4_tensor` allocated `int64` "
-        "`nibbles.long()` + 3 fp32 intermediates (`39 GiB/layer pass`, `~55–65 TB/step`), stalling Tensor Cores.\n"
-        "2. **`~93,700+` Blocking GPU→CPU Host Synchronizations per Step:** `90,112` syncs in `_distill_kl` "
-        "(`22,528` chunks × `4` syncs), `2,772+` in HSSD `boundary_ring`, `792` in `p_val.all()`, `360` in BPTT "
-        "blocking `.to('cpu')`, and `60` in `replay_meta.cpu()` constantly drained the CUDA command queue.\n"
-        "3. **`9–41 s/step` Synchronous CPU Data & Filter Stalls:** Blocking `next(self.stream)` ran 13-gram "
-        "decontam, tokenization, and packing on the GPU thread (amplified by upstream filter drop rates: `72%` "
-        "`openthoughts3`, `49%` `nemotron_post`, `50%` `arc_agi2_train`), causing `41 s` post-eval and `9 s` "
-        "inter-step GPU-idle gaps."
-    )
-    a("")
-    a("### 6.2 Ranked Breakdown of All 7 Profiled Blackwell Optimizations (`docs/PERF_PROFILE_S2.md`)")
-    a("")
-    a(
-        "| Rank | Bottleneck & File | Baseline Traffic / Syncs | Optimization Implemented | "
-        "Verified Speedup & Bandwidth / Sync Impact | Est. Time Saved |"
-    )
-    a("| ---: | :--- | :--- | :--- | :--- | :---: |")
-    a(
-        "| **1** | **D-LSA Sparse-Gather FlashAttention** (`src/qloop/model/lsa.py`) | "
-        "`52.8K` fwd (`67.6K` @ `d=3`) + `17.6K` bwd dispatches; `~71 TB/step` GDDR7 | "
-        "Single-shot `_TritonSparseGatherAttnFn` (8-head GQA SRAM reuse, atomic-free window/split-Q sink `dkv`, "
-        "cached `BucketIndex`, `tl.int64`) | "
-        "**`9.32×` E2E / `12.99×` kernel** (`174.56 ms` / `125.30 ms` vs `1,627.16 ms`), "
-        "`~70 TB/step` GDDR7 eliminated, `cos >= 0.999973` | **`195–250 s`** |"
-    )
-    a(
-        "| **2** | **D-LSA 2-Pass Triton Distill KL** (`src/qloop/model/lsa.py`) | "
-        "`90,112` host syncs/step + `22.5K` `autograd.grad` + `3.0 TB/step` fp32 K | "
-        "Zero-atomic 2-pass Triton teacher bucket-mass (`tl.dot`) + exact analytic `(d_qz, d_cent)` + single "
-        "`autograd.grad`/layer | "
-        "**`5.83×`** (`46.42 ms` vs `270.49 ms`), `~90,000 → < 180` host syncs/step, `cos_wq/wk = 1.000000` | "
-        "**`55–85 s`** |"
-    )
-    a(
-        "| **3** | **NVFP4 E2M1 MoE Dequant** (`src/qloop/model/quant_autograd.py`) | "
-        "`~55–65 TB/step` eager `int64`+`fp32` intermediates + `index_select` copies | "
-        "Fused bitwise `_nvfp4_dequant_fused_kernel` (`tl.int64`) + zero-copy contiguous `_select_dim0` | "
-        "**`18.99×`** (`0.12 ms` vs `2.22–2.23 ms`), **`1,144–1,148 GB/s = 71.9%` of peak `1,597 GB/s` GDDR7 "
-        "ECC**, `18.5×` less traffic, `max_diff = 0.0` | **`38–55 s`** |"
-    )
-    a(
-        "| **4** | **BPTT Auto-GDDR7 / Async DMA & CCE** (`bptt.py`, `trainer.py`) | "
-        "`10.7 GiB/step` blocking PCIe (`360` syncs) + `254 GiB/step` chunked logits + `16K` hooks | "
-        "`offload_prior_hidden: auto` (GDDR7-resident when `>= 8 GiB` free, else pinned async DMA) + "
-        "`cut_cross_entropy` + `query_sim_chunk=1024` + `loss_scale` | "
-        "**`54.03×` vs blocking / `13.5×` DMA** (`0.64 ms` / `2.56 ms` vs `34.46 ms`), `420` syncs & `16K` hooks "
-        "eliminated | **`35–60 s`** |"
-    )
-    a(
-        "| **5** | **HSSD v3.2 Sync Removal & `ckpt_every=16`** (`src/qloop/model/hssd.py`) | "
-        "`2,772+` `boundary_ring` + `792` `p_val.all()` syncs/step; `64` segs `s_ckpts` | "
-        "Device-side `bm <= 32` guard + `_all_swa_valid` flag propagation + internal `ckpt_every=16` (preserving "
-        "YAML `segment_chunks: 4`) | "
-        "`~3,564 → 0` host syncs/step; `2×` fewer `s_ckpts` copies (`-0.5 GiB`) | **`12–22 s`** |"
-    )
-    a(
-        "| **6** | **Async Data Pipeline & Hash-First Decontam** (`trainer.py`, `decontam.py`, `packing.py`) | "
-        "`9–41 s/step` GPU-idle stalls; `~50K` `set()`/seq; `131K` Python packing loop | "
-        "Deterministic `_AsyncBatchPrefetcher` (exact per-row `state_dict` + `pin_memory` + `non_blocking` H2D) "
-        "+ hash-first decontam + vectorized `Packer._emit` | "
-        "100% CPU overlap with GPU compute; `~4×` faster 13-gram decontam | **`18–45 s`** |"
-    )
-    a(
-        "| **7** | **Batched APOLLO / AdamW Optimizer** (`src/qloop/train/optim.py`) | "
-        "Duplicate `897`-tensor norm pass + `100` Python `AdamWLite` loops + blocking APOLLO H2D | "
-        "`_batched_grad_norms` (`_foreach_norm(..., dtype=fp32)`), reused `_foreach_mul_` clip, "
-        "`_step_batched_adamw_lite`, pinned `non_blocking` APOLLO proj | "
-        "`897 → ~4` norm launches with `0.0` error (vs `0.24` bf16 error); atomic whole-step non-finite guard "
-        "intact | **`2–6 s`** |"
-    )
-    a("")
-    a("### 6.3 Four Production Hardening Commits (Multi-Day Single-Card Resiliency)")
-    a("")
-    a(
-        "1. **`2e37bf6` — `T=131K` Triton `tl.int64` Pointer Overflow Fix:** At `T = 131,072`, `t * 20480` "
-        "exceeded `2^31 - 1` at `t = 104,858`, causing step-0 NaNs. Chunking `all_up` and auditing `tl.int64` "
-        "offsets across `32` kernels yielded `0.00e+00` parity error and cut transient buffers "
-        "`10.74 GiB → <= 671 MiB`.\n"
-        "2. **`5a82677` — Zero-Label BPTT C++-Bridged Autograd Cycle Leak Fix:** Under `respect_doc_boundaries=True`, "
-        "padded `128K` rows produced all-`-100` Segment-3 targets that skipped `.backward()`, leaking `90` "
-        "`_CheckpointFrame` cycles (`+16–19 GiB` → `52.0 GiB` alloc OOM on `b2c5513`). Adding "
-        "`LoopContext.release_graph()`, `saved_tensors_hooks(lambda x: x.detach())`, `__slots__` state detaching, "
-        "and all-`-100` segment pre-checks dropped post-step alloc from `32.6 GiB` (baseline) / `52.0 GiB` (leaky) "
-        "to **`25.3–25.4 GiB` rock-flat (`-7.0 GiB` vs baseline, `32h+` zero OOMs)**.\n"
-        "3. **`2f5a6ba` (`5aaf55d` / `28b88e4`) — `transformers 5.24.0` Cache-Kwarg `10.6×` Recovery:** Upgrading "
-        "to `transformers 5.24.0` renamed `cache_params → cache`, silently falling out of `_chunk_hssd_triton_fast` "
-        "to `~89 tok/s` (`252 W`, `82.7 GiB` peak). Unifying `cache` kwargs and isolating conv/recurrent snapshots "
-        "in `_ReplayKVCacheProxy` recovered **`10.6×` throughput (`89 → 942.6 tok/s` avg, peak `1,109 tok/s`)** "
-        "with `0.000e+00` 1-token checkpoint grad parity.\n"
-        "4. **`2c78ffc` (`919f2b8`) — Fused `tl.int64` Triton QED+DPLR Prep & Zero-Sync Cached `is_zero()`:** "
-        "Fuses L2-norm + QED + DPLR prep and its exact analytical VJP (`gradcheck`-verified) into a single "
-        "`tl.int64` Triton kernel and caches `GDN2Adapter.is_zero()` by `(data_ptr, _version)` tuples, eliminating "
-        "repeat `.any()` host syncs during `T=1` decode (`15.1×–18.5×` training speedup, `1.02×` native decode)."
-    )
-    a("")
-    a("### 6.4 Complete 11-Milestone Verification Ledger & Autonomous Resiliency")
-    a("")
-    a(
-        "| # | Engineering Milestone | Git Commit | Exact Blackwell `sm_120` Verification Measurement | "
-        "Measured Impact |"
-    )
-    a("| ---: | :--- | :---: | :--- | :--- |")
-    for idx_m, ms in enumerate(sm["systems_milestones"], start=1):
-        a(f"| {idx_m} | **{ms['component']}** | `{ms['commit']}` | {ms['measurement']} | {ms['impact']} |")
-    a("")
-    a(
-        "- **Autonomous Multi-Day Resiliency (`4f09463`, `c22bf62`, `28b88e4`):** Automated HF Hub commit sync "
-        "(`ckpt_every=25`), 235 GB SSD disk guard (`~210 GiB` consistently free), Colab `503` exponential backoff, "
-        "and clean time-budget VM rollover sustained **`"
-        f"{sup_tot_h:.2f}` active single-GPU hours** with zero lost checkpoints."
-    )
-    a("")
-    a("---")
-    a("")
-
-    # ------------------------------------------------------------------
-    # Section 7: Honest Limitations, Next Milestones & Compute Grant Justification
-    # ------------------------------------------------------------------
-    a("## 7. Honest Limitations, Next Milestones & Compute Grant Justification")
-    a("")
-    a("### 7.1 Honest Scientific Limitations")
-    a("")
-    a(
-        "1. **No Downstream 2026 Frontier Benchmark Scores Claimed Yet:** All current empirical numbers measure "
-        "held-out language-modeling NLL (`8K`, `16K`, `64K`, `131K`), zero-training diagnostic probes (`s0_probe`), "
-        "live `sm_120` kernel parity/latency, Phase-A generation/needle forensics, and dataset quality audits. "
-        "End-to-end reasoning scores (`HLE-Diamond/Rolling/Verified`, `GPQA/SuperGPQA`, `AIME 2026`, `HMMT Feb 2026`, "
-        "`ARC-AGI-2`, `MRCR 1M`, `LongBench v2`, `KernelBench L3/L4`, `Terminal-Bench 4.1`, `SWE-bench Pro Hard`) "
-        "will ONLY be reported after `s2_v2` and `s4_v2_rl` complete and pass our 13-gram decontaminated "
-        "`d ∈ {1, 2, 3}` sweep."
-    )
-    s3v2_pk_rec = _fmt_f(max(s3v2_rec_vals) if s3v2_rec_vals else None, 4)
-    s3v2_end_rec = _fmt_f(s3v2_rec_vals[-1] if s3v2_rec_vals else None, 4)
-    a(
-        f"2. **`s3_v2_long_1m_lsa` Is Mid-Stage (`step {s3v2_latest_step}/{s3v2_target}`) & "
-        "`512K–1M` Recall Is Below `0.70`:** "
-        f"While clean v2 raised peak `512K–1M` D-LSA Top-64 recall from `0.4848` (HSSD) to **`{s3v2_pk_rec}`** "
-        f"(latest `{s3v2_end_rec}`), it remains below our `0.70` `recall_ready` auto-switch threshold. Co-training "
-        "sparse D-LSA in `s2_v2` and conditional `index_dim: 64 → 96` / multi-scale pooling remain gated on the "
-        "upcoming `s3_v2@600` Phase-A needle gate and `MRCR 1M` bucketed audit."
-    )
-    a(
-        "3. **`s2_v2_joint_bptt` (GDN-2-1M+QED) & `s4_v2_rl` (SI-RSI) Are Queued, Not Yet Trained:** "
-        "GDN-2-1M + Bounded QED + fused `tl.int64` Triton prep + `fla 0.6.0` DPLR are live-verified on `sm_120` "
-        "for parity, speed, `T=4096` stability, and Step-0 bit-identity (`bench_v2_smoke_dplr/summary.json`, "
-        "`2c78ffc`), but full 600-step `s2_v2` convergence and 400-step `s4_v2_rl` RL gains are **not yet measured**."
-    )
-    s3v2_tps_lim = _fmt_f(s3v2.get("tok_per_s_mean"), 0) if s3v2.get("tok_per_s_mean") else "2,382"
-    a(
-        "4. **Single-GPU Autoregressive Rollout Bottleneck:** Single-GPU training handles `s1` (`~2,117 tok/s`) and "
-        f"`s3_v2` (`~2,202–{s3v2_tps_lim} tok/s`) comfortably, but online `d=3` (`88L`) GRPO/SI-RSI rollouts "
-        "(`8` prompts × `group=8` × `8,192` tokens/step) and full 16-benchmark `d ∈ {1, 2, 3}` sweeps are "
-        "throughput-bound without multi-GPU rollout parallelism."
-    )
-    a("")
-    a("### 7.2 Immediate Experimental Roadmap")
-    a("")
-    a(
-        f"1. **Complete `s3_v2_long_1m_lsa` (`step {s3v2_latest_step} → 600`) & Pass Phase-A Gate:** Confirm `64K` "
-        "`d=1/2/3` scaling through `s600` plus live `16K–256K` needle & coherence pass on `s3_v2@600`."
-    )
-    a(
-        "2. **Run `s2_v2_joint_bptt` (`600` Steps, `4×32K = 131K` K/V-Replay BPTT + `GDN-2-1M + Bounded QED`):** "
-        "Activate Step-0 bit-identical GDN-2-1M+QED (`27.53M` params, `fla` DPLR + fused Triton prep) on our "
-        "decontaminated `v1.2` mixture (`25%` `loop64_fable_sirsi`, `55%` `R=3` emphasis)."
-    )
-    a(
-        "3. **Run `s4_v2_rl` (`400` Steps Verifiable GRPO/DAPO + SI-RSI):** Train on `DAPO-Math-17k` + `KernelBench` "
-        "with surgical `[loop_adapters, router]` slap gradients and holdout promotion gates."
-    )
-    a(
-        "4. **Publish Full 16-Benchmark 2026 Frontier Depth Sweep (`d ∈ {1, 2, 3}`, FLOP-Matched) & Open Release:** "
-        "Release full weights (`safetensors` Whole Model Pack), `Loop64-Fable-SIRSI-v1`, custom Blackwell Triton "
-        "kernels, and raw telemetry logs."
-    )
-    a("")
-    a(
-        "### 7.3 Compute Grant Summary "
-        "*(See Standalone 2-Page Brief: [`docs/COMPUTE_GRANT_PROPOSAL.md`](COMPUTE_GRANT_PROPOSAL.md))*"
-    )
-    a("")
-    a(
-        f"With **`{sup_tot_h:.2f}` single-GPU hours** already invested to de-risk every architectural, mathematical, "
-        "data-hygiene, and Blackwell kernel risk (documented with full positive and negative evidence above), "
-        "a targeted **`1× 8×H200/B200` allocation for 2 weeks (`~2,500` GPU-hours — Tier 2 Primary Request)** unlocks "
-        "full `s2_v2` + `s4_v2_rl` SI-RSI + FLOP-matched `d ∈ {1, 2, 3}` ablations (`GDN-2-1M+QED` vs Native GDN) "
-        "and the complete 16-benchmark 2026 evaluation sweep. See "
-        "[`docs/COMPUTE_GRANT_PROPOSAL.md`](COMPUTE_GRANT_PROPOSAL.md) "
-        "for the exact 3-tier allocation budget (`400` / `2,500` / `6,000` GPU-hours) derived transparently from "
-        "measured throughput and latency."
-    )
-    a("")
-    a("---")
-    a("")
-    a("### Reproducibility")
-    a("")
-    a(
-        "Regenerate all raw CSV/JSON logs (`docs/experiment_logs/`), all 7 pure-SVG charts "
-        "(`docs/experiment_logs/charts/`), and this report directly from public HF Hub + local verified logs "
-        "(without disturbing any live Colab training session):"
-    )
-    a("")
-    a("```bash")
-    a("PYTHONPATH=src python scripts/export_experiment_report.py \\")
-    a(f"  --repo {sm['repo']} \\")
-    a("  --supervisor-log runs/colab_supervisor.log \\")
-    a("  --supervisor-v2-log runs/colab_supervisor_v2.log \\")
-    a("  --runs-dir runs \\")
-    a("  --out-dir docs/experiment_logs \\")
-    a("  --report docs/EXPERIMENT_REPORT.md")
-    a("```")
-    a("")
-
-    return "\n".join(lines)
-
+# render_experiment_report_md, render_experiment_report_md_with_order, and
+# render_experiment_report_zh_md are implemented in qloop.report_paper_en / qloop.report_paper_zh
+# and re-exported at module level above.
 
 # ---------------------------------------------------------------------------
 # End-to-End Export Orchestrator & CLI
@@ -3347,17 +1696,20 @@ def export_experiment_report(
     session: str | None = None,
     supervisor_log: str | None = "runs/colab_supervisor.log",
     supervisor_v2_log: str | None = "runs/colab_supervisor_v2.log",
+    supervisor_s2v2_log: str | None = "runs/colab_supervisor_s2v2.log",
     runs_dir: str | None = None,
     truth_check_path: str | None = None,
     dplr_bench_path: str | None = None,
     dataset_audit_path: str | None = None,
+    s3v2_gate_path: str | None = None,
     out_dir: str = "docs/experiment_logs",
     report_path: str = "docs/EXPERIMENT_REPORT.md",
+    report_zh_path: str | None = None,
     offline_dir: str | None = None,
     offline: bool = False,
     colab_bin: str = DEFAULT_COLAB_BIN,
 ) -> dict[str, Any]:
-    """Collect telemetry, archive CSV/JSON, render 7 SVGs, and write EXPERIMENT_REPORT.md."""
+    """Collect telemetry, archive CSV/JSON, render 7 SVGs, and write EN (+ optional ZH) academic reports."""
     raw_commits, probe_report, quality_check = collect_hub_history(
         repo=repo,
         offline_dir=offline_dir,
@@ -3372,6 +1724,7 @@ def export_experiment_report(
 
     eff_sup_log = supervisor_log
     eff_sup_v2_log = supervisor_v2_log
+    eff_sup_s2v2_log = supervisor_s2v2_log
     if offline_dir:
         cand_sup = os.path.join(offline_dir, "colab_supervisor.log")
         eff_sup_log = cand_sup if os.path.isfile(cand_sup) else (
@@ -3379,10 +1732,13 @@ def export_experiment_report(
         )
         cand_sup_v2 = os.path.join(offline_dir, "colab_supervisor_v2.log")
         eff_sup_v2_log = cand_sup_v2 if os.path.isfile(cand_sup_v2) else None
+        cand_sup_s2v2 = os.path.join(offline_dir, "colab_supervisor_s2v2.log")
+        eff_sup_s2v2_log = cand_sup_s2v2 if os.path.isfile(cand_sup_s2v2) else None
 
     sup_v1 = parse_supervisor_log(eff_sup_log)
     sup_v2 = parse_supervisor_log(eff_sup_v2_log, stage_override="s3_v2_long_1m_lsa")
-    supervisor_data = _merge_supervisor_logs(sup_v1, sup_v2)
+    sup_s2v2 = parse_supervisor_log(eff_sup_s2v2_log, stage_override="s2_v2_joint_bptt")
+    supervisor_data = _merge_supervisor_logs(sup_v1, sup_v2, sup_s2v2)
 
     eff_runs_dir = runs_dir
     if eff_runs_dir is None and eff_sup_log and os.path.isfile(eff_sup_log):
@@ -3407,9 +1763,15 @@ def export_experiment_report(
         search_roots,
         ("dataset_audit_summary.json", "datasets/Loop64-Fable-SIRSI-v1/audit_summary.json"),
     )
+    gate_file = _resolve_artifact(
+        s3v2_gate_path,
+        search_roots,
+        ("s3v2_gate_summary.json", "eval_s3v2_step600_gate/summary.json"),
+    )
     truth_check = load_truth_check_summary(tc_file)
     dplr_bench = load_dplr_bench_summary(db_file)
     dataset_audit = load_dataset_audit_summary(da_file)
+    s3v2_gate = load_s3v2_gate_summary(gate_file)
 
     use_anchors = (not offline_dir) and (repo == DEFAULT_REPO)
     bundle = normalize_experiment_data(
@@ -3424,6 +1786,7 @@ def export_experiment_report(
         truth_check=truth_check,
         dplr_bench=dplr_bench,
         dataset_audit=dataset_audit,
+        s3v2_gate=s3v2_gate,
     )
 
     charts_dir = os.path.join(out_dir, "charts")
@@ -3461,6 +1824,8 @@ def export_experiment_report(
         _write_json("dplr_bench_summary.json", dplr_bench)
     if dataset_audit is not None:
         _write_json("dataset_audit_summary.json", dataset_audit)
+    if s3v2_gate is not None:
+        _write_json("s3v2_gate_summary.json", s3v2_gate)
 
     # 4. 7 Pure-SVG vector charts
     for fname, renderer in ALL_CHART_RENDERERS.items():
@@ -3471,13 +1836,31 @@ def export_experiment_report(
             f.write(svg_text)
         written_files.append(svg_path)
 
-    # 5. EXPERIMENT_REPORT.md
+    # 5. EXPERIMENT_REPORT.md (English IEEE academic paper)
     rel_charts = os.path.relpath(charts_dir, start=report_parent or ".").replace("\\", "/")
-    md_text = render_experiment_report_md(bundle, chart_rel_dir=rel_charts)
+    md_text, cite_order = render_experiment_report_md_with_order(bundle, chart_rel_dir=rel_charts)
     _assert_secret_free(report_path, md_text)
+    validate_ieee_citations(md_text)
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(md_text)
     written_files.append(report_path)
+
+    # 6. Optional EXPERIMENT_REPORT_ZH.md (Simplified Chinese IEEE academic paper)
+    if report_zh_path:
+        zh_parent = os.path.dirname(os.path.abspath(report_zh_path))
+        if zh_parent:
+            os.makedirs(zh_parent, exist_ok=True)
+        rel_charts_zh = os.path.relpath(charts_dir, start=zh_parent or ".").replace("\\", "/")
+        zh_text = render_experiment_report_zh_md(
+            bundle,
+            chart_rel_dir=rel_charts_zh,
+            expected_cite_order=cite_order,
+        )
+        _assert_secret_free(report_zh_path, zh_text)
+        validate_ieee_citations(zh_text)
+        with open(report_zh_path, "w", encoding="utf-8") as f:
+            f.write(zh_text)
+        written_files.append(report_zh_path)
 
     return {
         "repo": repo,
@@ -3486,11 +1869,14 @@ def export_experiment_report(
         "stage_row_counts": {st: len(bundle["stage_tables"][st]) for st in STAGES},
         "rolled_back_count": len(bundle["rolled_back_events"]),
         "live_s2_rows": len(live_s2),
+        "ieee_reference_count": len(cite_order),
         "ingested_artifacts": {
             "truth_check": truth_check is not None,
             "dplr_bench": dplr_bench is not None,
             "dataset_audit": dataset_audit is not None,
+            "s3v2_gate": s3v2_gate is not None,
             "supervisor_v2": bool(sup_v2.get("present")),
+            "supervisor_s2v2": bool(sup_s2v2.get("present")),
         },
     }
 
@@ -3499,7 +1885,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=(
             "Export verified v1 + v2 experiment telemetry (HF Hub + supervisor logs + local artifacts), "
-            "7 pure-SVG charts, and docs/EXPERIMENT_REPORT.md."
+            "7 pure-SVG charts, and EN/ZH IEEE academic reports."
         )
     )
     ap.add_argument("--repo", default=DEFAULT_REPO, help="Hugging Face Hub repository ID")
@@ -3515,6 +1901,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Path to local colab_supervisor_v2.log",
     )
     ap.add_argument(
+        "--supervisor-s2v2-log",
+        default="runs/colab_supervisor_s2v2.log",
+        help="Path to local colab_supervisor_s2v2.log",
+    )
+    ap.add_argument(
         "--runs-dir",
         default=None,
         help="Directory containing local stage metrics & verified JSON artifacts",
@@ -3522,8 +1913,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--truth-check", default=None, help="Explicit path to truth_check_summary.json")
     ap.add_argument("--dplr-bench", default=None, help="Explicit path to bench_v2_smoke_dplr/summary.json")
     ap.add_argument("--dataset-audit", default=None, help="Explicit path to Loop64-Fable-SIRSI-v1/audit_summary.json")
+    ap.add_argument("--s3v2-gate", default=None, help="Explicit path to eval_s3v2_step600_gate/summary.json")
     ap.add_argument("--out-dir", default="docs/experiment_logs", help="Output directory for raw CSV/JSON and charts/")
-    ap.add_argument("--report", default="docs/EXPERIMENT_REPORT.md", help="Output Markdown report path")
+    ap.add_argument("--report", default="docs/EXPERIMENT_REPORT.md", help="Output English Markdown report path")
+    ap.add_argument(
+        "--report-zh",
+        default="docs/EXPERIMENT_REPORT_ZH.md",
+        help="Output Simplified Chinese Markdown report path (pass '' to skip)",
+    )
     ap.add_argument("--offline-dir", default=None, help="Offline fixture directory (zero network/Colab calls)")
     ap.add_argument("--offline", action="store_true", help="Skip network and live Colab session queries")
     ap.add_argument("--colab-bin", default=DEFAULT_COLAB_BIN, help="Path to colab CLI binary")
@@ -3537,12 +1934,15 @@ def main(argv: list[str] | None = None) -> int:
         session=args.session,
         supervisor_log=args.supervisor_log,
         supervisor_v2_log=args.supervisor_v2_log,
+        supervisor_s2v2_log=args.supervisor_s2v2_log,
         runs_dir=args.runs_dir,
         truth_check_path=args.truth_check,
         dplr_bench_path=args.dplr_bench,
         dataset_audit_path=args.dataset_audit,
+        s3v2_gate_path=args.s3v2_gate,
         out_dir=args.out_dir,
         report_path=args.report,
+        report_zh_path=args.report_zh or None,
         offline_dir=args.offline_dir,
         offline=args.offline,
         colab_bin=args.colab_bin,

@@ -541,13 +541,31 @@ def render_s3_hssd_vs_v2_gdn_ab_svg(bundle: dict[str, Any]) -> str:
     v1_s = summaries.get("s3_long_1m_lsa") or {}
     v2_s = summaries.get("s3_v2_long_1m_lsa") or {}
     v2_max_step = int(v2_s.get("latest_step") or (v2_rows[-1]["step"] if v2_rows else 375))
+    v2_done = str(v2_s.get("status") or "") == "completed" or v2_max_step >= 600
+    v2_status_lbl = f"Completed {v2_max_step}/600" if v2_done else f"through step {v2_max_step}"
+
+    # Determine latest matched eval step (prefer s600 if present, else s400, else s200)
+    matched_step = 200
+    v1_match = None
+    v2_match = None
+    for cand_step in (600, 400, 200):
+        c1 = next((r for r in v1_ev if int(r["step"]) == cand_step and isinstance(r.get("d3"), (int, float))), None)
+        c2 = next((r for r in v2_ev if int(r["step"]) == cand_step and isinstance(r.get("d3"), (int, float))), None)
+        if c1 and c2:
+            matched_step, v1_match, v2_match = cand_step, c1, c2
+            break
+    panel_a_delta = (
+        f"{float(v2_match['d3']) - float(v1_match['d3']):+.3f} nats @ s{matched_step}"
+        if (v1_match and v2_match)
+        else "-0.594 nats @ s600"
+    )
 
     svg = _SvgCanvas(
         1220,
         625,
         "Controlled A/B Comparison: v1 HSSD (s3_long_1m_lsa) vs. Clean Native-GDN (s3_v2_long_1m_lsa)",
         f"Identical 88L Loop + 1M YaRN + Per-Pass D-LSA on 1× RTX PRO 6000 Blackwell · "
-        f"Clean v2 (through step {v2_max_step}) Wins Every Quality, Recall, Speed & Memory Axis",
+        f"Clean v2 ({v2_status_lbl}) Wins Every Quality, Recall, Speed & Memory Axis",
     )
     svg.legend_row(
         34,
@@ -590,7 +608,7 @@ def render_s3_hssd_vs_v2_gdn_ab_svg(bundle: dict[str, Any]) -> str:
         ya_ticks,
         y_label="Held-Out 64K d=3 NLL",
         y_digits=2,
-        panel_title="A. Held-Out 64K d=3 NLL (Lower Is Better · -0.630 nats @ s200)",
+        panel_title=f"A. Held-Out 64K d=3 NLL (Lower Is Better · {panel_a_delta})",
     )
     v1_d3_pts = [
         (_map_lin(float(r["step"]), x_lo, x_hi, lx, lx + lw),
@@ -623,23 +641,23 @@ def render_s3_hssd_vs_v2_gdn_ab_svg(bundle: dict[str, Any]) -> str:
     for cx, cy in v2_d3_pts:
         svg.circle(cx, cy, 4.8, fill=C_EMERALD)
 
-    # Draw vertical improvement gap arrow at matched step 200
-    v1_s200 = next((r for r in v1_ev if int(r["step"]) == 200 and isinstance(r.get("d3"), (int, float))), None)
-    v2_s200 = next((r for r in v2_ev if int(r["step"]) == 200 and isinstance(r.get("d3"), (int, float))), None)
-    if v1_s200 and v2_s200:
-        x200 = _map_lin(200.0, x_lo, x_hi, lx, lx + lw)
-        y_v1 = _map_lin(float(v1_s200["d3"]), ya_lo, ya_hi, ty + th, ty)
-        y_v2 = _map_lin(float(v2_s200["d3"]), ya_lo, ya_hi, ty + th, ty)
-        diff = float(v2_s200["d3"]) - float(v1_s200["d3"])
-        ppl_v2 = math.exp(float(v2_s200["d3"]))
-        ppl_v1 = math.exp(float(v1_s200["d3"]))
-        svg.line(x200, y_v1 + 5, x200, y_v2 - 5, stroke=C_EMERALD, stroke_width=2.0, dash="3,2")
+    # Draw vertical improvement gap arrow at latest matched step (s600 or s200)
+    if v1_match and v2_match:
+        xm = _map_lin(float(matched_step), x_lo, x_hi, lx, lx + lw)
+        y_v1 = _map_lin(float(v1_match["d3"]), ya_lo, ya_hi, ty + th, ty)
+        y_v2 = _map_lin(float(v2_match["d3"]), ya_lo, ya_hi, ty + th, ty)
+        diff = float(v2_match["d3"]) - float(v1_match["d3"])
+        ppl_v2 = math.exp(float(v2_match["d3"]))
+        ppl_v1 = math.exp(float(v1_match["d3"]))
+        svg.line(xm, y_v1 + 5, xm, y_v2 - 5, stroke=C_EMERALD, stroke_width=2.0, dash="3,2")
+        on_right = matched_step >= 400
         svg.badge(
-            x200 + 10,
+            xm - 10 if on_right else xm + 10,
             0.5 * (y_v1 + y_v2) + 5,
-            f"Matched s200: {diff:+.3f} nats (PPL {ppl_v2:.2f} vs {ppl_v1:.2f})",
+            f"Matched s{matched_step}: {diff:+.3f} nats (PPL {ppl_v2:.2f} vs {ppl_v1:.2f})",
             bg=C_EMERALD,
             font_size=9.2,
+            anchor="end" if on_right else "start",
         )
     if v2_ev:
         last_v2e = v2_ev[-1]
@@ -869,13 +887,19 @@ def render_s3_hssd_vs_v2_gdn_ab_svg(bundle: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Chart 3 (NEW): Live Blackwell sm_120 (fla 0.6.0) DPLR / GDN-2 Kernel Bench
+# Chart 3: Live Blackwell sm_120 (fla 0.6.0) DPLR / GDN-2 + 574898d 4x8K VRAM
 # ---------------------------------------------------------------------------
 def render_dplr_gdn2_kernel_bench_svg(bundle: dict[str, Any]) -> str:
-    """Render live Blackwell sm_120 fla 0.6.0 DPLR / GDN-2 kernel latencies (T=32K & T=1)."""
+    """Render live Blackwell sm_120 fla 0.6.0 DPLR/GDN-2 latencies & 574898d 4x8K VRAM cut."""
     db = bundle.get("dplr_bench") or {}
     t32 = db.get("T32768_fwd_bwd") or {}
     t1 = db.get("T1_decode") or {}
+
+    gate = bundle.get("s3v2_gate") or {}
+    g1_b = ((gate.get("gate1_cuda_gdn2") or {}).get("benchmarks") or {})
+    g1_t32 = g1_b.get("T32768_fwd_bwd") or {}
+    g1_t1 = g1_b.get("T1_decode") or {}
+    has_g1 = bool(g1_t32.get("gdn2_qed_dplr_triton_seg0") and g1_t32.get("gdn2_adapter_wrapper_seg8192"))
 
     def _med(d: dict[str, Any], key: str, sub: str | None = "total", default: float = 0.0) -> float:
         node = d.get(key) or {}
@@ -884,17 +908,14 @@ def render_dplr_gdn2_kernel_bench_svg(bundle: dict[str, Any]) -> str:
         val = node.get("median_ms")
         return float(val) if isinstance(val, (int, float)) else default
 
+    def _vram_gib(d: dict[str, Any], key: str, default: float = 0.0) -> float:
+        node = d.get(key) or {}
+        val = node.get("peak_vram_delta_gib")
+        return float(val) if isinstance(val, (int, float)) else default
+
     py_tot = _med(t32, "pytorch_chunk_gdn2", "total", 657.32)
     py_fwd = _med(t32, "pytorch_chunk_gdn2", "fwd", 92.56)
     py_bwd = _med(t32, "pytorch_chunk_gdn2", "bwd", 565.20)
-
-    e2e_tot = _med(t32, "fla_chunk_dplr_gdn2_qed_e2e", "total", 69.84)
-    e2e_fwd = _med(t32, "fla_chunk_dplr_gdn2_qed_e2e", "fwd", 19.84)
-    e2e_bwd = _med(t32, "fla_chunk_dplr_gdn2_qed_e2e", "bwd", 50.00)
-
-    dplr_tot = _med(t32, "fla_chunk_dplr_raw", "total", 43.64)
-    dplr_fwd = _med(t32, "fla_chunk_dplr_raw", "fwd", 12.59)
-    dplr_bwd = _med(t32, "fla_chunk_dplr_raw", "bwd", 31.05)
 
     gdn2_tot = _med(t32, "fla_ops_gdn2_chunk_gdn2", "total", 35.55)
     gdn2_fwd = _med(t32, "fla_ops_gdn2_chunk_gdn2", "fwd", 8.00)
@@ -904,21 +925,50 @@ def render_dplr_gdn2_kernel_bench_svg(bundle: dict[str, Any]) -> str:
     nat_fwd = _med(t32, "native_chunk_gated_delta_rule", "fwd", 3.64)
     nat_bwd = _med(t32, "native_chunk_gated_delta_rule", "bwd", 10.21)
 
+    if has_g1:
+        dplr_tot = _med(g1_t32, "fla_chunk_dplr_raw", "total", 46.25)
+        dplr_fwd = _med(g1_t32, "fla_chunk_dplr_raw", "fwd", 12.17)
+        dplr_bwd = _med(g1_t32, "fla_chunk_dplr_raw", "bwd", 34.09)
+        tri_tot = _med(g1_t32, "gdn2_qed_dplr_triton_seg0", "total", 53.55)
+        tri_fwd = _med(g1_t32, "gdn2_qed_dplr_triton_seg0", "fwd", 14.78)
+        tri_bwd = _med(g1_t32, "gdn2_qed_dplr_triton_seg0", "bwd", 38.76)
+        seg_tot = _med(g1_t32, "gdn2_qed_dplr_triton_seg8192", "total", 92.30)
+        seg_fwd = _med(g1_t32, "gdn2_qed_dplr_triton_seg8192", "fwd", 15.08)
+        seg_bwd = _med(g1_t32, "gdn2_qed_dplr_triton_seg8192", "bwd", 77.20)
+        pyp_tot = _med(g1_t32, "gdn2_qed_dplr_pytorch_prep_seg0", "total", 106.93)
+        pyp_fwd = _med(g1_t32, "gdn2_qed_dplr_pytorch_prep_seg0", "fwd", 31.36)
+        pyp_bwd = _med(g1_t32, "gdn2_qed_dplr_pytorch_prep_seg0", "bwd", 75.55)
+    else:
+        dplr_tot = _med(t32, "fla_chunk_dplr_raw", "total", 43.64)
+        dplr_fwd = _med(t32, "fla_chunk_dplr_raw", "fwd", 12.59)
+        dplr_bwd = _med(t32, "fla_chunk_dplr_raw", "bwd", 31.05)
+        tri_tot, tri_fwd, tri_bwd = 53.55, 14.78, 38.76
+        seg_tot, seg_fwd, seg_bwd = 92.30, 15.08, 77.20
+        pyp_tot = _med(t32, "fla_chunk_dplr_gdn2_qed_e2e", "total", 69.84)
+        pyp_fwd = _med(t32, "fla_chunk_dplr_gdn2_qed_e2e", "fwd", 19.84)
+        pyp_bwd = _med(t32, "fla_chunk_dplr_gdn2_qed_e2e", "bwd", 50.00)
+
     t1_nat = _med(t1, "native_fused_recurrent_gated_delta_rule", None, 0.0421)
-    t1_dplr = _med(t1, "fla_fused_recurrent_dplr_raw", None, 0.0430)
+    t1_dplr = _med(g1_t1, "fla_fused_recurrent_dplr_raw", None, 0.0404) if has_g1 else _med(
+        t1, "fla_fused_recurrent_dplr_raw", None, 0.0430
+    )
     t1_gdn2 = _med(t1, "fla_ops_gdn2_fused_recurrent_gdn2", None, 0.0480)
+    t1_tri = _med(g1_t1, "gdn2_qed_dplr_triton_t1", None, 0.0787)
     t1_py = _med(t1, "pytorch_recurrent_gdn2", None, 0.1279)
-    t1_e2e = _med(t1, "fla_fused_recurrent_dplr_gdn2_qed_e2e", None, 0.1512)
+    t1_pyp = _med(g1_t1, "gdn2_qed_dplr_pytorch_prep_t1", None, 0.1895) if has_g1 else _med(
+        t1, "fla_fused_recurrent_dplr_gdn2_qed_e2e", None, 0.1512
+    )
 
-    sp_dplr = py_tot / max(dplr_tot, 1e-6)
+    sp_tri = pyp_tot / max(tri_tot, 1e-6)
     sp_gdn2 = py_tot / max(gdn2_tot, 1e-6)
-    sp_e2e = py_tot / max(e2e_tot, 1e-6)
     dec_ratio = t1_dplr / max(t1_nat, 1e-6)
+    t1_tri_sp = t1_pyp / max(t1_tri, 1e-6)
 
+    canvas_h = 740 if has_g1 else 540
     svg = _SvgCanvas(
         1220,
-        540,
-        "Live Blackwell sm_120 (fla 0.6.0) GDN-2-1M + Bounded QED Kernel Latency Benchmark",
+        canvas_h,
+        "Live Blackwell sm_120 (fla 0.6.0) GDN-2-1M + QED Kernel Latency & 574898d 4×8K VRAM Cut",
         "RTX PRO 6000 Blackwell Server Ed. (96 GB GDDR7 ECC, 1,597 GB/s · CUDA 13.0, PyTorch 2.14.1, Triton 3.8.0) · "
         "Qwen3.6 Linear Shape (B=1, H=32, K=V=128, bf16)",
     )
@@ -926,28 +976,27 @@ def render_dplr_gdn2_kernel_bench_svg(bundle: dict[str, Any]) -> str:
         34,
         74,
         [
-            ("Native GDN Baseline", C_SLATE, "box"),
-            ("fla GDN-2 / DPLR Kernel (Highlight)", C_EMERALD, "box"),
-            ("fla DPLR + Unfused Eager Prep*", C_SKY, "box"),
-            ("PyTorch Chunk/Recurrent Reference", C_AMBER, "box"),
+            ("Native GDN / fla Core", C_SLATE, "box"),
+            ("Fused Triton Prep / 4×8K Cut (574898d)", C_EMERALD, "box"),
+            ("4×8K Checkpointed Triton / fla GDN-2", C_TEAL, "box"),
+            ("Unfused PyTorch Prep", C_SKY, "box"),
+            ("PyTorch Reference", C_AMBER, "box"),
         ],
-        spacing=20.0,
+        spacing=16.0,
     )
 
-    # Left Panel A: T=32K fwd+bwd (log10 x-axis: 5 ms .. 1200 ms)
-    lx, py, lw, ph = 205.0, 108.0, 405.0, 350.0
+    # Top-Left Panel A: T=32K fwd+bwd (log10 x-axis: 5 ms .. 1500 ms)
+    lx, py, lw, ph = 205.0, 108.0, 405.0, 340.0
     log_lo, log_hi = math.log10(5.0), math.log10(1500.0)
     x_ticks_a = [10.0, 30.0, 100.0, 300.0, 1000.0]
 
     svg.rect(lx, py, lw, ph, fill=C_PANEL, stroke=C_BORDER, stroke_width=1.0, rx=4.0)
-    svg.text(
-        lx - 175,
-        py - 9,
-        f"A. T=32,768 Training Fwd+Bwd Latency ({sp_dplr:.1f}×–{sp_gdn2:.1f}× vs PyTorch)",
-        size=11.3,
-        fill=C_TEXT,
-        weight="700",
+    title_a = (
+        f"A. T=32K Training Fwd+Bwd (Fused Triton {tri_tot:.2f} ms = {sp_tri:.2f}× vs PyTorch Prep)"
+        if has_g1
+        else f"A. T=32,768 Training Fwd+Bwd Latency ({py_tot/dplr_tot:.1f}×–{sp_gdn2:.1f}× vs PyTorch)"
     )
+    svg.text(lx - 175, py - 9, title_a, size=11.0, fill=C_TEXT, weight="700")
     for xt in x_ticks_a:
         xx = _map_lin(math.log10(xt), log_lo, log_hi, lx, lx + lw)
         svg.line(xx, py, xx, py + ph, stroke=C_GRID, stroke_width=1.0, dash="3,3")
@@ -956,70 +1005,101 @@ def render_dplr_gdn2_kernel_bench_svg(bundle: dict[str, Any]) -> str:
         lx + lw / 2.0,
         py + ph + 33,
         "Total Fwd+Bwd ms/layer (log₁₀ scale · lower is better)",
-        size=10.2,
+        size=10.1,
         fill=C_MUTED,
         weight="600",
         anchor="middle",
     )
 
-    rows_a = [
-        (
-            "Native GDN", "chunk_gated_delta_rule", nat_tot, nat_fwd, nat_bwd,
-            C_SLATE, f"{nat_tot:.2f} ms (base)", False,
-        ),
-        (
-            "fla GDN-2 (no QED)", "fla.ops.gdn2.chunk_gdn2", gdn2_tot, gdn2_fwd, gdn2_bwd,
-            C_EMERALD, f"{gdn2_tot:.2f} ms ({sp_gdn2:.1f}×)", True,
-        ),
-        (
-            "fla DPLR (QED+GDN-2)", "chunk_dplr_delta_rule", dplr_tot, dplr_fwd, dplr_bwd,
-            C_TEAL, f"{dplr_tot:.2f} ms ({sp_dplr:.1f}×)", True,
-        ),
-        (
-            "DPLR + Eager Prep*", "unfused PyTorch prep", e2e_tot, e2e_fwd, e2e_bwd,
-            C_SKY, f"{e2e_tot:.2f} ms ({sp_e2e:.1f}×)", False,
-        ),
-        (
-            "PyTorch GDN-2 Ref", "chunked Python/CUDA", py_tot, py_fwd, py_bwd,
-            C_AMBER, f"{py_tot:.1f} ms (1.0×)", False,
-        ),
-    ]
+    if has_g1:
+        rows_a = [
+            (
+                "Native GDN", "chunk_gated_delta_rule", nat_tot, nat_fwd, nat_bwd,
+                C_SLATE, f"{nat_tot:.2f} ms (base)", False,
+            ),
+            (
+                "fla GDN-2 (no QED)", "fla.ops.gdn2", gdn2_tot, gdn2_fwd, gdn2_bwd,
+                C_TEAL, f"{gdn2_tot:.2f} ms ({sp_gdn2:.1f}×)", False,
+            ),
+            (
+                "fla DPLR Core", "chunk_dplr (574898d)", dplr_tot, dplr_fwd, dplr_bwd,
+                C_SLATE, f"{dplr_tot:.2f} ms (raw)", False,
+            ),
+            (
+                "GDN-2+QED Triton", "fused tl.int64 (seg0)", tri_tot, tri_fwd, tri_bwd,
+                C_EMERALD, f"{tri_tot:.2f} ms ({sp_tri:.2f}×)", True,
+            ),
+            (
+                "Triton 4×8K Seg", "seg8192 (5.91 GiB)", seg_tot, seg_fwd, seg_bwd,
+                C_TEAL, f"{seg_tot:.2f} ms (2.22× mem)", True,
+            ),
+            (
+                "PyTorch Prep+DPLR", "unfused eager (seg0)", pyp_tot, pyp_fwd, pyp_bwd,
+                C_SKY, f"{pyp_tot:.2f} ms (17.6G)", False,
+            ),
+            (
+                "PyTorch GDN-2 Ref", "chunked Python/CUDA", py_tot, py_fwd, py_bwd,
+                C_AMBER, f"{py_tot:.1f} ms (1.0×)", False,
+            ),
+        ]
+    else:
+        rows_a = [
+            (
+                "Native GDN", "chunk_gated_delta_rule", nat_tot, nat_fwd, nat_bwd,
+                C_SLATE, f"{nat_tot:.2f} ms (base)", False,
+            ),
+            (
+                "fla GDN-2 (no QED)", "fla.ops.gdn2.chunk_gdn2", gdn2_tot, gdn2_fwd, gdn2_bwd,
+                C_EMERALD, f"{gdn2_tot:.2f} ms ({sp_gdn2:.1f}×)", True,
+            ),
+            (
+                "fla DPLR (QED+GDN-2)", "chunk_dplr_delta_rule", dplr_tot, dplr_fwd, dplr_bwd,
+                C_TEAL, f"{dplr_tot:.2f} ms ({py_tot / dplr_tot:.1f}×)", True,
+            ),
+            (
+                "DPLR + Eager Prep*", "unfused PyTorch prep", pyp_tot, pyp_fwd, pyp_bwd,
+                C_SKY, f"{pyp_tot:.2f} ms ({py_tot / pyp_tot:.1f}×)", False,
+            ),
+            (
+                "PyTorch GDN-2 Ref", "chunked Python/CUDA", py_tot, py_fwd, py_bwd,
+                C_AMBER, f"{py_tot:.1f} ms (1.0×)", False,
+            ),
+        ]
     slot_a = ph / len(rows_a)
-    bh_a = 30.0
+    bh_a = min(28.0, slot_a * 0.62)
     for i, (nm, sub, tot, fwd, bwd, col, lbl, hl) in enumerate(rows_a):
         cy = py + (i + 0.5) * slot_a
         by = cy - bh_a / 2.0
         svg.text(
-            lx - 10, cy - 2, nm, size=10.4,
+            lx - 10, cy - 2, nm, size=10.0,
             fill=col if hl else C_TEXT, weight="700" if hl else "600", anchor="end",
         )
-        svg.text(lx - 10, cy + 12, sub, size=8.8, fill=C_SUBTLE, anchor="end")
+        svg.text(lx - 10, cy + 11, sub, size=8.4, fill=C_SUBTLE, anchor="end")
         bw = _map_lin(math.log10(max(tot, 5.5)), log_lo, log_hi, 0.0, lw)
         svg.rect(lx, by, bw, bh_a, fill=col, opacity=0.88 if hl else 0.72, rx=3.0)
         if hl:
-            svg.rect(lx, by, bw, bh_a, fill="none", stroke=C_TEXT, stroke_width=1.4, rx=3.0)
+            svg.rect(lx, by, bw, bh_a, fill="none", stroke=C_TEXT, stroke_width=1.3, rx=3.0)
         if lx + bw + 125.0 < lx + lw:
             svg.text(
-                lx + bw + 7, cy - 1, lbl, size=9.6,
+                lx + bw + 7, cy - 1, lbl, size=9.3,
                 fill=col if hl else C_TEXT, weight="700" if hl else "600", mono=True,
             )
-            svg.text(lx + bw + 7, cy + 12, f"fwd {fwd:.1f} + bwd {bwd:.1f}", size=8.5, fill=C_SUBTLE, mono=True)
+            svg.text(lx + bw + 7, cy + 11, f"fwd {fwd:.1f} + bwd {bwd:.1f}", size=8.2, fill=C_SUBTLE, mono=True)
         else:
-            svg.badge(lx + bw - 6, cy + 4, lbl, bg=C_TEXT, font_size=9.0, anchor="end")
+            svg.badge(lx + bw - 6, cy + 4, lbl, bg=C_TEXT, font_size=8.8, anchor="end")
 
-    # Right Panel B: T=1 Decode latency (linear x-axis 0 .. 0.19 ms)
+    # Top-Right Panel B: T=1 Decode latency (linear x-axis)
     rx, rw = 795.0, 395.0
-    x_hi_b = max(0.185, max(t1_nat, t1_dplr, t1_gdn2, t1_py, t1_e2e) * 1.24)
+    t1_vals = [t1_nat, t1_dplr, t1_gdn2, t1_py, t1_pyp] + ([t1_tri] if has_g1 else [])
+    x_hi_b = max(0.22 if has_g1 else 0.185, max(t1_vals) * 1.24)
     _, x_hi_b, x_ticks_b = _nice_ticks(0.0, x_hi_b, n_ticks=5)
     svg.rect(rx, py, rw, ph, fill=C_PANEL, stroke=C_BORDER, stroke_width=1.0, rx=4.0)
-    svg.text(
-        rx - 150,
-        py - 9,
-        f"B. T=1 Autoregressive Decode (fla DPLR = {t1_dplr:.4f} ms = {dec_ratio:.2f}× Native)",
-        size=11.3,
-        fill=C_TEXT,
-        weight="700",
+    title_b = (
+        f"B. T=1 Decode (Triton Prep {t1_tri:.4f} ms = {t1_tri_sp:.2f}× vs PyTorch Prep)"
+        if has_g1
+        else f"B. T=1 Autoregressive Decode (fla DPLR = {t1_dplr:.4f} ms = {dec_ratio:.2f}× Native)"
     )
+    svg.text(rx - 150, py - 9, title_b, size=11.0, fill=C_TEXT, weight="700")
     for xt in x_ticks_b:
         xx = _map_lin(xt, 0.0, x_hi_b, rx, rx + rw)
         svg.line(xx, py, xx, py + ph, stroke=C_GRID, stroke_width=1.0, dash="3,3")
@@ -1028,54 +1108,161 @@ def render_dplr_gdn2_kernel_bench_svg(bundle: dict[str, Any]) -> str:
         rx + rw / 2.0,
         py + ph + 33,
         "Decode Step Latency ms/layer (linear · lower is better)",
-        size=10.2,
+        size=10.1,
         fill=C_MUTED,
         weight="600",
         anchor="middle",
     )
 
-    # Vertical native GDN parity line
     x_nat = _map_lin(t1_nat, 0.0, x_hi_b, rx, rx + rw)
     svg.line(x_nat, py, x_nat, py + ph, stroke=C_SLATE, stroke_width=1.3, dash="4,3")
 
-    rows_b = [
-        ("Native GDN", "fused_recurrent_gdn", t1_nat, C_SLATE, f"{t1_nat:.4f} ms (1.00×)", False),
-        ("fla DPLR (QED)", "fused_recurrent_dplr", t1_dplr, C_EMERALD, f"{t1_dplr:.4f} ms ({dec_ratio:.2f}×)", True),
-        (
-            "fla GDN-2", "fused_recurrent_gdn2", t1_gdn2,
-            C_TEAL, f"{t1_gdn2:.4f} ms ({t1_gdn2 / max(t1_nat, 1e-6):.2f}×)", True,
-        ),
-        (
-            "PyTorch GDN-2", "eager recurrent ref", t1_py,
-            C_AMBER, f"{t1_py:.4f} ms ({t1_py / max(t1_nat, 1e-6):.2f}×)", False,
-        ),
-        (
-            "Eager Prep+DPLR*", "unfused pre-919f2b8", t1_e2e,
-            C_SKY, f"{t1_e2e:.4f} ms ({t1_e2e / max(t1_nat, 1e-6):.2f}×)", False,
-        ),
-    ]
+    if has_g1:
+        rows_b = [
+            ("Native GDN", "fused_recurrent_gdn", t1_nat, C_SLATE, f"{t1_nat:.4f} ms (1.00×)", False),
+            (
+                "fla DPLR Core", "fused_recurrent_dplr", t1_dplr, C_SLATE,
+                f"{t1_dplr:.4f} ms ({dec_ratio:.2f}×)", False,
+            ),
+            (
+                "fla GDN-2", "fused_recurrent_gdn2", t1_gdn2, C_TEAL,
+                f"{t1_gdn2:.4f} ms ({t1_gdn2 / max(t1_nat, 1e-6):.2f}×)", False,
+            ),
+            (
+                "GDN-2+QED Triton", "fused tl.int64 (T=1)", t1_tri, C_EMERALD,
+                f"{t1_tri:.4f} ms ({t1_tri_sp:.2f}× vs py)", True,
+            ),
+            (
+                "PyTorch GDN-2 Ref", "eager recurrent ref", t1_py, C_AMBER,
+                f"{t1_py:.4f} ms ({t1_py / max(t1_nat, 1e-6):.2f}×)", False,
+            ),
+            (
+                "PyTorch Prep+DPLR", "unfused eager (T=1)", t1_pyp, C_SKY,
+                f"{t1_pyp:.4f} ms ({t1_pyp / max(t1_nat, 1e-6):.2f}×)", False,
+            ),
+        ]
+    else:
+        rows_b = [
+            ("Native GDN", "fused_recurrent_gdn", t1_nat, C_SLATE, f"{t1_nat:.4f} ms (1.00×)", False),
+            (
+                "fla DPLR (QED)", "fused_recurrent_dplr", t1_dplr, C_EMERALD,
+                f"{t1_dplr:.4f} ms ({dec_ratio:.2f}×)", True,
+            ),
+            (
+                "fla GDN-2", "fused_recurrent_gdn2", t1_gdn2, C_TEAL,
+                f"{t1_gdn2:.4f} ms ({t1_gdn2 / max(t1_nat, 1e-6):.2f}×)", True,
+            ),
+            (
+                "PyTorch GDN-2", "eager recurrent ref", t1_py, C_AMBER,
+                f"{t1_py:.4f} ms ({t1_py / max(t1_nat, 1e-6):.2f}×)", False,
+            ),
+            (
+                "Eager Prep+DPLR*", "unfused pre-919f2b8", t1_pyp, C_SKY,
+                f"{t1_pyp:.4f} ms ({t1_pyp / max(t1_nat, 1e-6):.2f}×)", False,
+            ),
+        ]
     slot_b = ph / len(rows_b)
+    bh_b = min(28.0, slot_b * 0.62)
     for i, (nm, sub, val, col, lbl, hl) in enumerate(rows_b):
         cy = py + (i + 0.5) * slot_b
-        by = cy - bh_a / 2.0
+        by = cy - bh_b / 2.0
         svg.text(
-            rx - 10, cy - 2, nm, size=10.4,
+            rx - 10, cy - 2, nm, size=10.0,
             fill=col if hl else C_TEXT, weight="700" if hl else "600", anchor="end",
         )
-        svg.text(rx - 10, cy + 12, sub, size=8.8, fill=C_SUBTLE, anchor="end")
+        svg.text(rx - 10, cy + 11, sub, size=8.4, fill=C_SUBTLE, anchor="end")
         bw = _map_lin(val, 0.0, x_hi_b, 0.0, rw)
-        svg.rect(rx, by, bw, bh_a, fill=col, opacity=0.90 if hl else 0.72, rx=3.0)
+        svg.rect(rx, by, bw, bh_b, fill=col, opacity=0.90 if hl else 0.72, rx=3.0)
         if hl:
-            svg.rect(rx, by, bw, bh_a, fill="none", stroke=C_TEXT, stroke_width=1.4, rx=3.0)
-        if rx + bw + 125.0 < rx + rw:
+            svg.rect(rx, by, bw, bh_b, fill="none", stroke=C_TEXT, stroke_width=1.3, rx=3.0)
+        if rx + bw + 145.0 < rx + rw:
             svg.text(
-                rx + bw + 7, cy + 4, lbl, size=9.6,
+                rx + bw + 7, cy + 4, lbl, size=9.2,
                 fill=col if hl else C_TEXT, weight="700" if hl else "600", mono=True,
             )
         else:
-            svg.badge(rx + bw - 6, cy + 4, lbl, bg=C_TEXT, font_size=9.0, anchor="end")
+            svg.badge(rx + bw - 6, cy + 4, lbl, bg=C_TEXT, font_size=8.6, anchor="end")
 
-    # Footer note explaining fused Triton prep kernel (919f2b8 / 2c78ffc) & verified parity
+    # Bottom Panel C (when Gate 1 574898d VRAM data is present): 4x8K Macro-Segmenting VRAM Cut
+    if has_g1:
+        v_raw = _vram_gib(g1_t32, "fla_chunk_dplr_raw", 11.625)
+        v_pyp = _vram_gib(g1_t32, "gdn2_qed_dplr_pytorch_prep_seg0", 17.637)
+        v_tri0 = _vram_gib(g1_t32, "gdn2_qed_dplr_triton_seg0", 13.125)
+        v_tri8 = _vram_gib(g1_t32, "gdn2_qed_dplr_triton_seg8192", 5.914)
+        v_wrp0 = _vram_gib(g1_t32, "gdn2_adapter_wrapper_seg0", 23.051)
+        v_wrp8 = _vram_gib(g1_t32, "gdn2_adapter_wrapper_seg8192", 7.032)
+        cut_wrp = v_wrp0 / max(v_wrp8, 1e-6)
+        cut_tri = v_tri0 / max(v_tri8, 1e-6)
+
+        cx_p, cy_p, cw_p, ch_p = 265.0, 505.0, 925.0, 175.0
+        v_hi = 28.0
+        v_ticks = [0.0, 5.0, 10.0, 15.0, 20.0, 25.0]
+        svg.rect(cx_p, cy_p, cw_p, ch_p, fill=C_PANEL, stroke=C_BORDER, stroke_width=1.0, rx=4.0)
+        svg.text(
+            28,
+            cy_p - 9,
+            f"C. Commit 574898d Checkpointed 4×8K Macro-Segmenting Peak VRAM Delta (T=32,768 bf16 · "
+            f"{cut_wrp:.2f}× Full-Wrapper Cut: {v_wrp0:.2f} → {v_wrp8:.2f} GiB)",
+            size=11.0,
+            fill=C_TEXT,
+            weight="700",
+        )
+        for vt in v_ticks:
+            xx = _map_lin(vt, 0.0, v_hi, cx_p, cx_p + cw_p)
+            svg.line(xx, cy_p, xx, cy_p + ch_p, stroke=C_GRID, stroke_width=1.0, dash="3,3")
+            svg.text(xx, cy_p + ch_p + 15, f"{int(vt)} GiB", size=9.3, fill=C_SUBTLE, anchor="middle", mono=True)
+        svg.text(
+            cx_p + cw_p / 2.0,
+            cy_p + ch_p + 31,
+            "Single-Layer Peak VRAM Delta at T=32,768 bf16 (GiB · lower is better)",
+            size=10.0,
+            fill=C_MUTED,
+            weight="600",
+            anchor="middle",
+        )
+
+        rows_c = [
+            (
+                "GDN2Adapter Wrapper (4×8K)", v_wrp8, C_EMERALD,
+                f"{v_wrp8:.3f} GiB ({cut_wrp:.2f}× cut, -{v_wrp0 - v_wrp8:.2f} GiB vs seg0)", True,
+            ),
+            (
+                "GDN2Adapter Wrapper (seg0)", v_wrp0, C_AMBER,
+                f"{v_wrp0:.3f} GiB (unsegmented full wrapper)", False,
+            ),
+            (
+                "Triton QED+DPLR (4×8K)", v_tri8, C_TEAL,
+                f"{v_tri8:.3f} GiB ({cut_tri:.2f}× cut, -{v_tri0 - v_tri8:.2f} GiB vs seg0)", True,
+            ),
+            (
+                "Triton QED+DPLR (seg0)", v_tri0, C_SLATE,
+                f"{v_tri0:.3f} GiB (-{v_pyp - v_tri0:.2f} GiB vs PyTorch prep)", False,
+            ),
+            ("PyTorch Prep+DPLR (seg0)", v_pyp, C_SKY, f"{v_pyp:.3f} GiB (unfused eager prep)", False),
+            ("fla DPLR Core (raw)", v_raw, C_SLATE, f"{v_raw:.3f} GiB (raw DPLR kernel delta)", False),
+        ]
+        slot_c = ch_p / len(rows_c)
+        bh_c = min(20.0, slot_c * 0.68)
+        for i, (nm, vg, col, lbl, hl) in enumerate(rows_c):
+            cy_r = cy_p + (i + 0.5) * slot_c
+            by_r = cy_r - bh_c / 2.0
+            svg.text(
+                cx_p - 10, cy_r + 3.5, nm, size=9.6,
+                fill=col if hl else C_TEXT, weight="700" if hl else "600", anchor="end",
+            )
+            bw = _map_lin(vg, 0.0, v_hi, 0.0, cw_p)
+            svg.rect(cx_p, by_r, bw, bh_c, fill=col, opacity=0.90 if hl else 0.72, rx=2.5)
+            if hl:
+                svg.rect(cx_p, by_r, bw, bh_c, fill="none", stroke=C_TEXT, stroke_width=1.2, rx=2.5)
+            if cx_p + bw + 260.0 < cx_p + cw_p:
+                svg.text(
+                    cx_p + bw + 8, cy_r + 3.5, lbl, size=9.1,
+                    fill=col if hl else C_TEXT, weight="700" if hl else "500", mono=True,
+                )
+            else:
+                svg.badge(cx_p + bw - 6, cy_r + 4, lbl, bg=C_TEXT, font_size=8.4, anchor="end")
+
+    # Footer note
     ps_d = db.get("parity_summary") or {}
     t1_fp32_diff = (ps_d.get("fp32_T1_decode_o") or {}).get("max_abs_diff")
     diff_str = (
@@ -1085,15 +1272,16 @@ def render_dplr_gdn2_kernel_bench_svg(bundle: dict[str, Any]) -> str:
     )
     bf16_min_cos = ps_d.get("bf16_chunk_dplr_e2e_min_grad_cos")
     cos_str = f"{float(bf16_min_cos):.6f}" if isinstance(bf16_min_cos, (int, float)) else "0.999966"
-    svg.text(
-        28,
-        522,
-        "*Unfused PyTorch prep added 26.20 ms (T=32K) & 0.108 ms (T=1); "
+    footer_y = canvas_h - 14
+    footer_txt = (
+        f"Gate 1 (574898d): 38/38 CUDA pytest green · Gate 3 4×32K d=3 peak 67.194 GiB (<85 GiB) · "
+        f"bf16 parity cos >= {cos_str} · fp32 T=1 max_diff = {diff_str}."
+        if has_g1
+        else "*Unfused PyTorch prep added 26.20 ms (T=32K) & 0.108 ms (T=1); "
         "commits 919f2b8 / 2c78ffc fuse QED+DPLR prep into a single tl.int64 Triton kernel. "
-        f"Verified sm_120 bf16 parity: cos >= {cos_str} (e2e fwd+bwd); fp32 T=1 max_diff = {diff_str}.",
-        size=9.4,
-        fill=C_MUTED,
+        f"Verified sm_120 bf16 parity: cos >= {cos_str} (e2e fwd+bwd); fp32 T=1 max_diff = {diff_str}."
     )
+    svg.text(28, footer_y, footer_txt, size=9.3, fill=C_MUTED)
 
     return svg.to_svg()
 

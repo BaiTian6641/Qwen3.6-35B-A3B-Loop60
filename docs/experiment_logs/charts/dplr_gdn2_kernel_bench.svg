@@ -1,98 +1,146 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="540" viewBox="0 0 1220 540" role="img" aria-label="Live Blackwell sm_120 (fla 0.6.0) GDN-2-1M + Bounded QED Kernel Latency Benchmark">
-<title>Live Blackwell sm_120 (fla 0.6.0) GDN-2-1M + Bounded QED Kernel Latency Benchmark</title>
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="740" viewBox="0 0 1220 740" role="img" aria-label="Live Blackwell sm_120 (fla 0.6.0) GDN-2-1M + QED Kernel Latency &amp; 574898d 4×8K VRAM Cut">
+<title>Live Blackwell sm_120 (fla 0.6.0) GDN-2-1M + QED Kernel Latency &amp; 574898d 4×8K VRAM Cut</title>
 <defs>
 <style type="text/css">
 text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
 .mono { font-family: 'SFMono-Regular', Menlo, Consolas, 'Liberation Mono', monospace; }
 </style>
 </defs>
-<rect x="0" y="0" width="1220" height="540" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
-<text x="28" y="32" font-size="17" font-weight="700" fill="#0f172a">Live Blackwell sm_120 (fla 0.6.0) GDN-2-1M + Bounded QED Kernel Latency Benchmark</text>
+<rect x="0" y="0" width="1220" height="740" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+<text x="28" y="32" font-size="17" font-weight="700" fill="#0f172a">Live Blackwell sm_120 (fla 0.6.0) GDN-2-1M + QED Kernel Latency &amp; 574898d 4×8K VRAM Cut</text>
 <text x="28" y="51" font-size="11.3" fill="#475569">RTX PRO 6000 Blackwell Server Ed. (96 GB GDDR7 ECC, 1,597 GB/s · CUDA 13.0, PyTorch 2.14.1, Triton 3.8.0) · Qwen3.6 Linear Shape (B=1, H=32, K=V=128, bf16)</text>
 <rect x="34.0" y="65.0" width="12.0" height="10.0" rx="2.0" fill="#475569" stroke="none" stroke-width="1.0"/>
-<text x="55.0" y="74.0" font-size="10.5" font-weight="500" fill="#0f172a" text-anchor="start">Native GDN Baseline</text>
-<rect x="194.0" y="65.0" width="12.0" height="10.0" rx="2.0" fill="#059669" stroke="none" stroke-width="1.0"/>
-<text x="215.0" y="74.0" font-size="10.5" font-weight="500" fill="#0f172a" text-anchor="start">fla GDN-2 / DPLR Kernel (Highlight)</text>
-<rect x="450.0" y="65.0" width="12.0" height="10.0" rx="2.0" fill="#0284c7" stroke="none" stroke-width="1.0"/>
-<text x="471.0" y="74.0" font-size="10.5" font-weight="500" fill="#0f172a" text-anchor="start">fla DPLR + Unfused Eager Prep*</text>
-<rect x="676.0" y="65.0" width="12.0" height="10.0" rx="2.0" fill="#d97706" stroke="none" stroke-width="1.0"/>
-<text x="697.0" y="74.0" font-size="10.5" font-weight="500" fill="#0f172a" text-anchor="start">PyTorch Chunk/Recurrent Reference</text>
-<rect x="205.0" y="108.0" width="405.0" height="350.0" rx="4.0" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.0"/>
-<text x="30.0" y="99.0" font-size="11.3" font-weight="700" fill="#0f172a" text-anchor="start">A. T=32,768 Training Fwd+Bwd Latency (15.1×–18.5× vs PyTorch)</text>
-<line x1="254.2" y1="108.0" x2="254.2" y2="458.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
-<text x="254.2" y="473.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">10 ms</text>
-<line x1="332.2" y1="108.0" x2="332.2" y2="458.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
-<text x="332.2" y="473.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">30 ms</text>
-<line x1="417.7" y1="108.0" x2="417.7" y2="458.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
-<text x="417.7" y="473.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">100 ms</text>
-<line x1="495.7" y1="108.0" x2="495.7" y2="458.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
-<text x="495.7" y="473.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">300 ms</text>
-<line x1="581.2" y1="108.0" x2="581.2" y2="458.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
-<text x="581.2" y="473.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">1000 ms</text>
-<text x="407.5" y="491.0" font-size="10.2" font-weight="600" fill="#475569" text-anchor="middle">Total Fwd+Bwd ms/layer (log₁₀ scale · lower is better)</text>
-<text x="195.0" y="141.0" font-size="10.4" font-weight="600" fill="#0f172a" text-anchor="end">Native GDN</text>
-<text x="195.0" y="155.0" font-size="8.8" font-weight="400" fill="#64748b" text-anchor="end">chunk_gated_delta_rule</text>
-<rect x="205.0" y="128.0" width="72.3" height="30.0" rx="3.0" fill="#475569" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
-<text x="284.3" y="142.0" font-size="9.6" font-weight="600" fill="#0f172a" text-anchor="start" class="mono">13.85 ms (base)</text>
-<text x="284.3" y="155.0" font-size="8.5" font-weight="400" fill="#64748b" text-anchor="start" class="mono">fwd 3.6 + bwd 10.2</text>
-<text x="195.0" y="211.0" font-size="10.4" font-weight="700" fill="#059669" text-anchor="end">fla GDN-2 (no QED)</text>
-<text x="195.0" y="225.0" font-size="8.8" font-weight="400" fill="#64748b" text-anchor="end">fla.ops.gdn2.chunk_gdn2</text>
-<rect x="205.0" y="198.0" width="139.3" height="30.0" rx="3.0" fill="#059669" fill-opacity="0.88" stroke="none" stroke-width="1.0"/>
-<rect x="205.0" y="198.0" width="139.3" height="30.0" rx="3.0" fill="none" stroke="#0f172a" stroke-width="1.4"/>
-<text x="351.3" y="212.0" font-size="9.6" font-weight="700" fill="#059669" text-anchor="start" class="mono">35.55 ms (18.5×)</text>
-<text x="351.3" y="225.0" font-size="8.5" font-weight="400" fill="#64748b" text-anchor="start" class="mono">fwd 8.0 + bwd 27.6</text>
-<text x="195.0" y="281.0" font-size="10.4" font-weight="700" fill="#0d9488" text-anchor="end">fla DPLR (QED+GDN-2)</text>
-<text x="195.0" y="295.0" font-size="8.8" font-weight="400" fill="#64748b" text-anchor="end">chunk_dplr_delta_rule</text>
-<rect x="205.0" y="268.0" width="153.8" height="30.0" rx="3.0" fill="#0d9488" fill-opacity="0.88" stroke="none" stroke-width="1.0"/>
-<rect x="205.0" y="268.0" width="153.8" height="30.0" rx="3.0" fill="none" stroke="#0f172a" stroke-width="1.4"/>
-<text x="365.8" y="282.0" font-size="9.6" font-weight="700" fill="#0d9488" text-anchor="start" class="mono">43.64 ms (15.1×)</text>
-<text x="365.8" y="295.0" font-size="8.5" font-weight="400" fill="#64748b" text-anchor="start" class="mono">fwd 12.6 + bwd 31.0</text>
-<text x="195.0" y="351.0" font-size="10.4" font-weight="600" fill="#0f172a" text-anchor="end">DPLR + Eager Prep*</text>
-<text x="195.0" y="365.0" font-size="8.8" font-weight="400" fill="#64748b" text-anchor="end">unfused PyTorch prep</text>
-<rect x="205.0" y="338.0" width="187.2" height="30.0" rx="3.0" fill="#0284c7" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
-<text x="399.2" y="352.0" font-size="9.6" font-weight="600" fill="#0f172a" text-anchor="start" class="mono">69.84 ms (9.4×)</text>
-<text x="399.2" y="365.0" font-size="8.5" font-weight="400" fill="#64748b" text-anchor="start" class="mono">fwd 19.8 + bwd 50.0</text>
-<text x="195.0" y="421.0" font-size="10.4" font-weight="600" fill="#0f172a" text-anchor="end">PyTorch GDN-2 Ref</text>
-<text x="195.0" y="435.0" font-size="8.8" font-weight="400" fill="#64748b" text-anchor="end">chunked Python/CUDA</text>
-<rect x="205.0" y="408.0" width="346.4" height="30.0" rx="3.0" fill="#d97706" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
-<rect x="452.8" y="414.0" width="92.6" height="16.0" rx="4.0" fill="#0f172a" stroke="none" stroke-width="1.0"/>
-<text x="499.1" y="425.0" font-size="9.0" font-weight="600" fill="#ffffff" text-anchor="middle">657.3 ms (1.0×)</text>
-<rect x="795.0" y="108.0" width="395.0" height="350.0" rx="4.0" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.0"/>
-<text x="645.0" y="99.0" font-size="11.3" font-weight="700" fill="#0f172a" text-anchor="start">B. T=1 Autoregressive Decode (fla DPLR = 0.0430 ms = 1.02× Native)</text>
-<line x1="795.0" y1="108.0" x2="795.0" y2="458.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
-<text x="795.0" y="473.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">0.00 ms</text>
-<line x1="893.8" y1="108.0" x2="893.8" y2="458.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
-<text x="893.8" y="473.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">0.05 ms</text>
-<line x1="992.5" y1="108.0" x2="992.5" y2="458.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
-<text x="992.5" y="473.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">0.10 ms</text>
-<line x1="1091.2" y1="108.0" x2="1091.2" y2="458.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
-<text x="1091.2" y="473.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">0.15 ms</text>
-<line x1="1190.0" y1="108.0" x2="1190.0" y2="458.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
-<text x="1190.0" y="473.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">0.20 ms</text>
-<text x="992.5" y="491.0" font-size="10.2" font-weight="600" fill="#475569" text-anchor="middle">Decode Step Latency ms/layer (linear · lower is better)</text>
-<line x1="878.1" y1="108.0" x2="878.1" y2="458.0" stroke="#475569" stroke-width="1.3" stroke-dasharray="4,3"/>
-<text x="785.0" y="141.0" font-size="10.4" font-weight="600" fill="#0f172a" text-anchor="end">Native GDN</text>
-<text x="785.0" y="155.0" font-size="8.8" font-weight="400" fill="#64748b" text-anchor="end">fused_recurrent_gdn</text>
-<rect x="795.0" y="128.0" width="83.1" height="30.0" rx="3.0" fill="#475569" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
-<text x="885.1" y="147.0" font-size="9.6" font-weight="600" fill="#0f172a" text-anchor="start" class="mono">0.0421 ms (1.00×)</text>
-<text x="785.0" y="211.0" font-size="10.4" font-weight="700" fill="#059669" text-anchor="end">fla DPLR (QED)</text>
-<text x="785.0" y="225.0" font-size="8.8" font-weight="400" fill="#64748b" text-anchor="end">fused_recurrent_dplr</text>
-<rect x="795.0" y="198.0" width="84.9" height="30.0" rx="3.0" fill="#059669" fill-opacity="0.90" stroke="none" stroke-width="1.0"/>
-<rect x="795.0" y="198.0" width="84.9" height="30.0" rx="3.0" fill="none" stroke="#0f172a" stroke-width="1.4"/>
-<text x="886.9" y="217.0" font-size="9.6" font-weight="700" fill="#059669" text-anchor="start" class="mono">0.0430 ms (1.02×)</text>
-<text x="785.0" y="281.0" font-size="10.4" font-weight="700" fill="#0d9488" text-anchor="end">fla GDN-2</text>
-<text x="785.0" y="295.0" font-size="8.8" font-weight="400" fill="#64748b" text-anchor="end">fused_recurrent_gdn2</text>
-<rect x="795.0" y="268.0" width="94.8" height="30.0" rx="3.0" fill="#0d9488" fill-opacity="0.90" stroke="none" stroke-width="1.0"/>
-<rect x="795.0" y="268.0" width="94.8" height="30.0" rx="3.0" fill="none" stroke="#0f172a" stroke-width="1.4"/>
-<text x="896.8" y="287.0" font-size="9.6" font-weight="700" fill="#0d9488" text-anchor="start" class="mono">0.0480 ms (1.14×)</text>
-<text x="785.0" y="351.0" font-size="10.4" font-weight="600" fill="#0f172a" text-anchor="end">PyTorch GDN-2</text>
-<text x="785.0" y="365.0" font-size="8.8" font-weight="400" fill="#64748b" text-anchor="end">eager recurrent ref</text>
-<rect x="795.0" y="338.0" width="252.6" height="30.0" rx="3.0" fill="#d97706" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
-<text x="1054.6" y="357.0" font-size="9.6" font-weight="600" fill="#0f172a" text-anchor="start" class="mono">0.1279 ms (3.04×)</text>
-<text x="785.0" y="421.0" font-size="10.4" font-weight="600" fill="#0f172a" text-anchor="end">Eager Prep+DPLR*</text>
-<text x="785.0" y="435.0" font-size="8.8" font-weight="400" fill="#64748b" text-anchor="end">unfused pre-919f2b8</text>
-<rect x="795.0" y="408.0" width="298.6" height="30.0" rx="3.0" fill="#0284c7" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
-<rect x="984.3" y="414.0" width="103.3" height="16.0" rx="4.0" fill="#0f172a" stroke="none" stroke-width="1.0"/>
-<text x="1036.0" y="425.0" font-size="9.0" font-weight="600" fill="#ffffff" text-anchor="middle">0.1512 ms (3.59×)</text>
-<text x="28.0" y="522.0" font-size="9.4" font-weight="400" fill="#475569" text-anchor="start">*Unfused PyTorch prep added 26.20 ms (T=32K) &amp; 0.108 ms (T=1); commits 919f2b8 / 2c78ffc fuse QED+DPLR prep into a single tl.int64 Triton kernel. Verified sm_120 bf16 parity: cos &gt;= 0.999966 (e2e fwd+bwd); fp32 T=1 max_diff = 3.73e-09.</text>
+<text x="55.0" y="74.0" font-size="10.5" font-weight="500" fill="#0f172a" text-anchor="start">Native GDN / fla Core</text>
+<rect x="202.0" y="65.0" width="12.0" height="10.0" rx="2.0" fill="#059669" stroke="none" stroke-width="1.0"/>
+<text x="223.0" y="74.0" font-size="10.5" font-weight="500" fill="#0f172a" text-anchor="start">Fused Triton Prep / 4×8K Cut (574898d)</text>
+<rect x="472.0" y="65.0" width="12.0" height="10.0" rx="2.0" fill="#0d9488" stroke="none" stroke-width="1.0"/>
+<text x="493.0" y="74.0" font-size="10.5" font-weight="500" fill="#0f172a" text-anchor="start">4×8K Checkpointed Triton / fla GDN-2</text>
+<rect x="730.0" y="65.0" width="12.0" height="10.0" rx="2.0" fill="#0284c7" stroke="none" stroke-width="1.0"/>
+<text x="751.0" y="74.0" font-size="10.5" font-weight="500" fill="#0f172a" text-anchor="start">Unfused PyTorch Prep</text>
+<rect x="892.0" y="65.0" width="12.0" height="10.0" rx="2.0" fill="#d97706" stroke="none" stroke-width="1.0"/>
+<text x="913.0" y="74.0" font-size="10.5" font-weight="500" fill="#0f172a" text-anchor="start">PyTorch Reference</text>
+<rect x="205.0" y="108.0" width="405.0" height="340.0" rx="4.0" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.0"/>
+<text x="30.0" y="99.0" font-size="11.0" font-weight="700" fill="#0f172a" text-anchor="start">A. T=32K Training Fwd+Bwd (Fused Triton 53.55 ms = 2.00× vs PyTorch Prep)</text>
+<line x1="254.2" y1="108.0" x2="254.2" y2="448.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="254.2" y="463.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">10 ms</text>
+<line x1="332.2" y1="108.0" x2="332.2" y2="448.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="332.2" y="463.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">30 ms</text>
+<line x1="417.7" y1="108.0" x2="417.7" y2="448.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="417.7" y="463.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">100 ms</text>
+<line x1="495.7" y1="108.0" x2="495.7" y2="448.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="495.7" y="463.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">300 ms</text>
+<line x1="581.2" y1="108.0" x2="581.2" y2="448.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="581.2" y="463.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">1000 ms</text>
+<text x="407.5" y="481.0" font-size="10.1" font-weight="600" fill="#475569" text-anchor="middle">Total Fwd+Bwd ms/layer (log₁₀ scale · lower is better)</text>
+<text x="195.0" y="130.3" font-size="10.0" font-weight="600" fill="#0f172a" text-anchor="end">Native GDN</text>
+<text x="195.0" y="143.3" font-size="8.4" font-weight="400" fill="#64748b" text-anchor="end">chunk_gated_delta_rule</text>
+<rect x="205.0" y="118.3" width="72.3" height="28.0" rx="3.0" fill="#475569" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<text x="284.3" y="131.3" font-size="9.3" font-weight="600" fill="#0f172a" text-anchor="start" class="mono">13.85 ms (base)</text>
+<text x="284.3" y="143.3" font-size="8.2" font-weight="400" fill="#64748b" text-anchor="start" class="mono">fwd 3.6 + bwd 10.2</text>
+<text x="195.0" y="178.9" font-size="10.0" font-weight="600" fill="#0f172a" text-anchor="end">fla GDN-2 (no QED)</text>
+<text x="195.0" y="191.9" font-size="8.4" font-weight="400" fill="#64748b" text-anchor="end">fla.ops.gdn2</text>
+<rect x="205.0" y="166.9" width="139.3" height="28.0" rx="3.0" fill="#0d9488" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<text x="351.3" y="179.9" font-size="9.3" font-weight="600" fill="#0f172a" text-anchor="start" class="mono">35.55 ms (18.5×)</text>
+<text x="351.3" y="191.9" font-size="8.2" font-weight="400" fill="#64748b" text-anchor="start" class="mono">fwd 8.0 + bwd 27.6</text>
+<text x="195.0" y="227.4" font-size="10.0" font-weight="600" fill="#0f172a" text-anchor="end">fla DPLR Core</text>
+<text x="195.0" y="240.4" font-size="8.4" font-weight="400" fill="#64748b" text-anchor="end">chunk_dplr (574898d)</text>
+<rect x="205.0" y="215.4" width="158.0" height="28.0" rx="3.0" fill="#475569" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<text x="370.0" y="228.4" font-size="9.3" font-weight="600" fill="#0f172a" text-anchor="start" class="mono">46.25 ms (raw)</text>
+<text x="370.0" y="240.4" font-size="8.2" font-weight="400" fill="#64748b" text-anchor="start" class="mono">fwd 12.2 + bwd 34.1</text>
+<text x="195.0" y="276.0" font-size="10.0" font-weight="700" fill="#059669" text-anchor="end">GDN-2+QED Triton</text>
+<text x="195.0" y="289.0" font-size="8.4" font-weight="400" fill="#64748b" text-anchor="end">fused tl.int64 (seg0)</text>
+<rect x="205.0" y="264.0" width="168.4" height="28.0" rx="3.0" fill="#059669" fill-opacity="0.88" stroke="none" stroke-width="1.0"/>
+<rect x="205.0" y="264.0" width="168.4" height="28.0" rx="3.0" fill="none" stroke="#0f172a" stroke-width="1.3"/>
+<text x="380.4" y="277.0" font-size="9.3" font-weight="700" fill="#059669" text-anchor="start" class="mono">53.55 ms (2.00×)</text>
+<text x="380.4" y="289.0" font-size="8.2" font-weight="400" fill="#64748b" text-anchor="start" class="mono">fwd 14.8 + bwd 38.8</text>
+<text x="195.0" y="324.6" font-size="10.0" font-weight="700" fill="#0d9488" text-anchor="end">Triton 4×8K Seg</text>
+<text x="195.0" y="337.6" font-size="8.4" font-weight="400" fill="#64748b" text-anchor="end">seg8192 (5.91 GiB)</text>
+<rect x="205.0" y="312.6" width="207.0" height="28.0" rx="3.0" fill="#0d9488" fill-opacity="0.88" stroke="none" stroke-width="1.0"/>
+<rect x="205.0" y="312.6" width="207.0" height="28.0" rx="3.0" fill="none" stroke="#0f172a" stroke-width="1.3"/>
+<text x="419.0" y="325.6" font-size="9.3" font-weight="700" fill="#0d9488" text-anchor="start" class="mono">92.30 ms (2.22× mem)</text>
+<text x="419.0" y="337.6" font-size="8.2" font-weight="400" fill="#64748b" text-anchor="start" class="mono">fwd 15.1 + bwd 77.2</text>
+<text x="195.0" y="373.1" font-size="10.0" font-weight="600" fill="#0f172a" text-anchor="end">PyTorch Prep+DPLR</text>
+<text x="195.0" y="386.1" font-size="8.4" font-weight="400" fill="#64748b" text-anchor="end">unfused eager (seg0)</text>
+<rect x="205.0" y="361.1" width="217.5" height="28.0" rx="3.0" fill="#0284c7" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<text x="429.5" y="374.1" font-size="9.3" font-weight="600" fill="#0f172a" text-anchor="start" class="mono">106.93 ms (17.6G)</text>
+<text x="429.5" y="386.1" font-size="8.2" font-weight="400" fill="#64748b" text-anchor="start" class="mono">fwd 31.4 + bwd 75.6</text>
+<text x="195.0" y="421.7" font-size="10.0" font-weight="600" fill="#0f172a" text-anchor="end">PyTorch GDN-2 Ref</text>
+<text x="195.0" y="434.7" font-size="8.4" font-weight="400" fill="#64748b" text-anchor="end">chunked Python/CUDA</text>
+<rect x="205.0" y="409.7" width="346.4" height="28.0" rx="3.0" fill="#d97706" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<rect x="454.5" y="414.9" width="90.9" height="15.8" rx="4.0" fill="#0f172a" stroke="none" stroke-width="1.0"/>
+<text x="500.0" y="425.7" font-size="8.8" font-weight="600" fill="#ffffff" text-anchor="middle">657.3 ms (1.0×)</text>
+<rect x="795.0" y="108.0" width="395.0" height="340.0" rx="4.0" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.0"/>
+<text x="645.0" y="99.0" font-size="11.0" font-weight="700" fill="#0f172a" text-anchor="start">B. T=1 Decode (Triton Prep 0.0787 ms = 2.41× vs PyTorch Prep)</text>
+<line x1="795.0" y1="108.0" x2="795.0" y2="448.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="795.0" y="463.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">0.00 ms</text>
+<line x1="926.7" y1="108.0" x2="926.7" y2="448.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="926.7" y="463.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">0.10 ms</text>
+<line x1="1058.3" y1="108.0" x2="1058.3" y2="448.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="1058.3" y="463.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">0.20 ms</text>
+<line x1="1190.0" y1="108.0" x2="1190.0" y2="448.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="1190.0" y="463.0" font-size="9.4" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">0.30 ms</text>
+<text x="992.5" y="481.0" font-size="10.1" font-weight="600" fill="#475569" text-anchor="middle">Decode Step Latency ms/layer (linear · lower is better)</text>
+<line x1="850.4" y1="108.0" x2="850.4" y2="448.0" stroke="#475569" stroke-width="1.3" stroke-dasharray="4,3"/>
+<text x="785.0" y="134.3" font-size="10.0" font-weight="600" fill="#0f172a" text-anchor="end">Native GDN</text>
+<text x="785.0" y="147.3" font-size="8.4" font-weight="400" fill="#64748b" text-anchor="end">fused_recurrent_gdn</text>
+<rect x="795.0" y="122.3" width="55.4" height="28.0" rx="3.0" fill="#475569" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<text x="857.4" y="140.3" font-size="9.2" font-weight="600" fill="#0f172a" text-anchor="start" class="mono">0.0421 ms (1.00×)</text>
+<text x="785.0" y="191.0" font-size="10.0" font-weight="600" fill="#0f172a" text-anchor="end">fla DPLR Core</text>
+<text x="785.0" y="204.0" font-size="8.4" font-weight="400" fill="#64748b" text-anchor="end">fused_recurrent_dplr</text>
+<rect x="795.0" y="179.0" width="53.2" height="28.0" rx="3.0" fill="#475569" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<text x="855.2" y="197.0" font-size="9.2" font-weight="600" fill="#0f172a" text-anchor="start" class="mono">0.0404 ms (0.96×)</text>
+<text x="785.0" y="247.7" font-size="10.0" font-weight="600" fill="#0f172a" text-anchor="end">fla GDN-2</text>
+<text x="785.0" y="260.7" font-size="8.4" font-weight="400" fill="#64748b" text-anchor="end">fused_recurrent_gdn2</text>
+<rect x="795.0" y="235.7" width="63.2" height="28.0" rx="3.0" fill="#0d9488" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<text x="865.2" y="253.7" font-size="9.2" font-weight="600" fill="#0f172a" text-anchor="start" class="mono">0.0480 ms (1.14×)</text>
+<text x="785.0" y="304.3" font-size="10.0" font-weight="700" fill="#059669" text-anchor="end">GDN-2+QED Triton</text>
+<text x="785.0" y="317.3" font-size="8.4" font-weight="400" fill="#64748b" text-anchor="end">fused tl.int64 (T=1)</text>
+<rect x="795.0" y="292.3" width="103.6" height="28.0" rx="3.0" fill="#059669" fill-opacity="0.90" stroke="none" stroke-width="1.0"/>
+<rect x="795.0" y="292.3" width="103.6" height="28.0" rx="3.0" fill="none" stroke="#0f172a" stroke-width="1.3"/>
+<text x="905.6" y="310.3" font-size="9.2" font-weight="700" fill="#059669" text-anchor="start" class="mono">0.0787 ms (2.41× vs py)</text>
+<text x="785.0" y="361.0" font-size="10.0" font-weight="600" fill="#0f172a" text-anchor="end">PyTorch GDN-2 Ref</text>
+<text x="785.0" y="374.0" font-size="8.4" font-weight="400" fill="#64748b" text-anchor="end">eager recurrent ref</text>
+<rect x="795.0" y="349.0" width="168.4" height="28.0" rx="3.0" fill="#d97706" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<text x="970.4" y="367.0" font-size="9.2" font-weight="600" fill="#0f172a" text-anchor="start" class="mono">0.1279 ms (3.04×)</text>
+<text x="785.0" y="417.7" font-size="10.0" font-weight="600" fill="#0f172a" text-anchor="end">PyTorch Prep+DPLR</text>
+<text x="785.0" y="430.7" font-size="8.4" font-weight="400" fill="#64748b" text-anchor="end">unfused eager (T=1)</text>
+<rect x="795.0" y="405.7" width="249.5" height="28.0" rx="3.0" fill="#0284c7" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<text x="1051.5" y="423.7" font-size="9.2" font-weight="600" fill="#0f172a" text-anchor="start" class="mono">0.1895 ms (4.50×)</text>
+<rect x="265.0" y="505.0" width="925.0" height="175.0" rx="4.0" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.0"/>
+<text x="28.0" y="496.0" font-size="11.0" font-weight="700" fill="#0f172a" text-anchor="start">C. Commit 574898d Checkpointed 4×8K Macro-Segmenting Peak VRAM Delta (T=32,768 bf16 · 3.28× Full-Wrapper Cut: 23.05 → 7.03 GiB)</text>
+<line x1="265.0" y1="505.0" x2="265.0" y2="680.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="265.0" y="695.0" font-size="9.3" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">0 GiB</text>
+<line x1="430.2" y1="505.0" x2="430.2" y2="680.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="430.2" y="695.0" font-size="9.3" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">5 GiB</text>
+<line x1="595.4" y1="505.0" x2="595.4" y2="680.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="595.4" y="695.0" font-size="9.3" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">10 GiB</text>
+<line x1="760.5" y1="505.0" x2="760.5" y2="680.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="760.5" y="695.0" font-size="9.3" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">15 GiB</text>
+<line x1="925.7" y1="505.0" x2="925.7" y2="680.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="925.7" y="695.0" font-size="9.3" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">20 GiB</text>
+<line x1="1090.9" y1="505.0" x2="1090.9" y2="680.0" stroke="#e2e8f0" stroke-width="1.0" stroke-dasharray="3,3"/>
+<text x="1090.9" y="695.0" font-size="9.3" font-weight="400" fill="#64748b" text-anchor="middle" class="mono">25 GiB</text>
+<text x="727.5" y="711.0" font-size="10.0" font-weight="600" fill="#475569" text-anchor="middle">Single-Layer Peak VRAM Delta at T=32,768 bf16 (GiB · lower is better)</text>
+<text x="255.0" y="523.1" font-size="9.6" font-weight="700" fill="#059669" text-anchor="end">GDN2Adapter Wrapper (4×8K)</text>
+<rect x="265.0" y="509.7" width="232.3" height="19.8" rx="2.5" fill="#059669" fill-opacity="0.90" stroke="none" stroke-width="1.0"/>
+<rect x="265.0" y="509.7" width="232.3" height="19.8" rx="2.5" fill="none" stroke="#0f172a" stroke-width="1.2"/>
+<text x="505.3" y="523.1" font-size="9.1" font-weight="700" fill="#059669" text-anchor="start" class="mono">7.032 GiB (3.28× cut, -16.02 GiB vs seg0)</text>
+<text x="255.0" y="552.2" font-size="9.6" font-weight="600" fill="#0f172a" text-anchor="end">GDN2Adapter Wrapper (seg0)</text>
+<rect x="265.0" y="538.8" width="761.5" height="19.8" rx="2.5" fill="#d97706" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<rect x="824.1" y="540.4" width="196.4" height="15.4" rx="4.0" fill="#0f172a" stroke="none" stroke-width="1.0"/>
+<text x="922.3" y="550.8" font-size="8.4" font-weight="600" fill="#ffffff" text-anchor="middle">23.051 GiB (unsegmented full wrapper)</text>
+<text x="255.0" y="581.4" font-size="9.6" font-weight="700" fill="#0d9488" text-anchor="end">Triton QED+DPLR (4×8K)</text>
+<rect x="265.0" y="568.0" width="195.4" height="19.8" rx="2.5" fill="#0d9488" fill-opacity="0.90" stroke="none" stroke-width="1.0"/>
+<rect x="265.0" y="568.0" width="195.4" height="19.8" rx="2.5" fill="none" stroke="#0f172a" stroke-width="1.2"/>
+<text x="468.4" y="581.4" font-size="9.1" font-weight="700" fill="#0d9488" text-anchor="start" class="mono">5.914 GiB (2.22× cut, -7.21 GiB vs seg0)</text>
+<text x="255.0" y="610.6" font-size="9.6" font-weight="600" fill="#0f172a" text-anchor="end">Triton QED+DPLR (seg0)</text>
+<rect x="265.0" y="597.2" width="433.6" height="19.8" rx="2.5" fill="#475569" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<text x="706.6" y="610.6" font-size="9.1" font-weight="500" fill="#0f172a" text-anchor="start" class="mono">13.125 GiB (-4.51 GiB vs PyTorch prep)</text>
+<text x="255.0" y="639.8" font-size="9.6" font-weight="600" fill="#0f172a" text-anchor="end">PyTorch Prep+DPLR (seg0)</text>
+<rect x="265.0" y="626.3" width="582.7" height="19.8" rx="2.5" fill="#0284c7" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<text x="855.7" y="639.8" font-size="9.1" font-weight="500" fill="#0f172a" text-anchor="start" class="mono">17.637 GiB (unfused eager prep)</text>
+<text x="255.0" y="668.9" font-size="9.6" font-weight="600" fill="#0f172a" text-anchor="end">fla DPLR Core (raw)</text>
+<rect x="265.0" y="655.5" width="384.0" height="19.8" rx="2.5" fill="#475569" fill-opacity="0.72" stroke="none" stroke-width="1.0"/>
+<text x="657.0" y="668.9" font-size="9.1" font-weight="500" fill="#0f172a" text-anchor="start" class="mono">11.625 GiB (raw DPLR kernel delta)</text>
+<text x="28.0" y="726.0" font-size="9.3" font-weight="400" fill="#475569" text-anchor="start">Gate 1 (574898d): 38/38 CUDA pytest green · Gate 3 4×32K d=3 peak 67.194 GiB (&lt;85 GiB) · bf16 parity cos &gt;= 0.999966 · fp32 T=1 max_diff = 3.73e-09.</text>
 </svg>

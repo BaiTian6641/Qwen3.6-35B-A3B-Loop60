@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -19,6 +20,7 @@ from qloop.report import (
     parse_supervisor_log,
     sanitize_obj,
 )
+from qloop.report_citations import validate_ieee_citations
 
 SVG_NS = "{http://www.w3.org/2000/svg}"
 FAKE_HF_TOKEN = "hf_FAKEUNITTESTTOKEN1234567890ABCD"
@@ -569,32 +571,97 @@ def _build_offline_fixture(offline_dir: Path) -> None:
             ),
         },
         {
-            "commit_id": "db49747400000000",
-            "short_sha": "db497474",
-            "created_at": "2026-11-24T05:48:06+00:00",
-            "title": "[qloop:s3_v2_long_1m_lsa] step=375 (ckpt) loss=1.29",
+            "commit_id": "6b521f4700000000",
+            "short_sha": "6b521f47",
+            "created_at": "2026-11-24T11:02:33+00:00",
+            "title": "[qloop:s3_v2_long_1m_lsa] step=600 (completed) loss=1.28 depth_gain=+0.0873",
             "message": "",
             "manifest": _make_manifest(
                 "s3_v2_long_1m_lsa",
-                375,
-                "in_progress",
+                600,
+                "completed",
                 {
-                    "loss/lm": 1.29,
-                    "loss/lsa_kl": 18.8,
-                    "lsa/distill_kl/L3": 1.88,
-                    "lsa/recall/L3": 0.5708,
-                    "lsa/min_head_recall/L3": 0.4051,
-                    "lsa/last_recall": 0.5708,
-                    "loop/gate_abs_mean_p2": 0.0217,
-                    "loop/gate_abs_mean_p3": 0.0489,
-                    "loop/bridge_w_anchor_p3": 0.875,
-                    "tokens_seen": 75268096,
-                    "tok_per_s": 2350.0,
-                    "optim/optim/global_grad_norm": 14.0,
+                    "loss/lm": 1.28,
+                    "loss/lsa_kl": 18.6,
+                    "lsa/distill_kl/L3": 1.86,
+                    "lsa/recall/L3": 0.5715,
+                    "lsa/min_head_recall/L3": 0.4242,
+                    "lsa/last_recall": 0.5715,
+                    "loop/gate_abs_mean_p2": 0.0220,
+                    "loop/gate_abs_mean_p3": 0.0517,
+                    "loop/bridge_w_anchor_p3": 0.876,
+                    "tokens_seen": 120111104,
+                    "tok_per_s": 2365.1,
+                    "optim/optim/global_grad_norm": 14.04,
                     "optim/optim/skipped_total": 0.0,
                     "mem/peak_gib": 69.96,
+                    "eval/loss_d1": 1.3689,
+                    "eval/loss_d2": 1.2996,
+                    "eval/loss_d3": 1.2816,
+                    "eval/depth_gain": 0.0873,
                 },
                 n_params=24_556_598,
+                target_steps=600,
+            ),
+        },
+        # Live s2_v2_joint_bptt (GDN-2-1M + Bounded QED on commit 574898d)
+        {
+            "commit_id": "39c29a6d00000000",
+            "short_sha": "39c29a6d",
+            "created_at": "2026-11-24T14:02:39+00:00",
+            "title": "[qloop:s2_v2_joint_bptt] step=25 (ckpt) loss=6.1811",
+            "message": "",
+            "manifest": _make_manifest(
+                "s2_v2_joint_bptt",
+                25,
+                "in_progress",
+                {
+                    "loss/lm": 6.1811,
+                    "depth": 3,
+                    "tokens_seen": 5242880,
+                    "tok_per_s": 1041.1,
+                    "optim/optim/global_grad_norm": 10.09,
+                    "optim/optim/skipped_total": 0.0,
+                    "loss/bptt_offload_to_cpu": 0.0,
+                    "mem/peak_gib": 67.69,
+                    "gdn2/adapter_norm": 0.0369,
+                    "gdn2/qed_lambda_abs_mean": 4.66e-5,
+                    "gdn2/neg_eigval_scale_mean": 0.99998,
+                    "gdn2/decay_horizon_mult_max": 1.0139,
+                    "gdn2/erase_write_l1": 0.00190,
+                    "gdn2/decay_spread": 7.79e-5,
+                },
+                n_params=156_941_238,
+                target_steps=600,
+            ),
+        },
+        {
+            "commit_id": "d0a1d1d000000000",
+            "short_sha": "d0a1d1d0",
+            "created_at": "2026-11-24T19:01:02+00:00",
+            "title": "[qloop:s2_v2_joint_bptt] step=100 (ckpt) loss=5.8075",
+            "message": "",
+            "manifest": _make_manifest(
+                "s2_v2_joint_bptt",
+                100,
+                "in_progress",
+                {
+                    "loss/lm": 5.8075,
+                    "depth": 3,
+                    "tokens_seen": 26214400,
+                    "tok_per_s": 1040.2,
+                    "optim/optim/global_grad_norm": 1.00,
+                    "optim/optim/skipped_total": 0.0,
+                    "loss/bptt_offload_to_cpu": 0.0,
+                    "mem/peak_gib": 67.77,
+                    "gdn2/adapter_norm": 0.3884,
+                    "gdn2/qed_lambda_abs_mean": 3.55e-4,
+                    "gdn2/neg_eigval_scale_mean": 0.99983,
+                    "gdn2/decay_horizon_mult_max": 1.5439,
+                    "gdn2/erase_write_l1": 0.02940,
+                    "gdn2/decay_spread": 0.00210,
+                },
+                n_params=156_941_238,
                 target_steps=600,
             ),
         },
@@ -849,29 +916,141 @@ def _build_offline_fixture(offline_dir: Path) -> None:
     )
     (offline_dir / "colab_supervisor_v2.log").write_text(sup_v2_log + "\n", encoding="utf-8")
 
+    sup_s2v2_log = "\n".join(
+        [
+            "2026-11-24T12:20:00Z [BOOT] ready session=loop64 launched=True pid=55001 head=574898d",
+            f"2026-11-24T12:24:16Z [KEEPALIVE] {ka} util=99% mem=71000/97887MiB pwr=480.0W temp=61C"
+            " | 12:24:00 I [-] step 1/600 lm 6.6937 d=3 849 tok/s"
+            " mem alloc 27.6G / reserved 71.4G / peak 67.2G",
+            f"2026-11-24T12:34:16Z [KEEPALIVE] {ka} util=99% mem=71500/97887MiB pwr=490.0W temp=61C"
+            " | 12:34:00 I [-] step 100/600 lm 5.8075 d=3 1040 tok/s"
+            " mem alloc 27.6G / reserved 71.8G / peak 67.8G",
+        ]
+    )
+    (offline_dir / "colab_supervisor_s2v2.log").write_text(sup_s2v2_log + "\n", encoding="utf-8")
+
+    s3v2_gate = {
+        "gate1_cuda_gdn2": {
+            "pytest": {"passed": 38, "failed": 0, "cpu_passed": 33, "cuda_passed": 5},
+            "benchmarks": {
+                "T32768_fwd_bwd": {
+                    "fla_chunk_dplr_raw": {
+                        "fwd": {"median_ms": 12.17},
+                        "bwd": {"median_ms": 34.09},
+                        "total": {"median_ms": 46.25},
+                        "peak_vram_delta_gib": 11.625,
+                    },
+                    "gdn2_qed_dplr_triton_seg0": {
+                        "fwd": {"median_ms": 14.78},
+                        "bwd": {"median_ms": 38.76},
+                        "total": {"median_ms": 53.55},
+                        "peak_vram_delta_gib": 13.125,
+                    },
+                    "gdn2_qed_dplr_triton_seg8192": {
+                        "fwd": {"median_ms": 15.08},
+                        "bwd": {"median_ms": 77.20},
+                        "total": {"median_ms": 92.30},
+                        "peak_vram_delta_gib": 5.914,
+                    },
+                    "gdn2_qed_dplr_pytorch_prep_seg0": {
+                        "fwd": {"median_ms": 31.36},
+                        "bwd": {"median_ms": 75.55},
+                        "total": {"median_ms": 106.93},
+                        "peak_vram_delta_gib": 17.637,
+                    },
+                    "gdn2_adapter_wrapper_seg0": {
+                        "fwd": {"median_ms": 45.37},
+                        "bwd": {"median_ms": 91.07},
+                        "total": {"median_ms": 136.43},
+                        "peak_vram_delta_gib": 23.051,
+                    },
+                    "gdn2_adapter_wrapper_seg8192": {
+                        "fwd": {"median_ms": 45.79},
+                        "bwd": {"median_ms": 140.85},
+                        "total": {"median_ms": 186.62},
+                        "peak_vram_delta_gib": 7.032,
+                    },
+                },
+                "T1_decode": {
+                    "fla_fused_recurrent_dplr_raw": {"median_ms": 0.0404},
+                    "gdn2_qed_dplr_triton_t1": {"median_ms": 0.0787},
+                    "gdn2_qed_dplr_pytorch_prep_t1": {"median_ms": 0.1895},
+                    "gdn2_adapter_wrapper_t1": {"median_ms": 0.4193},
+                },
+            },
+        },
+        "gate2_s3v2_step600_truth_check": {
+            "elapsed_sec": 540.6,
+            "runs": [
+                {
+                    "config": "d3_sparse64",
+                    "task": "needle_64k",
+                    "prompt_tokens": 59575,
+                    "prefill_tok_per_s": 4238.0,
+                    "decode_tok_per_s": 6.45,
+                    "peak_vram_gib": 26.71,
+                    "distinct_3": 1.0,
+                    "slop_score": 0.0,
+                    "needle_hit": True,
+                    "rep_loop": False,
+                },
+            ],
+        },
+        "gate3_s2v2_4x32k_d3_smoke": {
+            "peak_vram_gib": 67.194,
+            "post_step_alloc_gib": 27.6,
+            "stepped_params": 379,
+            "secret_test": FAKE_HF_TOKEN,
+        },
+    }
+    (offline_dir / "s3v2_gate_summary.json").write_text(json.dumps(s3v2_gate), encoding="utf-8")
+
+
+def _assert_markdown_tables_within_7_cols(md_text: str, label: str) -> None:
+    in_tbl = False
+    hdr_cols = 0
+    for ln_no, ln in enumerate(md_text.splitlines(), 1):
+        s = ln.strip()
+        if s.startswith("|") and s.endswith("|"):
+            cols = len(s.split("|")) - 2
+            assert cols <= 7, f"{label}:{ln_no} has {cols} columns (>7 US-Letter limit)"
+            if not in_tbl:
+                in_tbl = True
+                hdr_cols = cols
+            else:
+                assert cols == hdr_cols, f"{label}:{ln_no} col mismatch ({cols} != {hdr_cols})"
+        else:
+            in_tbl = False
+
 
 def test_offline_export_e2e_v2_artifacts_7_svgs_and_secret_redaction(tmp_path: Path) -> None:
     offline_dir = tmp_path / "offline"
     out_dir = tmp_path / "experiment_logs"
     report_path = tmp_path / "EXPERIMENT_REPORT.md"
+    report_zh_path = tmp_path / "EXPERIMENT_REPORT_ZH.md"
     _build_offline_fixture(offline_dir)
 
     res = export_experiment_report(
         repo="test/fake-loop64",
         supervisor_log=str(offline_dir / "colab_supervisor.log"),
         supervisor_v2_log=str(offline_dir / "colab_supervisor_v2.log"),
+        supervisor_s2v2_log=str(offline_dir / "colab_supervisor_s2v2.log"),
         out_dir=str(out_dir),
         report_path=str(report_path),
+        report_zh_path=str(report_zh_path),
         offline_dir=str(offline_dir),
     )
 
-    assert res["total_commits"] == 22
+    assert res["total_commits"] == 24
     assert res["rolled_back_count"] == 3  # 1 poisoned s1 + 2 pre-fix s1b explosion commits
+    assert res["ieee_reference_count"] == 23
     assert res["ingested_artifacts"] == {
         "truth_check": True,
         "dplr_bench": True,
         "dataset_audit": True,
+        "s3v2_gate": True,
         "supervisor_v2": True,
+        "supervisor_s2v2": True,
     }
 
     # 1. Verify hub_manifest_history.json flags rollbacks and strips secrets
@@ -879,8 +1058,9 @@ def test_offline_export_e2e_v2_artifacts_7_svgs_and_secret_redaction(tmp_path: P
     rb_shas = {c["short_sha"] for c in hist["commits"] if c["rolled_back"]}
     assert rb_shas == {"d1d92064", "7a2d590a", "dc7c4ad8"}
 
-    # 2. Verify CSV deduplication across all 5 stages (incl. clean v2 s3_v2_long_1m_lsa)
+    # 2. Verify CSV deduplication across all 6 stages (incl. s3_v2 & s2_v2)
     assert "s3_v2_long_1m_lsa" in STAGES
+    assert "s2_v2_joint_bptt" in STAGES
     for st in STAGES:
         csv_p = out_dir / f"{st}.csv"
         assert csv_p.is_file()
@@ -893,21 +1073,34 @@ def test_offline_export_e2e_v2_artifacts_7_svgs_and_secret_redaction(tmp_path: P
 
     with open(out_dir / "s3_v2_long_1m_lsa.csv", encoding="utf-8") as f:
         s3v2_rows = list(csv.DictReader(f))
-    assert [int(r["step"]) for r in s3v2_rows] == [125, 200, 375]
-    assert float(s3v2_rows[-1]["gate_abs_mean_p3"]) == pytest.approx(0.0489)
-    assert float(s3v2_rows[1]["eval_loss_d3"]) == pytest.approx(1.2860)
+    assert [int(r["step"]) for r in s3v2_rows] == [125, 200, 600]
+    assert float(s3v2_rows[-1]["gate_abs_mean_p3"]) == pytest.approx(0.0517)
+    assert float(s3v2_rows[-1]["eval_loss_d3"]) == pytest.approx(1.2816)
+
+    with open(out_dir / "s2_v2_joint_bptt.csv", encoding="utf-8") as f:
+        s2v2_rows = list(csv.DictReader(f))
+    assert [int(r["step"]) for r in s2v2_rows] == [1, 25, 100]
+    assert float(s2v2_rows[-1]["gdn2_adapter_norm"]) == pytest.approx(0.3884)
 
     # 3. Verify summary_metrics.json & archived local artifact JSONs
     sm = json.loads((out_dir / "summary_metrics.json").read_text(encoding="utf-8"))
     assert sm["stages"]["s2_joint_bptt"]["latest_step"] == 500
-    assert sm["stages"]["s3_v2_long_1m_lsa"]["latest_step"] == 375
-    assert sm["stages"]["s3_v2_long_1m_lsa"]["latest_commit_sha"] == "db497474"
+    assert sm["stages"]["s3_v2_long_1m_lsa"]["latest_step"] == 600
+    assert sm["stages"]["s3_v2_long_1m_lsa"]["latest_commit_sha"] == "6b521f47"
+    assert sm["stages"]["s2_v2_joint_bptt"]["latest_step"] == 100
+    assert sm["stages"]["s2_v2_joint_bptt"]["latest_commit_sha"] == "d0a1d1d0"
     assert sm["gpu_hours"]["supervisor_v1_active_h"] > 0
     assert sm["gpu_hours"]["supervisor_v2_active_h"] > 0
+    assert sm["gpu_hours"]["supervisor_s2v2_active_h"] > 0
     assert "post_tf524_fix_2f5a6ba" in sm["supervisor_s2_regimes"]
     assert sm["tf524_slowdown_window"]["slowdown_hours"] > 0
 
-    for art in ("truth_check_summary.json", "dplr_bench_summary.json", "dataset_audit_summary.json"):
+    for art in (
+        "truth_check_summary.json",
+        "dplr_bench_summary.json",
+        "dataset_audit_summary.json",
+        "s3v2_gate_summary.json",
+    ):
         assert (out_dir / art).is_file()
     dplr_arch = json.loads((out_dir / "dplr_bench_summary.json").read_text(encoding="utf-8"))
     assert dplr_arch["parity_summary"]["fp32_T1_decode_o"]["max_abs_diff"] == pytest.approx(3.73e-9)
@@ -928,50 +1121,67 @@ def test_offline_export_e2e_v2_artifacts_7_svgs_and_secret_redaction(tmp_path: P
         assert len(root.findall(f".//{SVG_NS}text")) >= 10, f"{fname} missing axis/labels"
         assert "hbm" not in svg_txt.lower(), f"Erroneous HBM reference found in {fname}"
 
-    # 5. Verify 7-section v3 EXPERIMENT_REPORT.md structure, 5 strict upgrades & relative SVG links
+    # 5. Verify EN & ZH IEEE academic reports, strict citations, <=7-col tables & key findings
     md = report_path.read_text(encoding="utf-8")
+    zh = report_zh_path.read_text(encoding="utf-8")
+    en_cites = validate_ieee_citations(md)
+    zh_cites = validate_ieee_citations(zh)
+    assert en_cites["num_references"] == 23
+    assert zh_cites["num_references"] == 23
+    assert en_cites["references"] == zh_cites["references"]
+    _assert_markdown_tables_within_7_cols(md, "offline_EN")
+    _assert_markdown_tables_within_7_cols(zh, "offline_ZH")
+
     for fname in EXPECTED_SVGS:
         assert f"experiment_logs/charts/{fname}" in md
+        assert f"experiment_logs/charts/{fname}" in zh
     for heading in (
-        "## 1. Executive Summary",
-        "## 2. Methodology, Architecture & Full VRAM Footprint Ledger",
-        "### 2.1 Foundational Single-GPU Enabler: APOLLO Optimizer (`arXiv:2412.05270`) & `FusedStepOptimizer`",
-        "### 2.2 Verified Blackwell Hardware Spec (`GDDR7 ECC`) & Three-Axis Looped Hybrid Architecture",
-        "### 2.3 Inference `1M`-Context (`88L @ R=3`, `batch=1`) VRAM Footprint Ledger & `BucketIndex` Code Audit",
-        "### 2.4 Single-Card Training VRAM Footprint Ledger (`96 GB GDDR7 ECC` / `94.97 GiB` Usable)",
-        "## 3. Full Stage-by-Stage Empirical Results",
-        "### 3.7 Phase-A Truth-Check & 4-Stage Causal Swap Forensics",
-        "#### 3.7.1 Deep HSSD v3.2 Experimental Post-Mortem & Why `GDN-2` Is the Principled Move",
-        "### 3.8 Controlled A/B Win: Clean Native-GDN `s3_v2_long_1m_lsa`",
-        (
-            "## 4. GDN-2-1M (`arXiv:2605.22791`) + Bounded QED (`arXiv:2608.13668`) + "
-            "Soft Neg-Eigval via `fla 0.6.0` `DPLR`"
-        ),
-        "## 5. Open Audited Dataset",
-        "## 6. Blackwell `sm_120` Speedup Chronology & Kernel Engineering Ledger",
-        "## 7. Honest Limitations, Next Milestones & Compute Grant Justification",
+        "## Abstract",
+        "## I. Introduction",
+        "## II. Architecture, Optimizer, and Memory Accounting",
+        "## III. Stage-by-Stage Empirical Evaluation and Negative Ablation",
+        "## IV. GDN-2-1M + Bounded QED, `4×8K` Macro-Segmenting, and Live `s2_v2` Progress",
+        "## V. Decontaminated Corpus (`Loop64-Fable-SIRSI-v1 v1.2`) and Stage 4 SI-RSI",
+        "## VI. Blackwell `sm_120` Systems Optimization and Hardening",
+        "## VII. Limitations, Roadmap, and Compute Allocation Summary",
+        "## References",
     ):
-        assert heading in md, f"Missing expected section heading: {heading}"
+        assert heading in md, f"Missing expected EN IEEE heading: {heading}"
+    for zh_heading in (
+        "## 摘要",
+        "## I. 引言",
+        "## II. 系统架构、优化器与全阶段显存账本",
+        "## III. 分阶段实证结果与负面消融分析",
+        "## IV. `GDN-2-1M + 有界 QED`、`4×8K` 宏分段与 `s2_v2` 在线进展",
+        "## V. 去污染开源语料（`Loop64-Fable-SIRSI-v1 v1.2`）与第四阶段 SI-RSI",
+        "## VI. Blackwell `sm_120` 系统优化与生产级工程加固",
+        "## VII. 局限性、后续路线图与算力申请摘要",
+        "## 参考文献",
+    ):
+        assert zh_heading in zh, f"Missing expected ZH IEEE heading: {zh_heading}"
+
     assert "3.73e-09" in md
     assert "halted@500" in md
     assert "hbm" not in md.lower(), "Erroneous HBM reference found in EXPERIMENT_REPORT.md"
+    assert "hbm" not in zh.lower(), "Erroneous HBM reference found in EXPERIMENT_REPORT_ZH.md"
     assert "hbm" not in json.dumps(sm).lower(), "Erroneous HBM reference found in summary_metrics.json"
     for required_token in (
         "GDDR7",
         "1,597 GB/s",
         "71.9%",
-        "arXiv:2412.05270",
         "FusedStepOptimizer",
         "_foreach_norm",
         "+1.04 GiB",
         "33.54 GiB",
-        "11.63 GiB",
-        "8,192",
-        "~47–53",
+        "53.55",
+        "7.032",
+        "67.194",
+        "3.28×",
+        "38/38",
+        "12/12",
+        "574898d",
         "5.0×",
         "2.50×",
-        "425–775",
-        "1.28e-4",
         "~129 TB/step",
         "93,700+",
         "2e37bf6",
@@ -979,7 +1189,7 @@ def test_offline_export_e2e_v2_artifacts_7_svgs_and_secret_redaction(tmp_path: P
         "2f5a6ba",
         "2c78ffc",
     ):
-        assert required_token in md, f"Missing required v3 report content: {required_token}"
+        assert required_token in md, f"Missing required academic report content: {required_token}"
 
     # 6. Verify ZERO secret / tunnel leakage across ALL emitted files
     for p in res["written_files"]:
@@ -994,6 +1204,7 @@ def test_cli_offline_entrypoint(tmp_path: Path, capsys: pytest.CaptureFixture[st
     offline_dir = tmp_path / "offline"
     out_dir = tmp_path / "logs"
     report_path = tmp_path / "REPORT.md"
+    report_zh_path = tmp_path / "REPORT_ZH.md"
     _build_offline_fixture(offline_dir)
 
     rc = main(
@@ -1006,13 +1217,16 @@ def test_cli_offline_entrypoint(tmp_path: Path, capsys: pytest.CaptureFixture[st
             str(out_dir),
             "--report",
             str(report_path),
+            "--report-zh",
+            str(report_zh_path),
         ]
     )
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
-    # 1 history + 5 CSVs + 1 summary + 3 archived JSONs + 7 SVGs + 1 report = 18 files
-    assert len(out["written_files"]) == 18
+    # 1 history + 6 CSVs + 1 summary + 4 archived JSONs + 7 SVGs + 2 reports (EN+ZH) = 21 files
+    assert len(out["written_files"]) == 21
     assert report_path.is_file()
+    assert report_zh_path.is_file()
 
 
 def test_secret_sanitization_and_guard() -> None:
@@ -1097,6 +1311,7 @@ def test_parse_supervisor_log_boot_resets_stage_and_tf524_hours_reconcile(tmp_pa
 def test_committed_docs_artifacts_xml_and_secret_free() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     report_p = repo_root / "docs" / "EXPERIMENT_REPORT.md"
+    report_zh_p = repo_root / "docs" / "EXPERIMENT_REPORT_ZH.md"
     grant_p = repo_root / "docs" / "COMPUTE_GRANT_PROPOSAL.md"
     perf_p = repo_root / "docs" / "PERF_PROFILE_S2.md"
     logs_dir = repo_root / "docs" / "experiment_logs"
@@ -1107,6 +1322,11 @@ def test_committed_docs_artifacts_xml_and_secret_free() -> None:
     assert not contains_secret(report_txt)
     assert "hbm" not in report_txt.lower(), "Erroneous HBM reference in committed EXPERIMENT_REPORT.md"
     assert "1,597 GB/s" in report_txt and "71.9%" in report_txt and "GDDR7" in report_txt
+    if report_zh_p.is_file():
+        zh_txt = report_zh_p.read_text(encoding="utf-8")
+        assert not contains_secret(zh_txt)
+        assert "hbm" not in zh_txt.lower(), "Erroneous HBM reference in committed EXPERIMENT_REPORT_ZH.md"
+        assert "1,597 GB/s" in zh_txt and "71.9%" in zh_txt and "GDDR7" in zh_txt
     if grant_p.is_file():
         grant_txt = grant_p.read_text(encoding="utf-8")
         assert not contains_secret(grant_txt)
@@ -1140,3 +1360,84 @@ def test_committed_docs_artifacts_xml_and_secret_free() -> None:
             steps = [int(r["step"]) for r in rows]
             assert steps == sorted(steps)
             assert len(steps) == len(set(steps))
+
+
+def test_ieee_citation_integrity_en_zh_and_grant() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    en_p = repo_root / "docs" / "EXPERIMENT_REPORT.md"
+    zh_p = repo_root / "docs" / "EXPERIMENT_REPORT_ZH.md"
+    grant_p = repo_root / "docs" / "COMPUTE_GRANT_PROPOSAL.md"
+    if not en_p.is_file() or not zh_p.is_file():
+        pytest.skip("Committed EN/ZH reports not present")
+
+    en_res = validate_ieee_citations(en_p.read_text(encoding="utf-8"))
+    zh_res = validate_ieee_citations(zh_p.read_text(encoding="utf-8"))
+    assert en_res["num_references"] == 23
+    assert zh_res["num_references"] == 23
+    assert en_res["first_appearance_order"] == list(range(1, 24))
+    assert zh_res["first_appearance_order"] == list(range(1, 24))
+    assert en_res["references"] == zh_res["references"]
+
+    if grant_p.is_file():
+        grant_res = validate_ieee_citations(grant_p.read_text(encoding="utf-8"))
+        assert grant_res["num_references"] >= 15
+        assert grant_res["first_appearance_order"] == list(range(1, grant_res["num_references"] + 1))
+
+    # Negative validation checks: out-of-order, missing, and unused references must fail
+    with pytest.raises(ValueError, match="first-appearance order"):
+        validate_ieee_citations("Intro cites [2] then [1].\n\n## References\n\n[1] Ref A.\n\n[2] Ref B.\n")
+    with pytest.raises(ValueError, match="undefined references"):
+        validate_ieee_citations("Intro cites [1] and [2].\n\n## References\n\n[1] Ref A.\n")
+    with pytest.raises(ValueError, match="Unused"):
+        validate_ieee_citations("Intro cites [1].\n\n## References\n\n[1] Ref A.\n\n[2] Ref B.\n")
+
+
+def test_markdown_tables_us_letter_width_en_and_zh() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    for rel in ("docs/EXPERIMENT_REPORT.md", "docs/EXPERIMENT_REPORT_ZH.md"):
+        p = repo_root / rel
+        if not p.is_file():
+            pytest.skip(f"{rel} not present")
+        _assert_markdown_tables_within_7_cols(p.read_text(encoding="utf-8"), rel)
+
+
+def test_rendered_academic_html_zero_math_leaks_and_us_letter_pdfs() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    renderer_path = repo_root / "scripts" / "render_academic_papers.py"
+    assert renderer_path.is_file()
+
+    spec = importlib.util.spec_from_file_location("render_academic_papers", str(renderer_path))
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    for rel_md, rel_pdf, lang in (
+        ("docs/EXPERIMENT_REPORT.md", "docs/papers/Loop64_Technical_Report_EN.pdf", "en"),
+        ("docs/EXPERIMENT_REPORT_ZH.md", "docs/papers/Loop64_Technical_Report_ZH.pdf", "zh"),
+    ):
+        md_p = repo_root / rel_md
+        pdf_p = repo_root / rel_pdf
+        if not md_p.is_file() or not pdf_p.is_file():
+            pytest.skip(f"Missing {rel_md} or {rel_pdf}")
+
+        html_out = mod.markdown_to_academic_html(
+            md_p.read_text(encoding="utf-8"),
+            base_dir=md_p.parent,
+            lang=lang,
+        )
+        assert mod.find_unrendered_math_leaks(html_out) == []
+        assert '<section class="abstract-box">' in html_out
+        assert '<section class="references">' in html_out
+        for k in range(1, 24):
+            assert f'<span class="ref-num">[{k}]</span>' in html_out
+        assert html_out.count("<svg") == 7
+        assert "hbm" not in html_out.lower()
+
+        raw_pdf = pdf_p.read_bytes()
+        assert raw_pdf.startswith(b"%PDF-")
+        boxes = mod.get_pdf_page_boxes(pdf_p)
+        assert 12 <= len(boxes) <= 20, f"Unexpected page count {len(boxes)} for {rel_pdf}"
+        for idx_p, (w, h) in enumerate(boxes, 1):
+            assert abs(w - 612.0) <= 1.0 and abs(h - 792.0) <= 1.0, (
+                f"{rel_pdf} page {idx_p} is not US Letter (612x792 pt): got {w}x{h} pt"
+            )

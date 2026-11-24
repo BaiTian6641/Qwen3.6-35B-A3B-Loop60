@@ -1,0 +1,283 @@
+{
+  "status": "blocked_phase_a_gate",
+  "reason": "s2_joint_bptt@500 failed Phase A coherence & 18K needle gate (root cause: s1b_hssd_distill non-identity HSSD replacement + dead vault_duty=3e-5; NOT a transformers 5.24.0 decode bug) AND eager HSSD decode speed (3.41 tok/s at d=3) puts full Phase B at ~18-35 hours instead of 45-90 min.",
+  "env": {
+    "torch": "2.14.1+cu130",
+    "transformers": "5.24.0",
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "vram_total_gib": 94.97
+  },
+  "decode_bug_check": {
+    "prefill_vs_decode_L70_top1_d1": 1.0,
+    "prefill_vs_decode_L70_top1_d3": 1.0,
+    "prefill_vs_decode_L650_sparse_top1_d1": 1.0,
+    "prefill_vs_decode_L650_sparse_mean_diff_d1": 0.1278,
+    "prefill_vs_decode_L650_sparse_top1_d3": 1.0,
+    "prefill_vs_decode_L650_sparse_mean_diff_d3": 0.1073,
+    "prefill_vs_decode_L650_stock_top1": 1.0,
+    "prefill_vs_decode_L650_stock_mean_diff": 0.3505,
+    "uncached_oracle_reproduces_degradation": true
+  },
+  "phase_a": {
+    "stock": {
+      "sanity_math": {
+        "completion_tokens": 512,
+        "decode_tok_s": 19.22,
+        "prefill_tok_s": 2.5,
+        "peak_vram_gib": 24.82,
+        "needle_hit": null,
+        "rep_loop": false,
+        "close_think": false,
+        "empty_think": false,
+        "slop_score": 0.0,
+        "distinct_2": 0.7253,
+        "distinct_3": 0.8103,
+        "slop_flags": []
+      },
+      "sanity_code": {
+        "completion_tokens": 512,
+        "decode_tok_s": 19.27,
+        "prefill_tok_s": 285.3,
+        "peak_vram_gib": 24.82,
+        "needle_hit": null,
+        "rep_loop": false,
+        "close_think": false,
+        "empty_think": false,
+        "slop_score": 0.0,
+        "distinct_2": 0.7708,
+        "distinct_3": 0.877,
+        "slop_flags": []
+      }
+    },
+    "loop64_d1": {
+      "sanity_math": {
+        "completion_tokens": 512,
+        "decode_tok_s": 7.72,
+        "prefill_tok_s": 7.7,
+        "peak_vram_gib": 26.46,
+        "needle_hit": null,
+        "rep_loop": false,
+        "close_think": false,
+        "empty_think": false,
+        "slop_score": 0.0,
+        "distinct_2": 0.4262,
+        "distinct_3": 0.5447,
+        "slop_flags": []
+      },
+      "sanity_code": {
+        "completion_tokens": 512,
+        "decode_tok_s": 7.78,
+        "prefill_tok_s": 232.5,
+        "peak_vram_gib": 26.46,
+        "needle_hit": null,
+        "rep_loop": false,
+        "close_think": false,
+        "empty_think": false,
+        "slop_score": 0.25,
+        "distinct_2": 0.2569,
+        "distinct_3": 0.2822,
+        "slop_flags": [
+          "slop:low_diversity(d2=0.26,d3=0.28)"
+        ]
+      },
+      "chunked_16k": {
+        "completion_tokens": 96,
+        "decode_tok_s": 6.37,
+        "prefill_tok_s": 1320.3,
+        "peak_vram_gib": 28.63,
+        "needle_hit": false,
+        "rep_loop": false,
+        "close_think": false,
+        "empty_think": false,
+        "slop_score": 0.0,
+        "distinct_2": 0.6512,
+        "distinct_3": 0.7765,
+        "slop_flags": []
+      }
+    },
+    "loop64_d3": {
+      "sanity_math": {
+        "completion_tokens": 512,
+        "decode_tok_s": 3.41,
+        "prefill_tok_s": 89.9,
+        "peak_vram_gib": 28.09,
+        "needle_hit": null,
+        "rep_loop": false,
+        "close_think": false,
+        "empty_think": false,
+        "slop_score": 0.0,
+        "distinct_2": 0.6481,
+        "distinct_3": 0.8019,
+        "slop_flags": []
+      },
+      "sanity_code": {
+        "completion_tokens": 512,
+        "decode_tok_s": 3.42,
+        "prefill_tok_s": 111.7,
+        "peak_vram_gib": 28.09,
+        "needle_hit": null,
+        "rep_loop": false,
+        "close_think": false,
+        "empty_think": false,
+        "slop_score": 0.0,
+        "distinct_2": 0.6124,
+        "distinct_3": 0.7746,
+        "slop_flags": []
+      },
+      "chunked_16k": {
+        "completion_tokens": 96,
+        "decode_tok_s": 3.18,
+        "prefill_tok_s": 2795.4,
+        "peak_vram_gib": 30.48,
+        "needle_hit": false,
+        "rep_loop": false,
+        "close_think": false,
+        "empty_think": false,
+        "slop_score": 0.0,
+        "distinct_2": 0.4651,
+        "distinct_3": 0.5294,
+        "slop_flags": []
+      }
+    }
+  },
+  "forensics": [
+    {
+      "label": "stock_plus_yarn1m",
+      "depth": null,
+      "needle16k": true,
+      "math_rep_loop": false,
+      "code_rep_loop": false,
+      "math_d3": 0.8739,
+      "code_d3": 1.0,
+      "math_head": "Here's a thinking process that leads to the solution:\n\n1.  **Understand the Goal:** The objective is to find the count of positive integers $n$ such that $1 \\le n \\le 100$ and $n$ ",
+      "code_head": "Here's a thinking process:\n\n1.  **Understand the Goal**: The user wants a concise Python function `is_balanced(s: str) -> bool` that checks if a string containing parentheses `()`,"
+    },
+    {
+      "label": "pristine_loop_hssd_lsa_init",
+      "depth": 1,
+      "needle16k": false,
+      "math_rep_loop": false,
+      "code_rep_loop": false,
+      "math_d3": 0.3077,
+      "code_d3": 1.0,
+      "math_head": "\n`, 0 1 1 1 1 1 1 1 1 1 1 1 1 11 111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+      "code_head": " message. , , , , , ,  message \u201c  ,  ,  ,  ,  ,  ,  , \n \n \n2 2  [  [  [  [  [                                                                                                       "
+    },
+    {
+      "label": "s1b_hssd_distill_lsa_dense",
+      "depth": 1,
+      "needle16k": false,
+      "math_rep_loop": false,
+      "code_rep_loop": false,
+      "math_d3": 0.05,
+      "code_d3": 0.1628,
+      "math_head": "\\boxed{\n\\frac{1}{2} + \\frac{1}{2} = \\frac{1}{2} + \\frac{1}{2} = \\frac{1}{2} + \\frac{1}{2} = \\frac{1}{2} + \\frac{1}{2} = \\frac{1}{2} + \\frac{1}{2} = \\frac{1}{2} + \\frac{1}{2} = \\fra",
+      "code_head": "\nassistant\n<think>\n\nassistant\n<think>\n\nassistant\n<think>\n\n\n</think>\n<answer>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code"
+    },
+    {
+      "label": "s1b_hssd_distill_lsa_dense",
+      "depth": 3,
+      "needle16k": false,
+      "math_rep_loop": false,
+      "code_rep_loop": true,
+      "math_d3": 0.1818,
+      "code_d3": 0.1607,
+      "math_head": "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"type\": \"string\", \"required\": \"bash\", \"description\": \"The command to run\", \"arguments\": {\"type\": \"object\", \"required\": \"bash\", \"descripti",
+      "code_head": "</think>\n\n<tool_call>\n{\"name\": \"search\", \"arguments\": {\"query\": \"<search_query>\"}}\n</tool_call>\n{\"name\": \"search\", \"arguments\": {\"query\": \"<search_query>\"}}\n</tool_call>\n<tool_call"
+    },
+    {
+      "label": "s3_long_1m_lsa_sparse",
+      "depth": 1,
+      "needle16k": false,
+      "math_rep_loop": false,
+      "code_rep_loop": true,
+      "math_d3": 0.0189,
+      "code_d3": 0.2632,
+      "math_head": "\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\box",
+      "code_head": "\nassistant\n<think>\n\nassistant\n<think>\n\nassistant\n<think>\n\n</think>\nThe function is a:\n```\n    def f(s) -> bool`f\n    def\n    def\n    def\n    def\n    def\n    def\n    def\n    def\n   "
+    },
+    {
+      "label": "s3_long_1m_lsa_sparse",
+      "depth": 3,
+      "needle16k": false,
+      "math_rep_loop": true,
+      "code_rep_loop": true,
+      "math_d3": 0.1429,
+      "code_d3": 0.0952,
+      "math_head": "Okay, so the problem is asking for the number of positive integers n such that n is divisible by 3, 5, or both.\n\nHmm, so the problem is asking for the number of positive integers n",
+      "code_head": "Now, let's write a function that takes a string and returns a boolean.\n\nNow, let's write a function that takes a string and returns a boolean.\n\nNow, let's write a function that tak"
+    },
+    {
+      "label": "s3_long_1m_lsa_dense",
+      "depth": 3,
+      "needle16k": false,
+      "math_rep_loop": true,
+      "code_rep_loop": true,
+      "math_d3": 0.1429,
+      "code_d3": 0.0565,
+      "math_head": "Okay, so the problem is asking for the number of positive integers n such that n is divisible by 3, 5, or both.\n\nHmm, so the problem is asking for the number of positive integers n",
+      "code_head": "Now, let's look at the code.\nNow, let's look at the code.\nNow, let's look at the code.\nNow, let's look at the code.\nNow, let's look at the code.\nNow, let's look at the code.\nNow, l"
+    },
+    {
+      "label": "s2_with_s3_attn_norms",
+      "depth": 3,
+      "needle16k": false,
+      "math_rep_loop": false,
+      "code_rep_loop": false,
+      "math_d3": 0.8491,
+      "code_d3": 0.9133,
+      "math_head": "Okay, so I need to find the number of positive integers n \u2264 100 that are divisible by 3 or 5 but not both. Hmm, let's think through this step.\n\nFirst, I remember that when dealing ",
+      "code_head": "Okay, so I need to write a concise Python function that checks if a string contains balanced brackets `()[]` brackets. Hmm, let me think about how to approach this. The problem is "
+    },
+    {
+      "label": "s2_with_s3_hssd",
+      "depth": 3,
+      "needle16k": false,
+      "math_rep_loop": true,
+      "code_rep_loop": false,
+      "math_d3": 0.3904,
+      "code_d3": 0.1494,
+      "math_head": "Okay, so the problem is asking for a positive integer n such that n is divisible by 3, 5, or both.\n\nLet me start by considering the divisibility by 3: n must be divisible by 3.\n\nLe",
+      "code_head": "Now, let's write a function `is_balanced(s: str) -> bool`checks(s: str) -> bool`is_balanced(s: str) -> bool`checks(s: str) -> bool`checks(s: str) -> bool`is_balanced(s: str) -> boo"
+    },
+    {
+      "label": "s2_with_pristine_attn_norms_lsadense",
+      "depth": 3,
+      "needle16k": false,
+      "math_rep_loop": false,
+      "code_rep_loop": false,
+      "math_d3": 0.8212,
+      "code_d3": 0.8403,
+      "math_head": "Okay, so I need to find the number of positive integers n \u2264 100 that are divisible by 3 or 5 but not both. Hmm, let's think through this step.\n\nFirst, let me recall the divisibilit",
+      "code_head": "Okay, so I need to write a concise Python function that checks if a string is balanced. The function should return True if the string contains balanced brackets. Hmm, let me think "
+    },
+    {
+      "label": "s1_loop_a6b",
+      "depth": 1,
+      "needle16k": true,
+      "math_rep_loop": false,
+      "code_rep_loop": false,
+      "math_d3": 0.8448,
+      "code_d3": 1.0,
+      "math_head": "Here's a thinking process that leads to the solution:\n\n1.  **Understand the Goal:** The objective is to count the number of positive integers $n$ such that $1 \\le n \\le 100$ and $n",
+      "code_head": "Here's a thinking process:\n\n1.  **Understand the Goal**: The user wants a concise Python function `is_balanced(s: str) -> bool` that checks if a string containing parentheses `()`,"
+    },
+    {
+      "label": "s1_loop_a6b",
+      "depth": 3,
+      "needle16k": true,
+      "math_rep_loop": false,
+      "code_rep_loop": false,
+      "math_d3": 0.8407,
+      "code_d3": 0.971,
+      "math_head": "Okay, so I need to find the number of positive integers n \u2264 100 that are divisible by 3 or 5 but not both. Hmm, let me think. This sounds like a problem where I can use the princip",
+      "code_head": "Okay, so I need to write a Python function called is_balanced that takes a string s and returns True if all the brackets are properly balanced, and False otherwise. The brackets ca"
+    }
+  ],
+  "colab_cleanup": {
+    "session": "loop64-eval",
+    "active_sessions": 0,
+    "usage_rate_hr": 0.0,
+    "balance_cu": 1155.77
+  }
+}

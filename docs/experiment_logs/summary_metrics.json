@@ -1,10 +1,30 @@
 {
-  "generated_at_utc": "2026-11-22T05:03:10Z",
+  "generated_at_utc": "2026-11-24T06:38:15Z",
   "repo": "TassP0lar/Qwen3.6-35B-A3B-Loop64",
+  "dataset_repo": "TassP0lar/Loop64-Fable-SIRSI-v1",
   "base_model": "unsloth/Qwen3.6-35B-A3B-NVFP4",
   "hardware": "1x NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120, 96 GiB HBM)",
-  "total_hub_commits": 163,
-  "total_tokens_trained": 423559168,
+  "total_hub_commits": 189,
+  "total_tokens_trained": 562823168,
+  "gpu_hours": {
+    "s0_probe_h": 0.05,
+    "s1_loop_a6b_h": 18.25,
+    "s1_quality_check_h": 0.53,
+    "s1b_hssd_p1_and_prefix_h": 11.98,
+    "s1b_hssd_p2_clean_h": 28.41,
+    "s3_hssd_h": 33.37,
+    "s2_hssd_preopt_h": 6.39,
+    "s2_hssd_leaky_h": 1.59,
+    "s2_hssd_5a82677_h": 21.23,
+    "s2_hssd_8409b6e_total_h": 23.8,
+    "s2_hssd_tf524_slowdown_h": 9.54,
+    "s2_hssd_2f5a6ba_post_fix_h": 14.18,
+    "v2_smoke_part_a_h": 0.15,
+    "s3_v2_native_gdn_h": 10.57,
+    "supervisor_v1_active_h": 145.02,
+    "supervisor_v2_active_h": 10.57,
+    "supervisor_total_active_h": 155.59
+  },
   "stages": {
     "s1_loop_a6b": {
       "status": "completed",
@@ -163,22 +183,22 @@
     },
     "s2_joint_bptt": {
       "status": "in_progress",
-      "latest_step": 280,
-      "latest_hub_step": 275,
+      "latest_step": 500,
+      "latest_hub_step": 500,
       "target_steps": 1200,
-      "latest_commit_sha": "c5f7391d",
+      "latest_commit_sha": "e050a4b8",
       "n_params": 187919238,
       "pct_of_34_661b": 0.542,
-      "n_rows": 35,
-      "tokens_seen": 73400320,
-      "tok_per_s_mean": 854.5,
+      "n_rows": 58,
+      "tokens_seen": 131072000,
+      "tok_per_s_mean": 888.5,
       "tok_per_s_min": 427.0,
-      "tok_per_s_max": 1041.3,
-      "mem_peak_max_gib": 72.51,
+      "tok_per_s_max": 1109.0,
+      "mem_peak_max_gib": 78.42,
       "skipped_total_max": 0.0,
       "post_fix_skipped_max": 0.0,
-      "grad_norm_final": 1.9844,
-      "hub_span_hours": 25.72,
+      "grad_norm_final": 1.4479,
+      "hub_span_hours": 53.21,
       "eval_first": {
         "step": 0,
         "d1": 1.4642,
@@ -190,14 +210,14 @@
         "source": "verified_launch_log"
       },
       "eval_last": {
-        "step": 200,
+        "step": 400,
         "status": "in_progress",
-        "d1": 1.2945143396398944,
-        "d2": 1.2728332462775231,
-        "d3": 1.221885310729084,
-        "depth_gain": 0.07262902891081047,
-        "commit_sha": "876de138",
-        "ts": "2026-11-21T22:37:18+00:00",
+        "d1": 1.2600205518682386,
+        "d2": 1.2362640964638794,
+        "d3": 1.1871772912189822,
+        "depth_gain": 0.07284326064925639,
+        "commit_sha": "91215ce1",
+        "ts": "2026-11-23T00:13:09+00:00",
         "source": "hub_manifest"
       },
       "eval_best_depth_gain": {
@@ -209,6 +229,58 @@
         "commit_sha": "2e37bf6",
         "ts": "2026-11-20T22:34:02Z",
         "source": "verified_launch_log"
+      }
+    },
+    "s3_v2_long_1m_lsa": {
+      "status": "in_progress",
+      "latest_step": 400,
+      "latest_hub_step": 400,
+      "target_steps": 600,
+      "latest_commit_sha": "084e8bad",
+      "n_params": 24556598,
+      "pct_of_34_661b": 0.071,
+      "n_rows": 16,
+      "tokens_seen": 81592320,
+      "tok_per_s_mean": 2369.5,
+      "tok_per_s_min": 1939.3,
+      "tok_per_s_max": 2953.3,
+      "mem_peak_max_gib": 69.96,
+      "skipped_total_max": 0.0,
+      "post_fix_skipped_max": 0.0,
+      "grad_norm_final": 5.0367,
+      "hub_span_hours": 9.71,
+      "eval_first": {
+        "step": 200,
+        "status": "in_progress",
+        "d1": 1.3732751308027238,
+        "d2": 1.3010701005897647,
+        "d3": 1.2860235603157848,
+        "depth_gain": 0.08725157048693899,
+        "commit_sha": "837fbc5d",
+        "ts": "2026-11-24T01:28:15+00:00",
+        "source": "hub_manifest"
+      },
+      "eval_last": {
+        "step": 400,
+        "status": "in_progress",
+        "d1": 1.3699526349427251,
+        "d2": 1.2998673645051908,
+        "d3": 1.2827065182610022,
+        "depth_gain": 0.08724611668172289,
+        "commit_sha": "084e8bad",
+        "ts": "2026-11-24T06:27:30+00:00",
+        "source": "hub_manifest"
+      },
+      "eval_best_depth_gain": {
+        "step": 200,
+        "status": "in_progress",
+        "d1": 1.3732751308027238,
+        "d2": 1.3010701005897647,
+        "d3": 1.2860235603157848,
+        "depth_gain": 0.08725157048693899,
+        "commit_sha": "837fbc5d",
+        "ts": "2026-11-24T01:28:15+00:00",
+        "source": "hub_manifest"
       }
     }
   },
@@ -459,6 +531,52 @@
         "commit_sha": "876de138",
         "ts": "2026-11-21T22:37:18+00:00",
         "source": "hub_manifest"
+      },
+      {
+        "step": 326,
+        "status": "in_progress",
+        "d1": 1.2657220261386308,
+        "d2": 1.2434916798202198,
+        "d3": 1.1938310760568727,
+        "depth_gain": 0.07189095008175816,
+        "commit_sha": "e49500ab",
+        "ts": "2026-11-22T08:22:38+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 400,
+        "status": "in_progress",
+        "d1": 1.2600205518682386,
+        "d2": 1.2362640964638794,
+        "d3": 1.1871772912189822,
+        "depth_gain": 0.07284326064925639,
+        "commit_sha": "91215ce1",
+        "ts": "2026-11-23T00:13:09+00:00",
+        "source": "hub_manifest"
+      }
+    ],
+    "s3_v2_long_1m_lsa": [
+      {
+        "step": 200,
+        "status": "in_progress",
+        "d1": 1.3732751308027238,
+        "d2": 1.3010701005897647,
+        "d3": 1.2860235603157848,
+        "depth_gain": 0.08725157048693899,
+        "commit_sha": "837fbc5d",
+        "ts": "2026-11-24T01:28:15+00:00",
+        "source": "hub_manifest"
+      },
+      {
+        "step": 400,
+        "status": "in_progress",
+        "d1": 1.3699526349427251,
+        "d2": 1.2998673645051908,
+        "d3": 1.2827065182610022,
+        "depth_gain": 0.08724611668172289,
+        "commit_sha": "084e8bad",
+        "ts": "2026-11-24T06:27:30+00:00",
+        "source": "hub_manifest"
       }
     ]
   },
@@ -489,7 +607,8 @@
       "peak_max_gib": 72.5,
       "power_mean_w": 324.2,
       "util_mean_pct": 98.2,
-      "observed_span_hours": 4.96
+      "observed_span_hours": 4.96,
+      "active_gpu_hours": 6.39
     },
     "post_opt_leaky_b2c5513": {
       "stage": "s2_joint_bptt",
@@ -506,24 +625,44 @@
       "peak_max_gib": 89.8,
       "power_mean_w": 358.5,
       "util_mean_pct": 99.0,
-      "observed_span_hours": 0.0
+      "observed_span_hours": 0.0,
+      "active_gpu_hours": 1.59
     },
     "post_leak_fix_5a82677": {
       "stage": "s2_joint_bptt",
       "head": "5a82677",
-      "n_samples": 16,
+      "n_samples": 19,
       "min_step": 60,
-      "max_step": 280,
-      "tok_per_s_min": 836.0,
+      "max_step": 320,
+      "tok_per_s_min": 806.0,
       "tok_per_s_max": 1041.0,
-      "tok_per_s_mean": 935.7,
+      "tok_per_s_mean": 933.4,
       "alloc_min_gib": 25.3,
       "alloc_max_gib": 25.4,
       "peak_min_gib": 70.0,
       "peak_max_gib": 70.1,
-      "power_mean_w": 372.6,
-      "util_mean_pct": 98.5,
-      "observed_span_hours": 17.13
+      "power_mean_w": 372.2,
+      "util_mean_pct": 97.4,
+      "observed_span_hours": 20.25,
+      "active_gpu_hours": 21.23
+    },
+    "post_tf524_fix_2f5a6ba": {
+      "stage": "s2_joint_bptt",
+      "head": "8409b6e",
+      "n_samples": 14,
+      "min_step": 340,
+      "max_step": 490,
+      "tok_per_s_min": 829.0,
+      "tok_per_s_max": 1109.0,
+      "tok_per_s_mean": 942.6,
+      "alloc_min_gib": 25.3,
+      "alloc_max_gib": 25.3,
+      "peak_min_gib": 78.4,
+      "peak_max_gib": 78.4,
+      "power_mean_w": 373.2,
+      "util_mean_pct": 98.1,
+      "observed_span_hours": 11.82,
+      "active_gpu_hours": 23.8
     }
   },
   "supervisor_stage_head_summary": [
@@ -542,7 +681,8 @@
       "peak_max_gib": 54.2,
       "power_mean_w": 414.6,
       "util_mean_pct": 97.5,
-      "observed_span_hours": 17.6
+      "observed_span_hours": 17.6,
+      "active_gpu_hours": 18.25
     },
     {
       "stage": "s1b_hssd_distill",
@@ -559,7 +699,8 @@
       "peak_max_gib": 69.0,
       "power_mean_w": 376.1,
       "util_mean_pct": 98.0,
-      "observed_span_hours": 10.98
+      "observed_span_hours": 10.98,
+      "active_gpu_hours": 11.98
     },
     {
       "stage": "s1b_hssd_distill",
@@ -576,10 +717,11 @@
       "peak_max_gib": 69.0,
       "power_mean_w": 384.9,
       "util_mean_pct": 98.0,
-      "observed_span_hours": 28.29
+      "observed_span_hours": 28.29,
+      "active_gpu_hours": 28.41
     },
     {
-      "stage": "s3_long_1m_lsa",
+      "stage": "s1b_hssd_distill",
       "head": "513879f",
       "n_samples": 28,
       "min_step": 10,
@@ -593,7 +735,8 @@
       "peak_max_gib": 80.7,
       "power_mean_w": 407.6,
       "util_mean_pct": 95.0,
-      "observed_span_hours": 17.59
+      "observed_span_hours": 17.59,
+      "active_gpu_hours": 17.88
     },
     {
       "stage": "s3_long_1m_lsa",
@@ -610,7 +753,8 @@
       "peak_max_gib": 81.2,
       "power_mean_w": 422.8,
       "util_mean_pct": 95.9,
-      "observed_span_hours": 13.65
+      "observed_span_hours": 13.65,
+      "active_gpu_hours": 15.49
     },
     {
       "stage": "s2_joint_bptt",
@@ -627,7 +771,8 @@
       "peak_max_gib": 72.5,
       "power_mean_w": 324.2,
       "util_mean_pct": 98.2,
-      "observed_span_hours": 4.96
+      "observed_span_hours": 4.96,
+      "active_gpu_hours": 6.39
     },
     {
       "stage": "s2_joint_bptt",
@@ -644,30 +789,106 @@
       "peak_max_gib": 89.8,
       "power_mean_w": 358.5,
       "util_mean_pct": 99.0,
-      "observed_span_hours": 0.0
+      "observed_span_hours": 0.0,
+      "active_gpu_hours": 1.59
     },
     {
       "stage": "s2_joint_bptt",
       "head": "5a82677",
-      "n_samples": 16,
+      "n_samples": 19,
       "min_step": 60,
-      "max_step": 280,
-      "tok_per_s_min": 836.0,
+      "max_step": 320,
+      "tok_per_s_min": 806.0,
       "tok_per_s_max": 1041.0,
-      "tok_per_s_mean": 935.7,
+      "tok_per_s_mean": 933.4,
       "alloc_min_gib": 25.3,
       "alloc_max_gib": 25.4,
       "peak_min_gib": 70.0,
       "peak_max_gib": 70.1,
-      "power_mean_w": 372.6,
-      "util_mean_pct": 98.5,
-      "observed_span_hours": 17.13
+      "power_mean_w": 372.2,
+      "util_mean_pct": 97.4,
+      "observed_span_hours": 20.25,
+      "active_gpu_hours": 21.23
+    },
+    {
+      "stage": "s2_joint_bptt",
+      "head": "8409b6e",
+      "n_samples": 14,
+      "min_step": 340,
+      "max_step": 490,
+      "tok_per_s_min": 829.0,
+      "tok_per_s_max": 1109.0,
+      "tok_per_s_mean": 942.6,
+      "alloc_min_gib": 25.3,
+      "alloc_max_gib": 25.3,
+      "peak_min_gib": 78.4,
+      "peak_max_gib": 78.4,
+      "power_mean_w": 373.2,
+      "util_mean_pct": 98.1,
+      "observed_span_hours": 11.82,
+      "active_gpu_hours": 23.8
+    },
+    {
+      "stage": "s3_v2_long_1m_lsa",
+      "head": "28b88e4",
+      "n_samples": 32,
+      "min_step": 1,
+      "max_step": 390,
+      "tok_per_s_min": 828.0,
+      "tok_per_s_max": 2953.0,
+      "tok_per_s_mean": 2182.1,
+      "alloc_min_gib": 24.7,
+      "alloc_max_gib": 25.2,
+      "peak_min_gib": 65.5,
+      "peak_max_gib": 70.0,
+      "power_mean_w": 505.0,
+      "util_mean_pct": 99.2,
+      "observed_span_hours": 10.07,
+      "active_gpu_hours": 10.57
     }
   ],
+  "tf524_slowdown_window": {
+    "slowdown_keepalives": 115,
+    "slowdown_hours": 9.54,
+    "slowdown_mean_power_w": 252.0,
+    "slowdown_max_driver_mem_mib": 91409,
+    "post_fix_keepalives": 169,
+    "post_fix_hours": 14.18,
+    "post_fix_mean_power_w": 368.9,
+    "post_fix_max_driver_mem_mib": 84545
+  },
   "kv_memory_1m": [
     {
+      "name": "Clean v2 Hadamard INT4 Serving (88L)",
+      "subtitle": "10L Blk-64 H_64 INT4 SharedKV + 66L GDN-2 + D-LSA (proj.)",
+      "virtual_layers": 88,
+      "global_kv_layers_stored": 10,
+      "kv_dtype": "Blk-64 INT4 (0.53\u20130.56B)",
+      "kv_gib": 5.31,
+      "linear_or_swa_gib": 0.33,
+      "indexer_gib": 0.32,
+      "total_gib": 5.96,
+      "highlight": false,
+      "is_projection": true,
+      "callout": "~5.96\u20136.08 GiB serving proj. (5.4\u00d7 vs Inkling)"
+    },
+    {
+      "name": "Clean v2 Native-GDN / GDN-2-1M (88L @ R=3)",
+      "subtitle": "10L FP8 1.0\u00d7 SharedKV + 66L GDN/GDN-2 + D-LSA",
+      "virtual_layers": 88,
+      "global_kv_layers_stored": 10,
+      "kv_dtype": "FP8 E4M3 (1B)",
+      "kv_gib": 10.0,
+      "linear_or_swa_gib": 0.33,
+      "indexer_gib": 0.32,
+      "total_gib": 10.65,
+      "highlight": true,
+      "is_projection": false,
+      "callout": "10.65 GiB (10.00 KV + 0.33 GDN + 0.32 D-LSA \u00b7 3.02\u00d7 vs Inkling)"
+    },
+    {
       "name": "LoopHSSD v3.2 (88L @ R=3)",
-      "subtitle": "10L FP8 1.0\u00d7 SharedKV + 66L HSSD + D-LSA",
+      "subtitle": "v1 ablation: 10L FP8 SharedKV + 66L HSSD (+5.17 GiB)",
       "virtual_layers": 88,
       "global_kv_layers_stored": 10,
       "kv_dtype": "FP8 E4M3 (1B)",
@@ -675,8 +896,9 @@
       "linear_or_swa_gib": 5.5,
       "indexer_gib": 0.32,
       "total_gib": 15.82,
-      "highlight": true,
-      "callout": "15.82 GiB (10.00 KV + ~5.50 HSSD + 0.32 D-LSA)"
+      "highlight": false,
+      "is_projection": false,
+      "callout": "15.82 GiB (10.00 KV + ~5.50 HSSD + 0.32 D-LSA \u00b7 +5.17 GiB vs v2)"
     },
     {
       "name": "Stock Qwen3.6-35B-A3B (40L @ R=1)",
@@ -689,7 +911,8 @@
       "indexer_gib": 0.0,
       "total_gib": 20.15,
       "highlight": false,
-      "callout": "20.15 GiB (20.00 BF16 KV + 0.15 GDN)"
+      "is_projection": false,
+      "callout": "20.15 GiB (20.00 BF16 KV + 0.15 GDN \u00b7 1.89\u00d7 v2)"
     },
     {
       "name": "Inkling 2 Mini (48L @ R=3)",
@@ -702,20 +925,22 @@
       "indexer_gib": 0.0,
       "total_gib": 32.16,
       "highlight": false,
-      "callout": "32.16 GiB (32.00 F16 KV \u00b7 2.03\u00d7 ours)"
+      "is_projection": false,
+      "callout": "32.16 GiB (32.00 F16 KV \u00b7 3.02\u00d7 Clean v2)"
     },
     {
       "name": "Unshared 88L Hybrid (No SharedKV)",
-      "subtitle": "22 virtual global layers BF16 + 66L HSSD",
+      "subtitle": "22 virtual global layers BF16 + 66L Native GDN",
       "virtual_layers": 88,
       "global_kv_layers_stored": 22,
       "kv_dtype": "BF16 (2B)",
       "kv_gib": 44.0,
-      "linear_or_swa_gib": 5.5,
+      "linear_or_swa_gib": 0.33,
       "indexer_gib": 0.0,
-      "total_gib": 49.5,
+      "total_gib": 44.33,
       "highlight": false,
-      "callout": "49.50 GiB (44.00 KV \u00b7 3.13\u00d7 ours)"
+      "is_projection": false,
+      "callout": "44.33 GiB (44.00 KV \u00b7 4.16\u00d7 Clean v2)"
     },
     {
       "name": "Standard Unshared 88L Full-Attn",
@@ -728,7 +953,8 @@
       "indexer_gib": 0.0,
       "total_gib": 176.0,
       "highlight": false,
-      "callout": "176.00 GiB (11.1\u00d7 ours \u00b7 OOM > 96 GiB)"
+      "is_projection": false,
+      "callout": "176.00 GiB (16.5\u00d7 Clean v2 \u00b7 OOM > 96 GiB)"
     }
   ],
   "probe_summary": {
@@ -772,6 +998,1384 @@
       "value": 13.720885700025299
     }
   },
+  "truth_check": {
+    "status": "blocked_phase_a_gate",
+    "reason": "s2_joint_bptt@500 failed Phase A coherence & 18K needle gate (root cause: s1b_hssd_distill non-identity HSSD replacement + dead vault_duty=3e-5; NOT a transformers 5.24.0 decode bug) AND eager HSSD decode speed (3.41 tok/s at d=3) puts full Phase B at ~18-35 hours instead of 45-90 min.",
+    "env": {
+      "torch": "2.14.1+cu130",
+      "transformers": "5.24.0",
+      "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "vram_total_gib": 94.97
+    },
+    "decode_bug_check": {
+      "prefill_vs_decode_L70_top1_d1": 1.0,
+      "prefill_vs_decode_L70_top1_d3": 1.0,
+      "prefill_vs_decode_L650_sparse_top1_d1": 1.0,
+      "prefill_vs_decode_L650_sparse_mean_diff_d1": 0.1278,
+      "prefill_vs_decode_L650_sparse_top1_d3": 1.0,
+      "prefill_vs_decode_L650_sparse_mean_diff_d3": 0.1073,
+      "prefill_vs_decode_L650_stock_top1": 1.0,
+      "prefill_vs_decode_L650_stock_mean_diff": 0.3505,
+      "uncached_oracle_reproduces_degradation": true
+    },
+    "phase_a": {
+      "stock": {
+        "sanity_math": {
+          "completion_tokens": 512,
+          "decode_tok_s": 19.22,
+          "prefill_tok_s": 2.5,
+          "peak_vram_gib": 24.82,
+          "needle_hit": null,
+          "rep_loop": false,
+          "close_think": false,
+          "empty_think": false,
+          "slop_score": 0.0,
+          "distinct_2": 0.7253,
+          "distinct_3": 0.8103,
+          "slop_flags": []
+        },
+        "sanity_code": {
+          "completion_tokens": 512,
+          "decode_tok_s": 19.27,
+          "prefill_tok_s": 285.3,
+          "peak_vram_gib": 24.82,
+          "needle_hit": null,
+          "rep_loop": false,
+          "close_think": false,
+          "empty_think": false,
+          "slop_score": 0.0,
+          "distinct_2": 0.7708,
+          "distinct_3": 0.877,
+          "slop_flags": []
+        }
+      },
+      "loop64_d1": {
+        "sanity_math": {
+          "completion_tokens": 512,
+          "decode_tok_s": 7.72,
+          "prefill_tok_s": 7.7,
+          "peak_vram_gib": 26.46,
+          "needle_hit": null,
+          "rep_loop": false,
+          "close_think": false,
+          "empty_think": false,
+          "slop_score": 0.0,
+          "distinct_2": 0.4262,
+          "distinct_3": 0.5447,
+          "slop_flags": []
+        },
+        "sanity_code": {
+          "completion_tokens": 512,
+          "decode_tok_s": 7.78,
+          "prefill_tok_s": 232.5,
+          "peak_vram_gib": 26.46,
+          "needle_hit": null,
+          "rep_loop": false,
+          "close_think": false,
+          "empty_think": false,
+          "slop_score": 0.25,
+          "distinct_2": 0.2569,
+          "distinct_3": 0.2822,
+          "slop_flags": [
+            "slop:low_diversity(d2=0.26,d3=0.28)"
+          ]
+        },
+        "chunked_16k": {
+          "completion_tokens": 96,
+          "decode_tok_s": 6.37,
+          "prefill_tok_s": 1320.3,
+          "peak_vram_gib": 28.63,
+          "needle_hit": false,
+          "rep_loop": false,
+          "close_think": false,
+          "empty_think": false,
+          "slop_score": 0.0,
+          "distinct_2": 0.6512,
+          "distinct_3": 0.7765,
+          "slop_flags": []
+        }
+      },
+      "loop64_d3": {
+        "sanity_math": {
+          "completion_tokens": 512,
+          "decode_tok_s": 3.41,
+          "prefill_tok_s": 89.9,
+          "peak_vram_gib": 28.09,
+          "needle_hit": null,
+          "rep_loop": false,
+          "close_think": false,
+          "empty_think": false,
+          "slop_score": 0.0,
+          "distinct_2": 0.6481,
+          "distinct_3": 0.8019,
+          "slop_flags": []
+        },
+        "sanity_code": {
+          "completion_tokens": 512,
+          "decode_tok_s": 3.42,
+          "prefill_tok_s": 111.7,
+          "peak_vram_gib": 28.09,
+          "needle_hit": null,
+          "rep_loop": false,
+          "close_think": false,
+          "empty_think": false,
+          "slop_score": 0.0,
+          "distinct_2": 0.6124,
+          "distinct_3": 0.7746,
+          "slop_flags": []
+        },
+        "chunked_16k": {
+          "completion_tokens": 96,
+          "decode_tok_s": 3.18,
+          "prefill_tok_s": 2795.4,
+          "peak_vram_gib": 30.48,
+          "needle_hit": false,
+          "rep_loop": false,
+          "close_think": false,
+          "empty_think": false,
+          "slop_score": 0.0,
+          "distinct_2": 0.4651,
+          "distinct_3": 0.5294,
+          "slop_flags": []
+        }
+      }
+    },
+    "forensics": [
+      {
+        "label": "stock_plus_yarn1m",
+        "depth": null,
+        "needle16k": true,
+        "math_rep_loop": false,
+        "code_rep_loop": false,
+        "math_d3": 0.8739,
+        "code_d3": 1.0,
+        "math_head": "Here's a thinking process that leads to the solution:\n\n1.  **Understand the Goal:** The objective is to find the count of positive integers $n$ such that $1 \\le n \\le 100$ and $n$ ",
+        "code_head": "Here's a thinking process:\n\n1.  **Understand the Goal**: The user wants a concise Python function `is_balanced(s: str) -> bool` that checks if a string containing parentheses `()`,"
+      },
+      {
+        "label": "pristine_loop_hssd_lsa_init",
+        "depth": 1,
+        "needle16k": false,
+        "math_rep_loop": false,
+        "code_rep_loop": false,
+        "math_d3": 0.3077,
+        "code_d3": 1.0,
+        "math_head": "\n`, 0 1 1 1 1 1 1 1 1 1 1 1 1 11 111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+        "code_head": " message. , , , , , ,  message \u201c  ,  ,  ,  ,  ,  ,  , \n \n \n2 2  [  [  [  [  [                                                                                                       "
+      },
+      {
+        "label": "s1b_hssd_distill_lsa_dense",
+        "depth": 1,
+        "needle16k": false,
+        "math_rep_loop": false,
+        "code_rep_loop": false,
+        "math_d3": 0.05,
+        "code_d3": 0.1628,
+        "math_head": "\\boxed{\n\\frac{1}{2} + \\frac{1}{2} = \\frac{1}{2} + \\frac{1}{2} = \\frac{1}{2} + \\frac{1}{2} = \\frac{1}{2} + \\frac{1}{2} = \\frac{1}{2} + \\frac{1}{2} = \\frac{1}{2} + \\frac{1}{2} = \\fra",
+        "code_head": "\nassistant\n<think>\n\nassistant\n<think>\n\nassistant\n<think>\n\n\n</think>\n<answer>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code>\n<code"
+      },
+      {
+        "label": "s1b_hssd_distill_lsa_dense",
+        "depth": 3,
+        "needle16k": false,
+        "math_rep_loop": false,
+        "code_rep_loop": true,
+        "math_d3": 0.1818,
+        "code_d3": 0.1607,
+        "math_head": "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"type\": \"string\", \"required\": \"bash\", \"description\": \"The command to run\", \"arguments\": {\"type\": \"object\", \"required\": \"bash\", \"descripti",
+        "code_head": "</think>\n\n<tool_call>\n{\"name\": \"search\", \"arguments\": {\"query\": \"<search_query>\"}}\n</tool_call>\n{\"name\": \"search\", \"arguments\": {\"query\": \"<search_query>\"}}\n</tool_call>\n<tool_call"
+      },
+      {
+        "label": "s3_long_1m_lsa_sparse",
+        "depth": 1,
+        "needle16k": false,
+        "math_rep_loop": false,
+        "code_rep_loop": true,
+        "math_d3": 0.0189,
+        "code_d3": 0.2632,
+        "math_head": "\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\boxed{\n\\box",
+        "code_head": "\nassistant\n<think>\n\nassistant\n<think>\n\nassistant\n<think>\n\n</think>\nThe function is a:\n```\n    def f(s) -> bool`f\n    def\n    def\n    def\n    def\n    def\n    def\n    def\n    def\n   "
+      },
+      {
+        "label": "s3_long_1m_lsa_sparse",
+        "depth": 3,
+        "needle16k": false,
+        "math_rep_loop": true,
+        "code_rep_loop": true,
+        "math_d3": 0.1429,
+        "code_d3": 0.0952,
+        "math_head": "Okay, so the problem is asking for the number of positive integers n such that n is divisible by 3, 5, or both.\n\nHmm, so the problem is asking for the number of positive integers n",
+        "code_head": "Now, let's write a function that takes a string and returns a boolean.\n\nNow, let's write a function that takes a string and returns a boolean.\n\nNow, let's write a function that tak"
+      },
+      {
+        "label": "s3_long_1m_lsa_dense",
+        "depth": 3,
+        "needle16k": false,
+        "math_rep_loop": true,
+        "code_rep_loop": true,
+        "math_d3": 0.1429,
+        "code_d3": 0.0565,
+        "math_head": "Okay, so the problem is asking for the number of positive integers n such that n is divisible by 3, 5, or both.\n\nHmm, so the problem is asking for the number of positive integers n",
+        "code_head": "Now, let's look at the code.\nNow, let's look at the code.\nNow, let's look at the code.\nNow, let's look at the code.\nNow, let's look at the code.\nNow, let's look at the code.\nNow, l"
+      },
+      {
+        "label": "s2_with_s3_attn_norms",
+        "depth": 3,
+        "needle16k": false,
+        "math_rep_loop": false,
+        "code_rep_loop": false,
+        "math_d3": 0.8491,
+        "code_d3": 0.9133,
+        "math_head": "Okay, so I need to find the number of positive integers n \u2264 100 that are divisible by 3 or 5 but not both. Hmm, let's think through this step.\n\nFirst, I remember that when dealing ",
+        "code_head": "Okay, so I need to write a concise Python function that checks if a string contains balanced brackets `()[]` brackets. Hmm, let me think about how to approach this. The problem is "
+      },
+      {
+        "label": "s2_with_s3_hssd",
+        "depth": 3,
+        "needle16k": false,
+        "math_rep_loop": true,
+        "code_rep_loop": false,
+        "math_d3": 0.3904,
+        "code_d3": 0.1494,
+        "math_head": "Okay, so the problem is asking for a positive integer n such that n is divisible by 3, 5, or both.\n\nLet me start by considering the divisibility by 3: n must be divisible by 3.\n\nLe",
+        "code_head": "Now, let's write a function `is_balanced(s: str) -> bool`checks(s: str) -> bool`is_balanced(s: str) -> bool`checks(s: str) -> bool`checks(s: str) -> bool`is_balanced(s: str) -> boo"
+      },
+      {
+        "label": "s2_with_pristine_attn_norms_lsadense",
+        "depth": 3,
+        "needle16k": false,
+        "math_rep_loop": false,
+        "code_rep_loop": false,
+        "math_d3": 0.8212,
+        "code_d3": 0.8403,
+        "math_head": "Okay, so I need to find the number of positive integers n \u2264 100 that are divisible by 3 or 5 but not both. Hmm, let's think through this step.\n\nFirst, let me recall the divisibilit",
+        "code_head": "Okay, so I need to write a concise Python function that checks if a string is balanced. The function should return True if the string contains balanced brackets. Hmm, let me think "
+      },
+      {
+        "label": "s1_loop_a6b",
+        "depth": 1,
+        "needle16k": true,
+        "math_rep_loop": false,
+        "code_rep_loop": false,
+        "math_d3": 0.8448,
+        "code_d3": 1.0,
+        "math_head": "Here's a thinking process that leads to the solution:\n\n1.  **Understand the Goal:** The objective is to count the number of positive integers $n$ such that $1 \\le n \\le 100$ and $n",
+        "code_head": "Here's a thinking process:\n\n1.  **Understand the Goal**: The user wants a concise Python function `is_balanced(s: str) -> bool` that checks if a string containing parentheses `()`,"
+      },
+      {
+        "label": "s1_loop_a6b",
+        "depth": 3,
+        "needle16k": true,
+        "math_rep_loop": false,
+        "code_rep_loop": false,
+        "math_d3": 0.8407,
+        "code_d3": 0.971,
+        "math_head": "Okay, so I need to find the number of positive integers n \u2264 100 that are divisible by 3 or 5 but not both. Hmm, let me think. This sounds like a problem where I can use the princip",
+        "code_head": "Okay, so I need to write a Python function called is_balanced that takes a string s and returns True if all the brackets are properly balanced, and False otherwise. The brackets ca"
+      }
+    ],
+    "colab_cleanup": {
+      "session": "loop64-eval",
+      "active_sessions": 0,
+      "usage_rate_hr": 0.0,
+      "balance_cu": 1155.77
+    }
+  },
+  "dplr_bench": {
+    "timestamp_utc": "2026-11-23T19:58:21Z",
+    "environment": {
+      "python": "3.13.16",
+      "gpu": {
+        "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "compute_cap": "12.0",
+        "total_vram_gib": 94.97,
+        "cuda_version": "13.0"
+      },
+      "disk_free_gib": 235.01,
+      "disk_total_gib": 235.68,
+      "versions": {
+        "torch": "2.14.1+cu130",
+        "triton": "3.8.0",
+        "transformers": "5.24.0",
+        "fla": "0.6.0",
+        "causal_conv1d": "1.7.0",
+        "compressed_tensors": "0.20.1",
+        "kernels": "0.18.3",
+        "cut_cross_entropy": "25.1.1",
+        "datasets": "5.0.1",
+        "huggingface_hub": "1.33.0",
+        "qloop": "0.1.0"
+      },
+      "git_head_short": "28b88e4",
+      "git_head_full": "28b88e4ab81cb59924c6a794ab2e0614460c125d",
+      "hf_token_configured": "[REDACTED]"
+    },
+    "part_a_smoke": {
+      "part_a_passed": true,
+      "data_stream": {
+        "hf_id": "TassP0lar/Loop64-Fable-SIRSI-v1",
+        "examples_kept": 16,
+        "reasoning_turns": 22,
+        "tool_call_turns": 6
+      },
+      "smoke_s3v2": {
+        "ok": true,
+        "elapsed_sec": 330.89,
+        "all_metrics_finite": true,
+        "lm_losses": [
+          1.6483415365219116,
+          0.2732551693916321
+        ],
+        "peak_gib": 38.41678476333618,
+        "step2_tok_per_s": 4214.427966167609
+      },
+      "smoke_s2v2": {
+        "ok": true,
+        "elapsed_sec": 214.62,
+        "all_metrics_finite": true,
+        "summary_metrics": {
+          "loss/lm": 39.3013916015625,
+          "depth": 3,
+          "tok_per_s": 397.97215160556465,
+          "mem/peak_gib": 43.12789869308472,
+          "loss/bptt_segments": 2.0,
+          "loss/bptt_replayed_tokens": 2048.0,
+          "loss/bptt_offload_to_cpu": 0.0
+        }
+      }
+    },
+    "fla_version": "0.6.0",
+    "identified_formula": "diag_plus_b_aT",
+    "mapping_doc": {
+      "state_equation": "S_t = (Diag(exp(gk_t)) + b_t a_t^T) S_{t-1} + k_t v_t^T  [equiv. row-state H_t = H_{t-1}(Diag(exp(gk_t)) + a_t b_t^T) + v_t k_t^T]; o_t = S_t^T (q_t * scale)",
+      "q": "q_hat (L2-normalized query)",
+      "k": "k_hat (L2-normalized key)",
+      "v": "z_t = w_t * v_raw (channel-wise write-gated value)",
+      "a": "-(e_t * exp(g_t)) (negative decay-premultiplied QED erase vector; row/read side of rank-1 transition)",
+      "b": "k_hat (normalized key; column/write side of rank-1 transition; sign may equivalently be moved onto b=-k_hat, a=e_t*exp(g_t))",
+      "gk": "g_t <= 0 (channel-wise log-decay)",
+      "decay_ordering": "additive DPLR: Diag(exp(gk)) + b a^T (pre-multiply e_t by exp(g_t) to match (I - k_hat e_t^T) Diag(exp(g_t)))"
+    },
+    "parity_summary": {
+      "fp32_chunk_dplr_e2e_o": {
+        "max_abs_diff": 0.00011464,
+        "mean_abs_diff": 1.55744e-05,
+        "rel_l2": 0.00140798,
+        "cosine": 0.99999964,
+        "finite": true
+      },
+      "fp32_chunk_dplr_e2e_s": {
+        "max_abs_diff": 0.00143224,
+        "mean_abs_diff": 0.00017431,
+        "rel_l2": 0.00114205,
+        "cosine": 0.9999994,
+        "finite": true
+      },
+      "fp32_chunk_dplr_e2e_min_grad_cos": 0.999999,
+      "fp32_T1_decode_o": {
+        "max_abs_diff": 3.72529e-09,
+        "mean_abs_diff": 7.14616e-10,
+        "rel_l2": 1.03454e-07,
+        "cosine": 1.0,
+        "finite": true
+      },
+      "fp32_T1_decode_s": {
+        "max_abs_diff": 5.96046e-08,
+        "mean_abs_diff": 2.9815e-09,
+        "rel_l2": 5.59389e-08,
+        "cosine": 1.0,
+        "finite": true
+      },
+      "bf16_chunk_dplr_e2e_o": {
+        "max_abs_diff": 0.00053094,
+        "mean_abs_diff": 6.23782e-05,
+        "rel_l2": 0.00560306,
+        "cosine": 0.99998426,
+        "finite": true
+      },
+      "bf16_chunk_dplr_e2e_s": {
+        "max_abs_diff": 0.00439085,
+        "mean_abs_diff": 0.00065724,
+        "rel_l2": 0.00432274,
+        "cosine": 0.9999907,
+        "finite": true
+      },
+      "bf16_chunk_dplr_e2e_min_grad_cos": 0.999966,
+      "bf16_T1_decode_o": {
+        "max_abs_diff": 0.00013524,
+        "mean_abs_diff": 2.17757e-05,
+        "rel_l2": 0.00305872,
+        "cosine": 0.99999577,
+        "finite": true
+      },
+      "bf16_T1_decode_s": {
+        "max_abs_diff": 0.00170386,
+        "mean_abs_diff": 5.70382e-05,
+        "rel_l2": 0.00105442,
+        "cosine": 0.99999946,
+        "finite": true
+      },
+      "bf16_fla_chunk_gdn2_o": {
+        "max_abs_diff": 0.00046012,
+        "mean_abs_diff": 5.94241e-05,
+        "rel_l2": 0.00535708,
+        "cosine": 0.99998569,
+        "finite": true
+      },
+      "bf16_fla_chunk_gdn2_min_grad_cos": 0.999978,
+      "bf16_fla_recurrent_gdn2_o": {
+        "max_abs_diff": 0.00029792,
+        "mean_abs_diff": 4.0977e-05,
+        "rel_l2": 0.00368181,
+        "cosine": 0.99999332,
+        "finite": true
+      },
+      "stability_T4096_H32_bf16": {
+        "o_finite": true,
+        "s_finite": true,
+        "o_abs_max": 0.11669921875,
+        "s_abs_max": 1.7048884630203247,
+        "grads_finite": true
+      }
+    },
+    "T32768_fwd_bwd": {
+      "native_chunk_gated_delta_rule": {
+        "fwd": {
+          "mean_ms": 3.6375,
+          "median_ms": 3.6383,
+          "min_ms": 3.6198,
+          "max_ms": 3.6514
+        },
+        "bwd": {
+          "mean_ms": 10.1919,
+          "median_ms": 10.2133,
+          "min_ms": 10.0987,
+          "max_ms": 10.2277
+        },
+        "total": {
+          "mean_ms": 13.8294,
+          "median_ms": 13.8501,
+          "min_ms": 13.7185,
+          "max_ms": 13.8792
+        },
+        "base_vram_mib": 772.41,
+        "peak_vram_mib": 4754.41,
+        "peak_vram_delta_mib": 3982.0,
+        "warmup": 3,
+        "iters": 10
+      },
+      "fla_chunk_dplr_raw": {
+        "fwd": {
+          "mean_ms": 12.5878,
+          "median_ms": 12.588,
+          "min_ms": 12.5712,
+          "max_ms": 12.6021
+        },
+        "bwd": {
+          "mean_ms": 31.0481,
+          "median_ms": 31.0487,
+          "min_ms": 31.0385,
+          "max_ms": 31.061
+        },
+        "total": {
+          "mean_ms": 43.6359,
+          "median_ms": 43.6363,
+          "min_ms": 43.6202,
+          "max_ms": 43.6589
+        },
+        "base_vram_mib": 1536.41,
+        "peak_vram_mib": 13440.41,
+        "peak_vram_delta_mib": 11904.0,
+        "warmup": 3,
+        "iters": 10
+      },
+      "fla_chunk_dplr_gdn2_qed_e2e": {
+        "fwd": {
+          "mean_ms": 19.8354,
+          "median_ms": 19.8388,
+          "min_ms": 19.8165,
+          "max_ms": 19.8444
+        },
+        "bwd": {
+          "mean_ms": 49.9931,
+          "median_ms": 49.9978,
+          "min_ms": 49.9692,
+          "max_ms": 50.0142
+        },
+        "total": {
+          "mean_ms": 69.8285,
+          "median_ms": 69.8359,
+          "min_ms": 69.8083,
+          "max_ms": 69.8452
+        },
+        "base_vram_mib": 1536.41,
+        "peak_vram_mib": 15494.41,
+        "peak_vram_delta_mib": 13958.0,
+        "warmup": 3,
+        "iters": 10
+      },
+      "pytorch_chunk_gdn2": {
+        "fwd": {
+          "mean_ms": 123.4256,
+          "median_ms": 92.5584,
+          "min_ms": 90.9053,
+          "max_ms": 395.1719
+        },
+        "bwd": {
+          "mean_ms": 565.1647,
+          "median_ms": 565.1972,
+          "min_ms": 564.1306,
+          "max_ms": 566.318
+        },
+        "total": {
+          "mean_ms": 688.5903,
+          "median_ms": 657.3207,
+          "min_ms": 655.4578,
+          "max_ms": 961.3557
+        },
+        "base_vram_mib": 1600.41,
+        "peak_vram_mib": 9950.41,
+        "peak_vram_delta_mib": 8350.0,
+        "warmup": 3,
+        "iters": 10,
+        "tested_T": 32768,
+        "scale_to_32768_factor": 1.0
+      },
+      "fla_ops_gdn2_chunk_gdn2": {
+        "fwd": {
+          "mean_ms": 7.9958,
+          "median_ms": 7.9999,
+          "min_ms": 7.986,
+          "max_ms": 8.0057
+        },
+        "bwd": {
+          "mean_ms": 27.5475,
+          "median_ms": 27.5508,
+          "min_ms": 27.52,
+          "max_ms": 27.561
+        },
+        "total": {
+          "mean_ms": 35.5433,
+          "median_ms": 35.5469,
+          "min_ms": 35.5241,
+          "max_ms": 35.561
+        },
+        "base_vram_mib": 1619.53,
+        "peak_vram_mib": 10579.53,
+        "peak_vram_delta_mib": 8960.0,
+        "warmup": 3,
+        "iters": 10
+      }
+    },
+    "T1_decode": {
+      "native_fused_recurrent_gated_delta_rule": {
+        "mean_ms": 0.0465,
+        "median_ms": 0.0421,
+        "min_ms": 0.0412,
+        "max_ms": 0.0758,
+        "warmup": 3,
+        "iters": 10
+      },
+      "fla_fused_recurrent_dplr_raw": {
+        "mean_ms": 0.0446,
+        "median_ms": 0.043,
+        "min_ms": 0.0421,
+        "max_ms": 0.0541,
+        "warmup": 3,
+        "iters": 10
+      },
+      "fla_fused_recurrent_dplr_gdn2_qed_e2e": {
+        "mean_ms": 0.1545,
+        "median_ms": 0.1512,
+        "min_ms": 0.1446,
+        "max_ms": 0.1839,
+        "warmup": 3,
+        "iters": 10
+      },
+      "pytorch_recurrent_gdn2": {
+        "mean_ms": 0.1284,
+        "median_ms": 0.1279,
+        "min_ms": 0.1196,
+        "max_ms": 0.1531,
+        "warmup": 3,
+        "iters": 10
+      },
+      "fla_ops_gdn2_fused_recurrent_gdn2": {
+        "mean_ms": 0.0496,
+        "median_ms": 0.048,
+        "min_ms": 0.0447,
+        "max_ms": 0.064,
+        "warmup": 3,
+        "iters": 10
+      }
+    }
+  },
+  "dataset_audit": {
+    "repo_id": "TassP0lar/Loop64-Fable-SIRSI-v1",
+    "release_version": "v1.2",
+    "elapsed_sec": 240.88,
+    "output_counts": {
+      "sft_core": 4081,
+      "salvage_queue": 2076,
+      "sirsi_preferences": 429,
+      "golden_seeds_sft": 18,
+      "golden_seeds_pref": 12,
+      "track_b_sft": 494,
+      "track_b_pref": 417,
+      "v12_fable_sft": 197,
+      "v12_fable_pref": 197
+    },
+    "licenses": {
+      "fable51": {
+        "name": "fable51",
+        "hf_id": "MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x",
+        "declared_license": "apache-2.0",
+        "live_license": "apache-2.0",
+        "allowed": true,
+        "included": true,
+        "reason": "ok",
+        "sha": "4904ca0c0904"
+      },
+      "ot_agent_sft": {
+        "name": "ot_agent_sft",
+        "hf_id": "open-thoughts/OpenThoughts-Agent-SFT-ColdStartForRL-10K",
+        "declared_license": "apache-2.0",
+        "live_license": "apache-2.0",
+        "allowed": true,
+        "included": true,
+        "reason": "ok",
+        "sha": "261a70c35c0b"
+      },
+      "openthoughts3": {
+        "name": "openthoughts3",
+        "hf_id": "open-thoughts/OpenThoughts3-1.2M",
+        "declared_license": "apache-2.0",
+        "live_license": "apache-2.0",
+        "allowed": true,
+        "included": true,
+        "reason": "ok",
+        "sha": "61bcf9d4eb38"
+      },
+      "nemotron_post": {
+        "name": "nemotron_post",
+        "hf_id": "nvidia/Llama-Nemotron-Post-Training-Dataset",
+        "declared_license": "cc-by-4.0",
+        "live_license": "cc-by-4.0",
+        "allowed": true,
+        "included": true,
+        "reason": "ok",
+        "sha": "ab2a40d258a6"
+      },
+      "opus46_3000x": {
+        "name": "opus46_3000x",
+        "hf_id": "nohurry/Opus-4.6-Reasoning-3000x-filtered",
+        "declared_license": "apache-2.0",
+        "live_license": "apache-2.0",
+        "allowed": true,
+        "included": true,
+        "reason": "ok",
+        "sha": "1cd388e9e117"
+      },
+      "opus46_3300x": {
+        "name": "opus46_3300x",
+        "hf_id": "Crownelius/Opus-4.6-Reasoning-3300x",
+        "declared_license": "apache-2.0",
+        "live_license": "apache-2.0",
+        "allowed": true,
+        "included": true,
+        "reason": "ok",
+        "sha": "795d673f5e05"
+      },
+      "opus46_traceinv": {
+        "name": "opus46_traceinv",
+        "hf_id": "Jackrong/Claude-opus-4.6-TraceInversion-9000x",
+        "declared_license": "apache-2.0",
+        "live_license": "apache-2.0",
+        "allowed": true,
+        "included": true,
+        "reason": "ok",
+        "sha": "dcb98612aa4e"
+      },
+      "arc_agi2_train": {
+        "name": "arc_agi2_train",
+        "hf_id": "github:arcprize/ARC-AGI-2",
+        "declared_license": "apache-2.0",
+        "live_license": "apache-2.0",
+        "allowed": true,
+        "included": true,
+        "reason": "ok",
+        "sha": "main"
+      },
+      "agentic_fable5": {
+        "name": "agentic_fable5",
+        "hf_id": "lordx64/agentic-distill-fable-5-sft",
+        "declared_license": "agpl-3.0",
+        "live_license": "agpl-3.0",
+        "allowed": false,
+        "included": false,
+        "reason": "license_incompatible:agpl-3.0 (strong copyleft incompatible with permissive Apache-2.0/CC-BY-4.0 release)",
+        "sha": "9df06dd13b69"
+      },
+      "fable5_distill": {
+        "name": "fable5_distill",
+        "hf_id": "HelioAI/Fable-5-Distill-Reasoning-462x",
+        "declared_license": "unknown",
+        "live_license": "unknown",
+        "allowed": false,
+        "included": false,
+        "reason": "license_incompatible:unknown (no permissive redistribution license declared on HF Hub)",
+        "sha": "ab4e69b74e7e"
+      }
+    },
+    "per_source": {
+      "sirsi_golden_seeds": {
+        "hf_id": "TassP0lar/Loop64-Fable-SIRSI-v1",
+        "license": "apache-2.0",
+        "streamed": 18,
+        "keep": 18,
+        "deterministic_salvaged_to_keep": 0,
+        "salvage": 0,
+        "drop": 0,
+        "drop_reasons": {},
+        "salvage_reasons": {},
+        "salvage_actions": {},
+        "mean_slop": 0.0,
+        "mean_3beat": 0.8271
+      },
+      "fable51": {
+        "hf_id": "MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x",
+        "license": "apache-2.0",
+        "excluded": false,
+        "streamed": 1200,
+        "keep": 3,
+        "deterministic_salvaged_to_keep": 0,
+        "salvage": 2,
+        "drop": 1195,
+        "drop_reasons": {
+          "dup:exact_prompt_sha256": 915,
+          "dup:exact_sha256": 31,
+          "dup:near_jaccard": 2,
+          "unrecoverable:private_repo_redacted_synonym_perturbation": 247
+        },
+        "salvage_reasons": {
+          "salvage:redacted_tool_args": 252,
+          "salvage:missing_beat2_audit": 10,
+          "salvage:thin_reasoning": 2
+        },
+        "salvage_actions": {
+          "unwrap_final_answer_tag": 182,
+          "repair_whitespace_and_fences": 6
+        },
+        "mean_slop": 0.0074,
+        "mean_3beat": 0.6812,
+        "track_b_rewritten_to_keep": 3
+      },
+      "ot_agent_sft": {
+        "hf_id": "open-thoughts/OpenThoughts-Agent-SFT-ColdStartForRL-10K",
+        "license": "apache-2.0",
+        "excluded": false,
+        "streamed": 1200,
+        "keep": 1155,
+        "deterministic_salvaged_to_keep": 806,
+        "salvage": 1,
+        "drop": 44,
+        "drop_reasons": {
+          "pathology:repetition_loop": 42,
+          "contaminated:swe_bench": 2
+        },
+        "salvage_reasons": {
+          "salvage:missing_beat2_audit": 1
+        },
+        "salvage_actions": {
+          "repair_reasoning_whitespace": 848,
+          "repair_whitespace_and_fences": 1
+        },
+        "mean_slop": 0.0,
+        "mean_3beat": 0.9213,
+        "track_b_rewritten_to_keep": 1
+      },
+      "openthoughts3": {
+        "hf_id": "open-thoughts/OpenThoughts3-1.2M",
+        "license": "apache-2.0",
+        "excluded": false,
+        "streamed": 1200,
+        "keep": 279,
+        "deterministic_salvaged_to_keep": 278,
+        "salvage": 0,
+        "drop": 921,
+        "drop_reasons": {
+          "think_unclosed": 760,
+          "pathology:repetition_loop": 74,
+          "dup:exact_prompt_sha256": 41,
+          "pathology:unclosed_code_fence": 37,
+          "domain:python_syntax_error": 6,
+          "pathology:mid_sentence_truncation": 5,
+          "contaminated:hle": 3,
+          "pathology:empty_response": 1
+        },
+        "salvage_reasons": {},
+        "salvage_actions": {
+          "repair_reasoning_whitespace": 393,
+          "repair_whitespace_and_fences": 204,
+          "strip_boilerplate_closer": 10
+        },
+        "mean_slop": 0.0043,
+        "mean_3beat": 0.9974
+      },
+      "nemotron_post": {
+        "hf_id": "nvidia/Llama-Nemotron-Post-Training-Dataset",
+        "license": "cc-by-4.0",
+        "excluded": false,
+        "streamed": 1200,
+        "keep": 1043,
+        "deterministic_salvaged_to_keep": 1028,
+        "salvage": 27,
+        "drop": 130,
+        "drop_reasons": {
+          "think_unclosed": 71,
+          "pathology:repetition_loop": 18,
+          "dup:exact_prompt_sha256(orig=openthoughts3)": 11,
+          "contaminated:supergpqa": 9,
+          "contaminated:hle": 9,
+          "dup:exact_prompt_sha256": 9,
+          "pathology:refusal_or_incomplete_prompt": 1,
+          "pathology:unclosed_code_fence": 1,
+          "pathology:mid_sentence_truncation": 1
+        },
+        "salvage_reasons": {
+          "salvage:missing_beat2_audit": 42
+        },
+        "salvage_actions": {
+          "strip_nemotron_thinking_sysprompt": 1091,
+          "repair_reasoning_whitespace": 593,
+          "repair_whitespace_and_fences": 529,
+          "strip_boilerplate_closer": 1
+        },
+        "mean_slop": 0.0055,
+        "mean_3beat": 0.8739,
+        "track_b_rewritten_to_keep": 22
+      },
+      "opus46_3000x": {
+        "hf_id": "nohurry/Opus-4.6-Reasoning-3000x-filtered",
+        "license": "apache-2.0",
+        "excluded": false,
+        "streamed": 1200,
+        "keep": 578,
+        "deterministic_salvaged_to_keep": 110,
+        "salvage": 429,
+        "drop": 193,
+        "drop_reasons": {
+          "pathology:refusal_or_incomplete_prompt": 132,
+          "dup:exact_sha256": 32,
+          "pathology:unclosed_code_fence": 11,
+          "pathology:empty_response": 10,
+          "dup:exact_prompt_sha256": 4,
+          "pathology:mid_sentence_truncation": 3,
+          "contaminated:hle": 3,
+          "domain:python_syntax_error": 2
+        },
+        "salvage_reasons": {
+          "salvage:missing_beat2_audit": 468,
+          "salvage:thin_reasoning": 1
+        },
+        "salvage_actions": {
+          "repair_whitespace_and_fences": 176,
+          "repair_reasoning_whitespace": 124,
+          "strip_boilerplate_closer": 11,
+          "strip_sycophantic_opener": 4
+        },
+        "mean_slop": 0.0056,
+        "mean_3beat": 0.5494,
+        "track_b_rewritten_to_keep": 90
+      },
+      "opus46_3300x": {
+        "hf_id": "Crownelius/Opus-4.6-Reasoning-3300x",
+        "license": "apache-2.0",
+        "excluded": false,
+        "streamed": 1200,
+        "keep": 36,
+        "deterministic_salvaged_to_keep": 9,
+        "salvage": 42,
+        "drop": 1122,
+        "drop_reasons": {
+          "dup:exact_sha256(orig=opus46_3000x)": 1020,
+          "pathology:refusal_or_incomplete_prompt": 83,
+          "dup:exact_prompt_sha256(orig=opus46_3000x)": 8,
+          "dup:exact_prompt_sha256": 4,
+          "contaminated:hle": 3,
+          "dup:exact_sha256": 2,
+          "pathology:unclosed_code_fence": 2
+        },
+        "salvage_reasons": {
+          "salvage:missing_beat2_audit": 42
+        },
+        "salvage_actions": {
+          "repair_whitespace_and_fences": 24,
+          "repair_reasoning_whitespace": 8,
+          "strip_sycophantic_opener": 5
+        },
+        "mean_slop": 0.0172,
+        "mean_3beat": 0.5172,
+        "track_b_rewritten_to_keep": 20
+      },
+      "opus46_traceinv": {
+        "hf_id": "Jackrong/Claude-opus-4.6-TraceInversion-9000x",
+        "license": "apache-2.0",
+        "excluded": false,
+        "streamed": 1200,
+        "keep": 563,
+        "deterministic_salvaged_to_keep": 1,
+        "salvage": 614,
+        "drop": 23,
+        "drop_reasons": {
+          "dup:exact_prompt_sha256(orig=opus46_3000x)": 12,
+          "pathology:repetition_loop": 11
+        },
+        "salvage_reasons": {
+          "salvage:missing_beat2_audit": 644
+        },
+        "salvage_actions": {
+          "repair_reasoning_whitespace": 1
+        },
+        "mean_slop": 0.0,
+        "mean_3beat": 0.526,
+        "track_b_rewritten_to_keep": 150
+      },
+      "arc_agi2_train": {
+        "hf_id": "github:arcprize/ARC-AGI-2",
+        "license": "apache-2.0",
+        "excluded": false,
+        "streamed": 1000,
+        "keep": 97,
+        "deterministic_salvaged_to_keep": 0,
+        "salvage": 961,
+        "drop": 18,
+        "drop_reasons": {
+          "dup:near_jaccard": 16,
+          "contaminated:arc_agi_2": 2
+        },
+        "salvage_reasons": {
+          "salvage:missing_cot_verified_answer": 1058
+        },
+        "salvage_actions": {},
+        "mean_slop": 0.0,
+        "mean_3beat": 0.0,
+        "track_b_rewritten_to_keep": 75
+      },
+      "agentic_fable5": {
+        "hf_id": "lordx64/agentic-distill-fable-5-sft",
+        "license": "agpl-3.0",
+        "excluded": true,
+        "exclusion_reason": "license_incompatible:agpl-3.0 (strong copyleft incompatible with permissive Apache-2.0/CC-BY-4.0 release)",
+        "streamed": 0,
+        "keep": 0,
+        "deterministic_salvaged_to_keep": 0,
+        "salvage": 0,
+        "drop": 0,
+        "drop_reasons": {
+          "license_incompatible:agpl-3.0 (strong copyleft incompatible with permissive Apache-2.0/CC-BY-4.0 release)": 1
+        },
+        "salvage_reasons": {},
+        "salvage_actions": {},
+        "mean_slop": 0.0,
+        "mean_3beat": 0.0
+      },
+      "fable5_distill": {
+        "hf_id": "HelioAI/Fable-5-Distill-Reasoning-462x",
+        "license": "unknown",
+        "excluded": true,
+        "exclusion_reason": "license_incompatible:unknown (no permissive redistribution license declared on HF Hub)",
+        "streamed": 0,
+        "keep": 0,
+        "deterministic_salvaged_to_keep": 0,
+        "salvage": 0,
+        "drop": 0,
+        "drop_reasons": {
+          "license_incompatible:unknown (no permissive redistribution license declared on HF Hub)": 1
+        },
+        "salvage_reasons": {},
+        "salvage_actions": {},
+        "mean_slop": 0.0,
+        "mean_3beat": 0.0
+      },
+      "track_b_aesthetic_craft": {
+        "hf_id": "TassP0lar/Loop64-Fable-SIRSI-v1",
+        "license": "apache-2.0",
+        "streamed": 79,
+        "keep": 76,
+        "deterministic_salvaged_to_keep": 0,
+        "salvage": 0,
+        "drop": 3,
+        "drop_reasons": {},
+        "salvage_reasons": {},
+        "salvage_actions": {
+          "v11_fable_organic_verified": 76
+        },
+        "mean_slop": 0.0,
+        "mean_3beat": 0.7464
+      },
+      "track_b_sirsi_recovery": {
+        "hf_id": "TassP0lar/Loop64-Fable-SIRSI-v1",
+        "license": "apache-2.0",
+        "streamed": 80,
+        "keep": 74,
+        "deterministic_salvaged_to_keep": 0,
+        "salvage": 0,
+        "drop": 6,
+        "drop_reasons": {},
+        "salvage_reasons": {},
+        "salvage_actions": {
+          "v11_fable_organic_verified": 74
+        },
+        "mean_slop": 0.0,
+        "mean_3beat": 0.7614
+      },
+      "track_b_terminal_agentic": {
+        "hf_id": "TassP0lar/Loop64-Fable-SIRSI-v1",
+        "license": "apache-2.0",
+        "streamed": 60,
+        "keep": 60,
+        "deterministic_salvaged_to_keep": 0,
+        "salvage": 0,
+        "drop": 0,
+        "drop_reasons": {},
+        "salvage_reasons": {},
+        "salvage_actions": {
+          "v11_fable_organic_verified": 60
+        },
+        "mean_slop": 0.0,
+        "mean_3beat": 0.7889
+      },
+      "v11_fable_swe": {
+        "hf_id": "TassP0lar/Loop64-Fable-SIRSI-v1",
+        "license": "apache-2.0",
+        "streamed": 2,
+        "keep": 2,
+        "deterministic_salvaged_to_keep": 0,
+        "salvage": 0,
+        "drop": 0,
+        "drop_reasons": {},
+        "salvage_reasons": {},
+        "salvage_actions": {
+          "v11_fable_organic_verified": 2
+        },
+        "mean_slop": 0.0,
+        "mean_3beat": 0.82
+      },
+      "v12_fable_swe": {
+        "hf_id": "TassP0lar/Loop64-Fable-SIRSI-v1",
+        "license": "apache-2.0",
+        "streamed": 38,
+        "keep": 38,
+        "deterministic_salvaged_to_keep": 0,
+        "salvage": 0,
+        "drop": 0,
+        "drop_reasons": {},
+        "salvage_reasons": {},
+        "salvage_actions": {
+          "v12_decoupled_fable_notebook": 38
+        },
+        "mean_slop": 0.0,
+        "mean_3beat": 0.8003
+      },
+      "v12_fable_math": {
+        "hf_id": "TassP0lar/Loop64-Fable-SIRSI-v1",
+        "license": "apache-2.0",
+        "streamed": 30,
+        "keep": 30,
+        "deterministic_salvaged_to_keep": 0,
+        "salvage": 0,
+        "drop": 0,
+        "drop_reasons": {},
+        "salvage_reasons": {},
+        "salvage_actions": {
+          "v12_decoupled_fable_notebook": 30
+        },
+        "mean_slop": 0.0,
+        "mean_3beat": 0.787
+      },
+      "v12_fable_taste": {
+        "hf_id": "TassP0lar/Loop64-Fable-SIRSI-v1",
+        "license": "apache-2.0",
+        "streamed": 29,
+        "keep": 29,
+        "deterministic_salvaged_to_keep": 0,
+        "salvage": 0,
+        "drop": 0,
+        "drop_reasons": {},
+        "salvage_reasons": {},
+        "salvage_actions": {
+          "v12_decoupled_fable_notebook": 29
+        },
+        "mean_slop": 0.0,
+        "mean_3beat": 0.7972
+      }
+    },
+    "dedup": {
+      "unique_indexed": 6525,
+      "dup_counts": {
+        "dup:exact_sha256": 1085,
+        "dup:exact_prompt_sha256": 1004,
+        "dup:near_jaccard": 18
+      },
+      "overlap_matrix": {
+        "arc_agi2_train<-arc_agi2_train": 16,
+        "fable51<-fable51": 948,
+        "nemotron_post<-nemotron_post": 9,
+        "nemotron_post<-openthoughts3": 11,
+        "openthoughts3<-openthoughts3": 41,
+        "opus46_3000x<-opus46_3000x": 36,
+        "opus46_3300x<-opus46_3000x": 1028,
+        "opus46_3300x<-opus46_3300x": 6,
+        "opus46_traceinv<-opus46_3000x": 12
+      }
+    },
+    "decontam": {
+      "ngram": 13,
+      "suites": {
+        "hle_diamond": {
+          "group": "hle",
+          "hf_id": "cais/hle-diamond",
+          "status": "loaded_cache",
+          "texts": 992,
+          "group_grams_total": 95814
+        },
+        "hle_rolling": {
+          "group": "hle",
+          "hf_id": "cais/hle-rolling",
+          "status": "loaded_cache",
+          "texts": 991,
+          "group_grams_total": 140544
+        },
+        "hle_verified": {
+          "group": "hle",
+          "hf_id": "lmms-lab/HLE-Verified",
+          "status": "loaded_cache",
+          "texts": 1808,
+          "group_grams_total": 300297
+        },
+        "gpqa_diamond": {
+          "group": "gpqa",
+          "hf_id": "Idavidrein/gpqa",
+          "status": "loaded_cache",
+          "texts": 266,
+          "group_grams_total": 12638
+        },
+        "supergpqa": {
+          "group": "supergpqa",
+          "hf_id": "m-a-p/SuperGPQA",
+          "status": "loaded_cache",
+          "texts": 25618,
+          "group_grams_total": 724974
+        },
+        "aime_2026": {
+          "group": "aime_2026",
+          "hf_id": "MathArena/aime_2026",
+          "status": "loaded_cache",
+          "texts": 30,
+          "group_grams_total": 1793
+        },
+        "hmmt_feb_2026": {
+          "group": "hmmt_2026",
+          "hf_id": "MathArena/hmmt_feb_2026",
+          "status": "loaded_cache",
+          "texts": 33,
+          "group_grams_total": 1351
+        },
+        "mrcr": {
+          "group": "mrcr",
+          "hf_id": "openai/mrcr",
+          "status": "loaded_cache",
+          "texts": 2400,
+          "group_grams_total": 619730
+        },
+        "terminal_bench_4_1": {
+          "group": "terminal_bench",
+          "hf_id": "harborframework/terminal-bench",
+          "status": "loaded_cache",
+          "texts": 66,
+          "group_grams_total": 17198
+        },
+        "swe_bench_pro": {
+          "group": "swe_bench",
+          "hf_id": "ScaleAI/SWE-bench_Pro",
+          "status": "loaded_cache",
+          "texts": 1424,
+          "group_grams_total": 182096
+        },
+        "deep_swe": {
+          "group": "swe_bench",
+          "hf_id": "datacurve/deep-swe",
+          "status": "skipped_gated (DatasetNotFoundError)",
+          "texts": 0
+        },
+        "arc_agi_2": {
+          "group": "arc_agi_2",
+          "hf_id": "github:arcprize/ARC-AGI-2",
+          "status": "loaded_cache",
+          "texts": 167,
+          "group_grams_total": 16098
+        },
+        "kernelbench_l3_l4": {
+          "group": "kernelbench",
+          "hf_id": "ScalingIntelligence/KernelBench",
+          "status": "loaded_cache",
+          "texts": 70,
+          "group_grams_total": 13290
+        }
+      },
+      "index_size": 1889432,
+      "texts_per_group": {
+        "hle": 3791,
+        "gpqa": 266,
+        "supergpqa": 25618,
+        "aime_2026": 30,
+        "hmmt_2026": 33,
+        "mrcr": 2400,
+        "terminal_bench": 66,
+        "swe_bench": 1424,
+        "arc_agi_2": 167,
+        "kernelbench": 70
+      },
+      "grams_per_group": {
+        "hle": 300297,
+        "gpqa": 12638,
+        "supergpqa": 724974,
+        "aime_2026": 1793,
+        "hmmt_2026": 1351,
+        "mrcr": 619730,
+        "terminal_bench": 17198,
+        "swe_bench": 182096,
+        "arc_agi_2": 16098,
+        "kernelbench": 13290
+      },
+      "hits": {
+        "arc_agi_2<-arc_agi2_train": 2,
+        "hle<-nemotron_post": 9,
+        "hle<-openthoughts3": 3,
+        "hle<-opus46_3000x": 3,
+        "hle<-opus46_3300x": 3,
+        "supergpqa<-nemotron_post": 9,
+        "swe_bench<-ot_agent_sft": 2
+      },
+      "checked": {
+        "sirsi_golden_seeds": 18,
+        "fable51": 1200,
+        "ot_agent_sft": 1200,
+        "openthoughts3": 440,
+        "nemotron_post": 1129,
+        "opus46_3000x": 1200,
+        "opus46_3300x": 1200,
+        "opus46_traceinv": 1200,
+        "arc_agi2_train": 1076
+      }
+    },
+    "track_b_local_agent": {
+      "engine": "local_agent/gemini-4",
+      "waves": 2,
+      "mode_counts": {
+        "salvage_rewrite:rejected": 81,
+        "salvage_rewrite:accepted": 361,
+        "aesthetic_craft:accepted": 77,
+        "aesthetic_craft:rejected": 3,
+        "sirsi_recovery:accepted": 74,
+        "sirsi_recovery:rejected": 6,
+        "terminal_agentic:accepted": 60
+      },
+      "rewritten_by_source": {
+        "fable51": 3,
+        "ot_agent_sft": 1,
+        "nemotron_post": 22,
+        "opus46_3000x": 90,
+        "opus46_3300x": 20,
+        "opus46_traceinv": 150,
+        "arc_agi2_train": 75
+      },
+      "reject_reasons": {
+        "rejected:weak_3beat": 53,
+        "rejected:answer_mismatch": 41,
+        "pathology:refusal_or_incomplete_prompt": 1,
+        "pathology:repetition_loop": 2,
+        "rejected:contaminated": 1,
+        "rejected:contaminated_rejected": 1
+      },
+      "unrecoverable_fable51_dropped": 247,
+      "sft_added": 572,
+      "pref_added": 497,
+      "mean_slop_track_b": 0.0,
+      "mean_3beat_track_b": 0.8513
+    },
+    "v11_fable_upgrade": {
+      "cleanup_stats": {
+        "kept_organic_upstream": 3569,
+        "kept_clean_v1_rewrite": 33,
+        "purged_defective_v1_rewrite": 283,
+        "purge_reason:cot:spoiler_first": 259,
+        "purge_reason:cot:meta_summary_stub": 280,
+        "stripped_headers_v1_rewrite": 45,
+        "kept_clean_v1_synth": 141,
+        "stripped_headers_v1_synth": 69,
+        "purged_defective_v1_synth": 1,
+        "kept_clean_v1_pref": 144,
+        "purged_defective_v1_pref": 284,
+        "stripped_headers_v1_pref": 69,
+        "restored_to_salvage_queue": 283
+      },
+      "mode_counts": {
+        "fable_rewrite:rejected": 113,
+        "fable_rewrite:accepted": 7,
+        "fable_original:rejected": 98,
+        "fable_original:accepted": 2
+      },
+      "v11_by_source": {
+        "opus46_3000x": 5,
+        "arc_agi2_train": 2,
+        "v11_fable_swe": 2
+      },
+      "reject_reasons": {
+        "rejected:weak_3beat": 201,
+        "rejected:fable_too_short": 210,
+        "rejected:answer_mismatch": 12,
+        "rejected:slop_score": 1,
+        "rejected:v11_slop": 1
+      },
+      "v11_thinking_words": {
+        "min": 355,
+        "median": 481,
+        "mean": 507.2,
+        "max": 704
+      },
+      "mean_slop_v11": 0.0,
+      "mean_3beat_v11": 0.825,
+      "cot_artifact_hits_final": 0
+    },
+    "v12_fable_notebook": {
+      "mode_counts": {
+        "orig_notebook:accepted": 97,
+        "rw_notebook:accepted": 100
+      },
+      "v12_by_source": {
+        "v12_fable_swe": 38,
+        "opus46_3000x": 35,
+        "v12_fable_math": 30,
+        "v12_fable_taste": 29,
+        "opus46_traceinv": 30,
+        "nemotron_post": 15,
+        "arc_agi2_train": 20
+      },
+      "reject_reasons": {},
+      "v12_thinking_words": {
+        "min": 361,
+        "median": 437,
+        "mean": 434.9,
+        "max": 478
+      },
+      "mean_slop_v12": 0.0,
+      "mean_3beat_v12": 0.8156,
+      "cot_artifact_hits_final": 0,
+      "future_outline_hits_final": 0
+    }
+  },
   "systems_milestones": [
     {
       "component": "NVFP4 MoE Dequant (Triton E2M1)",
@@ -805,9 +2409,9 @@
     },
     {
       "component": "Live 1,048,576-Token FP8 Calibration Pass",
-      "commit": "513879f",
+      "commit": "513879f / 28b88e4",
       "measurement": "1,015,808 prefix + 32,768 suffix = 1,048,576 tok sparse FP8 long_calib",
-      "impact": "78.60 GiB peak VRAM, 24.57 GiB post-step alloc (0 leak), 888.9 s, 0 non-finite"
+      "impact": "v1 HSSD: 78.60 GiB peak (0 leak); clean v2 Native-GDN: 69.52 GiB peak (-9.08 GiB, 0 skips)"
     },
     {
       "component": "HSSD Phase-2 O(T) Jacobian Stability Fix",
@@ -825,7 +2429,19 @@
       "component": "Zero-Label BPTT C++-Bridged VRAM Leak Fix",
       "commit": "5a82677",
       "measurement": "Broke LoopContext + saved_tensors_hooks C++ autograd cycles on -100 segments",
-      "impact": "Alloc 52.0G (OOM) / 32.6G (baseline) \u2192 25.3\u201325.4 GiB flat (-7.0 GiB vs baseline, 17h+)"
+      "impact": "Alloc 52.0G (OOM) / 32.6G (baseline) \u2192 25.3\u201325.4 GiB flat (-7.0 GiB vs baseline, 32h+)"
+    },
+    {
+      "component": "transformers 5.24.0 Cache Kwarg & Proxy Fix",
+      "commit": "5aaf55d / 28b88e4",
+      "measurement": "Unified cache kwarg + isolated conv/recurrent snapshots in _ReplayKVCacheProxy",
+      "impact": "10.6\u00d7 recovery (89 \u2192 942.6 tok/s avg, pk 1,109); 0.000e+00 1-tok checkpoint grad parity"
+    },
+    {
+      "component": "GDN-2-1M+QED Triton Prep & fla 0.6.0 DPLR",
+      "commit": "919f2b8 / 2c78ffc",
+      "measurement": "T=32K: 35.55\u201343.64 ms vs 657.32 ms ref; T=1: 0.0430 ms vs 0.0421 ms native GDN",
+      "impact": "15.1\u00d7\u201318.5\u00d7 train speedup, 1.02\u00d7 native decode, 0.0 Step-0 diff, zero-sync is_zero() cache"
     }
   ]
 }

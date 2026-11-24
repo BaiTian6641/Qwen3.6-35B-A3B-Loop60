@@ -1,0 +1,62 @@
+# Compute Allocation Proposal: `Qwen3.6-35B-A6B-Loop64`
+### Parameter-Efficient 88-Layer Looped Hybrid Reasoning & 1M-Context Retrofitting of Frozen NVFP4 MoE Models
+
+> **Public Model Hub:** [`TassP0lar/Qwen3.6-35B-A3B-Loop64`](https://huggingface.co/TassP0lar/Qwen3.6-35B-A3B-Loop64) (`189` live commits) · **Public Dataset:** [`TassP0lar/Loop64-Fable-SIRSI-v1`](https://huggingface.co/datasets/TassP0lar/Loop64-Fable-SIRSI-v1) (`v1.2`, `cc-by-4.0`)  
+> **Full Empirical Technical Report:** [`docs/EXPERIMENT_REPORT.md`](EXPERIMENT_REPORT.md) (7 pure-SVG figures + raw CSV/JSON telemetry in [`docs/experiment_logs/`](experiment_logs/))  
+> **Codebase Readiness:** Open repository (`origin/main` `2c78ffc`), **`709` passing CPU unit/parity tests** (`749` total incl. `40` CUDA-only), `0` lint / Python 3.9 AST errors  
+> **Primary Compute Request:** **`~2,500` GPU-hours** (`1× 8×H200/B200` node for ~2 weeks; scalable from **`~400` GPU-h** Tier 1 to **`~6,000` GPU-h** Tier 3)
+
+---
+
+## 1. Research Pitch & Motivation
+
+Scaling test-time reasoning via long chains of thought alone hits severe KV-cache and serial-token bottlenecks, while training looped or ultra-long-context transformers from scratch requires industrial-scale pretraining budgets. We investigate a sharp, under-explored alternative: **can a frozen `35B` (`A3B`) NVFP4 hybrid MoE backbone (`unsloth/Qwen3.6-35B-A3B-NVFP4`, `32.212B` routed experts 100% frozen and SHA-256 verified) be retrofitted with `< 0.6%` trainable parameters into a runtime-scalable `88`-virtual-layer looped reasoner supporting `1,048,576`-token (`1M`) context inside `10.65 GiB` of context state?** Our clean v2 architecture combines three orthogonal mechanisms: (1) a calibrated `[12,36)` ETD sandwich loop with mHC `LoopBridge` and per-pass router adapters that scale depth dynamically across `40L` (`R=1`), `64L` (`R=2`), and `88L` (`R=3`) by unlocking diverse frozen experts across passes; (2) **Step-0 IEEE-754 bit-identical `GDN-2-1M + Bounded QED + Soft Negative Eigenvalues`** (`arXiv:2608.13668`) mapped 1-to-1 onto `fla 0.6.0` `DPLR` kernels (`0` extra recurrent state bytes); and (3) pure `4.0×` YaRN `FP8 1.0× SharedKV` with untied per-pass `D-LSA` Ward-bucketed sparse attention. We have already completed `155.59` single-GPU hours of end-to-end engineering, negative-ablation forensics, Blackwell Triton kernel optimization, and live `1M`-token training on a single rented GPU; we now seek a focused multi-GPU allocation to execute controlled `s2_v2` + verifiable `s4_v2_rl` (SI-RSI) training and a rigorous FLOP-matched `d ∈ {1, 2, 3}` evaluation across 16 frontier 2026 benchmarks.
+
+---
+
+## 2. Why This Work Is Already De-Risked (Single-GPU Evidence)
+
+Every architectural, kernel, numerical-stability, and data-hygiene risk has been resolved on **`1× NVIDIA RTX PRO 6000 Blackwell (96 GiB HBM)`** (`155.59` measured active supervisor single-GPU hours across `562.82M` tokens, zero multi-node cluster). All metrics below separate **Measured Results** (from live public HF Hub manifests and archived local JSON logs) from **Analytical Formulas**; no downstream benchmark scores are claimed before controlled runs complete.
+
+| Research Pillar | Class | Verified Evidence (Single Rented Blackwell GPU) | Reproducible Artifact |
+| :--- | :---: | :--- | :--- |
+| **Zero-Training Calibration (`s0_probe`)** | `Measured` | **`5/5`** gates passed in `177.44 s`; `1.3061` nats expert headroom (`88.9%` hard tokens); `[12,36)` core cuts zero-shot shock `3.26×`; pure `YaRN 4.0×` wins `1M` extrap (`100%` needle) | `artifacts/probes/probe_report.json` (`058b4ad3`) |
+| **88L Loop Healing (`s1_loop_a6b@1000`)** | `Measured` | **`18.41M` params (`0.053%`)**, `0` skips; `8K` held-out NLL `0.9800 → 0.9191` (`depth_gain = +0.0609`); **`82.27%`** Pass-2 expert re-routing (`17.36` unique core experts/tok); `9/9` cache parity & `16K` needle **PASS** | Hub `32eb565e`, `s1_quality_check.json` |
+| **Clean v2 A/B Win (`s3_v2_long_1m_lsa`)** | `Measured` | **`24.56M` params (`0.071%`)**, `0` skips (live `s400/600`): `64K` NLL **`1.3700 → 1.2999 → 1.2827`** (`depth_gain = +0.0872`, **`-0.6083` nats / `45.6%` lower PPL** vs HSSD `s3@s400`, **`-0.6301` nats** @ `s200`); `512K–1M` recall **`0.6064`** peak (vs `0.4848`); **`2,370 tok/s`** (`2.26×`); peak **`69.96 GiB`** (`69.52 GiB` live **`1,048,576`-tok** pass @ `s125`); organic Pass-3 mHC gate **`+53.0%`** (`0.0325 → 0.0497`) | Hub `084e8bad`, `ec34f825`, `colab_supervisor_v2.log` |
+| **`GDN-2-1M + QED` on `fla 0.6.0` `DPLR`** | `Measured` | **`27.53M` params (`0.079%`)**, **`0.0`** Step-0 IEEE-754 parity, `0` extra state bytes; `T=32K` fwd+bwd **`35.55–43.64 ms`** (**`15.1×–18.5×`** vs PyTorch `657.3 ms`); `T=1` decode **`0.0430 ms = 1.02×`** native GDN; fused `tl.int64` Triton prep + zero-sync `is_zero()`; `T=4096 bf16` `0` NaNs | `dplr_bench_summary.json`, commits `919f2b8`, `2c78ffc` |
+| **1M Context-State HBM Footprint** | `Formula` | **`10.65 GiB`** (`10.00` FP8 `1.0×` SharedKV + `0.33` 66L Native GDN/GDN-2 + `0.32` D-LSA) — **`3.02×` smaller** than Inkling 2 Mini (`32.16 GiB`), **`5.17 GiB` smaller** than HSSD (`15.82 GiB`); `~5.96–6.08 GiB` Block-64 Hadamard INT4 serving projection | Exact tensor-shape formula (`report.py`) + live `1M` pass |
+| **Audited Dataset (`v1.2`) & SI-RSI** | `Measured` | `4,081` `sft_core` + `429` pref pairs; **`1,889,432`** live 2026 13-grams (`31` leaks blocked across 12 suites); decoupled `working_notebook` CoT raised pass rate **`4.1% → 100.0%`** (`197/197`, `0` defects); surgical `[loop_adapters, router]` SI-RSI implemented & unit-tested | `dataset_audit_summary.json`, `def3624`, `dc7a14e` |
+| **Blackwell `sm_120` Systems Stack** | `Measured` | **11** verified kernel/memory fixes (`18.99×` NVFP4 E2M1 MoE, `9.32×` D-LSA FlashAttn, `5.83×` 2-pass KL, `2.06×` BPTT speedup, `-7.0 GiB` leak fix → `25.3 GiB` flat alloc, `10.6×` `transformers 5.24` recovery); **`709` passing tests** | `docs/PERF_PROFILE_S2.md`, `EXPERIMENT_REPORT.md` §6 |
+
+---
+
+## 3. Lessons From Honest Negative Ablations
+
+A central differentiator of our engineering methodology is catching silent failure modes early rather than masking them behind loss curves:
+
+1. **Why We Replaced HSSD v3.2 With Step-0 Bit-Identical `GDN-2-1M + Bounded QED`:** Our v1 pipeline replaced stock GDN with HSSD v3.2 (`s1b → s3 → s2@500`). Although `s2_joint_bptt` lowered `131K` held-out NLL (`1.3508 → 1.1872`), an adversarial **Phase-A truth-check & 4-stage causal component swap** (`docs/experiment_logs/truth_check_summary.json`) before launching RL proved: (a) incremental decode parity was exact (`top1 = 1.0000`, uncached oracle reproduced degradation), (b) `88L` looping and `D-LSA` sparse attention were innocent (`s1_loop_a6b` passed `16K` needle at `d=1/3`; turning D-LSA dense yielded identical collapse), and (c) **HSSD v3.2 itself caused the failure** — leaving a permanent `+0.79` nat non-identity shock (`0.919 → 1.705`), dead long-horizon vault pages (`vault_duty = 3.26e-5`), `5.17 GiB` extra 1M state, and `3.41 tok/s` `d=3` decode (`5.6×` slower than stock `19.22 tok/s`). Dropping HSSD immediately delivered the `-0.630` nat (`46.7%` PPL) clean v2 win in `s3_v2`, and led to `GDN-2-1M + QED` via `fla` `DPLR`: exact `0.0` Step-0 identity, `0` extra state bytes, and `1.02×` native decode latency.
+2. **Quarantining Upstream Tool-Call Poisoning (`fable51`) & Eliminating Eval Contamination:** Forensics caught `s1b` `d=3` emitting literal `{"query": "<search_query>"}` loops, traced to `100%` placeholder-redacted `tool_calls` in raw upstream `fable51` (`<bash_command>` `6,098×`, `<file_path>` `5,972×`, `<search_query>` `2,441×`). Auditing all sources removed `2,107` duplicates, `2` non-permissive repos, `247` poisoned rows, and `31` live 2026 benchmark leaks, while decoupled `working_notebook` synthesis lifted reasoning-trace quality from `4.1%` to `100.0%` (`197/197`).
+3. **Transparent Unmeasured Scope:** Because `s3_v2` is currently at `step 400/600` (`512K–1M` peak recall `0.606`, latest `0.503`, still below our `0.70` auto-switch target) and `s2_v2` / `s4_v2_rl` have only passed live smoke/kernel verification, **we make zero claims on downstream 2026 frontier benchmarks yet**. Measuring those gains — and running the decisive ablations — is the exact purpose of the allocation below.
+
+---
+
+## 4. Concrete Three-Tier Compute Allocation Request *(Forward Compute Estimates)*
+
+All budgets below are **forward compute estimates derived explicitly from our measured single-GPU rates** on `1×` Blackwell (`96 GiB`):
+- **Long-context `131K` K/V-replay BPTT (`s2_v2`):** Measured `s2` post-fix throughput is **`~935–943 tok/s`** (`~4.6 min/step` @ `262,144` tok/step); with `fla` DPLR + fused Triton prep replacing HSSD, `600` steps (`157.3M` tok) require **`~50–60` GPU-hours** (`~7` wall-hours on `8×` GPUs).
+- **Verifiable GRPO/DAPO + SI-RSI (`s4_v2_rl`):** `400` steps × `8` prompts × `group=8` × `~4K–8K` generated tokens (`~105M–210M` generated tokens at `88L` `d=3`). At batched H200/B200 decode (`~250–500` aggregate tok/s/GPU), one `400`-step RL run requires **`~150–250` GPU-hours** (`~20–30` wall-hours on `8×` GPUs).
+- **Full 16-Benchmark 2026 Depth Sweep (`d ∈ {1, 2, 3}`):** Evaluating `HLE-Diamond/Verified`, `GPQA/SuperGPQA`, `AIME 2026`, `HMMT Feb 2026`, `ARC-AGI-2`, `MRCR 1M`, `LongBench v2`, `KernelBench L3/L4`, `Terminal-Bench 4.1`, and `SWE-bench Pro Hard` across `3` depths + FLOP-matched `d=1` CoT requires **`~150–250` GPU-hours** per model configuration.
+
+| Allocation Tier | Total GPU-Hours | Target Hardware / Wall Time | Funded Experiments & Scientific Scope |
+| :--- | :---: | :---: | :--- |
+| **Tier 1: Core Completion** | **`~400` GPU-h** | `1×–4×` H200/B200 (`4–7` days) | Finish `s3_v2` + Phase-A gate (`10 h`) · Full `s2_v2` `GDN-2-1M+QED` (`60 h`) · Focused `s4_v2_rl` (`DAPO-Math` + `KernelBench`, `200 h`) · Core 2026 depth sweep (`AIME 2026`, `GPQA`, `MRCR 1M`, `KernelBench L3`, `130 h`). |
+| **Tier 2: Full Conference Paper *(Primary Recommendation)*** | **`~2,500` GPU-h** | **`1× 8×H200/B200` node (`~2` weeks)** | Full `s2_v2` (`600–1,200` steps) + multi-round `s4_v2_rl` incl. agentic rollouts (`700 h`) · **3 controlled ablations (`850 h`)**: (i) `GDN-2-1M+QED` vs. Native GDN (`200 h`), (ii) FLOP-matched `88L` loop vs. `40L` extended CoT (`350 h`), (iii) surgical `[loop_adapters, router]` SI-RSI vs. standard GRPO + D-LSA `index_dim` `64 vs 96` (`300 h`) · **Complete 16-benchmark 2026 `d ∈ {1, 2, 3}` sweep** (`750 h`) · Serving/forensics buffer (`200 h`). |
+| **Tier 3: Scaling & Systems Extension** | **`~6,000` GPU-h** | `1×–2× 8×H200/B200` nodes (`~4` weeks) | All of Tier 2 (`2,500 h`) · Multi-seed variance bars + recurrence sweep `R ∈ {1, 2, 3, 4}` (`40L/64L/88L/112L`, `1,800 h`) · `1M–10M` Block-64 Hadamard INT4 serving + Pass-1→Pass-3 self-speculative decoding (`900 h`) · Extended multi-turn agentic RL & Whole Model Pack release QA (`800 h`). |
+
+---
+
+## 5. Expected Research Outputs & Execution Readiness
+
+- **Publication Target:** One full-length conference paper (**NeurIPS / ICML / ICLR / MLSys**) answering three open questions with complete positive and negative ablations: (1) whether `< 0.6%`-parameter looped retrofits over frozen NVFP4 MoE experts beat FLOP-matched extended CoT on hard reasoning and `1M`-context retrieval; (2) whether Step-0 bit-identical `GDN-2-1M + Bounded QED` via `DPLR` closes linear-attention long-range recall gaps without catastrophic distribution shift; and (3) whether surgical token-level unlikelihood (`SI-RSI`) stabilizes looped RL rollouts without degrading attention or base capabilities.
+- **100% Open Community Artifacts:** (1) Full open weights & adapters on Hugging Face (`TassP0lar/Qwen3.6-35B-A3B-Loop64`); (2) live decontaminated dataset [`TassP0lar/Loop64-Fable-SIRSI-v1`](https://huggingface.co/datasets/TassP0lar/Loop64-Fable-SIRSI-v1) (`cc-by-4.0`); (3) standalone Blackwell `sm_120` Triton kernels (`NVFP4 E2M1` MoE, D-LSA sparse FlashAttention + 2-pass distill KL, fused `tl.int64` QED+DPLR prep with verified analytical VJP); and (4) reproducible telemetry export & 13-gram-decontaminated evaluation harness.
+- **Day-1 Execution Readiness:** The codebase is self-contained, verified by `709` passing unit/parity tests, logs directly to public HF Hub manifests with atomic non-finite rollback guards, and requires zero infrastructure build-out before launching Tier-1 or Tier-2 runs immediately upon allocation.

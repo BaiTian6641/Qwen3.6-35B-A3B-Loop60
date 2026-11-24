@@ -1,0 +1,329 @@
+{
+  "timestamp_utc": "2026-11-23T19:58:21Z",
+  "environment": {
+    "python": "3.13.16",
+    "gpu": {
+      "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "compute_cap": "12.0",
+      "total_vram_gib": 94.97,
+      "cuda_version": "13.0"
+    },
+    "disk_free_gib": 235.01,
+    "disk_total_gib": 235.68,
+    "versions": {
+      "torch": "2.14.1+cu130",
+      "triton": "3.8.0",
+      "transformers": "5.24.0",
+      "fla": "0.6.0",
+      "causal_conv1d": "1.7.0",
+      "compressed_tensors": "0.20.1",
+      "kernels": "0.18.3",
+      "cut_cross_entropy": "25.1.1",
+      "datasets": "5.0.1",
+      "huggingface_hub": "1.33.0",
+      "qloop": "0.1.0"
+    },
+    "git_head_short": "28b88e4",
+    "git_head_full": "28b88e4ab81cb59924c6a794ab2e0614460c125d",
+    "hf_token_configured": "[REDACTED]"
+  },
+  "part_a_smoke": {
+    "part_a_passed": true,
+    "data_stream": {
+      "hf_id": "TassP0lar/Loop64-Fable-SIRSI-v1",
+      "examples_kept": 16,
+      "reasoning_turns": 22,
+      "tool_call_turns": 6
+    },
+    "smoke_s3v2": {
+      "ok": true,
+      "elapsed_sec": 330.89,
+      "all_metrics_finite": true,
+      "lm_losses": [
+        1.6483415365219116,
+        0.2732551693916321
+      ],
+      "peak_gib": 38.41678476333618,
+      "step2_tok_per_s": 4214.427966167609
+    },
+    "smoke_s2v2": {
+      "ok": true,
+      "elapsed_sec": 214.62,
+      "all_metrics_finite": true,
+      "summary_metrics": {
+        "loss/lm": 39.3013916015625,
+        "depth": 3,
+        "tok_per_s": 397.97215160556465,
+        "mem/peak_gib": 43.12789869308472,
+        "loss/bptt_segments": 2.0,
+        "loss/bptt_replayed_tokens": 2048.0,
+        "loss/bptt_offload_to_cpu": 0.0
+      }
+    }
+  },
+  "fla_version": "0.6.0",
+  "identified_formula": "diag_plus_b_aT",
+  "mapping_doc": {
+    "state_equation": "S_t = (Diag(exp(gk_t)) + b_t a_t^T) S_{t-1} + k_t v_t^T  [equiv. row-state H_t = H_{t-1}(Diag(exp(gk_t)) + a_t b_t^T) + v_t k_t^T]; o_t = S_t^T (q_t * scale)",
+    "q": "q_hat (L2-normalized query)",
+    "k": "k_hat (L2-normalized key)",
+    "v": "z_t = w_t * v_raw (channel-wise write-gated value)",
+    "a": "-(e_t * exp(g_t)) (negative decay-premultiplied QED erase vector; row/read side of rank-1 transition)",
+    "b": "k_hat (normalized key; column/write side of rank-1 transition; sign may equivalently be moved onto b=-k_hat, a=e_t*exp(g_t))",
+    "gk": "g_t <= 0 (channel-wise log-decay)",
+    "decay_ordering": "additive DPLR: Diag(exp(gk)) + b a^T (pre-multiply e_t by exp(g_t) to match (I - k_hat e_t^T) Diag(exp(g_t)))"
+  },
+  "parity_summary": {
+    "fp32_chunk_dplr_e2e_o": {
+      "max_abs_diff": 0.00011464,
+      "mean_abs_diff": 1.55744e-05,
+      "rel_l2": 0.00140798,
+      "cosine": 0.99999964,
+      "finite": true
+    },
+    "fp32_chunk_dplr_e2e_s": {
+      "max_abs_diff": 0.00143224,
+      "mean_abs_diff": 0.00017431,
+      "rel_l2": 0.00114205,
+      "cosine": 0.9999994,
+      "finite": true
+    },
+    "fp32_chunk_dplr_e2e_min_grad_cos": 0.999999,
+    "fp32_T1_decode_o": {
+      "max_abs_diff": 3.72529e-09,
+      "mean_abs_diff": 7.14616e-10,
+      "rel_l2": 1.03454e-07,
+      "cosine": 1.0,
+      "finite": true
+    },
+    "fp32_T1_decode_s": {
+      "max_abs_diff": 5.96046e-08,
+      "mean_abs_diff": 2.9815e-09,
+      "rel_l2": 5.59389e-08,
+      "cosine": 1.0,
+      "finite": true
+    },
+    "bf16_chunk_dplr_e2e_o": {
+      "max_abs_diff": 0.00053094,
+      "mean_abs_diff": 6.23782e-05,
+      "rel_l2": 0.00560306,
+      "cosine": 0.99998426,
+      "finite": true
+    },
+    "bf16_chunk_dplr_e2e_s": {
+      "max_abs_diff": 0.00439085,
+      "mean_abs_diff": 0.00065724,
+      "rel_l2": 0.00432274,
+      "cosine": 0.9999907,
+      "finite": true
+    },
+    "bf16_chunk_dplr_e2e_min_grad_cos": 0.999966,
+    "bf16_T1_decode_o": {
+      "max_abs_diff": 0.00013524,
+      "mean_abs_diff": 2.17757e-05,
+      "rel_l2": 0.00305872,
+      "cosine": 0.99999577,
+      "finite": true
+    },
+    "bf16_T1_decode_s": {
+      "max_abs_diff": 0.00170386,
+      "mean_abs_diff": 5.70382e-05,
+      "rel_l2": 0.00105442,
+      "cosine": 0.99999946,
+      "finite": true
+    },
+    "bf16_fla_chunk_gdn2_o": {
+      "max_abs_diff": 0.00046012,
+      "mean_abs_diff": 5.94241e-05,
+      "rel_l2": 0.00535708,
+      "cosine": 0.99998569,
+      "finite": true
+    },
+    "bf16_fla_chunk_gdn2_min_grad_cos": 0.999978,
+    "bf16_fla_recurrent_gdn2_o": {
+      "max_abs_diff": 0.00029792,
+      "mean_abs_diff": 4.0977e-05,
+      "rel_l2": 0.00368181,
+      "cosine": 0.99999332,
+      "finite": true
+    },
+    "stability_T4096_H32_bf16": {
+      "o_finite": true,
+      "s_finite": true,
+      "o_abs_max": 0.11669921875,
+      "s_abs_max": 1.7048884630203247,
+      "grads_finite": true
+    }
+  },
+  "T32768_fwd_bwd": {
+    "native_chunk_gated_delta_rule": {
+      "fwd": {
+        "mean_ms": 3.6375,
+        "median_ms": 3.6383,
+        "min_ms": 3.6198,
+        "max_ms": 3.6514
+      },
+      "bwd": {
+        "mean_ms": 10.1919,
+        "median_ms": 10.2133,
+        "min_ms": 10.0987,
+        "max_ms": 10.2277
+      },
+      "total": {
+        "mean_ms": 13.8294,
+        "median_ms": 13.8501,
+        "min_ms": 13.7185,
+        "max_ms": 13.8792
+      },
+      "base_vram_mib": 772.41,
+      "peak_vram_mib": 4754.41,
+      "peak_vram_delta_mib": 3982.0,
+      "warmup": 3,
+      "iters": 10
+    },
+    "fla_chunk_dplr_raw": {
+      "fwd": {
+        "mean_ms": 12.5878,
+        "median_ms": 12.588,
+        "min_ms": 12.5712,
+        "max_ms": 12.6021
+      },
+      "bwd": {
+        "mean_ms": 31.0481,
+        "median_ms": 31.0487,
+        "min_ms": 31.0385,
+        "max_ms": 31.061
+      },
+      "total": {
+        "mean_ms": 43.6359,
+        "median_ms": 43.6363,
+        "min_ms": 43.6202,
+        "max_ms": 43.6589
+      },
+      "base_vram_mib": 1536.41,
+      "peak_vram_mib": 13440.41,
+      "peak_vram_delta_mib": 11904.0,
+      "warmup": 3,
+      "iters": 10
+    },
+    "fla_chunk_dplr_gdn2_qed_e2e": {
+      "fwd": {
+        "mean_ms": 19.8354,
+        "median_ms": 19.8388,
+        "min_ms": 19.8165,
+        "max_ms": 19.8444
+      },
+      "bwd": {
+        "mean_ms": 49.9931,
+        "median_ms": 49.9978,
+        "min_ms": 49.9692,
+        "max_ms": 50.0142
+      },
+      "total": {
+        "mean_ms": 69.8285,
+        "median_ms": 69.8359,
+        "min_ms": 69.8083,
+        "max_ms": 69.8452
+      },
+      "base_vram_mib": 1536.41,
+      "peak_vram_mib": 15494.41,
+      "peak_vram_delta_mib": 13958.0,
+      "warmup": 3,
+      "iters": 10
+    },
+    "pytorch_chunk_gdn2": {
+      "fwd": {
+        "mean_ms": 123.4256,
+        "median_ms": 92.5584,
+        "min_ms": 90.9053,
+        "max_ms": 395.1719
+      },
+      "bwd": {
+        "mean_ms": 565.1647,
+        "median_ms": 565.1972,
+        "min_ms": 564.1306,
+        "max_ms": 566.318
+      },
+      "total": {
+        "mean_ms": 688.5903,
+        "median_ms": 657.3207,
+        "min_ms": 655.4578,
+        "max_ms": 961.3557
+      },
+      "base_vram_mib": 1600.41,
+      "peak_vram_mib": 9950.41,
+      "peak_vram_delta_mib": 8350.0,
+      "warmup": 3,
+      "iters": 10,
+      "tested_T": 32768,
+      "scale_to_32768_factor": 1.0
+    },
+    "fla_ops_gdn2_chunk_gdn2": {
+      "fwd": {
+        "mean_ms": 7.9958,
+        "median_ms": 7.9999,
+        "min_ms": 7.986,
+        "max_ms": 8.0057
+      },
+      "bwd": {
+        "mean_ms": 27.5475,
+        "median_ms": 27.5508,
+        "min_ms": 27.52,
+        "max_ms": 27.561
+      },
+      "total": {
+        "mean_ms": 35.5433,
+        "median_ms": 35.5469,
+        "min_ms": 35.5241,
+        "max_ms": 35.561
+      },
+      "base_vram_mib": 1619.53,
+      "peak_vram_mib": 10579.53,
+      "peak_vram_delta_mib": 8960.0,
+      "warmup": 3,
+      "iters": 10
+    }
+  },
+  "T1_decode": {
+    "native_fused_recurrent_gated_delta_rule": {
+      "mean_ms": 0.0465,
+      "median_ms": 0.0421,
+      "min_ms": 0.0412,
+      "max_ms": 0.0758,
+      "warmup": 3,
+      "iters": 10
+    },
+    "fla_fused_recurrent_dplr_raw": {
+      "mean_ms": 0.0446,
+      "median_ms": 0.043,
+      "min_ms": 0.0421,
+      "max_ms": 0.0541,
+      "warmup": 3,
+      "iters": 10
+    },
+    "fla_fused_recurrent_dplr_gdn2_qed_e2e": {
+      "mean_ms": 0.1545,
+      "median_ms": 0.1512,
+      "min_ms": 0.1446,
+      "max_ms": 0.1839,
+      "warmup": 3,
+      "iters": 10
+    },
+    "pytorch_recurrent_gdn2": {
+      "mean_ms": 0.1284,
+      "median_ms": 0.1279,
+      "min_ms": 0.1196,
+      "max_ms": 0.1531,
+      "warmup": 3,
+      "iters": 10
+    },
+    "fla_ops_gdn2_fused_recurrent_gdn2": {
+      "mean_ms": 0.0496,
+      "median_ms": 0.048,
+      "min_ms": 0.0447,
+      "max_ms": 0.064,
+      "warmup": 3,
+      "iters": 10
+    }
+  }
+}

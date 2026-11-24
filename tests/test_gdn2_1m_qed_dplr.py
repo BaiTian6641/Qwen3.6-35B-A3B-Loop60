@@ -1331,11 +1331,55 @@ def test_fla_macro_segmenting_edge_cases_non_divisible_nested_ckpt_and_guards(
     for sk in ("erase_write_l1", "decay_spread", "decay_horizon_mult_max"):
         assert ad_s.last_stats[sk] == pytest.approx(ad_u.last_stats[sk], abs=1e-10)
 
-    # Guard rails: torch.no_grad() and checkpoint_segments=False run un-segmented (1 call of T=130)
+    # Guard rails: torch.no_grad(), checkpoint_segments=False, and requires_grad=False (even with grad_enabled=True)
+    # all run un-segmented (1 call) with zero checkpoint overhead!
     calls.clear()
     with torch.no_grad():
         ws(q0, k0, v0, gb0, beta0, use_qk_l2norm_in_kernel=True)
     assert [c["T"] for c in calls] == [130]
+
+    # Direct chunk_gdn2 with requires_grad=False inputs under default grad_enabled=True -> 1 un-checkpointed call
+    g_nograd = -(0.05 + 0.2 * torch.rand(bsz, 64, hv, dk, dtype=torch.float64))
+    b_nograd = 0.1 + 1.2 * torch.rand(bsz, 64, hv, dk, dtype=torch.float64)
+    w_nograd = 0.1 + 0.8 * torch.rand(bsz, 64, hv, dv, dtype=torch.float64)
+    lam_nograd = torch.tensor([-0.2, 0.25], dtype=torch.float64)
+    calls.clear()
+    chunk_gdn2(
+        q0[:, :64],
+        k0[:, :64],
+        v0[:, :64],
+        g_nograd,
+        b_nograd,
+        w_nograd,
+        qed_lambda=lam_nograd,
+        backend="dplr",
+        checkpoint_segments=True,
+        fla_segment_len=16,
+        use_qk_l2norm_in_kernel=True,
+    )
+    assert [c["T"] for c in calls] == [64]
+
+    # Trained (non-zero), frozen, .eval() adapter + requires_grad=False inputs under default grad_enabled=True -> 1 call
+    ad_frozen = gdn2_mod.GDN2Adapter(hs, hv, dk, dv, cfg_s, layer_id=0).double()
+    ad_frozen.load_state_dict(ad_u.state_dict())
+    ad_frozen.eval()
+    for p in ad_frozen.parameters():
+        p.requires_grad_(False)
+    eval_attn = torch.nn.Module()
+    eval_attn.eval()
+    w_frozen = gdn2_mod._make_rule_wrapper(eval_attn, ad_frozen, [x0], _never, recurrent_only=False)
+    calls.clear()
+    w_frozen(q0, k0, v0, gb0, beta0, use_qk_l2norm_in_kernel=True)
+    assert [c["T"] for c in calls] == [130]
+
+    # Same frozen adapter WITH an input requiring grad (upstream grad flow) MUST still segment!
+    x_req = x0.clone().requires_grad_(True)
+    w_frozen_up = gdn2_mod._make_rule_wrapper(eval_attn, ad_frozen, [x_req], _never, recurrent_only=False)
+    calls.clear()
+    o_fup, _ = w_frozen_up(q0, k0, v0, gb0, beta0, use_qk_l2norm_in_kernel=True)
+    assert [c["T"] for c in calls] == [64, 64, 2]
+    o_fup.sum().backward()
+    assert x_req.grad is not None and float(x_req.grad.abs().max()) > 0.0
 
     ad_nockpt = gdn2_mod.GDN2Adapter(
         hs,
@@ -1351,7 +1395,7 @@ def test_fla_macro_segmenting_edge_cases_non_divisible_nested_ckpt_and_guards(
     w_nockpt(q0, k0, v0, gb0, beta0, use_qk_l2norm_in_kernel=True)
     assert [c["T"] for c in calls] == [130]
 
-    # No-QED fla_gdn2 wrapper path also segments cleanly
+    # No-QED fla_gdn2 wrapper path also segments cleanly (incl. Layer-0 frozen-input training via need_ad_grad)
     ad_g = gdn2_mod.GDN2Adapter(
         hs,
         hv,

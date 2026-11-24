@@ -1510,7 +1510,13 @@ def chunk_gdn2(
     resolved = _resolve_backend(backend, qed_lambda is not None, query)
     if resolved in ("dplr", "fla_gdn2"):
         seq_len_fla = int(query.shape[1])
-        if fla_segment_len > 0 and seq_len_fla > fla_segment_len and checkpoint_segments and torch.is_grad_enabled():
+        grad_tensors_fla = (
+            (query, key, value, g_vec, b_gate, w_gate)
+            + ((initial_state,) if initial_state is not None else ())
+            + ((qed_lambda,) if qed_lambda is not None else ())
+        )
+        need_grad_fla = torch.is_grad_enabled() and any(t.requires_grad for t in grad_tensors_fla)
+        if fla_segment_len > 0 and seq_len_fla > fla_segment_len and checkpoint_segments and need_grad_fla:
             return _run_fla_segmented(
                 resolved,
                 query,
@@ -2091,11 +2097,18 @@ def _make_rule_wrapper(
             has_qed = adapter.qed_lambda_raw is not None
             resolved = _resolve_backend(backend, has_qed, query)
             fla_seg_len = int(adapter.cfg.fla_segment_len)
+            need_grad_fla = need_ad_grad or (
+                torch.is_grad_enabled()
+                and (
+                    any(t.requires_grad for t in (x_in, query, key, value, g, beta))
+                    or (init_st is not None and init_st.requires_grad)
+                )
+            )
             if (
                 resolved in ("dplr", "fla_gdn2")
                 and fla_seg_len > 0
                 and seq_len > fla_seg_len
-                and torch.is_grad_enabled()
+                and need_grad_fla
                 and adapter.cfg.checkpoint_segments
             ):
                 out, final_state = _run_adapter_fla_segmented(

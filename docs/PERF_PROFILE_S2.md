@@ -2,7 +2,7 @@
 
 - **Branch**: `perf/blackwell-s2-throughput` (branched from `main` `2e37bf6`)
 - **Hardware**: Single NVIDIA RTX PRO 6000 Blackwell Server Edition (`GB202`, `sm_120`, **`96 GB GDDR7 with ECC`** [`94.97 GiB` CUDA-usable], `512-bit` bus, **`1,597 GB/s`** peak Server Edition bandwidth [vs. `1,792 GB/s` Workstation Edition], `24,064` CUDA cores, `600 W` configurable max TDP, passive server cooling; 48 host CPUs, 185 GiB host RAM; PyTorch `2.14.1+cu130`, Triton `3.8.0`, `apollo_torch`, `cut_cross_entropy`)
-- **Workload**: `s2_joint_bptt` (`Qwen3.6-35B-A3B-Loop64`, 88 virtual layers at `d=3` = `66` HSSD v3.2 + `22` D-LSA sparse full-attention, `4 × 32,768 = 131,072` K/V-replay BPTT, `grad_accum=2` -> `262,144` tokens/step, `train.optim.fused=False`, `897` trainable tensors / `104.86M` params)
+- **Workload**: `s2_joint_bptt` (`Qwen3.6-35B-A3B-Loop64`, 88 virtual layers at `d=3` = `66` HSSD v3.2 + `22` D-LSA sparse full-attention, `4 × 32,768 = 131,072` K/V-replay BPTT, `grad_accum=2` -> `262,144` tokens/step, `train.optim.fused=False`, `897` trainable tensors / `187.92M` cumulative trainable params [incl. `104.86M` across `30` 2D full-attn `k/v/o` matrices + `83.06M` prior bundle across `867` tensors])
 - **Constraint**: 100% mathematical equivalence (zero NaN masking, frozen NVFP4 base experts, exact gradients, `gdn2.enabled=false`, `optim.fused=false` atomic whole-step non-finite guard + global `clip_grad_norm_` intact, HSSD v3.2 + D-LSA sparse + 1M YaRN intact, `s2 == s4` config schema invariants preserved).
 
 ---

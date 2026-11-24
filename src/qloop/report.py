@@ -1695,11 +1695,12 @@ def render_experiment_report_md(
     a(
         "| **Single-GPU Optimizer (`APOLLO` + `FusedStepOptimizer`)** | `Measured` + `Derived Formula` | "
         "`rank=256` channel-wise APOLLO (`apollo_torch`) routes all `30` large 2D `k/v/o` matrices (`104.86M` "
-        "params in `s2*`, `4.2×` moment savings, `8×` on `o_proj`) and `o_proj + shared_expert` (`209.72M` in "
-        "`s4_v2_rl`); `fused=True` in-backward `.grad` release in `s1`, atomic `fused=False` guard (`3a17c0d`) "
-        "with `_foreach_norm` (`897 → ~4` launches, `0.0` error) in `s1b/s3/s2/s4` | "
+        "params in `s2*`: `5.0×` moments / `4.2×` net incl. proj, `8.0×` / `6.4×` on `o_proj`) and `o_proj + "
+        "shared_expert` (`209.72M` in `s4_v2_rl`: `2.86×` moments / `2.50×` net, `-0.94 GiB` net); `fused=True` "
+        "in-backward `.grad` release in `s1`, atomic `fused=False` guard (`3a17c0d`) with `_foreach_norm` "
+        "(`897 → ~4` launches, `0.0` error) in `s1b/s3/s2/s4` | "
         "`configs/base.yaml:89-97`, `src/qloop/train/optim.py:382-421`, `docs/PERF_PROFILE_S2.md:59`, "
-        "`runs/s1_loop_a6b_run.log` |"
+        "`runs/s1_loop_a6b_run.log:57-60` |"
     )
     a(
         "| **88L Loop Healing (`s1_loop_a6b`)** | `Measured` | "
@@ -1766,9 +1767,9 @@ def render_experiment_report_md(
         "| **1M Inference & Single-Card Training VRAM Ledger** | `Derived Formula` + `Measured` | "
         f"1M Inference state: **`{v2_tot_gib:.2f} GiB`** (`10.45 GiB` w/ raw `0.133 GiB` GDN; **`3.02×` smaller** "
         "than Inkling 2 Mini `32.16 GiB`; `5.96–6.28 GiB` Hadamard INT4); honest `BucketIndex` audit adds "
-        "`+1.04 GiB` eager `int64` (`~33.54 GiB` total, compactable to `~0.04 GiB` → `~32.5 GiB`). "
-        "Training fits `96 GB` GDDR7 ECC across all stages (`54.24–81.23 GiB` measured; `s2_v2` est. `~62–68 GiB` "
-        "alloc as-is, `~49–55 GiB` w/ `8,192`-tok sub-segmenting) | "
+        "`+1.04 GiB` eager `int64` (`~33.54 GiB` total w/ `21.85 GiB` NVFP4+adapters, compactable to `~0.04 GiB` "
+        "→ `~32.5 GiB`). Training fits `96 GB` GDDR7 ECC across all stages (`54.24–81.23 GiB` measured; `s2_v2` "
+        "est. `~62–68 GiB` alloc envelope as-is, `~47–53 GiB` w/ `8,192`-tok sub-segmenting) | "
         "`src/qloop/model/lsa.py:743-768`, `report.py`, live `1M` pass (`69.52 GiB` @ `ec34f825`) |"
     )
     if da.get("output_counts"):
@@ -1848,7 +1849,7 @@ def render_experiment_report_md(
         "| **`s1_loop_a6b`** (`18.41M`, `137` tensors) | `fused=True` | "
         "`adamw:AdamWLite x137` (in-backward hook steps & frees `.grad` immediately) | "
         "`0` APOLLO tensors (all `100` norms are 1D & `37` loop adapters have `min_dim < 128` / excluded) | "
-        "`Measured` (`runs/s1_loop_a6b_run.log:55-58`) |"
+        "`Measured` (`runs/s1_loop_a6b_run.log:57-60`) |"
     )
     a(
         "| **`s1b_hssd_distill`** (`76.92M`, `807` tensors) | `True` (P1) → **`False`** (`3a17c0d`) | "
@@ -1864,26 +1865,28 @@ def render_experiment_report_md(
         "`Measured` (`configs/stages/s3*_long_1m_lsa.yaml`) |"
     )
     a(
-        "| **`s2_joint_bptt`** (`897` tensors, `104.86M` 2D attn) | `fused=False` | "
+        "| **`s2_joint_bptt`** (`187.92M` total / `897` tensors: `104.86M` 2D attn + `83.06M` prior bundle) | "
+        "`fused=False` | "
         "**`apollo_torch` `APOLLOAdamW` (`30` tensors)** + `767` fp32 fused `AdamW` + `100` bf16 `AdamWLite` | "
         "**Active APOLLO (`rank=256`, channel-wise)** on all `30` large 2D full-attn weights (`k_proj` `[512,2048]`, "
-        "`v_proj` `[512,2048]`, `o_proj` `[2048,4096]` × `10L`): `0.156 GiB` moments (`+0.029` proj = `0.186 GiB`) "
-        "vs `0.781 GiB` AdamW (**`4.2×` smaller**, **`8×`** on `o_proj`) | "
+        "`v_proj` `[512,2048]`, `o_proj` `[2048,4096]` × `10L`): vs `0.781 GiB` AdamW, moments-only **`0.156 GiB` "
+        "(`5.0×`, `-0.625 GiB`; `o_proj` `8.0×`)** or **`0.186 GiB` incl. `+0.029 GiB` fp32 proj (`4.2×` net, "
+        "`-0.60 GiB` net; `o_proj` `6.4×` net)** | "
         "`Measured` (`docs/PERF_PROFILE_S2.md:59`) + `Derived Formula` |"
     )
     a(
-        "| **`s2_v2_joint_bptt`** (`~156.9M` trainable, queued) | `fused=False` | "
+        "| **`s2_v2_joint_bptt`** (`156.94M` trainable, queued) | `fused=False` | "
         "**`APOLLOAdamW` (`30` tensors)** + fused `AdamW` / `AdamWLite` (`gdn2_adapter`, `loop`, `lsa`, `norms`) | "
-        "Identical active APOLLO coverage on all `30` large 2D `k/v/o` matrices (`104.86M` params, `-0.60 GiB` "
-        "moment savings vs AdamW) | "
+        "Identical active APOLLO coverage on all `30` large 2D `k/v/o` matrices (`104.86M` params: `-0.625 GiB` "
+        "moments-only / **`-0.60 GiB` net** after `+0.029 GiB` fp32 proj) | "
         "`Derived Formula` (`configs/stages/s2_v2_joint_bptt.yaml`) |"
     )
     a(
         "| **`s4_v2_rl`** (`SI-RSI`, queued) | `fused=False` | "
         "**`APOLLOAdamW` (`130` tensors)** + fused `AdamW` / `AdamWLite` (`max_grad_norm=0.5`, atomic guard) | "
-        "APOLLO covers **`10` `o_proj` (`83.89M`, `8×` savings: `0.625 → 0.078 GiB`) + `120` `shared_expert` 2D "
-        "matrices (`40L × {gate,up,down}`, `125.83M`, `2×` savings: `0.938 → 0.469 GiB`)** = `209.72M` 2D weights "
-        "(`~1.02 GiB` moments saved) | "
+        "APOLLO covers **`10` `o_proj` (`83.89M`) + `120` `shared_expert` 2D matrices (`40L × {gate,up,down}`, "
+        "`125.83M`)** = `209.72M` 2D weights: vs `1.563 GiB` AdamW, moments-only **`0.547 GiB` (`2.86×`, "
+        "`-1.02 GiB`)** or **`0.625 GiB` incl. `+0.078 GiB` fp32 proj (`2.50×` net, `-0.94 GiB` net)** | "
         "`Derived Formula` (`configs/stages/s4_v2_rl.yaml`) |"
     )
     a("")
@@ -1975,12 +1978,13 @@ def render_experiment_report_md(
         "cached `unit_members` `[1,2,2048,64,8]` `0.156 GiB` + `labels`/`slot_labels` `2×[1,2,2048,128]` "
         "`0.078 GiB` + `slot_counts`/`active`/misc `~0.025 GiB`, or `+1.08 GiB` incl. `counts`/`slot_end`/"
         "`block_id`; plus eager `key_latent` upcasts centroids to `fp32` `+0.31 GiB` until cast to `bf16` at "
-        "inference). Including `~21.8 GiB` pure NVFP4 base weights + adapters, current eager `1M` serving totals "
-        "**`~33.54 GiB`** (or `~35.8 GiB` on the live-loaded `24.09 GiB` mixed-precision `32` NVFP4 + `8` FP8 "
-        "HF checkpoint, `s1_loop_a6b_run.log:24`). Storing `unit_members`/`labels`/`slot_counts` in `int8` "
-        "(`~0.03–0.04 GiB`), dropping training-only `key2slot`, and materializing `members` on-the-fly for the "
-        "selected `Top-64` buckets compacts the `+1.04 GiB` overhead down to **`~0.04 GiB`** → **`~32.5 GiB`** "
-        "total (`34%` of a single `96 GB` GDDR7 ECC card)!\n"
+        "inference). Including `~21.8 GiB` pure NVFP4 base weights + `~0.05 GiB` clean-v2 bf16 adapters "
+        "(`21.85 GiB`), current eager `1M` serving totals **`~33.54 GiB`** (`21.85 + 10.65 + 1.04 GiB`, or "
+        "`~35.8 GiB` on the live-loaded `24.09 GiB` mixed-precision `32` NVFP4 + `8` FP8 HF checkpoint, "
+        "`s1_loop_a6b_run.log:22-29`). Storing `unit_members`/`labels`/`slot_counts` in `int8` (`~0.03–0.04 GiB`), "
+        "dropping training-only `key2slot`, and materializing `members` on-the-fly for the selected `Top-64` "
+        "buckets compacts the `+1.04 GiB` overhead down to **`~0.04 GiB`** → **`~32.5 GiB`** total (`34%` of a "
+        "single `96 GB` GDDR7 ECC card)!\n"
         "- **Inkling 2 Mini (`32.16 GiB`, `Derived Formula`):** Thinking Machines Lab (`24L → 48L`, `R=3`, `5:1` "
         "SWA:global, `8` KV heads × `128` dim, unshared per-pass F16 KV across `8` logical global layers) "
         "= `8 × 2 × 8 × 128 × 2 B × 1,048,576 = 32.00 GiB` + `0.16 GiB` across `40` `1,024`-window SWA layers."
@@ -2041,8 +2045,9 @@ def render_experiment_report_md(
     a(
         "| Resident base weights (`24.09 GiB`) + adapters + APOLLO/AdamW states + grads | "
         "`Measured` + `Derived Formula` | **`~25.50`** | "
-        "`24.09 GiB` loaded mixed NVFP4/FP8 base (`s1_loop_a6b_run.log:24`) + `~156.9M` adapters/attn + "
-        "APOLLO `rank=256` on `30` `k/v/o` matrices (`0.186 GiB` vs `0.781 GiB` AdamW, saving `-0.60 GiB`) |"
+        "`24.09 GiB` loaded mixed NVFP4/FP8 base (`s1_loop_a6b_run.log:22-29`, `:25`) + `156.94M` adapters/attn + "
+        "APOLLO `rank=256` on `30` `k/v/o` matrices (`0.156 GiB` moments / `0.186 GiB` incl. proj vs `0.781 GiB` "
+        "AdamW, saving `-0.60 GiB` net) |"
     )
     a(
         "| `88` activation-checkpoint boundary tensors | `Derived Formula` | **`11.00`** | "
@@ -2058,8 +2063,9 @@ def render_experiment_report_md(
     )
     a(
         "| `u_seg` cached pre-attention hidden states (`3` prior segs × `10L`) | `Derived Formula` | **`3.75`** | "
-        "`3 × 10 × [1, 32768, 2048] × 2 B`; **spills to pinned CPU RAM via `offload_prior_hidden: auto`** "
-        "async DMA when free headroom `< 8 GiB` |"
+        "`3 × 10 × [1, 32768, 2048] × 2 B`; `offload_prior_hidden: auto` (`bptt.py:81-92`) keeps `u_seg` "
+        "resident at step start on `96 GB` (`bptt_offload_to_cpu = 0.0` in `s2` & `smoke_s2v2`), spilling to "
+        "pinned CPU RAM via async DMA if free headroom `< 8 GiB` |"
     )
     a(
         "| `66L` GDN-2 recurrent + conv states & segment snapshots | `Derived Formula` | **`~0.50`** | "
@@ -2074,14 +2080,16 @@ def render_experiment_report_md(
     a(
         "| **Total `s2_v2` Peak As-Is (`T=32K` un-segmented `GDN-2+DPLR`)** | "
         "`Estimated (derived from measured rates)` | **`~62–68` alloc** (`~75–84` res.) | "
-        "Sum with `u_seg` spilled (`auto`) + `~3–5 GiB` CCE/MoE/LSA workspace; fits `94.97 GiB` usable "
+        "Spilled-to-resident envelope (`39.05` spilled / `42.80` resident + `19.5–20.5` transient + `3–5` "
+        "CCE/MoE/LSA workspace = **`~62–65` spilled / `~65–68` resident**); fits `94.97 GiB` usable "
         "(`96 GB` GDDR7 ECC) |"
     )
     a(
         "| **With Clean `8,192`-Token Sub-Segmenting (`4×` Transient Cut)** | "
-        "`Estimated (derived from measured rates)` | **`~49–55` alloc** | "
+        "`Estimated (derived from measured rates)` | **`~47–53` alloc** | "
         "Sub-segmenting `GDN-2 + DPLR` into `4 × 8,192`-tok sub-segments per `32K` chunk cuts the "
-        "`~19.5–20.5 GiB` transient **`4×` → `~5.1 GiB`**, freeing `> 40 GiB` single-card headroom |"
+        "`~19.5–20.5 GiB` transient **`4×` → `~4.9–5.1 GiB`** (**`~47–49` spilled / `~51–53` resident**), "
+        "freeing `> 41 GiB` single-card headroom |"
     )
     a("")
     a("---")
@@ -2614,10 +2622,11 @@ def render_experiment_report_md(
     a("**(b) Exhaustive Failure-Mode Audit (Every Exact Failure Observed in Authoritative Logs):**")
     a("")
     a(
-        "1. **$O(T)$ Cumulative-Phase Backward Jacobian Blowup (`s1b` steps `425–650`, `7a2d590a..dc7c4ad8`):** "
-        "In unscaled Phase-2 distillation, cumulative phase differentiation produced an $O(T)$ Jacobian explosion "
-        "reaching **`global_grad_norm = 6.12e+19`** and **`194,510` skipped parameter updates** (loss `12.0742`, "
-        "`s600` eval NLL `7.1876`). Scaling cumulative-phase backward by `chunk_size / T` + live blend + atomic "
+        "1. **$O(T)$ Cumulative-Phase Backward Jacobian Blowup (`s1b` steps `425–775`, `7a2d590a..6df29172`):** "
+        "In unscaled Phase-2 distillation (`15` Hub commits), cumulative phase differentiation produced an $O(T)$ "
+        "Jacobian explosion reaching **`global_grad_norm = 6.12e+19`** and loss **`12.0742`** (`dc7c4ad8` @ "
+        "`s650`, `121,740` skips; `s600` eval NLL `7.1876`), accumulating **`194,510` skipped parameter updates** "
+        "by `s775` (`6df29172`). Scaling cumulative-phase backward by `chunk_size / T` + live blend + atomic "
         "`fused=False` guard (`a0877a3` / `3a17c0d`) fully resolved numerical stability (`0 / 1,100` skips), "
         "proving the remaining failures below were **architectural**, not numerical."
     )
@@ -2629,10 +2638,11 @@ def render_experiment_report_md(
         "this degraded `1.8757` `64K` NLL floor and topped out at `0.4848` `512K–1M` D-LSA recall."
     )
     a(
-        "3. **Dead Long-Horizon Vault Pages (`hssd/vault_duty` Collapse):** Across `500` steps of `131K` "
-        "`s2_joint_bptt`, `hssd/vault_duty` collapsed to **`2e-4 → 3.26e-5`** (`1.14e-6` early, `~2` dead pages) "
-        "despite `budget_weight = 1.0` and `distill_kl = 0.72` — meaning the STE `Top-2` surprise router "
-        "effectively abandoned long-horizon pages and degenerated into a noisy local-window approximation."
+        "3. **Dead Long-Horizon Vault Pages (`hssd/vault_duty` Collapse):** From `1.81e-4` at `s1b` `s400`, across "
+        "`500` steps of `131K` `s2_joint_bptt`, `hssd/vault_duty` peaked at **`1.28e-4` (`s43`)**, dropped to a "
+        "minimum of **`1.14e-6` (`s425`)**, and finished at **`3.26e-5` (`s500`, `~2` dead pages)** despite "
+        "`budget_weight = 1.0` and `distill_kl = 0.72` — meaning the STE `Top-2` surprise router effectively "
+        "abandoned long-horizon pages and degenerated into a noisy local-window approximation."
     )
     a(
         "4. **Generative & `18K` Needle Failure Even Under `LSA = dense`:** In `truth_check_summary.json`, EVERY "

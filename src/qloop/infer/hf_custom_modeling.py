@@ -550,6 +550,8 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
         arch = config.qloop_v3_arch or {}
         gcfg = dict(arch.get("gdn2") or {})
         if gcfg.pop("enabled", False):
+            known_g = {f.name for f in fields(GDN2Config)}
+            gcfg = {k: v for k, v in gcfg.items() if k in known_g}
             self.gdn2_manager = install_gdn2(self.backbone, GDN2Config.from_dict(gcfg))
 
         hcfg = dict(arch.get("hssd") or {})

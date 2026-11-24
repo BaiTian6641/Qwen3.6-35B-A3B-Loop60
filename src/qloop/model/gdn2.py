@@ -99,6 +99,7 @@ class GDN2Config:
     chunk_size: int = 64
     segment_chunks: int = 16         # 16 * 64 = 1024 tokens per checkpointable WY macro-segment
     checkpoint_segments: bool = True
+    fla_segment_len: int = 8192      # checkpointed macro-segment length for `fla` training (0 disables; >= 64)
     gate_logit_cap: float = 8.0      # smooth tanh bound on channel-wise erase/write logit shifts
     decay_log_cap: float = 1.0       # symmetric fallback bound on log-decay multiplier exp(+-cap)
     decay_log_min: float | None = None   # optional asymmetric min log-decay shift (< 0, e.g. -3.0 => 20.1x horizon)
@@ -124,6 +125,12 @@ class GDN2Config:
             raise ValueError(f"gdn2.chunk_size must be >= 1, got {self.chunk_size}")
         if self.segment_chunks < 1:
             raise ValueError(f"gdn2.segment_chunks must be >= 1, got {self.segment_chunks}")
+        if (
+            isinstance(self.fla_segment_len, bool)
+            or not isinstance(self.fla_segment_len, int)
+            or (self.fla_segment_len != 0 and self.fla_segment_len < 64)
+        ):
+            raise ValueError(f"gdn2.fla_segment_len must be 0 (disabled) or >= 64, got {self.fla_segment_len}")
         if self.gate_logit_cap <= 0 or self.decay_log_cap <= 0:
             raise ValueError("gdn2.gate_logit_cap and gdn2.decay_log_cap must be > 0")
         if self.decay_log_min is not None and float(self.decay_log_min) >= 0.0:
@@ -1073,7 +1080,8 @@ def _run_fla_dplr(
         use_qk_l2norm=use_qk_l2norm_in_kernel,
         out_dtype=init_dtype,
     )
-    init_st = initial_state.to(torch.float32).contiguous() if initial_state is not None else None
+    state_dt = torch.float64 if init_dtype == torch.float64 else torch.float32
+    init_st = initial_state.to(state_dt).contiguous() if initial_state is not None else None
     # `fused_recurrent_dplr_delta_rule` is inference-only in fla 0.6.0 (raises NotImplementedError on backward).
     if seq_len == 1 and not torch.is_grad_enabled():
         out, final_state = rec_dplr(
@@ -1133,13 +1141,14 @@ def _run_fla_gdn2(
         require(hv % k.shape[2] == 0, "num_v_heads must be divisible by num_k_heads", k=k, v=value)
         k = k.repeat_interleave(hv // k.shape[2], dim=2)
 
+    state_dt = torch.float64 if init_dtype == torch.float64 else torch.float32
     q_c = q.to(init_dtype).contiguous()
     k_c = k.to(init_dtype).contiguous()
     v_c = value.to(init_dtype).contiguous()
-    g_c = g_vec.clamp(max=0.0).to(torch.float32).contiguous()
+    g_c = g_vec.clamp(max=0.0).to(state_dt).contiguous()
     b_c = b_gate.to(init_dtype).contiguous()
     w_c = w_gate.to(init_dtype).contiguous()
-    init_st = initial_state.to(torch.float32).contiguous() if initial_state is not None else None
+    init_st = initial_state.to(state_dt).contiguous() if initial_state is not None else None
 
     if seq_len == 1 and not torch.is_grad_enabled():
         out, final_state = fla_rec(
@@ -1168,6 +1177,110 @@ def _run_fla_gdn2(
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
     return out.to(init_dtype), (final_state if output_final_state else None)
+
+
+def _run_fla_segmented(
+    resolved: str,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g_vec: torch.Tensor,
+    b_gate: torch.Tensor,
+    w_gate: torch.Tensor,
+    *,
+    qed_lambda: torch.Tensor | None,
+    seg_len: int,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    use_qk_l2norm_in_kernel: bool,
+    scale: float | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Checkpointed macro-segmented `fla` DPLR / `fla.ops.gdn2` execution over `T`.
+
+    Splits `T` into `seg_len`-token sub-segments inside `checkpoint(..., use_reentrant=False)`,
+    keeping `cur_state` connected in autograd across sub-segments for mathematically exact
+    forward+backward gradients while bounding single-layer FLA scratch VRAM to `O(seg_len)`.
+    """
+    seq_len = int(query.shape[1])
+    cur_state: torch.Tensor | None = initial_state
+    seg_outs: list[torch.Tensor] = []
+
+    for s0 in range(0, seq_len, seg_len):
+        s1 = min(seq_len, s0 + seg_len)
+        need_state_next = (s1 < seq_len) or output_final_state
+
+        has_st = cur_state is not None
+        has_lam = (resolved == "dplr") and (qed_lambda is not None)
+        pos_args: list[torch.Tensor] = [
+            query[:, s0:s1],
+            key[:, s0:s1],
+            value[:, s0:s1],
+            g_vec[:, s0:s1],
+            b_gate[:, s0:s1],
+            w_gate[:, s0:s1],
+        ]
+        if has_st:
+            assert cur_state is not None
+            pos_args.append(cur_state)
+        if has_lam:
+            assert qed_lambda is not None
+            lam_s = (
+                qed_lambda[:, s0:s1]
+                if (qed_lambda.ndim >= 3 and qed_lambda.shape[1] == seq_len)
+                else qed_lambda
+            )
+            pos_args.append(lam_s)
+
+        def _ckpt_seg(
+            *t_args: torch.Tensor,
+            _has_st: bool = has_st,
+            _has_lam: bool = has_lam,
+            _need_st: bool = need_state_next,
+        ) -> Any:
+            idx = 6
+            st_in = t_args[idx] if _has_st else None
+            if _has_st:
+                idx += 1
+            lam_in = t_args[idx] if _has_lam else None
+            if resolved == "dplr":
+                o_s, nxt_s = _run_fla_dplr(
+                    t_args[0],
+                    t_args[1],
+                    t_args[2],
+                    t_args[3],
+                    t_args[4],
+                    t_args[5],
+                    lam_in,
+                    initial_state=st_in,
+                    output_final_state=_need_st,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    scale=scale,
+                )
+            else:
+                o_s, nxt_s = _run_fla_gdn2(
+                    t_args[0],
+                    t_args[1],
+                    t_args[2],
+                    t_args[3],
+                    t_args[4],
+                    t_args[5],
+                    initial_state=st_in,
+                    output_final_state=_need_st,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    scale=scale,
+                )
+            return (o_s, nxt_s) if _need_st else o_s
+
+        res = checkpoint(_ckpt_seg, *pos_args, use_reentrant=False)
+        if need_state_next:
+            o_seg, cur_state = res
+        else:
+            o_seg = res
+            cur_state = None
+        seg_outs.append(o_seg)
+
+    out = seg_outs[0] if len(seg_outs) == 1 else torch.cat(seg_outs, dim=1)
+    return out, (cur_state if output_final_state else None)
 
 
 # ============================================================================ pure-PyTorch & public kernels
@@ -1385,28 +1498,48 @@ def chunk_gdn2(
     chunk_size: int = 64,
     segment_chunks: int = 16,
     checkpoint_segments: bool = True,
+    fla_segment_len: int = 8192,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Parallel chunkwise Gated DeltaNet-2 (+ QED) kernel (`fla` DPLR / `fla.ops.gdn2` / PyTorch WY)."""
+    if isinstance(fla_segment_len, bool) or not isinstance(fla_segment_len, int) or fla_segment_len < 0:
+        raise ValueError(f"fla_segment_len must be an int >= 0, got {fla_segment_len}")
     resolved = _resolve_backend(backend, qed_lambda is not None, query)
-    if resolved == "dplr":
-        return _run_fla_dplr(
-            query,
-            key,
-            value,
-            g_vec,
-            b_gate,
-            w_gate,
-            qed_lambda,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            scale=scale,
-        )
-    if resolved == "fla_gdn2":
+    if resolved in ("dplr", "fla_gdn2"):
+        seq_len_fla = int(query.shape[1])
+        if fla_segment_len > 0 and seq_len_fla > fla_segment_len and checkpoint_segments and torch.is_grad_enabled():
+            return _run_fla_segmented(
+                resolved,
+                query,
+                key,
+                value,
+                g_vec,
+                b_gate,
+                w_gate,
+                qed_lambda=qed_lambda,
+                seg_len=fla_segment_len,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                scale=scale,
+            )
+        if resolved == "dplr":
+            return _run_fla_dplr(
+                query,
+                key,
+                value,
+                g_vec,
+                b_gate,
+                w_gate,
+                qed_lambda,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                scale=scale,
+            )
         return _run_fla_gdn2(
             query,
             key,
@@ -1797,6 +1930,123 @@ _REC_RULE_ATTRS: tuple[str, ...] = (
 )
 
 
+def _run_adapter_fla_segmented(
+    adapter: GDN2Adapter,
+    resolved: str,
+    x_in: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g_base: torch.Tensor,
+    beta_base: torch.Tensor,
+    *,
+    seg_len: int,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    use_qk_l2norm_in_kernel: bool,
+    scale: float | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Checkpointed macro-segmented `compute_gates` + `fla` DPLR / `fla.ops.gdn2` over `T`.
+
+    Running both `adapter.compute_gates` and `_run_fla_dplr` / `_run_fla_gdn2` inside each
+    `checkpoint(..., use_reentrant=False)` sub-segment keeps fp32 gate, prep, and FLA scratch
+    allocations bounded to `O(seg_len)` while keeping `cur_state` connected in autograd so
+    gradients flow bit-identically across all `seq_len` tokens.
+    """
+    seq_len = int(query.shape[1])
+    cur_state: torch.Tensor | None = initial_state
+    seg_outs: list[torch.Tensor] = []
+
+    record_stats = not _in_backward()
+    ew_acc: torch.Tensor | None = None
+    ds_acc: torch.Tensor | None = None
+    hm_acc: torch.Tensor | None = None
+
+    for s0 in range(0, seq_len, seg_len):
+        s1 = min(seq_len, s0 + seg_len)
+        seg_n = s1 - s0
+        need_state_next = (s1 < seq_len) or output_final_state
+
+        has_st = cur_state is not None
+        pos_args: list[torch.Tensor] = [
+            x_in[:, s0:s1],
+            query[:, s0:s1],
+            key[:, s0:s1],
+            value[:, s0:s1],
+            g_base[:, s0:s1],
+            beta_base[:, s0:s1],
+        ]
+        if has_st:
+            assert cur_state is not None
+            pos_args.append(cur_state)
+
+        def _ckpt_seg(
+            *t_args: torch.Tensor,
+            _has_st: bool = has_st,
+            _need_st: bool = need_state_next,
+        ) -> Any:
+            st_in = t_args[6] if _has_st else None
+            gv_s, bg_s, wg_s = adapter.compute_gates(t_args[0], t_args[4], t_args[5])
+            if resolved == "dplr":
+                o_s, nxt_s = _run_fla_dplr(
+                    t_args[1],
+                    t_args[2],
+                    t_args[3],
+                    gv_s,
+                    bg_s,
+                    wg_s,
+                    adapter.qed_lambda(),
+                    initial_state=st_in,
+                    output_final_state=_need_st,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    scale=scale,
+                )
+            else:
+                o_s, nxt_s = _run_fla_gdn2(
+                    t_args[1],
+                    t_args[2],
+                    t_args[3],
+                    gv_s,
+                    bg_s,
+                    wg_s,
+                    initial_state=st_in,
+                    output_final_state=_need_st,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    scale=scale,
+                )
+            return (o_s, nxt_s) if _need_st else o_s
+
+        if record_stats:
+            adapter._pending_stat_tensors = {}
+        res = checkpoint(_ckpt_seg, *pos_args, use_reentrant=False)
+        if need_state_next:
+            o_seg, cur_state = res
+        else:
+            o_seg = res
+            cur_state = None
+        seg_outs.append(o_seg)
+
+        if record_stats and adapter._pending_stat_tensors:
+            with torch.no_grad():
+                wt = float(seg_n) / float(seq_len)
+                ew_i = adapter._pending_stat_tensors["erase_write_l1"] * wt
+                ds_i = adapter._pending_stat_tensors["decay_spread"] * wt
+                hm_i = adapter._pending_stat_tensors["decay_horizon_mult_max"]
+                ew_acc = ew_i if ew_acc is None else (ew_acc + ew_i)
+                ds_acc = ds_i if ds_acc is None else (ds_acc + ds_i)
+                hm_acc = hm_i if hm_acc is None else torch.maximum(hm_acc, hm_i)
+
+    if record_stats and ew_acc is not None and ds_acc is not None and hm_acc is not None:
+        adapter._pending_stat_tensors = {
+            "erase_write_l1": ew_acc,
+            "decay_spread": ds_acc,
+            "decay_horizon_mult_max": hm_acc,
+        }
+
+    out = seg_outs[0] if len(seg_outs) == 1 else torch.cat(seg_outs, dim=1)
+    return out, (cur_state if output_final_state else None)
+
+
 def _make_rule_wrapper(
     attn: nn.Module,
     adapter: GDN2Adapter,
@@ -1837,42 +2087,69 @@ def _make_rule_wrapper(
                 f"{(bsz, seq_len)}",
             )
 
-            g_vec, b_gate, w_gate = adapter.compute_gates(x_in, g, beta)
-            qed_lam = adapter.qed_lambda()
             backend = adapter.cfg.backend
-            if (recurrent_only or seq_len == 1) and not torch.is_grad_enabled():
-                out, final_state = recurrent_gdn2(
+            has_qed = adapter.qed_lambda_raw is not None
+            resolved = _resolve_backend(backend, has_qed, query)
+            fla_seg_len = int(adapter.cfg.fla_segment_len)
+            if (
+                resolved in ("dplr", "fla_gdn2")
+                and fla_seg_len > 0
+                and seq_len > fla_seg_len
+                and torch.is_grad_enabled()
+                and adapter.cfg.checkpoint_segments
+            ):
+                out, final_state = _run_adapter_fla_segmented(
+                    adapter,
+                    resolved,
+                    x_in,
                     query,
                     key,
                     value,
-                    g_vec,
-                    b_gate,
-                    w_gate,
-                    qed_lambda=qed_lam,
-                    backend=backend,
+                    g,
+                    beta,
+                    seg_len=fla_seg_len,
                     initial_state=init_st,
                     output_final_state=out_final,
                     use_qk_l2norm_in_kernel=use_l2,
                     scale=scale,
                 )
             else:
-                out, final_state = chunk_gdn2(
-                    query,
-                    key,
-                    value,
-                    g_vec,
-                    b_gate,
-                    w_gate,
-                    qed_lambda=qed_lam,
-                    backend=backend,
-                    chunk_size=csize,
-                    segment_chunks=adapter.cfg.segment_chunks,
-                    checkpoint_segments=adapter.cfg.checkpoint_segments,
-                    initial_state=init_st,
-                    output_final_state=out_final,
-                    use_qk_l2norm_in_kernel=use_l2,
-                    scale=scale,
-                )
+                g_vec, b_gate, w_gate = adapter.compute_gates(x_in, g, beta)
+                qed_lam = adapter.qed_lambda()
+                if (recurrent_only or seq_len == 1) and not torch.is_grad_enabled():
+                    out, final_state = recurrent_gdn2(
+                        query,
+                        key,
+                        value,
+                        g_vec,
+                        b_gate,
+                        w_gate,
+                        qed_lambda=qed_lam,
+                        backend=backend,
+                        initial_state=init_st,
+                        output_final_state=out_final,
+                        use_qk_l2norm_in_kernel=use_l2,
+                        scale=scale,
+                    )
+                else:
+                    out, final_state = chunk_gdn2(
+                        query,
+                        key,
+                        value,
+                        g_vec,
+                        b_gate,
+                        w_gate,
+                        qed_lambda=qed_lam,
+                        backend=backend,
+                        chunk_size=csize,
+                        segment_chunks=adapter.cfg.segment_chunks,
+                        checkpoint_segments=adapter.cfg.checkpoint_segments,
+                        fla_segment_len=fla_seg_len,
+                        initial_state=init_st,
+                        output_final_state=out_final,
+                        use_qk_l2norm_in_kernel=use_l2,
+                        scale=scale,
+                    )
             if head_first:
                 out = out.transpose(1, 2)
             return out, final_state
@@ -2072,7 +2349,7 @@ def install_gdn2(model: nn.Module, cfg: GDN2Config | dict[str, Any] | None = Non
     n_params = sum(p.numel() for p in (p for ad in adapters.values() for p in ad.parameters()))
     log.info(
         "GDN-2 installed on %d linear-attention layers (rank=%d, chunk=%d, decay=[%s,%s], qed=%s, "
-        "neg_boost=%.2f, backend=%s, params=%.2fM, step-0 bit-identical)",
+        "neg_boost=%.2f, backend=%s, fla_seg=%d, params=%.2fM, step-0 bit-identical)",
         len(adapters),
         cfg.rank,
         cfg.chunk_size,
@@ -2081,6 +2358,7 @@ def install_gdn2(model: nn.Module, cfg: GDN2Config | dict[str, Any] | None = Non
         cfg.qed_enabled,
         cfg.neg_eigval_max_boost,
         cfg.backend,
+        cfg.fla_segment_len,
         n_params / 1e6,
     )
     return GDN2Manager(model, cfg, adapters, hooks, restorers)

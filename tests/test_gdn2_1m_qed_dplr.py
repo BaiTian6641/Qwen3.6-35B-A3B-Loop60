@@ -140,12 +140,29 @@ def test_gdn2_1m_config_validation_and_asymmetric_tanh_bound() -> None:
     assert default_cfg.qed_max_lambda == pytest.approx(0.35)
     assert default_cfg.neg_eigval_max_boost == pytest.approx(0.0)
     assert default_cfg.backend == "auto"
+    assert default_cfg.fla_segment_len == 8192
 
     # Full 1M + QED + soft neg-eigval config
     cfg = GDN2Config.from_dict({"enabled": True, **FULL_1M_QED_CFG})
     cfg.validate()
+    assert cfg.fla_segment_len == 8192
+
+    # Valid fla_segment_len boundaries (0 disables; >= 64 enabled)
+    GDN2Config(fla_segment_len=0).validate()
+    GDN2Config(fla_segment_len=64).validate()
+    GDN2Config(fla_segment_len=8192).validate()
 
     # Invalid parameter rejection
+    with pytest.raises(ValueError, match="fla_segment_len"):
+        GDN2Config(fla_segment_len=-1).validate()
+    with pytest.raises(ValueError, match="fla_segment_len"):
+        GDN2Config(fla_segment_len=1).validate()
+    with pytest.raises(ValueError, match="fla_segment_len"):
+        GDN2Config(fla_segment_len=16).validate()
+    with pytest.raises(ValueError, match="fla_segment_len"):
+        GDN2Config(fla_segment_len=63).validate()
+    with pytest.raises(ValueError, match="fla_segment_len"):
+        GDN2Config(fla_segment_len=True).validate()  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="decay_log_min"):
         GDN2Config(decay_log_min=0.0).validate()
     with pytest.raises(ValueError, match="decay_log_min"):
@@ -913,6 +930,556 @@ def test_mocked_fla_dplr_and_fla_gdn2_dispatch_and_no_double_scaling(monkeypatch
     assert len(calls) == n_before
 
 
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+@pytest.mark.parametrize("use_init_state", [False, True])
+@pytest.mark.parametrize("output_final_state", [False, True])
+def test_fla_macro_segmenting_exact_fwd_bwd_parity(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    use_init_state: bool,
+    output_final_state: bool,
+) -> None:
+    """Verify exact forward + backward gradient parity between un-segmented (`fla_segment_len=0`)
+    and checkpointed macro-segmented (`fla_segment_len=16` on `T=64`) execution through:
+      1) Direct `chunk_gdn2(..., backend="dplr")` and `chunk_gdn2(..., backend="fla_gdn2")`
+      2) `_make_rule_wrapper` (including `compute_gates` + `qed_lambda_raw` + `neg_gamma_raw` grads,
+         deferred `_pending_stat_tensors`, and nested outer `checkpoint(use_reentrant=False)`)
+    with both `initial_state=None` and non-zero `initial_state`.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def _fake_chunk_dplr(*, q, k, v, a, b, gk, scale=None, initial_state=None, output_final_state=False):
+        calls.append(
+            {
+                "fn": "chunk_dplr",
+                "T": int(q.shape[1]),
+                "has_init": initial_state is not None,
+                "out_final": bool(output_final_state),
+                "in_bwd": gdn2_mod._in_backward(),
+            }
+        )
+        return _dplr_exact_ref(
+            q, k, v, a, b, gk, scale=scale, initial_state=initial_state, output_final_state=output_final_state
+        )
+
+    def _fake_rec_dplr(*, q, k, v, a, b, gk, scale=None, initial_state=None, output_final_state=False):
+        if torch.is_grad_enabled():
+            raise NotImplementedError("fused_recurrent_dplr_delta_rule is inference-only")
+        return _dplr_exact_ref(
+            q, k, v, a, b, gk, scale=scale, initial_state=initial_state, output_final_state=output_final_state
+        )
+
+    def _fake_chunk_gdn2(
+        *, q, k, v, g, b, w, scale=None, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=False
+    ):
+        calls.append(
+            {
+                "fn": "fla_chunk_gdn2",
+                "T": int(q.shape[1]),
+                "has_init": initial_state is not None,
+                "out_final": bool(output_final_state),
+                "in_bwd": gdn2_mod._in_backward(),
+            }
+        )
+        return recurrent_gdn2(
+            q,
+            k,
+            v,
+            g,
+            b,
+            w,
+            backend="pytorch",
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+        )
+
+    def _fake_rec_gdn2(
+        *, q, k, v, g, b, w, scale=None, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=False
+    ):
+        if torch.is_grad_enabled():
+            raise NotImplementedError("fused_recurrent_gdn2 is inference-only")
+        return recurrent_gdn2(
+            q,
+            k,
+            v,
+            g,
+            b,
+            w,
+            backend="pytorch",
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+        )
+
+    monkeypatch.setattr(gdn2_mod, "_is_fla_eligible_tensor", lambda _t: True)
+    monkeypatch.setattr(gdn2_mod, "_get_fla_dplr_ops", lambda: (_fake_chunk_dplr, _fake_rec_dplr))
+    monkeypatch.setattr(gdn2_mod, "_get_fla_gdn2_ops", lambda: (_fake_chunk_gdn2, _fake_rec_gdn2))
+
+    tol = 1e-6 if dtype == torch.float64 else 1e-5
+    torch.manual_seed(42 + int(use_init_state) + 2 * int(output_final_state))
+    bsz, seq_len = 1, 64
+    hs, hq, hk, hv, dk, dv = 16, 2, 2, 4, 8, 10  # GQA H_k < H_v and non-square d_k != d_v
+
+    q0 = torch.randn(bsz, seq_len, hq, dk, dtype=dtype)
+    k0 = torch.randn(bsz, seq_len, hk, dk, dtype=dtype)
+    v0 = torch.randn(bsz, seq_len, hv, dv, dtype=dtype)
+    g0 = -(0.02 + 0.25 * torch.rand(bsz, seq_len, hv, dk, dtype=dtype))
+    b0 = 0.05 + 1.40 * torch.rand(bsz, seq_len, hv, dk, dtype=dtype)
+    w0 = 0.05 + 0.90 * torch.rand(bsz, seq_len, hv, dv, dtype=dtype)
+    lam0 = torch.tensor([-0.28, 0.22, -0.15, 0.31], dtype=dtype)
+    h0 = (0.25 * torch.randn(bsz, hv, dk, dv, dtype=dtype)) if use_init_state else None
+
+    # --- 1) Direct chunk_gdn2(..., backend="dplr") parity (fla_segment_len=0 vs 16 on T=64)
+    def _clone_dplr_leaves():
+        leaves = [t.detach().clone().requires_grad_(True) for t in (q0, k0, v0, g0, b0, w0, lam0)]
+        st_leaf = None if h0 is None else h0.detach().clone().requires_grad_(True)
+        return leaves, st_leaf
+
+    u_leaves, u_st = _clone_dplr_leaves()
+    s_leaves, s_st = _clone_dplr_leaves()
+
+    calls.clear()
+    o_u, st_u = chunk_gdn2(
+        *u_leaves[:6],
+        qed_lambda=u_leaves[6],
+        backend="dplr",
+        checkpoint_segments=True,
+        fla_segment_len=0,
+        initial_state=u_st,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=True,
+    )
+    assert len(calls) == 1 and calls[0]["T"] == 64
+
+    calls.clear()
+    o_s, st_s = chunk_gdn2(
+        *s_leaves[:6],
+        qed_lambda=s_leaves[6],
+        backend="dplr",
+        checkpoint_segments=True,
+        fla_segment_len=16,
+        initial_state=s_st,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=True,
+    )
+    fwd_calls = list(calls)
+    assert len(fwd_calls) == 4
+    assert [c["T"] for c in fwd_calls] == [16, 16, 16, 16]
+    assert fwd_calls[0]["has_init"] is use_init_state
+    assert all(c["has_init"] for c in fwd_calls[1:])
+    assert all(c["out_final"] for c in fwd_calls[:-1])
+    assert fwd_calls[-1]["out_final"] is output_final_state
+
+    assert float((o_s - o_u).detach().abs().max()) < tol
+    if output_final_state:
+        assert st_u is not None and st_s is not None
+        assert float((st_s - st_u).detach().abs().max()) < tol
+    else:
+        assert st_u is None and st_s is None
+
+    go = torch.randn_like(o_u)
+    gs = torch.randn_like(st_u) if st_u is not None else None
+    loss_u = (o_u * go).sum() + ((st_u * gs).sum() if (st_u is not None and gs is not None) else 0.0)
+    loss_s = (o_s * go).sum() + ((st_s * gs).sum() if (st_s is not None and gs is not None) else 0.0)
+    loss_u.backward()
+    calls.clear()
+    loss_s.backward()
+    assert len(calls) == 4 and all(c["in_bwd"] for c in calls)
+
+    for nm, tu, ts in zip(("q", "k", "v", "g_vec", "b_gate", "w_gate", "qed_lambda"), u_leaves, s_leaves):
+        assert tu.grad is not None and ts.grad is not None, nm
+        assert float((ts.grad - tu.grad).abs().max()) < tol, f"chunk_gdn2 dplr grad mismatch on {nm}"
+    if use_init_state:
+        assert u_st is not None and s_st is not None and u_st.grad is not None and s_st.grad is not None
+        assert float((s_st.grad - u_st.grad).abs().max()) < tol, "chunk_gdn2 dplr initial_state grad mismatch"
+
+    # --- 1b) Direct chunk_gdn2(..., backend="fla_gdn2") parity (no QED)
+    if not output_final_state and use_init_state:
+        u_g_leaves, u_g_st = _clone_dplr_leaves()
+        s_g_leaves, s_g_st = _clone_dplr_leaves()
+        calls.clear()
+        og_u, _ = chunk_gdn2(
+            *u_g_leaves[:6],
+            qed_lambda=None,
+            backend="fla_gdn2",
+            checkpoint_segments=True,
+            fla_segment_len=0,
+            initial_state=u_g_st,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        assert len(calls) == 1 and calls[0]["fn"] == "fla_chunk_gdn2"
+        calls.clear()
+        og_s, _ = chunk_gdn2(
+            *s_g_leaves[:6],
+            qed_lambda=None,
+            backend="fla_gdn2",
+            checkpoint_segments=True,
+            fla_segment_len=16,
+            initial_state=s_g_st,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        assert len(calls) == 4 and all(c["fn"] == "fla_chunk_gdn2" for c in calls)
+        assert float((og_s - og_u).detach().abs().max()) < tol
+        (og_u * go).sum().backward()
+        (og_s * go).sum().backward()
+        for nm, tu, ts in zip(("q", "k", "v", "g_vec", "b_gate", "w_gate"), u_g_leaves[:6], s_g_leaves[:6]):
+            assert tu.grad is not None and ts.grad is not None, nm
+            assert float((ts.grad - tu.grad).abs().max()) < tol, f"chunk_gdn2 fla_gdn2 grad mismatch on {nm}"
+        assert u_g_st is not None and s_g_st is not None and u_g_st.grad is not None and s_g_st.grad is not None
+        assert float((s_g_st.grad - u_g_st.grad).abs().max()) < tol
+
+    # --- 2) _make_rule_wrapper parity (compute_gates + qed_lambda_raw + neg_gamma_raw + stats)
+    x0 = torch.randn(bsz, seq_len, hs, dtype=dtype)
+    gb0 = -(0.02 + 0.25 * torch.rand(bsz, seq_len, hv, dtype=dtype))
+    beta0 = 0.1 + 0.8 * torch.rand(bsz, seq_len, hv, dtype=dtype)
+
+    base_cfg_kw = {
+        "rank": 8,
+        "chunk_size": 8,
+        "segment_chunks": 2,
+        "checkpoint_segments": True,
+        "decay_log_min": -3.0,
+        "decay_log_max": 0.5,
+        "qed_enabled": True,
+        "qed_max_lambda": 0.35,
+        "neg_eigval_max_boost": 0.5,
+        "backend": "dplr",
+    }
+    ad_unseg = gdn2_mod.GDN2Adapter(
+        hs, hv, dk, dv, GDN2Config(**base_cfg_kw, fla_segment_len=0), layer_id=0
+    ).to(dtype=dtype)
+    with torch.no_grad():
+        for p in ad_unseg.parameters():
+            p.copy_(0.2 * torch.randn_like(p))
+    ad_seg = gdn2_mod.GDN2Adapter(
+        hs, hv, dk, dv, GDN2Config(**base_cfg_kw, fla_segment_len=64), layer_id=0
+    ).to(dtype=dtype)
+    ad_seg.load_state_dict(ad_unseg.state_dict())
+    monkeypatch.setattr(ad_seg.cfg, "fla_segment_len", 16)
+
+    dummy_attn = torch.nn.Module()
+    dummy_attn.train()
+
+    def _never_orig(*_a: Any, **_kw: Any):
+        raise AssertionError("orig_fn must not be called for non-zero trained adapter")
+
+    x_u, q_u, k_u, v_u, g_u, bt_u = (t.detach().clone().requires_grad_(True) for t in (x0, q0, k0, v0, gb0, beta0))
+    st_wu = None if h0 is None else h0.detach().clone().requires_grad_(True)
+    x_s, q_s, k_s, v_s, g_s, bt_s = (t.detach().clone().requires_grad_(True) for t in (x0, q0, k0, v0, gb0, beta0))
+    st_ws = None if h0 is None else h0.detach().clone().requires_grad_(True)
+
+    w_unseg = gdn2_mod._make_rule_wrapper(dummy_attn, ad_unseg, [x_u], _never_orig, recurrent_only=False)
+    w_seg = gdn2_mod._make_rule_wrapper(dummy_attn, ad_seg, [x_s], _never_orig, recurrent_only=False)
+
+    calls.clear()
+    ow_u, stw_u = w_unseg(
+        q_u, k_u, v_u, g_u, bt_u,
+        initial_state=st_wu, output_final_state=output_final_state, use_qk_l2norm_in_kernel=True,
+    )
+    assert len(calls) == 1 and calls[0]["T"] == 64
+
+    calls.clear()
+    ow_s, stw_s = w_seg(
+        q_s, k_s, v_s, g_s, bt_s,
+        initial_state=st_ws, output_final_state=output_final_state, use_qk_l2norm_in_kernel=True,
+    )
+    assert len(calls) == 4 and [c["T"] for c in calls] == [16, 16, 16, 16]
+    # Deferred GPU/CPU stat tensors must remain pending (not materialized yet) right after forward
+    assert set(ad_seg._pending_stat_tensors.keys()) == {"erase_write_l1", "decay_spread", "decay_horizon_mult_max"}
+
+    assert float((ow_s - ow_u).detach().abs().max()) < tol
+    if output_final_state:
+        assert stw_u is not None and stw_s is not None
+        assert float((stw_s - stw_u).detach().abs().max()) < tol
+    else:
+        assert stw_u is None and stw_s is None
+
+    gw_o = torch.randn_like(ow_u)
+    gw_s = torch.randn_like(stw_u) if stw_u is not None else None
+    ((ow_u * gw_o).sum() + ((stw_u * gw_s).sum() if (stw_u is not None and gw_s is not None) else 0.0)).backward()
+    calls.clear()
+    ((ow_s * gw_o).sum() + ((stw_s * gw_s).sum() if (stw_s is not None and gw_s is not None) else 0.0)).backward()
+    assert len(calls) == 4 and all(c["in_bwd"] for c in calls)
+
+    # Deferred stats must remain intact after backward recomputation and match un-segmented exactly!
+    assert set(ad_seg._pending_stat_tensors.keys()) == {"erase_write_l1", "decay_spread", "decay_horizon_mult_max"}
+    stats_u = ad_unseg.last_stats
+    stats_s = ad_seg.last_stats
+    for sk in ("erase_write_l1", "decay_spread", "decay_horizon_mult_max"):
+        assert stats_s[sk] == pytest.approx(stats_u[sk], abs=tol, rel=tol), f"stat {sk} mismatch"
+
+    for nm, tu, ts in zip(
+        ("x_in", "q", "k", "v", "g_base", "beta_base"),
+        (x_u, q_u, k_u, v_u, g_u, bt_u),
+        (x_s, q_s, k_s, v_s, g_s, bt_s),
+    ):
+        assert tu.grad is not None and ts.grad is not None, nm
+        assert float((ts.grad - tu.grad).abs().max()) < tol, f"wrapper input grad mismatch on {nm}"
+    if use_init_state:
+        assert st_wu is not None and st_ws is not None and st_wu.grad is not None and st_ws.grad is not None
+        assert float((st_ws.grad - st_wu.grad).abs().max()) < tol, "wrapper initial_state grad mismatch"
+
+    for (pnu, pu), (pns, ps) in zip(ad_unseg.named_parameters(), ad_seg.named_parameters()):
+        assert pnu == pns
+        assert pu.grad is not None and ps.grad is not None, pnu
+        assert float(ps.grad.abs().max()) > 0.0, f"{pnu} got zero grad"
+        assert float((ps.grad - pu.grad).abs().max()) < tol, f"wrapper param grad mismatch on {pnu}"
+
+
+def test_fla_macro_segmenting_edge_cases_non_divisible_nested_ckpt_and_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify non-divisible `T=130` with valid `GDN2Config(fla_segment_len=64)` (`[64, 64, 2]`),
+    nested outer `checkpoint(..., use_reentrant=False)` (matching `loop.py`), `fla_gdn2` wrapper,
+    and guard rails (`checkpoint_segments=False` & `torch.no_grad()` run un-segmented).
+    """
+    from torch.utils.checkpoint import checkpoint as torch_ckpt
+
+    calls: list[dict[str, Any]] = []
+
+    def _fake_chunk_dplr(*, q, k, v, a, b, gk, scale=None, initial_state=None, output_final_state=False):
+        calls.append({"fn": "chunk_dplr", "T": int(q.shape[1]), "in_bwd": gdn2_mod._in_backward()})
+        return _dplr_exact_ref(
+            q, k, v, a, b, gk, scale=scale, initial_state=initial_state, output_final_state=output_final_state
+        )
+
+    def _fake_chunk_gdn2(
+        *, q, k, v, g, b, w, scale=None, initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=False
+    ):
+        calls.append({"fn": "fla_chunk_gdn2", "T": int(q.shape[1]), "in_bwd": gdn2_mod._in_backward()})
+        return recurrent_gdn2(
+            q,
+            k,
+            v,
+            g,
+            b,
+            w,
+            backend="pytorch",
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            scale=scale,
+        )
+
+    monkeypatch.setattr(gdn2_mod, "_is_fla_eligible_tensor", lambda _t: True)
+    monkeypatch.setattr(gdn2_mod, "_get_fla_dplr_ops", lambda: (_fake_chunk_dplr, _fake_chunk_dplr))
+    monkeypatch.setattr(gdn2_mod, "_get_fla_gdn2_ops", lambda: (_fake_chunk_gdn2, _fake_chunk_gdn2))
+
+    torch.manual_seed(77)
+    bsz, seq_len, hs, hv, dk, dv = 1, 130, 8, 2, 4, 4  # 130 = 64 + 64 + 2 (non-divisible tail!)
+    x0 = torch.randn(bsz, seq_len, hs, dtype=torch.float64)
+    q0 = torch.randn(bsz, seq_len, hv, dk, dtype=torch.float64)
+    k0 = torch.randn(bsz, seq_len, hv, dk, dtype=torch.float64)
+    v0 = torch.randn(bsz, seq_len, hv, dv, dtype=torch.float64)
+    gb0 = -(0.05 + 0.2 * torch.rand(bsz, seq_len, hv, dtype=torch.float64))
+    beta0 = 0.1 + 0.8 * torch.rand(bsz, seq_len, hv, dtype=torch.float64)
+
+    cfg_u = GDN2Config(
+        rank=4, chunk_size=8, segment_chunks=2, checkpoint_segments=True,
+        fla_segment_len=0, qed_enabled=True, neg_eigval_max_boost=0.5, backend="dplr",
+    )
+    cfg_s = GDN2Config(
+        rank=4, chunk_size=8, segment_chunks=2, checkpoint_segments=True,
+        fla_segment_len=64, qed_enabled=True, neg_eigval_max_boost=0.5, backend="dplr",
+    )
+    ad_u = gdn2_mod.GDN2Adapter(hs, hv, dk, dv, cfg_u, layer_id=0).double()
+    with torch.no_grad():
+        for p in ad_u.parameters():
+            p.copy_(0.15 * torch.randn_like(p))
+    ad_s = gdn2_mod.GDN2Adapter(hs, hv, dk, dv, cfg_s, layer_id=0).double()
+    ad_s.load_state_dict(ad_u.state_dict())
+
+    dummy_attn = torch.nn.Module()
+    dummy_attn.train()
+
+    def _never(*_a: Any, **_kw: Any):
+        raise AssertionError("unexpected orig_fn call")
+
+    # Test nested outer checkpoint(..., use_reentrant=False) + non-divisible T=130 -> [64, 64, 2]
+    xu = x0.clone().requires_grad_(True)
+    xs = x0.clone().requires_grad_(True)
+    wu = gdn2_mod._make_rule_wrapper(dummy_attn, ad_u, [xu], _never, recurrent_only=False)
+    ws = gdn2_mod._make_rule_wrapper(dummy_attn, ad_s, [xs], _never, recurrent_only=False)
+
+    ou, stu = wu(q0, k0, v0, gb0, beta0, output_final_state=True, use_qk_l2norm_in_kernel=True)
+    calls.clear()
+
+    def _outer_layer(xi: torch.Tensor):
+        w_inner = gdn2_mod._make_rule_wrapper(dummy_attn, ad_s, [xi], _never, recurrent_only=False)
+        return w_inner(q0, k0, v0, gb0, beta0, output_final_state=True, use_qk_l2norm_in_kernel=True)
+
+    os_, sts = torch_ckpt(_outer_layer, xs, use_reentrant=False)
+    assert [c["T"] for c in calls] == [64, 64, 2]
+    assert float((os_ - ou).detach().abs().max()) < 1e-10
+    assert stu is not None and sts is not None
+    assert float((sts - stu).detach().abs().max()) < 1e-10
+
+    go = torch.randn_like(ou)
+    gs = torch.randn_like(stu)
+    ((ou * go).sum() + (stu * gs).sum()).backward()
+    ((os_ * go).sum() + (sts * gs).sum()).backward()
+    assert xu.grad is not None and xs.grad is not None
+    assert float((xs.grad - xu.grad).abs().max()) < 1e-10
+    for (pnu, pu), (_, ps) in zip(ad_u.named_parameters(), ad_s.named_parameters()):
+        assert pu.grad is not None and ps.grad is not None, pnu
+        assert float((ps.grad - pu.grad).abs().max()) < 1e-10, pnu
+    for sk in ("erase_write_l1", "decay_spread", "decay_horizon_mult_max"):
+        assert ad_s.last_stats[sk] == pytest.approx(ad_u.last_stats[sk], abs=1e-10)
+
+    # Guard rails: torch.no_grad() and checkpoint_segments=False run un-segmented (1 call of T=130)
+    calls.clear()
+    with torch.no_grad():
+        ws(q0, k0, v0, gb0, beta0, use_qk_l2norm_in_kernel=True)
+    assert [c["T"] for c in calls] == [130]
+
+    ad_nockpt = gdn2_mod.GDN2Adapter(
+        hs,
+        hv,
+        dk,
+        dv,
+        GDN2Config(rank=4, checkpoint_segments=False, fla_segment_len=64, qed_enabled=True, backend="dplr"),
+        layer_id=0,
+    ).double()
+    ad_nockpt.load_state_dict(ad_u.state_dict(), strict=False)
+    w_nockpt = gdn2_mod._make_rule_wrapper(dummy_attn, ad_nockpt, [x0], _never, recurrent_only=False)
+    calls.clear()
+    w_nockpt(q0, k0, v0, gb0, beta0, use_qk_l2norm_in_kernel=True)
+    assert [c["T"] for c in calls] == [130]
+
+    # No-QED fla_gdn2 wrapper path also segments cleanly
+    ad_g = gdn2_mod.GDN2Adapter(
+        hs,
+        hv,
+        dk,
+        dv,
+        GDN2Config(rank=4, checkpoint_segments=True, fla_segment_len=64, qed_enabled=False, backend="fla_gdn2"),
+        layer_id=0,
+    ).double()
+    with torch.no_grad():
+        for p in ad_g.parameters():
+            p.copy_(0.15 * torch.randn_like(p))
+    w_g = gdn2_mod._make_rule_wrapper(dummy_attn, ad_g, [x0], _never, recurrent_only=False)
+    calls.clear()
+    o_g, _ = w_g(q0, k0, v0, gb0, beta0, use_qk_l2norm_in_kernel=True)
+    assert len(calls) == 3
+    assert all(c["fn"] == "fla_chunk_gdn2" for c in calls)
+    assert [c["T"] for c in calls] == [64, 64, 2]
+    o_g.sum().backward()
+    assert ad_g.erase_up.weight.grad is not None and float(ad_g.erase_up.weight.grad.abs().max()) > 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for T=32768 VRAM & parity benchmark")
+def test_cuda_fla_32k_macro_segmenting_vram_delta_and_parity() -> None:
+    """Benchmark `T=32768` (`B=1, H=32, K=128, V=128, bf16`) peak VRAM delta & fwd+bwd parity
+    for `fla_segment_len=8192` (`4 x 8,192`) vs un-segmented (`fla_segment_len=0`).
+    """
+    import gc
+
+    if gdn2_mod._get_fla_dplr_ops() is None:
+        pytest.skip("fla DPLR ops not installed in this CUDA environment")
+    total_gib = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    if total_gib < 32.0:
+        pytest.skip(f"GPU has {total_gib:.1f} GiB (< 32 GiB needed for un-segmented 32K baseline)")
+
+    dev = torch.device("cuda")
+    dtype = torch.bfloat16
+    bsz, seq_len, hs, hv, dk, dv = 1, 32768, 2048, 32, 128, 128
+
+    torch.manual_seed(17)
+    x_base = torch.randn(bsz, seq_len, hs, device=dev, dtype=dtype)
+    q_base = torch.randn(bsz, seq_len, hv, dk, device=dev, dtype=dtype)
+    k_base = torch.randn(bsz, seq_len, hv, dk, device=dev, dtype=dtype)
+    v_base = torch.randn(bsz, seq_len, hv, dv, device=dev, dtype=dtype)
+    g_base = -(0.02 + 0.20 * torch.rand(bsz, seq_len, hv, device=dev, dtype=torch.float32))
+    beta_base = 0.1 + 0.8 * torch.rand(bsz, seq_len, hv, device=dev, dtype=torch.float32)
+    go_base = torch.randn(bsz, seq_len, hv, dv, device=dev, dtype=dtype)
+
+    base_cfg_kw = {
+        "rank": 64,
+        "chunk_size": 64,
+        "checkpoint_segments": True,
+        "decay_log_min": -3.0,
+        "decay_log_max": 0.5,
+        "qed_enabled": True,
+        "qed_max_lambda": 0.35,
+        "neg_eigval_max_boost": 0.5,
+        "backend": "dplr",
+    }
+    ref_ad = gdn2_mod.GDN2Adapter(
+        hs, hv, dk, dv, GDN2Config(**base_cfg_kw, fla_segment_len=0), layer_id=0
+    ).to(device=dev, dtype=torch.float32)
+    with torch.no_grad():
+        for p in ref_ad.parameters():
+            p.copy_(0.05 * torch.randn_like(p))
+    init_sd = {k: v.detach().cpu().clone() for k, v in ref_ad.state_dict().items()}
+    del ref_ad
+
+    def _run_once(seg_len: int) -> tuple[float, torch.Tensor, dict[str, torch.Tensor]]:
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        ad = gdn2_mod.GDN2Adapter(
+            hs, hv, dk, dv, GDN2Config(**base_cfg_kw, fla_segment_len=seg_len), layer_id=0
+        ).to(device=dev, dtype=torch.float32)
+        ad.load_state_dict({k: v.to(device=dev) for k, v in init_sd.items()})
+        dummy = torch.nn.Module()
+        dummy.train()
+
+        def _never(*_a: Any, **_kw: Any):
+            raise AssertionError("unexpected orig_fn call")
+
+        x = x_base.detach().clone().requires_grad_(True)
+        q = q_base.detach().clone().requires_grad_(True)
+        k = k_base.detach().clone().requires_grad_(True)
+        v = v_base.detach().clone().requires_grad_(True)
+        gb = g_base.detach().clone().requires_grad_(True)
+        bt = beta_base.detach().clone().requires_grad_(True)
+        wrap = gdn2_mod._make_rule_wrapper(dummy, ad, [x], _never, recurrent_only=False)
+
+        torch.cuda.synchronize()
+        base_alloc = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        out, _ = wrap(q, k, v, gb, bt, output_final_state=False, use_qk_l2norm_in_kernel=True)
+        (out.float() * go_base.float()).sum().backward()
+        torch.cuda.synchronize()
+        peak_delta_gib = (torch.cuda.max_memory_allocated() - base_alloc) / (1024**3)
+
+        out_cpu = out.detach().cpu()
+        grads: dict[str, torch.Tensor] = {
+            "x": x.grad.detach().cpu(),
+            "q": q.grad.detach().cpu(),
+            "k": k.grad.detach().cpu(),
+            "v": v.grad.detach().cpu(),
+            "g": gb.grad.detach().cpu(),
+            "beta": bt.grad.detach().cpu(),
+        }
+        for pname, p in ad.named_parameters():
+            assert p.grad is not None, pname
+            grads[f"param.{pname}"] = p.grad.detach().cpu()
+        del out, x, q, k, v, gb, bt, ad, wrap
+        gc.collect()
+        torch.cuda.empty_cache()
+        return peak_delta_gib, out_cpu, grads
+
+    unseg_gib, out_unseg, grads_unseg = _run_once(0)
+    seg_gib, out_seg, grads_seg = _run_once(8192)
+
+    assert seg_gib < unseg_gib * 0.5, (
+        f"expected >=2x peak VRAM reduction, got seg={seg_gib:.2f} GiB vs unseg={unseg_gib:.2f} GiB"
+    )
+    out_cos = float(F.cosine_similarity(out_seg.float().reshape(1, -1), out_unseg.float().reshape(1, -1)))
+    assert out_cos > 0.9999, f"32K bf16 forward cosine mismatch: {out_cos}"
+    for nm, g_u in grads_unseg.items():
+        g_s = grads_seg[nm]
+        g_cos = float(F.cosine_similarity(g_s.float().reshape(1, -1), g_u.float().reshape(1, -1)))
+        assert g_cos > 0.999, f"32K bf16 grad cosine mismatch on {nm}: {g_cos}"
+
+
 # ============================================================================ 5. s3_v2 -> s2_v2 -> s4_v2 -> eval & Hub
 
 
@@ -1158,6 +1725,24 @@ def test_s3_v2_to_s2_v2_gdn2_bptt_to_s4_v2_rl_eval_and_hub_e2e(
     assert s2_gdn2_meta["qed_enabled"] is True
     assert s2_gdn2_meta["qed_max_lambda"] == pytest.approx(0.35)
     assert s2_gdn2_meta["neg_eigval_max_boost"] == pytest.approx(0.5)
+    assert s2_gdn2_meta["fla_segment_len"] == 8192
+
+    # Older checkpoints without `fla_segment_len` in `stack_meta["gdn2"]` must deserialize cleanly to 8192
+    legacy_meta = {k: v for k, v in s2_gdn2_meta.items() if k != "fla_segment_len"}
+    assert GDN2Config.from_dict(legacy_meta).fla_segment_len == 8192
+
+    # Pack deserialization (`Qwen36LoopHSSDForCausalLM`) accepts both missing and present `fla_segment_len`
+    from qloop.export_pack import extract_arch_spec
+    from qloop.infer.hf_custom_modeling import Qwen36LoopHSSDConfig, Qwen36LoopHSSDForCausalLM
+
+    bcfg_pack, arch_pack = extract_arch_spec(tr_s2.stack)
+    assert arch_pack["gdn2"]["fla_segment_len"] == 8192
+    arch_legacy = copy.deepcopy(arch_pack)
+    arch_legacy["gdn2"].pop("fla_segment_len", None)
+    arch_legacy["gdn2"]["future_ignored_key"] = 123
+    rebuilt_legacy = Qwen36LoopHSSDForCausalLM(Qwen36LoopHSSDConfig(base_config=bcfg_pack, qloop_v3_arch=arch_legacy))
+    assert rebuilt_legacy.gdn2_manager is not None
+    assert rebuilt_legacy.gdn2_manager.cfg.fla_segment_len == 8192
 
     # Perturb saved s2_v2 qed_lambda_raw slightly so we verify non-trivial weight transfer to s4_v2_rl and eval
     saved_s2_dir = ck_s2["path"]

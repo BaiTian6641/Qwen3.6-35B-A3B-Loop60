@@ -758,7 +758,7 @@ def render_s3_hssd_vs_v2_gdn_ab_svg(bundle: dict[str, Any]) -> str:
         ),
         (
             "Peak Train VRAM",
-            "GiB @ 1M (lower better)",
+            "GiB peak (lower better)",
             v1_vram,
             v2_vram,
             96.0,
@@ -849,10 +849,16 @@ def render_s3_hssd_vs_v2_gdn_ab_svg(bundle: dict[str, Any]) -> str:
             anchor="end",
         )
     if len(v2_g2) >= 2:
+        wa_vals = [
+            float(r["bridge_w_anchor_p3"])
+            for r in v2_rows
+            if isinstance(r.get("bridge_w_anchor_p3"), (int, float))
+        ]
+        wa_latest = wa_vals[-1] if wa_vals else 0.875
         svg.text(
             rx + rw - 8,
             by + bh - 10,
-            f"Pass-2 |α|: {v2_g2[0][1]:.4f} → {v2_g2[-1][1]:.4f} · w_anchor_p3 ≈ 0.875 (stable)",
+            f"Pass-2 |α|: {v2_g2[0][1]:.4f} → {v2_g2[-1][1]:.4f} · w_anchor_p3 ≈ {wa_latest:.3f} (stable)",
             size=9.0,
             fill=C_MUTED,
             anchor="end",
@@ -1772,7 +1778,7 @@ def render_kv_memory_vs_inkling_svg(bundle: dict[str, Any]) -> str:
         545,
         "1M-Context (1,048,576 Tokens) Context-State Memory Breakdown",
         "Clean v2 Native-GDN / GDN-2-1M (10.65 GiB FP8 · 3.02× smaller than Inkling 2 Mini) & "
-        "Block-64 Hadamard INT4 Serving Projection (~5.96–6.08 GiB)",
+        "Block-64 Hadamard INT4 Serving Projection (~5.96–6.28 GiB)",
     )
     svg.legend_row(
         34,

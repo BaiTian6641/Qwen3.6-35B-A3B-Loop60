@@ -1,6 +1,6 @@
 {
   "repo": "TassP0lar/Qwen3.6-35B-A3B-Loop64",
-  "total_commits": 189,
+  "total_commits": 190,
   "commits": [
     {
       "commit_id": "d82fefaa9540738beb51b9e56ed11acc6e464d8a",
@@ -3776,6 +3776,26 @@
       "grad_norm": 5.036707088103035,
       "skipped_total": 0.0,
       "tok_per_s": 2703.4082648287176,
+      "mem_peak_gib": 69.96363592147827,
+      "eval_loss_d1": 1.3699526349427251,
+      "eval_loss_d2": 1.2998673645051908,
+      "eval_loss_d3": 1.2827065182610022,
+      "eval_depth_gain": 0.08724611668172289
+    },
+    {
+      "commit_id": "fd4efe819d9b1414bc96483a89f22a1af6187733",
+      "short_sha": "fd4efe81",
+      "created_at": "2026-11-24T06:56:09+00:00",
+      "title": "[qloop:s3_v2_long_1m_lsa] step=425 (ckpt) loss=1.4745 depth_gain=+0.0872",
+      "stage": "s3_v2_long_1m_lsa",
+      "step": 425,
+      "status": "in_progress",
+      "rolled_back": false,
+      "rollback_reason": "",
+      "loss_lm": 1.4745053052902222,
+      "grad_norm": 5.964294788643863,
+      "skipped_total": 0.0,
+      "tok_per_s": 2661.970115301631,
       "mem_peak_gib": 69.96363592147827,
       "eval_loss_d1": 1.3699526349427251,
       "eval_loss_d2": 1.2998673645051908,

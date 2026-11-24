@@ -3,7 +3,7 @@
 > **Model Hub:** [`TassP0lar/Qwen3.6-35B-A3B-Loop64`](https://huggingface.co/TassP0lar/Qwen3.6-35B-A3B-Loop64) · **Dataset Hub:** [`TassP0lar/Loop64-Fable-SIRSI-v1`](https://huggingface.co/datasets/TassP0lar/Loop64-Fable-SIRSI-v1) (`v1.2`)  
 > **Base Backbone:** `unsloth/Qwen3.6-35B-A3B-NVFP4` (`34.661B` text decoder; `32.212B` routed MoE experts **100% frozen**, SHA-256 verified)  
 > **Hardware:** `1x NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120, 96 GiB HBM)` (single rented Google Colab G4 VM, zero multi-node cluster)  
-> **Telemetry Snapshot:** `2026-11-24T06:38:15Z` · **`189` Hugging Face Hub commits** + local `colab_supervisor.log` (`145.02` h) + `colab_supervisor_v2.log` (`10.57` h) + verified local JSON artifacts
+> **Telemetry Snapshot:** `2026-11-24T07:01:52Z` · **`190` Hugging Face Hub commits** + local `colab_supervisor.log` (`145.02` h) + `colab_supervisor_v2.log` (`10.99` h) + verified local JSON artifacts
 
 > [!IMPORTANT]
 > **Strict Empirical Grounding & Provenance Policy:** Every metric, commit SHA, loss, recall, throughput, VRAM, GPU-hour, dataset count, and latency figure in this report traces directly to live Hugging Face Hub `manifest.json` commits, `runs/colab_supervisor.log`, `runs/colab_supervisor_v2.log`, `runs/eval_truth_check_s2_step500/truth_check_summary.json`, `runs/bench_v2_smoke_dplr/summary.json`, `runs/datasets/Loop64-Fable-SIRSI-v1/audit_summary.json`, `docs/PERF_PROFILE_S2.md`, or an explicitly labeled closed-form analytical tensor-shape formula. Unmeasured downstream benchmarks (`HLE`, `AIME 2026`, `MRCR 1M`, etc.) and queued stages (`s2_v2`, `s4_v2_rl`) are **never** claimed.
@@ -12,7 +12,7 @@
 
 ## 1. Executive Summary
 
-On a **single rented Google Colab RTX PRO 6000 Blackwell (`96 GiB` HBM, `155.59` measured supervisor GPU-hours across `562.82M` total tokens)**, we developed an open, parameter-efficient (`< 0.6%` trainable) 88-virtual-layer looped hybrid reasoning & `1M`-context retrofit of `unsloth/Qwen3.6-35B-A3B-NVFP4` while keeping all `32.212B` routed MoE experts **100% frozen (SHA-256 verified)**. Our empirical record documents both a decisive **negative architectural ablation (v1 HSSD)** — caught early by an adversarial Phase-A truth-check & 4-stage causal component swap before wasting full RL/eval compute — and the resulting **clean v2 breakthrough (`Native-GDN / GDN-2-1M + Bounded QED + 88L Loop + FP8 1.0× SharedKV + D-LSA`)**:
+On a **single rented Google Colab RTX PRO 6000 Blackwell (`96 GiB` HBM, `156.01` measured supervisor GPU-hours across `566.38M` total tokens)**, we developed an open, parameter-efficient (`< 0.6%` trainable) 88-virtual-layer looped hybrid reasoning & `1M`-context retrofit of `unsloth/Qwen3.6-35B-A3B-NVFP4` while keeping all `32.212B` routed MoE experts **100% frozen (SHA-256 verified)**. Our empirical record documents both a decisive **negative architectural ablation (v1 HSSD)** — caught early by an adversarial Phase-A truth-check & 4-stage causal component swap before wasting full RL/eval compute — and the resulting **clean v2 breakthrough (`Native-GDN / GDN-2-1M + Bounded QED + 88L Loop + FP8 1.0× SharedKV + D-LSA`)**:
 
 ### Headline Verified Results (Measured Telemetry vs. Analytical Formulas)
 
@@ -20,11 +20,11 @@ On a **single rented Google Colab RTX PRO 6000 Blackwell (`96 GiB` HBM, `155.59`
 | :--- | :---: | :--- | :--- |
 | **88L Loop Healing (`s1_loop_a6b`)** | `Measured` | `18.41M` params (`0.053%`) healed `40L → 64L → 88L` (`depth_gain = +0.0609`), `82.3%` Pass-2 expert re-routing (`17.36` unique core experts/tok), `100%` `d=1/2/3` cache parity & `16K` needle pass | Hub `32eb565e`, `s1_quality_check.json`, `truth_check_summary.json` |
 | **v1 Negative Ablation (HSSD Forensics)** | `Measured` | 4-stage causal swap proved `top1 = 1.0000` decode parity & D-LSA innocence, isolating HSSD v3.2 as the root failure (`+0.79` nat `s1b` shock `0.919 → 1.705`, dead `vault_duty = 3.26e-05`, `3.41 tok/s` `d=3` decode) + raw `fable51` `<search_query>` tool poisoning | `runs/eval_truth_check_s2_step500/truth_check_summary.json`, Hub `e050a4b8` |
-| **Clean v2 A/B Win (`s3_v2_long_1m_lsa`)** | `Measured` | Held-out `64K` NLL **`1.370 → 1.300 → 1.283`** (`depth_gain = +0.0872`) (**`-0.608` nats / `45.6%` lower PPL** vs HSSD `s3@s400`); `512K–1M` recall **`0.606`** peak (vs `0.485` HSSD); **`2370 tok/s`** (`2.2×` faster); peak **`69.96 GiB`** (`-11.3 GiB`) | Hub `084e8bad` (`s400/600`), `colab_supervisor_v2.log` |
+| **Clean v2 A/B Win (`s3_v2_long_1m_lsa`)** | `Measured` | Held-out `64K` NLL **`1.370 → 1.300 → 1.283`** (`depth_gain = +0.0872`) (**`-0.608` nats / `45.6%` lower PPL** vs HSSD `s3@s400`); `512K–1M` recall **`0.606`** peak (vs `0.485` HSSD); **`2387 tok/s`** (`2.27×` faster); peak **`69.96 GiB`** (`-11.3 GiB`) | Hub `fd4efe81` (`s425/600`), `colab_supervisor_v2.log` |
 | **GDN-2-1M + Bounded QED (`fla 0.6.0` DPLR)** | `Measured` | `27.53M` params (`0.079%`), `0.0` IEEE-754 Step-0 identity; `T=32K` fwd+bwd **`35.55–43.64 ms`** (**`15.1×–18.5×`** vs PyTorch `657.3 ms`); `T=1` decode **`0.0430 ms = 1.02×`** native GDN | `runs/bench_v2_smoke_dplr/summary.json`, `919f2b8`, `2c78ffc` |
-| **1M Context-State HBM Footprint** | `Formula` | **`10.65 GiB`** (`10.00` FP8 `1.0×` SharedKV + `0.33` 66L Native GDN/GDN-2 + `0.32` D-LSA) — **`3.02×` smaller than Inkling 2 Mini (`32.16 GiB`)**, **`5.17 GiB` smaller than HSSD (`15.82 GiB`)**; `~5.96–6.08 GiB` Block-64 Hadamard INT4 serving projection | Exact tensor-shape formula + live `1,048,576`-tok pass (`69.52 GiB` peak, `ec34f825`) |
+| **1M Context-State HBM Footprint** | `Formula` | **`10.65 GiB`** (`10.00` FP8 `1.0×` SharedKV + `0.33` 66L Native GDN/GDN-2 + `0.32` D-LSA) — **`3.02×` smaller than Inkling 2 Mini (`32.16 GiB`)**, **`5.17 GiB` smaller than HSSD (`15.82 GiB`)**; `~5.96–6.28 GiB` Block-64 Hadamard INT4 serving projection (`5.77–6.08 GiB` w/ raw `0.133 GiB` fp32 GDN) | Exact tensor-shape formula + live `1,048,576`-tok pass (`69.52 GiB` peak, `ec34f825`) |
 | **Open Audited Dataset (`v1.2`) & SI-RSI** | `Measured` | `4,081` `sft_core` + `429` pref pairs + `2,076` salvage; **`1,889,432`** 2026 13-grams (`31` leaks dropped); decoupled `working_notebook` CoT raised pass rate **`4.1% → 100.0%`** (`197/197`, `0` defects) | `Loop64-Fable-SIRSI-v1/audit_summary.json`, `def3624`, `dc7a14e` |
-| **Blackwell `sm_120` Kernel & Test Hardening** | `Measured` | 11 verified kernel/systems milestones (`5.8×–19.0×` micro-speedups, `2.07×` BPTT speedup, `-7.0 GiB` leak fix, `10.6×` TF 5.24 recovery), **`0` post-fix optimizer skips**, **`709` passing CPU unit/parity tests** (`749` total) | `docs/PERF_PROFILE_S2.md`, `colab_supervisor*.log`, `origin/main` `2c78ffc` |
+| **Blackwell `sm_120` Kernel & Test Hardening** | `Measured` | 11 verified kernel/systems milestones (`5.8×–19.0×` micro-speedups, `2.06×` BPTT speedup, `-7.0 GiB` leak fix, `10.6×` TF 5.24 recovery), **`0` post-fix optimizer skips**, **`709` passing CPU unit/parity tests** (`749` total) | `docs/PERF_PROFILE_S2.md`, `colab_supervisor*.log`, `origin/main` `2c78ffc` |
 
 ---
 
@@ -52,7 +52,7 @@ On a **single rented Google Colab RTX PRO 6000 Blackwell (`96 GiB` HBM, `155.59`
 
 *Exact formula provenance:*
 - **Clean v2 FP8 SharedKV (`10.65 GiB`):** `10 × 2(K,V) × 2 KV heads × 256 dim × 1 B × 1,048,576 = 10.00 GiB` + `0.33 GiB` (`66/30 × 0.15 GiB` stock GDN recurrent+conv budget; exact raw fp32 `66 × [32×128×128×4B + 8192×4×2B] = 0.133 GiB`) + `0.32 GiB` D-LSA centroids = **`10.65 GiB`** (**`3.02×` smaller** than Inkling 2 Mini's `32.16 GiB`, **`5.17 GiB` smaller** than HSSD v1's `15.82 GiB`). Together with `~21.8 GiB` NVFP4 base weights, full `1M` serving fits in **`~32.5 GiB`** (`34%` of a single `96 GiB` Blackwell card).
-- **Block-64 Walsh-Hadamard INT4 Serving Projection (`~5.96–6.08 GiB`):** Implemented in `src/qloop/infer/engine.py` (`_HadamardINT4Slot`: symmetric INT4 + `fp16` scale = `34/64 = 0.53125 B/scalar` → `5.31 GiB` KV + `0.33` GDN + `0.32` D-LSA = **`5.96 GiB`**) and `src/qloop/model/offload.py` (`Block64HadamardINT4Cache`: asymmetric `36/64 = 0.5625 B/scalar` → `5.63 GiB` KV + `0.133` exact fp32 GDN + `0.32` D-LSA = **`6.08 GiB`**; `53.64 GiB` Host-DDR5 at `10M` tokens).
+- **Block-64 Walsh-Hadamard INT4 Serving Projection (`~5.96–6.28 GiB` on table `0.33 GiB` GDN budget):** Implemented in `src/qloop/infer/engine.py` (`_HadamardINT4Slot`: symmetric INT4 + `fp16` scale = `34/64 = 0.53125 B/scalar` → `5.31 GiB` KV + `0.33` GDN + `0.32` D-LSA = **`5.96 GiB`**) and `src/qloop/model/offload.py` (`Block64HadamardINT4Cache`: asymmetric `36/64 = 0.5625 B/scalar` → `5.625 GiB` KV + `0.33` GDN + `0.32` D-LSA = **`6.275 ≈ 6.28 GiB`**; `53.64 GiB` Host-DDR5 at `10M` tokens). Substituting exact raw fp32+conv GDN state (`0.133 GiB` instead of `0.33 GiB`) lowers the INT4 range to `5.77–6.08 GiB` (and FP8 SharedKV to `10.45 GiB`).
 - **Inkling 2 Mini (`32.16 GiB`):** Thinking Machines Lab (`24L → 48L`, `R=3`, `5:1` SWA:global, `8` KV heads × `128` dim, unshared per-pass F16 KV across `8` logical global layers) = `8 × 2 × 8 × 128 × 2 B × 1,048,576 = 32.00 GiB` + `0.16 GiB` across `40` `1,024`-window SWA layers.
 
 ---
@@ -67,7 +67,7 @@ On a **single rented Google Colab RTX PRO 6000 Blackwell (`96 GiB` HBM, `155.59`
 | `s1b_hssd_distill` (16K) | v1 HSSD | `completed` | `1500/1500` | `2fb912db` | `76.92M` (`0.222%`) | `98.30M` | `946.7` | `68.97` | `0` | `1.7679 → 1.7052` | **`+0.0626`** |
 | `s3_long_1m_lsa` (64K/1M) | v1 HSSD | `completed` | `600/600` | `55c7a680` | `83.06M` (`0.240%`) | `120.78M` | `1049.8` | `81.23` | `0` | `2.0171 → 1.8757` | **`+0.1414`** |
 | `s2_joint_bptt` (131K) | v1 HSSD | `halted@500` | `500/1200` | `e050a4b8` | `187.92M` (`0.542%`) | `131.07M` | `453.5 → 935.6` (`2.06×`) | `78.42` | `0` | `1.2600 → 1.1872` | **`+0.0728`** |
-| **`s3_v2_long_1m_lsa` (64K/1M)** | **Clean v2** | `in_progress` | `400/600` | `084e8bad` | `24.56M` (`0.071%`) | `81.59M` | `2369.5` | `69.96` | `0` | `1.3700 → 1.2827` | **`+0.0872`** |
+| **`s3_v2_long_1m_lsa` (64K/1M)** | **Clean v2** | `in_progress` | `425/600` | `fd4efe81` | `24.56M` (`0.071%`) | `85.15M` | `2386.7` | `69.96` | `0` | `1.3700 → 1.2827` | **`+0.0872`** |
 
 ![Held-Out Evaluation Depth Curves Across Stages](experiment_logs/charts/eval_depth_curves.svg)
 
@@ -80,10 +80,10 @@ On a **single rented Google Colab RTX PRO 6000 Blackwell (`96 GiB` HBM, `155.59`
 | `s1b_hssd_distill` Phase 1 + Pre-Fix Explosion | `fbd7a35` | `11.98 h` | Phase 1 (`~4.9 h`) + rolled-back Jacobian explosion (`dd5093d3`) |
 | `s1b_hssd_distill` Post-Fix Phase 2 (1,100 steps) | `3a17c0d` | `28.41 h` | `0 / 1,100` skips; v1 HSSD negative ablation |
 | `s3_long_1m_lsa` (v1 HSSD, 600 steps) | `513879f`, `4f09463` | `33.37 h` | `0` skips; 2 Colab sessions with clean auto-rollover |
-| `s2_joint_bptt` (v1 HSSD, steps 0–500) | `2e37bf6..2f5a6ba` | `53.01 h` | Pre-opt `6.39 h` + leaky OOM `1.59 h` + `5a82677` `21.23 h` + TF 5.24 slowdown `9.54 h` + `2f5a6ba` recovery `14.18 h` |
+| `s2_joint_bptt` (v1 HSSD, steps 0–500) | `2e37bf6..2f5a6ba` | `53.01 h` | Pre-opt `6.39 h` + leaky OOM `1.59 h` + `5a82677` `21.23 h` + TF 5.24 slowdown `9.54 h` + `2f5a6ba` recovery `14.26 h` |
 | `bench_v2_smoke_dplr` (Part A smoke + Part B DPLR) | `28b88e4` | `0.15 h` (+ Part B) | Live `s3_v2`/`s2_v2` smoke + `fla 0.6.0` parity/latency bench |
-| **`s3_v2_long_1m_lsa` (Clean v2, live through `s400`)** | `28b88e4` | **`10.57 h`** | Live in progress (`0` skips, `~2,180 tok/s` sup. mean) |
-| **Total Measured Supervisor Active Single-GPU Time** | `colab_supervisor*.log` | **`155.59 h`** | `v1`: `145.02 h` + `v2`: `10.57 h` (excl. ~`1.3 h` standalone probe/eval) |
+| **`s3_v2_long_1m_lsa` (Clean v2, live through `s425`)** | `28b88e4` | **`10.99 h`** | Live in progress (`0` skips, `~2,180 tok/s` sup. mean) |
+| **Total Measured Supervisor Active Single-GPU Time** | `colab_supervisor*.log` | **`156.01 h`** | `v1`: `145.02 h` + `v2`: `10.99 h` (supervisor `pid_alive=True` wall time; `c22bf62` includes `0.59 h` post-done idle before VM teardown; excl. ~`1.3 h` standalone probe/eval) |
 
 ### 3.2 `s0_probe` — Zero-Training Diagnostic & Calibration Gates (`5/5` Passed)
 
@@ -192,7 +192,7 @@ Before committing multi-day RL compute, we executed an adversarial Phase-A gener
 
 **Four Actionable Engineering Conclusions:** (1) Drop HSSD v3.2; branch clean v2 directly from healed Native-GDN `s1_loop_a6b@1000`. (2) Keep `88L` ETD Loop + mHC `LoopBridge` + `1M` YaRN + per-pass `D-LSA` (all exonerated). (3) Ban raw upstream `fable51` completely and train exclusively on our audited `v1.2` `TassP0lar/Loop64-Fable-SIRSI-v1` dataset. (4) Only upgrade linear attention via **100% IEEE-754 Step-0 bit-identical `GDN-2-1M + Bounded QED`** on fused `fla 0.6.0` kernels (Section 4).
 
-### 3.8 Controlled A/B Win: Clean Native-GDN `s3_v2_long_1m_lsa` (Live Through Step `400/600`)
+### 3.8 Controlled A/B Win: Clean Native-GDN `s3_v2_long_1m_lsa` (Live Through Step `425/600`)
 
 Starting directly from `s1_loop_a6b@1000` with **Native Qwen3.6 GDN** (`hssd.enabled=false`), `24.56M` cumulative params (`0.071%` of `34.661B`), gentle mHC protection (`loop_adapters lr_mult=2.0`), and audited `loop64_fable_sirsi` (`15%` mix, zero raw `fable51`), clean `s3_v2_long_1m_lsa` is beating v1 HSSD `s3_long_1m_lsa` decisively on **every measured axis** with **`0` skipped updates**:
 
@@ -203,13 +203,13 @@ Starting directly from `s1_loop_a6b@1000` with **Native Qwen3.6 GDN** (`hssd.ena
 | **Held-Out `64K` `d=1 / d=2 / d=3` NLL @ Step 200** | `2.0269 / 1.9698 / 1.9162` (PPL `6.79`) | **`1.3733 / 1.3011 / 1.2860`** (PPL **`3.62`**) | **`-0.6301` nats (`46.7%` lower PPL)** |
 | **Held-Out `64K` `depth_gain` (`d1−d3`) @ Step 200** | `+0.1108` | **`+0.0873`** | Strong positive monotonic depth gain (`40L → 64L → 88L`) |
 | **Held-Out `64K` `d=1 / d=2 / d=3` NLL @ Step 400** | `2.0214 / 1.9616 / 1.8910` (PPL `6.63`) | **`1.3700 / 1.2999 / 1.2827`** (PPL **`3.61`**, `dg=+0.0872`) | **`-0.6083` nats (`45.6%` lower PPL)** |
-| **`512K–1M` D-LSA Top-64 Recall (Peak / Latest)** | `0.4848` / `0.4595` | **`0.6064`** / **`0.5026`** | **`+0.1216` peak recall** |
-| **`512K–1M` Min-Head Recall (Peak / Latest)** | `0.3217` | **`0.4613`** / `0.3582` | **`+0.1396` worst-head lift** |
-| **Mean Throughput (`tok/s`)** | `1049.8` | **`2369.5`** (`2182.1` sup. mean) | **`2.26×` faster** |
+| **`512K–1M` D-LSA Top-64 Recall (Peak / Latest)** | `0.4848` / `0.4595` | **`0.6064`** / **`0.5970`** | **`+0.1216` peak recall** |
+| **`512K–1M` Min-Head Recall (Peak / Latest)** | `0.3217` | **`0.4644`** / `0.4644` | **`+0.1427` worst-head lift** |
+| **Mean Throughput (`tok/s`)** | `1049.8` | **`2386.7`** (`2199.5` sup. mean) | **`2.27×` faster** |
 | **Peak Training VRAM (incl. `1,048,576`-tok pass)** | `81.23 GiB` (`78.60 GiB` @ 1M) | **`69.96 GiB`** (`69.52 GiB` @ 1M `s125`) | **`-11.27 GiB`** |
 | **Cumulative Trainable Bundle Params** | `83.06M` (`0.240%`) | **`24.56M` (`0.071%`)** | **`3.38×` fewer adapter params** |
 | **1M Context-State Footprint *(Formula)*** | `15.82 GiB` | **`10.65 GiB`** | **`-5.17 GiB` (`-32.7%`)** |
-| **mHC `LoopBridge` Health (`gate_abs_mean_p3`)** | *(not tracked in `s3` v1)* | **`0.0325 → 0.0497` (`+53.0%`)** · `w_anchor_p3 ≈ 0.876` | Organic monotonic Pass-3 growth, zero bridge collapse |
+| **mHC `LoopBridge` Health (`gate_abs_mean_p3`)** | *(not tracked in `s3` v1)* | **`0.0325 → 0.0500` (`+54.2%`)** · `w_anchor_p3 ≈ 0.876` | Organic monotonic Pass-3 growth, zero bridge collapse |
 
 - **Verified Live `1,048,576`-Token Clean v2 Pass:** At `step 125` (`ec34f825`), `s3_v2_long_1m_lsa` streamed **`1,015,808` prefix + `32,768` suffix = `1,048,576` tokens** at **`69.52 GiB` peak VRAM** (`25.45 GiB` headroom on a single 96 GiB card) and `0` non-finite steps.
 
@@ -217,7 +217,7 @@ Starting directly from `s1_loop_a6b@1000` with **Native Qwen3.6 GDN** (`hssd.ena
 
 ## 4. GDN-2-1M + Bounded QED (`arXiv:2608.13668`) + Soft Neg-Eigval via `fla 0.6.0` `DPLR`
 
-To upgrade Qwen3.6's stock scalar-gated DeltaNet linear layers **without repeating HSSD's non-identity shock or decode bottleneck**, commits **`919f2b8`** and **`2c78ffc`** implement **GDN-2-1M + Bounded QED + Soft Negative Eigenvalues** (`src/qloop/model/gdn2.py`, enabled cleanly in `s2_v2_joint_bptt` and `s4_v2_rl`, `917,568` params/layer × `30` physical linear layers = **`27.53M` params**, `0.079%` of `34.661B` — `< 47%` of HSSD's `58.5M` overhead, adding **`0` bytes** to the recurrent state):
+To upgrade Qwen3.6's stock scalar-gated DeltaNet linear layers **without repeating HSSD's non-identity shock or decode bottleneck**, commits **`919f2b8`** and **`2c78ffc`** implement **GDN-2-1M + Bounded QED + Soft Negative Eigenvalues** (`src/qloop/model/gdn2.py`, enabled cleanly in `s2_v2_joint_bptt` and `s4_v2_rl`, `917,568` params/layer × `30` physical linear layers = **`27.53M` params**, `0.079%` of `34.661B` — `47.1%` of HSSD's `58.51M` overhead, adding **`0` bytes** to the recurrent state):
 
 1. **Decoupled Channel-Wise Erase/Write/Decay + Bounded QED (`arXiv:2608.13668`) + Soft Neg-Eigval:** Using unscaled unit-norm $(\hat{\mathbf{q}}_t, \hat{\mathbf{k}}_t)$, channel-wise erase $\mathbf{b}_t \in (0, 1.5)^{d_k}$ (`neg_eigval_max_boost = 0.5` enabling soft Householder reflection), write $\mathbf{w}_t \in (0, 1)^{d_v}$, $C^1$-continuous asymmetric `tanh` log-decay shift in `[-3.0, +0.5]` (stretching memory horizon up to $e^3 \approx 20.1\times$ for `1M` context), and per-head bounded QED coupling $\lambda_h = 0.35 \tanh(\lambda_{\text{raw},h})$:
 
@@ -254,7 +254,7 @@ To eliminate upstream contamination, truncation, and tool-call poisoning, we bui
 | Audit Pillar | Verified Metric (`audit_summary.json`) | Key Engineering Takeaway |
 | :--- | :--- | :--- |
 | **Published Parquet Splits** | **`4,081`** `sft_core` · **`429`** `sirsi_preferences` · `2,076` `salvage_queue` | `18` author-original golden seeds + `494` verified Track B SFT + `197` `v1.2` working-notebook traces |
-| **Live License Audit** | `8` permissive repos included (`apache-2.0`, `cc-by-4.0`); `2` excluded (`agpl-3.0`, `unknown`) | Zero copyleft or unlicensed rows; full per-row provenance & BibTeX attribution |
+| **Live License Audit** | `8` permissive repos included (`74.4%` Apache-2.0 / `25.6%` CC-BY-4.0 in `sft_core`); `2` excluded (`agpl-3.0`, `unknown`) | Zero copyleft or unlicensed rows; full per-row provenance & BibTeX attribution |
 | **Cross-Source Dedup** | `6,525` unique pairs indexed; **`2,107`** duplicates removed | `opus46_3300x` overlapped `opus46_3000x` by `85.7%` (`1,028/1,200`); `fable51` had `948/1,200` internal prompt repeats |
 | **Live 2026 13-Gram Decontam** | **`1,889,432`** unique 13-grams across `12` accessible 2026 eval suites; **`31`** leaks removed | Blocked `18` HLE, `9` SuperGPQA, `2` SWE-bench Pro, `2` ARC-AGI-2 leaks; zero leaks in published splits |
 | **Raw `fable51` Poison Discovery** | `100%` of sampled `tool_calls` had redacted placeholders (`<bash_command>` `6,098×`, `<file_path>` `5,972×`, `<search_query>` `2,441×`) | Quarantined `252` unique rows (`247` unrecoverable dropped); prevented tool-call collapse proven in Section 3.7 |
@@ -282,7 +282,7 @@ Every kernel, cache proxy, and stability fix below was verified live on `loop64`
 | 10 | **transformers 5.24.0 Cache Kwarg & Proxy Fix** | `5aaf55d / 28b88e4` | Unified cache kwarg + isolated conv/recurrent snapshots in _ReplayKVCacheProxy | 10.6× recovery (89 → 942.6 tok/s avg, pk 1,109); 0.000e+00 1-tok checkpoint grad parity |
 | 11 | **GDN-2-1M+QED Triton Prep & fla 0.6.0 DPLR** | `919f2b8 / 2c78ffc` | T=32K: 35.55–43.64 ms vs 657.32 ms ref; T=1: 0.0430 ms vs 0.0421 ms native GDN | 15.1×–18.5× train speedup, 1.02× native decode, 0.0 Step-0 diff, zero-sync is_zero() cache |
 
-- **Autonomous Multi-Day Resiliency (`4f09463`, `c22bf62`, `28b88e4`):** Automated HF Hub commit sync (`ckpt_every=25`), 235 GB SSD disk guard (`~210 GiB` consistently free), Colab `503` exponential backoff, and clean time-budget VM rollover sustained **`155.59` active single-GPU hours** with zero lost checkpoints.
+- **Autonomous Multi-Day Resiliency (`4f09463`, `c22bf62`, `28b88e4`):** Automated HF Hub commit sync (`ckpt_every=25`), 235 GB SSD disk guard (`~210 GiB` consistently free), Colab `503` exponential backoff, and clean time-budget VM rollover sustained **`156.01` active single-GPU hours** with zero lost checkpoints.
 
 ---
 
@@ -291,20 +291,20 @@ Every kernel, cache proxy, and stability fix below was verified live on `loop64`
 ### 7.1 Honest Scientific Limitations
 
 1. **No Downstream 2026 Frontier Benchmark Scores Claimed Yet:** All current empirical numbers measure held-out language-modeling NLL (`8K`, `16K`, `64K`, `131K`), zero-training diagnostic probes (`s0_probe`), live `sm_120` kernel parity/latency, Phase-A generation/needle forensics, and dataset quality audits. End-to-end reasoning scores (`HLE-Diamond/Rolling/Verified`, `GPQA/SuperGPQA`, `AIME 2026`, `HMMT Feb 2026`, `ARC-AGI-2`, `MRCR 1M`, `LongBench v2`, `KernelBench L3/L4`, `Terminal-Bench 4.1`, `SWE-bench Pro Hard`) will ONLY be reported after `s2_v2` and `s4_v2_rl` complete and pass our 13-gram decontaminated `d ∈ {1, 2, 3}` sweep.
-2. **`s3_v2_long_1m_lsa` Is Mid-Stage (`step 400/600`) & `512K–1M` Recall Is Below `0.70`:** While clean v2 raised peak `512K–1M` D-LSA Top-64 recall from `0.4848` (HSSD) to **`0.6064`** (latest `0.5026`), it remains below our `0.70` `recall_ready` auto-switch threshold. Co-training sparse D-LSA in `s2_v2` and conditional `index_dim: 64 → 96` / multi-scale pooling remain gated on the upcoming `s3_v2@600` Phase-A needle gate and `MRCR 1M` bucketed audit.
+2. **`s3_v2_long_1m_lsa` Is Mid-Stage (`step 425/600`) & `512K–1M` Recall Is Below `0.70`:** While clean v2 raised peak `512K–1M` D-LSA Top-64 recall from `0.4848` (HSSD) to **`0.6064`** (latest `0.5970`), it remains below our `0.70` `recall_ready` auto-switch threshold. Co-training sparse D-LSA in `s2_v2` and conditional `index_dim: 64 → 96` / multi-scale pooling remain gated on the upcoming `s3_v2@600` Phase-A needle gate and `MRCR 1M` bucketed audit.
 3. **`s2_v2_joint_bptt` (GDN-2-1M+QED) & `s4_v2_rl` (SI-RSI) Are Queued, Not Yet Trained:** GDN-2-1M + Bounded QED + fused `tl.int64` Triton prep + `fla 0.6.0` DPLR are live-verified on `sm_120` for parity, speed, `T=4096` stability, and Step-0 bit-identity (`bench_v2_smoke_dplr/summary.json`, `2c78ffc`), but full 600-step `s2_v2` convergence and 400-step `s4_v2_rl` RL gains are **not yet measured**.
 4. **Single-GPU Autoregressive Rollout Bottleneck:** Single-GPU training handles `s1` (`~2,117 tok/s`) and `s3_v2` (`~2,180–2,370 tok/s`) comfortably, but online `d=3` (`88L`) GRPO/SI-RSI rollouts (`8` prompts × `group=8` × `8,192` tokens/step) and full 16-benchmark `d ∈ {1, 2, 3}` sweeps are throughput-bound without multi-GPU rollout parallelism.
 
 ### 7.2 Immediate Experimental Roadmap
 
-1. **Complete `s3_v2_long_1m_lsa` (`step 400 → 600`) & Pass Phase-A Gate:** Confirm `64K` `d=1/2/3` scaling through `s600` plus live `16K–256K` needle & coherence pass on `s3_v2@600`.
+1. **Complete `s3_v2_long_1m_lsa` (`step 425 → 600`) & Pass Phase-A Gate:** Confirm `64K` `d=1/2/3` scaling through `s600` plus live `16K–256K` needle & coherence pass on `s3_v2@600`.
 2. **Run `s2_v2_joint_bptt` (`600` Steps, `4×32K = 131K` K/V-Replay BPTT + `GDN-2-1M + Bounded QED`):** Activate Step-0 bit-identical GDN-2-1M+QED (`27.53M` params, `fla` DPLR + fused Triton prep) on our decontaminated `v1.2` mixture (`25%` `loop64_fable_sirsi`, `55%` `R=3` emphasis).
 3. **Run `s4_v2_rl` (`400` Steps Verifiable GRPO/DAPO + SI-RSI):** Train on `DAPO-Math-17k` + `KernelBench` with surgical `[loop_adapters, router]` slap gradients and holdout promotion gates.
 4. **Publish Full 16-Benchmark 2026 Frontier Depth Sweep (`d ∈ {1, 2, 3}`, FLOP-Matched) & Open Release:** Release full weights (`safetensors` Whole Model Pack), `Loop64-Fable-SIRSI-v1`, custom Blackwell Triton kernels, and raw telemetry logs.
 
 ### 7.3 Compute Grant Summary *(See Standalone 2-Page Brief: [`docs/COMPUTE_GRANT_PROPOSAL.md`](COMPUTE_GRANT_PROPOSAL.md))*
 
-With **`155.59` single-GPU hours** already invested to de-risk every architectural, mathematical, data-hygiene, and Blackwell kernel risk (documented with full positive and negative evidence above), a targeted **`1× 8×H200/B200` allocation for 2 weeks (`~2,500` GPU-hours — Tier 2 Primary Request)** unlocks full `s2_v2` + `s4_v2_rl` SI-RSI + FLOP-matched `d ∈ {1, 2, 3}` ablations (`GDN-2-1M+QED` vs Native GDN) and the complete 16-benchmark 2026 evaluation sweep. See [`docs/COMPUTE_GRANT_PROPOSAL.md`](COMPUTE_GRANT_PROPOSAL.md) for the exact 3-tier allocation budget (`400` / `2,500` / `6,000` GPU-hours) derived transparently from measured throughput and latency.
+With **`156.01` single-GPU hours** already invested to de-risk every architectural, mathematical, data-hygiene, and Blackwell kernel risk (documented with full positive and negative evidence above), a targeted **`1× 8×H200/B200` allocation for 2 weeks (`~2,500` GPU-hours — Tier 2 Primary Request)** unlocks full `s2_v2` + `s4_v2_rl` SI-RSI + FLOP-matched `d ∈ {1, 2, 3}` ablations (`GDN-2-1M+QED` vs Native GDN) and the complete 16-benchmark 2026 evaluation sweep. See [`docs/COMPUTE_GRANT_PROPOSAL.md`](COMPUTE_GRANT_PROPOSAL.md) for the exact 3-tier allocation budget (`400` / `2,500` / `6,000` GPU-hours) derived transparently from measured throughput and latency.
 
 ---
 

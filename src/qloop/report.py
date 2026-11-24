@@ -242,11 +242,14 @@ def compute_kv_memory_1m() -> list[dict[str, Any]]:
     v2_tot = round(v2_kv + v2_gdn + ours_idx, 2)  # 10.65 GiB
 
     # Clean v2 Inference-Time Block-64 Walsh-Hadamard INT4 Serving Projection:
-    # engine.py _HadamardINT4Slot (symmetric INT4 + fp16 scale / 64 scalars = 34/64 = 0.53125 B/scalar -> 5.31 GiB KV)
-    # offload.py Block64HadamardINT4Cache (asymmetric 36/64 = 0.5625 B/scalar -> 5.63 GiB KV; with exact 0.13 GiB fp32
-    # GDN state + 0.32 GiB D-LSA = 6.08 GiB total).
-    int4_kv = kv_gib(10, 2, 256, 34.0 / 64.0)  # 5.31 GiB exact (symmetric engine.py)
-    int4_tot = round(int4_kv + v2_gdn + ours_idx, 2)  # 5.96 GiB (5.96-6.08 GiB serving range)
+    # Under the table's consistent 0.33 GiB 66L GDN budget:
+    #   engine.py _HadamardINT4Slot (symmetric 34/64 = 0.53125 B/scalar -> 5.31 GiB KV + 0.33 + 0.32 = 5.96 GiB)
+    #   offload.py Block64HadamardINT4Cache (asymmetric 36/64 = 0.5625 B/scalar -> 5.63 GiB KV + 0.33 + 0.32 = 6.28 GiB)
+    # (Using exact raw fp32+conv GDN state 0.133 GiB instead of 0.33 GiB yields 5.77–6.08 GiB INT4 / 10.45 GiB FP8.)
+    int4_kv = kv_gib(10, 2, 256, 34.0 / 64.0)  # 5.31 GiB (exact 5.3125 GiB, symmetric engine.py)
+    int4_asym_kv_exact = (10 * 2 * 2 * 256 * (36.0 / 64.0) * t_1m) / gib  # 5.625 GiB exact (offload.py)
+    int4_tot = round(int4_kv + v2_gdn + ours_idx, 2)  # 5.96 GiB (5.3125 + 0.33 + 0.32 = 5.9625)
+    int4_asym_tot = round(int4_asym_kv_exact + v2_gdn + ours_idx + 1e-9, 2)  # 6.28 GiB (6.275 half-up)
 
     # LoopHSSD v3.2 (v1 ablation): 10L FP8 SharedKV + 66L HSSD bf16 state (~5.50 GiB) + 0.32 GiB D-LSA = 15.82 GiB
     ours_hssd = 5.50
@@ -283,7 +286,10 @@ def compute_kv_memory_1m() -> list[dict[str, Any]]:
             "total_gib": int4_tot,
             "highlight": False,
             "is_projection": True,
-            "callout": f"~{int4_tot:.2f}–6.08 GiB serving proj. ({inkling_tot / int4_tot:.1f}× vs Inkling)",
+            "callout": (
+                f"~{int4_tot:.2f}–{int4_asym_tot:.2f} GiB serving proj. "
+                f"({inkling_tot / int4_asym_tot:.1f}×–{inkling_tot / int4_tot:.1f}× vs Inkling)"
+            ),
         },
         {
             "name": "Clean v2 Native-GDN / GDN-2-1M (88L @ R=3)",
@@ -574,6 +580,8 @@ def parse_supervisor_log(log_path: str | None, stage_override: str | None = None
     prev_head: str | None = None
     tf524_pre_rows: list[tuple[str, int, int, float]] = []
     tf524_post_rows: list[tuple[str, int, int, float]] = []
+    tf524_pre_s = 0.0
+    tf524_post_s = 0.0
 
     with open(log_path, encoding="utf-8", errors="replace") as f:
         for raw_ln in f:
@@ -582,6 +590,7 @@ def parse_supervisor_log(log_path: str | None, stage_override: str | None = None
             if mb:
                 ts, sess, launched, pid, head = mb.groups()
                 cur_head = head
+                cur_run_dir_stage = stage_override
                 prev_ts = None
                 boots.append(
                     {
@@ -613,6 +622,11 @@ def parse_supervisor_log(log_path: str | None, stage_override: str | None = None
                         delta_s = (t_obj - prev_ts).total_seconds()
                         if 0 < delta_s <= 1800:
                             active_hours_by_head[cur_head] = active_hours_by_head.get(cur_head, 0.0) + delta_s / 3600.0
+                            if cur_head == "8409b6e":
+                                if ts < "2026-11-22T18:08:00Z":
+                                    tf524_pre_s += delta_s
+                                else:
+                                    tf524_post_s += delta_s
                     prev_ts = t_obj
                     prev_head = cur_head
                     if cur_head == "8409b6e":
@@ -637,7 +651,7 @@ def parse_supervisor_log(log_path: str | None, stage_override: str | None = None
             if ms:
                 step, target, lm, depth, tps, alloc_g, res_g, peak_g = ms.groups()
                 tgt_i = int(target)
-                if cur_run_dir_stage and cur_run_dir_stage in STAGES and tgt_i == 600:
+                if cur_run_dir_stage in ("s3_long_1m_lsa", "s3_v2_long_1m_lsa") and tgt_i == 600:
                     stage = cur_run_dir_stage
                 else:
                     stage = _TARGET_TO_STAGE.get(tgt_i, cur_run_dir_stage or f"target_{target}")
@@ -721,14 +735,9 @@ def parse_supervisor_log(log_path: str | None, stage_override: str | None = None
 
     tf524_window = None
     if len(tf524_pre_rows) >= 2:
-        t0_p = _parse_iso(tf524_pre_rows[0][0])
-        t1_p = _parse_iso(tf524_pre_rows[-1][0])
-        pre_h = round((t1_p - t0_p).total_seconds() / 3600.0, 2) if (t0_p and t1_p) else 0.0
-        post_h = 0.0
-        if len(tf524_post_rows) >= 2:
-            t0_q = _parse_iso(tf524_post_rows[0][0])
-            t1_q = _parse_iso(tf524_post_rows[-1][0])
-            post_h = round((t1_q - t0_q).total_seconds() / 3600.0, 2) if (t0_q and t1_q) else 0.0
+        tot_8409_h = round(active_hours_by_head.get("8409b6e", 0.0), 2)
+        pre_h = round(tf524_pre_s / 3600.0, 2)
+        post_h = round(max(0.0, tot_8409_h - pre_h), 2) if tf524_post_s > 0 else 0.0
         tf524_window = {
             "slowdown_keepalives": len(tf524_pre_rows),
             "slowdown_hours": pre_h,
@@ -1705,12 +1714,15 @@ def render_experiment_report_md(
                 f" (**`{diff_n:+.3f}` nats / `{(1.0 - ppl_v2/ppl_v1)*100:.1f}%` lower PPL** "
                 f"vs HSSD `s3@s{int(s3_match['step'])}`)"
             )
+        v2_tps_h = s3v2.get("tok_per_s_mean")
+        v1_tps_h = s3.get("tok_per_s_mean")
+        v2_sp_str = f"`{v2_tps_h / v1_tps_h:.2f}×` faster" if (v2_tps_h and v1_tps_h) else "`2.26×` faster"
         a(
             "| **Clean v2 A/B Win (`s3_v2_long_1m_lsa`)** | `Measured` | "
             f"Held-out `64K` NLL **`{_fmt_f(s3v2_ev_last.get('d1'), 3)} → {_fmt_f(s3v2_ev_last.get('d2'), 3)} → "
             f"{_fmt_f(s3v2_d3, 3)}`** (`depth_gain = {_fmt_f(s3v2_ev_last.get('depth_gain'), 4, True)}`){cmp_str}; "
             f"`512K–1M` recall **`{max(s3v2_rec_vals):.3f}`** peak (vs `0.485` HSSD); "
-            f"**`{_fmt_f(s3v2.get('tok_per_s_mean'), 0)} tok/s`** (`2.2×` faster); "
+            f"**`{_fmt_f(v2_tps_h, 0)} tok/s`** ({v2_sp_str}); "
             f"peak **`{_fmt_f(s3v2.get('mem_peak_max_gib'), 2)} GiB`** (`-11.3 GiB`) | "
             f"Hub `{s3v2.get('latest_commit_sha') or '—'}` "
             f"(`s{s3v2_latest_step}/{s3v2_target}`), `colab_supervisor_v2.log` |"
@@ -1735,7 +1747,7 @@ def render_experiment_report_md(
         "| **1M Context-State HBM Footprint** | `Formula` | "
         f"**`{v2_tot_gib:.2f} GiB`** (`10.00` FP8 `1.0×` SharedKV + `0.33` 66L Native GDN/GDN-2 + `0.32` D-LSA) — "
         "**`3.02×` smaller than Inkling 2 Mini (`32.16 GiB`)**, **`5.17 GiB` smaller than HSSD (`15.82 GiB`)**; "
-        "`~5.96–6.08 GiB` Block-64 Hadamard INT4 serving projection | "
+        "`~5.96–6.28 GiB` Block-64 Hadamard INT4 serving projection (`5.77–6.08 GiB` w/ raw `0.133 GiB` fp32 GDN) | "
         "Exact tensor-shape formula + live `1,048,576`-tok pass (`69.52 GiB` peak, `ec34f825`) |"
     )
     if da.get("output_counts"):
@@ -1749,9 +1761,10 @@ def render_experiment_report_md(
             "decoupled `working_notebook` CoT raised pass rate **`4.1% → 100.0%`** (`197/197`, `0` defects) | "
             "`Loop64-Fable-SIRSI-v1/audit_summary.json`, `def3624`, `dc7a14e` |"
         )
+    s2_sp_txt = f"{s2_speedup:.2f}×" if s2_speedup else "2.06×"
     a(
         "| **Blackwell `sm_120` Kernel & Test Hardening** | `Measured` | "
-        "11 verified kernel/systems milestones (`5.8×–19.0×` micro-speedups, `2.07×` BPTT speedup, "
+        f"11 verified kernel/systems milestones (`5.8×–19.0×` micro-speedups, `{s2_sp_txt}` BPTT speedup, "
         "`-7.0 GiB` leak fix, `10.6×` TF 5.24 recovery), **`0` post-fix optimizer skips**, "
         "**`709` passing CPU unit/parity tests** (`749` total) | "
         "`docs/PERF_PROFILE_S2.md`, `colab_supervisor*.log`, `origin/main` `2c78ffc` |"
@@ -1824,12 +1837,14 @@ def render_experiment_report_md(
         "(**`3.02×` smaller** than Inkling 2 Mini's `32.16 GiB`, **`5.17 GiB` smaller** than HSSD v1's `15.82 GiB`). "
         "Together with `~21.8 GiB` NVFP4 base weights, full `1M` serving fits in **`~32.5 GiB`** "
         "(`34%` of a single `96 GiB` Blackwell card).\n"
-        "- **Block-64 Walsh-Hadamard INT4 Serving Projection (`~5.96–6.08 GiB`):** Implemented in "
-        "`src/qloop/infer/engine.py` (`_HadamardINT4Slot`: symmetric INT4 + `fp16` scale = "
+        "- **Block-64 Walsh-Hadamard INT4 Serving Projection (`~5.96–6.28 GiB` on table `0.33 GiB` GDN budget):** "
+        "Implemented in `src/qloop/infer/engine.py` (`_HadamardINT4Slot`: symmetric INT4 + `fp16` scale = "
         "`34/64 = 0.53125 B/scalar` → `5.31 GiB` KV + `0.33` GDN + `0.32` D-LSA = **`5.96 GiB`**) "
         "and `src/qloop/model/offload.py` (`Block64HadamardINT4Cache`: asymmetric `36/64 = 0.5625 B/scalar` "
-        "→ `5.63 GiB` KV + `0.133` exact fp32 GDN + `0.32` D-LSA = **`6.08 GiB`**; "
-        "`53.64 GiB` Host-DDR5 at `10M` tokens).\n"
+        "→ `5.625 GiB` KV + `0.33` GDN + `0.32` D-LSA = **`6.275 ≈ 6.28 GiB`**; "
+        "`53.64 GiB` Host-DDR5 at `10M` tokens). "
+        "Substituting exact raw fp32+conv GDN state (`0.133 GiB` instead of `0.33 GiB`) lowers the INT4 range to "
+        "`5.77–6.08 GiB` (and FP8 SharedKV to `10.45 GiB`).\n"
         "- **Inkling 2 Mini (`32.16 GiB`):** Thinking Machines Lab (`24L → 48L`, `R=3`, `5:1` SWA:global, "
         "`8` KV heads × `128` dim, unshared per-pass F16 KV across `8` logical global layers) "
         "= `8 × 2 × 8 × 128 × 2 B × 1,048,576 = 32.00 GiB` + `0.16 GiB` across `40` `1,024`-window SWA layers."
@@ -1946,7 +1961,9 @@ def render_experiment_report_md(
         a(
             f"| **Total Measured Supervisor Active Single-GPU Time** | `colab_supervisor*.log` | "
             f"**`{sup_tot_h:.2f} h`** | "
-            f"`v1`: `{sup_v1_h:.2f} h` + `v2`: `{sup_v2_h:.2f} h` (excl. ~`1.3 h` standalone probe/eval) |"
+            f"`v1`: `{sup_v1_h:.2f} h` + `v2`: `{sup_v2_h:.2f} h` "
+            "(supervisor `pid_alive=True` wall time; `c22bf62` includes `0.59 h` post-done idle before VM teardown; "
+            "excl. ~`1.3 h` standalone probe/eval) |"
         )
         a("")
 
@@ -2469,7 +2486,7 @@ def render_experiment_report_md(
         "shock or decode bottleneck**, commits **`919f2b8`** and **`2c78ffc`** implement **GDN-2-1M + Bounded QED + "
         "Soft Negative Eigenvalues** (`src/qloop/model/gdn2.py`, enabled cleanly in `s2_v2_joint_bptt` and `s4_v2_rl`, "
         "`917,568` params/layer × `30` physical linear layers = **`27.53M` params**, `0.079%` of `34.661B` — "
-        "`< 47%` of HSSD's `58.5M` overhead, adding **`0` bytes** to the recurrent state):"
+        "`47.1%` of HSSD's `58.51M` overhead, adding **`0` bytes** to the recurrent state):"
     )
     a("")
     a(
@@ -2643,8 +2660,8 @@ def render_experiment_report_md(
             f"`{oc.get('v12_fable_sft', 0):,}` `v1.2` working-notebook traces |"
         )
         a(
-            f"| **Live License Audit** | `{n_inc}` permissive repos included (`apache-2.0`, `cc-by-4.0`); "
-            f"`{n_exc}` excluded (`agpl-3.0`, `unknown`) | "
+            f"| **Live License Audit** | `{n_inc}` permissive repos included (`74.4%` Apache-2.0 / `25.6%` CC-BY-4.0 "
+            f"in `sft_core`); `{n_exc}` excluded (`agpl-3.0`, `unknown`) | "
             "Zero copyleft or unlicensed rows; full per-row provenance & BibTeX attribution |"
         )
         dup_tot = sum((ded.get("dup_counts") or {}).values())

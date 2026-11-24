@@ -1021,6 +1021,44 @@ def test_parse_supervisor_log_missing_returns_empty() -> None:
     assert res["active_gpu_hours_total"] == 0.0
 
 
+def test_parse_supervisor_log_boot_resets_stage_and_tf524_hours_reconcile(tmp_path: Path) -> None:
+    ka = "session=loop64 pid_alive=True exit_code=None disk_free=209.2GiB gpu=RTX"
+    log_p = tmp_path / "sup.log"
+    log_p.write_text(
+        "\n".join(
+            [
+                "2026-11-18T00:00:00Z [BOOT] ready session=loop64 launched=True pid=1 head=3a17c0d",
+                f"2026-11-18T00:05:00Z [KEEPALIVE] {ka} util=99% mem=70000/97887MiB pwr=350.0W temp=55C"
+                " | run dir: /content/runs/s1b_hssd_distill",
+                f"2026-11-18T00:10:00Z [KEEPALIVE] {ka} util=99% mem=70000/97887MiB pwr=350.0W temp=55C"
+                " | 00:09:00 I [-] step 500/1500 lm 1.2000 d=2 900 tok/s"
+                " mem alloc 24.0G / reserved 68.0G / peak 68.9G",
+                "2026-11-19T10:00:00Z [BOOT] ready session=loop64 launched=True pid=2 head=513879f",
+                f"2026-11-19T10:10:00Z [KEEPALIVE] {ka} util=99% mem=81000/97887MiB pwr=360.0W temp=56C"
+                " | 10:09:00 I [-] step 10/600 lm 2.4000 d=3 1050 tok/s"
+                " mem alloc 25.0G / reserved 79.0G / peak 80.7G",
+                "2026-11-22T17:50:00Z [BOOT] ready session=loop64 launched=True pid=3 head=8409b6e",
+                f"2026-11-22T17:55:00Z [KEEPALIVE] {ka} util=99% mem=91409/97887MiB pwr=252.0W temp=52C | slow",
+                f"2026-11-22T18:05:00Z [KEEPALIVE] {ka} util=99% mem=91409/97887MiB pwr=252.0W temp=52C | slow",
+                f"2026-11-22T18:10:00Z [KEEPALIVE] {ka} util=98% mem=80100/97887MiB pwr=373.0W temp=58C | fast",
+                f"2026-11-22T18:25:00Z [KEEPALIVE] {ka} util=98% mem=80100/97887MiB pwr=373.0W temp=58C | fast",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    res = parse_supervisor_log(str(log_p))
+    s3_samples = [s for s in res["step_samples"] if s["head"] == "513879f"]
+    assert len(s3_samples) == 1
+    assert s3_samples[0]["stage"] == "s3_long_1m_lsa"
+
+    tf = res["tf524_slowdown_window"]
+    assert tf is not None
+    assert tf["slowdown_hours"] + tf["post_fix_hours"] == pytest.approx(
+        res["active_gpu_hours_by_head"]["8409b6e"], abs=1e-6
+    )
+
+
 def test_committed_docs_artifacts_xml_and_secret_free() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     report_p = repo_root / "docs" / "EXPERIMENT_REPORT.md"

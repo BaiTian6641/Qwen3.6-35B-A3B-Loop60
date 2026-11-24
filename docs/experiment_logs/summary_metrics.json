@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-11-24T07:57:04Z",
+  "generated_at_utc": "2026-11-24T08:00:22Z",
   "repo": "TassP0lar/Qwen3.6-35B-A3B-Loop64",
   "dataset_repo": "TassP0lar/Loop64-Fable-SIRSI-v1",
   "base_model": "unsloth/Qwen3.6-35B-A3B-NVFP4",

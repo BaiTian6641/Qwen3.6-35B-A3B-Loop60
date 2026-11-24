@@ -2624,11 +2624,11 @@ def render_experiment_report_md(
     a(
         "1. **$O(T)$ Cumulative-Phase Backward Jacobian Blowup (`s1b` steps `425–775`, `7a2d590a..6df29172`):** "
         "In unscaled Phase-2 distillation (`15` Hub commits), cumulative phase differentiation produced an $O(T)$ "
-        "Jacobian explosion reaching **`global_grad_norm = 6.12e+19`** and loss **`12.0742`** (`dc7c4ad8` @ "
-        "`s650`, `121,740` skips; `s600` eval NLL `7.1876`), accumulating **`194,510` skipped parameter updates** "
-        "by `s775` (`6df29172`). Scaling cumulative-phase backward by `chunk_size / T` + live blend + atomic "
-        "`fused=False` guard (`a0877a3` / `3a17c0d`) fully resolved numerical stability (`0 / 1,100` skips), "
-        "proving the remaining failures below were **architectural**, not numerical."
+        "Jacobian explosion reaching peak **`global_grad_norm = 6.12e+19`** (`a93bcaef` @ `s475`), peak loss "
+        "**`12.0742`** (`dc7c4ad8` @ `s650`, `121,740` skips; `s600` eval NLL `7.1876`), and **`194,510` total "
+        "skipped parameter updates** by `s775` (`6df29172`). Scaling cumulative-phase backward by `chunk_size / T` "
+        "+ live blend + atomic `fused=False` guard (`a0877a3` / `3a17c0d`) fully resolved numerical stability "
+        "(`0 / 1,100` skips), proving the remaining failures below were **architectural**, not numerical."
     )
     a(
         "2. **Irreversible `+0.79` Nat Non-Identity Representation Shock (`s1b` → `s3`):** Even with `0` skips and "

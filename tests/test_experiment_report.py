@@ -926,25 +926,55 @@ def test_offline_export_e2e_v2_artifacts_7_svgs_and_secret_redaction(tmp_path: P
         )
         assert n_geom >= 8, f"{fname} missing plotted geometry"
         assert len(root.findall(f".//{SVG_NS}text")) >= 10, f"{fname} missing axis/labels"
+        assert "hbm" not in svg_txt.lower(), f"Erroneous HBM reference found in {fname}"
 
-    # 5. Verify 7-section EXPERIMENT_REPORT.md structure & relative SVG links
+    # 5. Verify 7-section v3 EXPERIMENT_REPORT.md structure, 5 strict upgrades & relative SVG links
     md = report_path.read_text(encoding="utf-8")
     for fname in EXPECTED_SVGS:
         assert f"experiment_logs/charts/{fname}" in md
     for heading in (
         "## 1. Executive Summary",
-        "## 2. Architecture & 1M-Context Memory Ledger",
+        "## 2. Methodology, Architecture & Full VRAM Footprint Ledger",
+        "### 2.1 Foundational Single-GPU Enabler: APOLLO Optimizer (`arXiv:2412.05270`) & `FusedStepOptimizer`",
+        "### 2.2 Verified Blackwell Hardware Spec (`GDDR7 ECC`) & Three-Axis Looped Hybrid Architecture",
+        "### 2.3 Inference `1M`-Context (`88L @ R=3`, `batch=1`) VRAM Footprint Ledger & `BucketIndex` Code Audit",
+        "### 2.4 Single-Card Training VRAM Footprint Ledger (`96 GB GDDR7 ECC` / `94.97 GiB` Usable)",
         "## 3. Full Stage-by-Stage Empirical Results",
         "### 3.7 Phase-A Truth-Check & 4-Stage Causal Swap Forensics",
+        "#### 3.7.1 Deep HSSD v3.2 Experimental Post-Mortem & Why `GDN-2` Is the Principled Move",
         "### 3.8 Controlled A/B Win: Clean Native-GDN `s3_v2_long_1m_lsa`",
-        "## 4. GDN-2-1M + Bounded QED (`arXiv:2608.13668`) + Soft Neg-Eigval via `fla 0.6.0` `DPLR`",
+        (
+            "## 4. GDN-2-1M (`arXiv:2605.22791`) + Bounded QED (`arXiv:2608.13668`) + "
+            "Soft Neg-Eigval via `fla 0.6.0` `DPLR`"
+        ),
         "## 5. Open Audited Dataset",
-        "## 6. Blackwell `sm_120` Systems & Kernel Engineering Ledger",
+        "## 6. Blackwell `sm_120` Speedup Chronology & Kernel Engineering Ledger",
         "## 7. Honest Limitations, Next Milestones & Compute Grant Justification",
     ):
         assert heading in md, f"Missing expected section heading: {heading}"
     assert "3.73e-09" in md
     assert "halted@500" in md
+    assert "hbm" not in md.lower(), "Erroneous HBM reference found in EXPERIMENT_REPORT.md"
+    assert "hbm" not in json.dumps(sm).lower(), "Erroneous HBM reference found in summary_metrics.json"
+    for required_token in (
+        "GDDR7",
+        "1,597 GB/s",
+        "71.9%",
+        "arXiv:2412.05270",
+        "FusedStepOptimizer",
+        "_foreach_norm",
+        "+1.04 GiB",
+        "33.54 GiB",
+        "11.63 GiB",
+        "8,192",
+        "~129 TB/step",
+        "93,700+",
+        "2e37bf6",
+        "5a82677",
+        "2f5a6ba",
+        "2c78ffc",
+    ):
+        assert required_token in md, f"Missing required v3 report content: {required_token}"
 
     # 6. Verify ZERO secret / tunnel leakage across ALL emitted files
     for p in res["written_files"]:
@@ -1063,16 +1093,29 @@ def test_committed_docs_artifacts_xml_and_secret_free() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     report_p = repo_root / "docs" / "EXPERIMENT_REPORT.md"
     grant_p = repo_root / "docs" / "COMPUTE_GRANT_PROPOSAL.md"
+    perf_p = repo_root / "docs" / "PERF_PROFILE_S2.md"
     logs_dir = repo_root / "docs" / "experiment_logs"
     if not report_p.is_file() or not logs_dir.is_dir():
         pytest.skip("Generated docs/experiment_logs not present")
 
-    assert not contains_secret(report_p.read_text(encoding="utf-8"))
+    report_txt = report_p.read_text(encoding="utf-8")
+    assert not contains_secret(report_txt)
+    assert "hbm" not in report_txt.lower(), "Erroneous HBM reference in committed EXPERIMENT_REPORT.md"
+    assert "1,597 GB/s" in report_txt and "71.9%" in report_txt and "GDDR7" in report_txt
     if grant_p.is_file():
         grant_txt = grant_p.read_text(encoding="utf-8")
         assert not contains_secret(grant_txt)
+        assert "hbm" not in grant_txt.lower(), "Erroneous HBM reference in committed COMPUTE_GRANT_PROPOSAL.md"
+        assert "GDDR7" in grant_txt and "1,597 GB/s" in grant_txt and "71.9%" in grant_txt
+        assert "arXiv:2412.05270" in grant_txt and "FusedStepOptimizer" in grant_txt
         assert "10.65 GiB" in grant_txt
+        assert "+1.04 GiB" in grant_txt
         assert "2,500" in grant_txt
+    if perf_p.is_file():
+        perf_txt = perf_p.read_text(encoding="utf-8")
+        assert not contains_secret(perf_txt)
+        assert "hbm" not in perf_txt.lower(), "Erroneous HBM reference in committed PERF_PROFILE_S2.md"
+        assert "GDDR7" in perf_txt and "1,597 GB/s" in perf_txt
 
     for fname in EXPECTED_SVGS:
         assert (logs_dir / "charts" / fname).is_file(), f"Missing committed chart {fname}"
@@ -1083,6 +1126,7 @@ def test_committed_docs_artifacts_xml_and_secret_free() -> None:
         txt = p.read_text(encoding="utf-8")
         assert not contains_secret(txt), f"Potential secret in committed file {p}"
         if p.suffix == ".svg":
+            assert "hbm" not in txt.lower(), f"Erroneous HBM reference in committed chart {p.name}"
             root = ET.fromstring(txt)
             assert root.tag == f"{SVG_NS}svg"
         elif p.suffix == ".csv":

@@ -8,7 +8,7 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helve
 </defs>
 <rect x="0" y="0" width="1380" height="595" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
 <text x="28" y="32" font-size="17" font-weight="700" fill="#0f172a">Held-Out Evaluation NLL by Virtual Depth (d=1/2/3) &amp; Depth Gain Across v1 &amp; Clean v2 Stages</text>
-<text x="28" y="51" font-size="11.3" fill="#475569">Qwen3.6-35B-A6B-Loop64 (40L / 64L / 88L) · Single RTX PRO 6000 Blackwell (96 GiB) · Clean v2 Native-GDN Eliminates the +0.79 Nat HSSD Shock</text>
+<text x="28" y="51" font-size="11.3" fill="#475569">Qwen3.6-35B-A6B-Loop64 (40L / 64L / 88L) · Single RTX PRO 6000 Blackwell Server Ed. (96 GB GDDR7 ECC) · Clean v2 Native-GDN Eliminates the +0.79 Nat HSSD Shock</text>
 <line x1="34.0" y1="70.0" x2="50.0" y2="70.0" stroke="#475569" stroke-width="2.4"/>
 <circle cx="42.0" cy="70.0" r="3.0" fill="#475569" stroke="#ffffff" stroke-width="1.2"/>
 <text x="55.0" y="74.0" font-size="10.5" font-weight="500" fill="#0f172a" text-anchor="start">d=1 (40L)</text>

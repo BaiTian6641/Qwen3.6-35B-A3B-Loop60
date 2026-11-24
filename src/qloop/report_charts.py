@@ -316,7 +316,7 @@ def render_eval_depth_curves_svg(bundle: dict[str, Any]) -> str:
         1380,
         595,
         "Held-Out Evaluation NLL by Virtual Depth (d=1/2/3) & Depth Gain Across v1 & Clean v2 Stages",
-        "Qwen3.6-35B-A6B-Loop64 (40L / 64L / 88L) · Single RTX PRO 6000 Blackwell (96 GiB) · "
+        "Qwen3.6-35B-A6B-Loop64 (40L / 64L / 88L) · Single RTX PRO 6000 Blackwell Server Ed. (96 GB GDDR7 ECC) · "
         "Clean v2 Native-GDN Eliminates the +0.79 Nat HSSD Shock",
     )
     svg.legend_row(
@@ -767,7 +767,7 @@ def render_s3_hssd_vs_v2_gdn_ab_svg(bundle: dict[str, Any]) -> str:
         ),
         (
             "1M Context State",
-            "GiB HBM (lower better)",
+            "GiB VRAM (lower better)",
             v1_1m,
             v2_1m,
             24.0,
@@ -919,8 +919,8 @@ def render_dplr_gdn2_kernel_bench_svg(bundle: dict[str, Any]) -> str:
         1220,
         540,
         "Live Blackwell sm_120 (fla 0.6.0) GDN-2-1M + Bounded QED Kernel Latency Benchmark",
-        "RTX PRO 6000 Blackwell (CUDA 13.0, PyTorch 2.14.1, Triton 3.8.0) · "
-        "Qwen3.6 Linear Layer Shape (B=1, H=32, K=V=128, bf16) · Median of 10 Timed Runs",
+        "RTX PRO 6000 Blackwell Server Ed. (96 GB GDDR7 ECC, 1,597 GB/s · CUDA 13.0, PyTorch 2.14.1, Triton 3.8.0) · "
+        "Qwen3.6 Linear Shape (B=1, H=32, K=V=128, bf16)",
     )
     svg.legend_row(
         34,
@@ -1673,15 +1673,15 @@ def render_s2_bptt_throughput_vram_svg(bundle: dict[str, Any]) -> str:
         yc_hi,
         yc_ticks,
         x_label="s2_joint_bptt Step",
-        y_label="HBM Memory (GiB)",
+        y_label="GDDR7 VRAM (GiB)",
         y_digits=0,
         panel_title="C. -7.0 GiB Leak Fix (Flat 25.3 GiB Alloc)",
         x_pad=p3_pad,
     )
-    y_hbm = _map_lin(96.0, yc_lo, yc_hi, y_top + p_h, y_top)
-    svg.line(p3_x, y_hbm, p3_x + p3_w, y_hbm, stroke=C_CRIMSON, stroke_width=1.4, dash="5,3")
+    y_vram = _map_lin(96.0, yc_lo, yc_hi, y_top + p_h, y_top)
+    svg.line(p3_x, y_vram, p3_x + p3_w, y_vram, stroke=C_CRIMSON, stroke_width=1.4, dash="5,3")
     svg.text(
-        p3_x + p3_w - 4, y_hbm - 4, "96 GiB Blackwell HBM Limit",
+        p3_x + p3_w - 4, y_vram - 4, "96 GB GDDR7 ECC Limit",
         size=8.7, fill=C_CRIMSON, weight="600", anchor="end",
     )
 
@@ -1775,8 +1775,8 @@ def render_kv_memory_vs_inkling_svg(bundle: dict[str, Any]) -> str:
     mem_rows = bundle.get("kv_memory_1m") or []
     svg = _SvgCanvas(
         1180,
-        545,
-        "1M-Context (1,048,576 Tokens) Context-State Memory Breakdown",
+        568,
+        "1M-Context (1,048,576 Tokens) Context-State VRAM Breakdown",
         "Clean v2 Native-GDN / GDN-2-1M (10.65 GiB FP8 · 3.02× smaller than Inkling 2 Mini) & "
         "Block-64 Hadamard INT4 Serving Projection (~5.96–6.28 GiB)",
     )
@@ -1787,7 +1787,7 @@ def render_kv_memory_vs_inkling_svg(bundle: dict[str, Any]) -> str:
             ("Global Attention KV Cache", C_BLUE, "box"),
             ("Native GDN / HSSD / SWA State (O(1))", C_TEAL, "box"),
             ("D-LSA Ward Centroids", C_PURPLE, "box"),
-            ("Single Blackwell 96 GiB HBM", C_CRIMSON, "dash"),
+            ("Single Blackwell 96 GB GDDR7 ECC", C_CRIMSON, "dash"),
         ],
         spacing=22.0,
     )
@@ -1801,14 +1801,14 @@ def render_kv_memory_vs_inkling_svg(bundle: dict[str, Any]) -> str:
         xx = _map_lin(xt, x_lo, x_hi, px, px + pw)
         if xt == 96.0:
             svg.line(xx, py, xx, py + ph, stroke=C_CRIMSON, stroke_width=1.8, dash="6,4")
-            svg.badge(xx, py - 7, "96 GiB Single-GPU HBM Ceiling", bg=C_CRIMSON, font_size=9.2, anchor="middle")
+            svg.badge(xx, py - 7, "96 GB GDDR7 ECC Ceiling", bg=C_CRIMSON, font_size=9.2, anchor="middle")
         else:
             svg.line(xx, py, xx, py + ph, stroke=C_GRID, stroke_width=1.0, dash="3,3")
         svg.text(xx, py + ph + 16, f"{int(xt)} GiB", size=9.6, fill=C_SUBTLE, anchor="middle", mono=True)
     svg.text(
         px + pw / 2.0,
         py + ph + 36,
-        "1M-Token Context-State HBM Footprint (GiB, excluding ~21.8 GiB NVFP4 model weights)",
+        "1M-Token Context-State VRAM Footprint (GiB, excluding base model weights)",
         size=10.4,
         fill=C_MUTED,
         weight="600",
@@ -1876,6 +1876,16 @@ def render_kv_memory_vs_inkling_svg(bundle: dict[str, Any]) -> str:
             )
         else:
             svg.badge(min(end_x - 6, px + pw - 6), cy + 5, note, bg=C_TEXT, font_size=9.3, anchor="end")
+
+    svg.text(
+        28,
+        552,
+        "Code Audit (src/qloop/model/lsa.py:743-768): Eager BucketIndex int64 tables add +1.04 GiB "
+        "(members 0.625 + key2slot 0.156 + unit_members 0.156 + labels 0.078 + misc 0.025 GiB) -> "
+        "compactable to ~0.04 GiB via int8 & dropping key2slot.",
+        size=9.2,
+        fill=C_MUTED,
+    )
 
     return svg.to_svg()
 

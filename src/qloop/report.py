@@ -88,13 +88,16 @@ VERIFIED_SYSTEMS_MILESTONES: list[dict[str, str]] = [
         "component": "NVFP4 MoE Dequant (Triton E2M1)",
         "commit": "b2c5513 (41082e4)",
         "measurement": "0.12 ms (1,144–1,148 GB/s) vs 2.22–2.23 ms eager (E=64, M=512, K=2048)",
-        "impact": "18.99× speedup, 18.5× less HBM traffic, max_diff=0.000000 (bf16)",
+        "impact": (
+            "18.99× speedup, saturates 71.9% of 1,597 GB/s GDDR7 ECC peak, "
+            "18.5× less GDDR7 traffic, max_diff=0.000000 (bf16)"
+        ),
     },
     {
         "component": "D-LSA Sparse FlashAttention (fwd+bwd)",
         "commit": "b2c5513 (ff27029)",
         "measurement": "174.56 ms (125.30 ms kernel) vs 1,627.16 ms ref (Tq=32K, Tk=131K, D=256)",
-        "impact": "9.32× E2E / 12.99× kernel speedup; ~70 TB/step HBM eliminated; cos >= 0.999973",
+        "impact": "9.32× E2E / 12.99× kernel speedup; ~70 TB/step GDDR7 eliminated; cos >= 0.999973",
     },
     {
         "component": "D-LSA 2-Pass Triton Distill KL",
@@ -103,16 +106,16 @@ VERIFIED_SYSTEMS_MILESTONES: list[dict[str, str]] = [
         "impact": "5.83× speedup; ~90,000 host syncs/step eliminated; cos_wq/wk = 1.000000",
     },
     {
-        "component": "BPTT Auto HBM-Resident / Async DMA",
+        "component": "BPTT Auto GDDR7-Resident / Async DMA",
         "commit": "b2c5513 (786fdeb)",
-        "measurement": "0.64 ms HBM-resident (2.56 ms async pinned DMA) vs 34.46 ms blocking",
-        "impact": "54.03× vs blocking (13.5× DMA); 10.7 GiB/step PCIe eliminated on 96 GiB G4",
+        "measurement": "0.64 ms GDDR7-resident (2.56 ms async pinned DMA) vs 34.46 ms blocking",
+        "impact": "54.03× vs blocking (13.5× DMA); 10.7 GiB/step PCIe eliminated on 96 GB GDDR7",
     },
     {
         "component": "HSSD v3.2 Triton WY & Scan Kernels",
         "commit": "fbd7a35 (f48dc72)",
         "measurement": "Fused Triton chunk_hssd fwd+bwd + 64×64 block-doubling WY solver",
-        "impact": "28–33× kernel acceleration; Phase-1/2 fits < 69.0 GiB on single 96 GiB G4",
+        "impact": "28–33× kernel acceleration; Phase-1/2 fits < 69.0 GiB on single 96 GB GDDR7",
     },
     {
         "component": "Live 1,048,576-Token FP8 Calibration Pass",
@@ -225,7 +228,7 @@ def _parse_iso(ts: str | None) -> _dt.datetime | None:
 
 
 def compute_kv_memory_1m() -> list[dict[str, Any]]:
-    """Exact closed-form 1M-token (1,048,576) context-state HBM breakdown (GiB, analytical formula)."""
+    """Exact closed-form 1M-token (1,048,576) context-state VRAM breakdown (GiB, derived formula)."""
     t_1m = 1_048_576
     gib = float(1024 ** 3)
 
@@ -376,7 +379,7 @@ def compute_kv_memory_1m() -> list[dict[str, Any]]:
             "total_gib": unshared_88_kv,
             "highlight": False,
             "is_projection": False,
-            "callout": f"{unshared_88_kv:.2f} GiB ({unshared_88_kv / v2_tot:.1f}× Clean v2 · OOM > 96 GiB)",
+            "callout": f"{unshared_88_kv:.2f} GiB ({unshared_88_kv / v2_tot:.1f}× Clean v2 · OOM > 96 GB)",
         },
     ]
 
@@ -1435,7 +1438,10 @@ def normalize_experiment_data(
         "repo": repo,
         "dataset_repo": DEFAULT_DATASET_REPO,
         "base_model": "unsloth/Qwen3.6-35B-A3B-NVFP4",
-        "hardware": "1x NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120, 96 GiB HBM)",
+        "hardware": (
+            "1x NVIDIA RTX PRO 6000 Blackwell Server Edition "
+            "(GB202, sm_120, 96 GB GDDR7 ECC, 512-bit, 1,597 GB/s, 24,064 CUDA cores, 600 W TDP)"
+        ),
         "total_hub_commits": len(raw_commits),
         "total_tokens_trained": total_tokens,
         "gpu_hours": gpu_hours,
@@ -1669,34 +1675,47 @@ def render_experiment_report_md(
     a("## 1. Executive Summary")
     a("")
     a(
-        "On a **single rented Google Colab RTX PRO 6000 Blackwell (`96 GiB` HBM, "
-        f"`{sup_tot_h:.2f}` measured supervisor GPU-hours across `{tot_tok_m:.2f}M` total tokens)**, "
-        "we developed an open, parameter-efficient (`< 0.6%` trainable) 88-virtual-layer looped hybrid "
-        "reasoning & `1M`-context retrofit of `unsloth/Qwen3.6-35B-A3B-NVFP4` while keeping all `32.212B` "
-        "routed MoE experts **100% frozen (SHA-256 verified)**. Our empirical record documents both a "
-        "decisive **negative architectural ablation (v1 HSSD)** — caught early by an adversarial Phase-A "
-        "truth-check & 4-stage causal component swap before wasting full RL/eval compute — and the resulting "
-        "**clean v2 breakthrough (`Native-GDN / GDN-2-1M + Bounded QED + 88L Loop + FP8 1.0× SharedKV + D-LSA`)**:"
+        "On a **single rented Google Colab NVIDIA RTX PRO 6000 Blackwell Server Edition (`GB202`, `sm_120`, "
+        "`96 GB GDDR7 with ECC` [`94.97 GiB` CUDA-usable], `512-bit` bus, `1,597 GB/s` peak Server Edition "
+        "bandwidth [vs. `1,792 GB/s` Workstation Edition], `24,064` CUDA cores, `600 W` configurable max TDP, "
+        f"passive server cooling; `{sup_tot_h:.2f}` measured active supervisor GPU-hours across `{tot_tok_m:.2f}M` "
+        "total tokens)**, we developed an open, parameter-efficient (`< 0.6%` trainable) 88-virtual-layer looped "
+        "hybrid reasoning & `1M`-context retrofit of `unsloth/Qwen3.6-35B-A3B-NVFP4` while keeping all `32.212B` "
+        "routed MoE experts **100% frozen (SHA-256 verified)**. Grounded in **APOLLO (`arXiv:2412.05270`) + "
+        "`FusedStepOptimizer`** for single-card `96 GB` training, our empirical record documents both a decisive "
+        "**negative architectural ablation (v1 HSSD v3.2)** — caught early by an adversarial Phase-A truth-check "
+        "& 4-stage causal component swap before wasting full RL/eval compute — and the resulting **clean v2 "
+        "breakthrough (`Native-GDN / GDN-2-1M + Bounded QED + 88L Loop + FP8 1.0× SharedKV + D-LSA`)**:"
     )
     a("")
-    a("### Headline Verified Results (Measured Telemetry vs. Analytical Formulas)")
+    a("### Headline Verified Results (`Measured` Telemetry vs. `Derived Formula`)")
     a("")
     a("| Dimension | Class | Verified Finding | Ground-Truth Provenance |")
     a("| :--- | :---: | :--- | :--- |")
+    a(
+        "| **Single-GPU Optimizer (`APOLLO` + `FusedStepOptimizer`)** | `Measured` + `Derived Formula` | "
+        "`rank=256` channel-wise APOLLO (`apollo_torch`) routes all `30` large 2D `k/v/o` matrices (`104.86M` "
+        "params in `s2*`, `4.2×` moment savings, `8×` on `o_proj`) and `o_proj + shared_expert` (`209.72M` in "
+        "`s4_v2_rl`); `fused=True` in-backward `.grad` release in `s1`, atomic `fused=False` guard (`3a17c0d`) "
+        "with `_foreach_norm` (`897 → ~4` launches, `0.0` error) in `s1b/s3/s2/s4` | "
+        "`configs/base.yaml:89-97`, `src/qloop/train/optim.py:382-421`, `docs/PERF_PROFILE_S2.md:59`, "
+        "`runs/s1_loop_a6b_run.log` |"
+    )
     a(
         "| **88L Loop Healing (`s1_loop_a6b`)** | `Measured` | "
         "`18.41M` params (`0.053%`) healed `40L → 64L → 88L` "
         f"(`depth_gain = {_fmt_f(s1_ev_last.get('depth_gain'), 4, True)}`), "
         "`82.3%` Pass-2 expert re-routing (`17.36` unique core experts/tok), "
-        "`100%` `d=1/2/3` cache parity & `16K` needle pass | "
+        "`100%` `d=1/2/3` cache parity & `16K` needle pass; `54.24 GiB` peak VRAM | "
         "Hub `32eb565e`, `s1_quality_check.json`, `truth_check_summary.json` |"
     )
     vd_s500 = s2_vd_vals[-1] if s2_vd_vals else 3.26e-5
     a(
-        "| **v1 Negative Ablation (HSSD Forensics)** | `Measured` | "
+        "| **v1 Negative Ablation (HSSD v3.2 Post-Mortem)** | `Measured` | "
         "4-stage causal swap proved `top1 = 1.0000` decode parity & D-LSA innocence, isolating HSSD v3.2 as the "
-        f"root failure (`+0.79` nat `s1b` shock `0.919 → 1.705`, dead `vault_duty = {vd_s500:.2e}`, "
-        "`3.41 tok/s` `d=3` decode) + raw `fable51` `<search_query>` tool poisoning | "
+        f"root failure (`+0.79` nat `s1b` shock `0.919 → 1.705`, dead `vault_duty = {vd_s500:.2e}`, failed `18K` "
+        "needle under `LSA=dense`, `+5.17 GiB` 1M state, `3.41 tok/s` `5.6×` slower decode) + raw `fable51` "
+        "`100%` redacted tool-arg poisoning | "
         "`runs/eval_truth_check_s2_step500/truth_check_summary.json`, Hub `e050a4b8` |"
     )
     if s3v2_ev_last and s3v2_rec_vals:
@@ -1736,19 +1755,21 @@ def render_experiment_report_md(
         t1_nat = float((t1_d.get("native_fused_recurrent_gated_delta_rule") or {}).get("median_ms") or 0.0421)
         t1_dplr = float((t1_d.get("fla_fused_recurrent_dplr_raw") or {}).get("median_ms") or 0.0430)
         a(
-            "| **GDN-2-1M + Bounded QED (`fla 0.6.0` DPLR)** | `Measured` | "
-            "`27.53M` params (`0.079%`), `0.0` IEEE-754 Step-0 identity; "
+            "| **GDN-2-1M (`arXiv:2605.22791`) + QED (`arXiv:2608.13668`)** | `Measured` | "
+            "`27.53M` params (`0.079%`, `47.1%` of HSSD), `0.0` IEEE-754 Step-0 identity, `0` extra state bytes; "
             f"`T=32K` fwd+bwd **`{gdn2_m:.2f}–{dplr_m:.2f} ms`** "
-            f"(**`{py_m/dplr_m:.1f}×–{py_m/gdn2_m:.1f}×`** vs PyTorch `{py_m:.1f} ms`); "
+            f"(**`{py_m/dplr_m:.1f}×–{py_m/gdn2_m:.1f}×`** vs PyTorch `{py_m:.1f} ms`, `11.63 GiB` DPLR delta); "
             f"`T=1` decode **`{t1_dplr:.4f} ms = {t1_dplr/t1_nat:.2f}×`** native GDN | "
             "`runs/bench_v2_smoke_dplr/summary.json`, `919f2b8`, `2c78ffc` |"
         )
     a(
-        "| **1M Context-State HBM Footprint** | `Formula` | "
-        f"**`{v2_tot_gib:.2f} GiB`** (`10.00` FP8 `1.0×` SharedKV + `0.33` 66L Native GDN/GDN-2 + `0.32` D-LSA) — "
-        "**`3.02×` smaller than Inkling 2 Mini (`32.16 GiB`)**, **`5.17 GiB` smaller than HSSD (`15.82 GiB`)**; "
-        "`~5.96–6.28 GiB` Block-64 Hadamard INT4 serving projection (`5.77–6.08 GiB` w/ raw `0.133 GiB` fp32 GDN) | "
-        "Exact tensor-shape formula + live `1,048,576`-tok pass (`69.52 GiB` peak, `ec34f825`) |"
+        "| **1M Inference & Single-Card Training VRAM Ledger** | `Derived Formula` + `Measured` | "
+        f"1M Inference state: **`{v2_tot_gib:.2f} GiB`** (`10.45 GiB` w/ raw `0.133 GiB` GDN; **`3.02×` smaller** "
+        "than Inkling 2 Mini `32.16 GiB`; `5.96–6.28 GiB` Hadamard INT4); honest `BucketIndex` audit adds "
+        "`+1.04 GiB` eager `int64` (`~33.54 GiB` total, compactable to `~0.04 GiB` → `~32.5 GiB`). "
+        "Training fits `96 GB` GDDR7 ECC across all stages (`54.24–81.23 GiB` measured; `s2_v2` est. `~62–68 GiB` "
+        "alloc as-is, `~49–55 GiB` w/ `8,192`-tok sub-segmenting) | "
+        "`src/qloop/model/lsa.py:743-768`, `report.py`, live `1M` pass (`69.52 GiB` @ `ec34f825`) |"
     )
     if da.get("output_counts"):
         oc = da["output_counts"]
@@ -1763,10 +1784,11 @@ def render_experiment_report_md(
         )
     s2_sp_txt = f"{s2_speedup:.2f}×" if s2_speedup else "2.06×"
     a(
-        "| **Blackwell `sm_120` Kernel & Test Hardening** | `Measured` | "
-        f"11 verified kernel/systems milestones (`5.8×–19.0×` micro-speedups, `{s2_sp_txt}` BPTT speedup, "
-        "`-7.0 GiB` leak fix, `10.6×` TF 5.24 recovery), **`0` post-fix optimizer skips**, "
-        "**`709` passing CPU unit/parity tests** (`749` total) | "
+        "| **Blackwell `sm_120` Speedup & Hardening Stack** | `Measured` | "
+        f"7 profiled optimizations + 4 hardening commits: `18.99×` NVFP4 E2M1 (`1,148 GB/s = 71.9%` of peak "
+        f"`1,597 GB/s` GDDR7 ECC), `9.32×/12.99×` D-LSA FlashAttn (`-70 TB/step`), `5.83×` 2-pass KL (`-90K` "
+        f"syncs), `54.03×` BPTT offload/CCE, `{s2_sp_txt}` E2E BPTT speedup, `-7.0 GiB` leak fix (`25.3 GiB` "
+        "flat), `10.6×` TF 5.24 recovery; **`709` passing CPU tests** (`749` total) | "
         "`docs/PERF_PROFILE_S2.md`, `colab_supervisor*.log`, `origin/main` `2c78ffc` |"
     )
     a("")
@@ -1774,9 +1796,110 @@ def render_experiment_report_md(
     a("")
 
     # ------------------------------------------------------------------
-    # Section 2: Architecture & 1M-Context Memory Ledger
+    # Section 2: Methodology, Architecture & Full VRAM Footprint Ledger
     # ------------------------------------------------------------------
-    a("## 2. Architecture & 1M-Context Memory Ledger")
+    a("## 2. Methodology, Architecture & Full VRAM Footprint Ledger")
+    a("")
+
+    # 2.1 APOLLO Optimizer + FusedStepOptimizer (Foundational Enabler)
+    a("### 2.1 Foundational Single-GPU Enabler: APOLLO Optimizer (`arXiv:2412.05270`) & `FusedStepOptimizer`")
+    a("")
+    a(
+        "Training a `34.661B`-parameter looped hybrid MoE up to `131K–1M` tokens on a **single `96 GB GDDR7 ECC` "
+        "card** (`94.97 GiB` CUDA-usable) requires strict control over both **gradient/optimizer state memory** "
+        "and **kernel launch overhead**. Rather than relying on ZeRO/FSDP multi-GPU sharding or sacrificing "
+        "AdamW-level convergence on large 2D projections, our training stack is grounded in "
+        "**APOLLO (`arXiv:2412.05270`: SGD-like memory, AdamW-level performance)** integrated inside "
+        "**`FusedStepOptimizer`** (`configs/base.yaml:89-97`, `src/qloop/train/optim.py:382-421`):"
+    )
+    a("")
+    a(
+        "1. **Exact Parameter Routing Rule (`configs/base.yaml:89-97`, `src/qloop/train/optim.py:382-421`):** "
+        "Configured with `apollo: {enabled: true, rank: 256, scale_type: channel, scale: 1.0, "
+        "update_proj_gap: 200, min_dim: 128}` and `impl: auto` (`apollo_torch.APOLLOAdamW` when installed, "
+        "falling back to our built-in faithful `ApolloAdamWFallback` implementing Algorithm 1 + Fira norm-growth "
+        "limiter $\\gamma=1.01$). `build_param_groups()` routes **every large 2D trainable weight matrix "
+        "(`p.dim() == 2` and `min(shape) >= 128`)** not in `adamw_patterns` to low-rank `rank=256` channel-wise "
+        "APOLLO (storing $2 \\cdot r \\cdot \\max(m, n)$ fp32 moments instead of $2 m n$), while 1D norms, "
+        "scalars, and narrow `<128`-dim adapters (`loop_adapters`, `hssd_adapter.`, `lsa_indexer.`, "
+        "`gdn2_adapter.`, `mlp.gate.weight$`) use exact `AdamW` / `AdamWLite` (with fp32 master copies for "
+        "`bf16` weights)."
+    )
+    a(
+        "2. **Blackwell `sm_120` Optimizer Vectorization (`src/qloop/train/optim.py:893-1088`):** "
+        "In non-fused mode (`fused=False`), `_batched_grad_norms()` computes per-parameter L2 norms via "
+        "`torch._foreach_norm(grads, 2.0, dtype=torch.float32)` (`float64` for fp64), collapsing `897` kernel "
+        "launches into `~4` multi-tensor launches with **`0.0` max error** (avoiding PyTorch's default bf16 "
+        "`_foreach_norm` `0.24` rounding error), reuses `_step_gnorm_sq` directly via `torch._foreach_mul_` to "
+        "eliminate the redundant full-model `clip_grad_norm_` pass, batches all `100` bf16 master-weight "
+        "`AdamWLite` tensors into `_step_batched_adamw_lite` (`_foreach_*`), and transfers `ApolloAdamWFallback` "
+        "projections via pinned `non_blocking=True` DMA — all while preserving exact atomic whole-step "
+        "non-finite abort semantics."
+    )
+    a("")
+    a("#### Stage-by-Stage Verified Optimizer Runtime Behavior *(100% Grounded in Logs & Configs)*")
+    a("")
+    a(
+        "| Stage | Mode (`fused`) | Verified Runtime Optimizer Mix | Active APOLLO Coverage & Memory Savings | "
+        "Provenance |"
+    )
+    a("| :--- | :---: | :--- | :--- | :--- |")
+    a(
+        "| **`s1_loop_a6b`** (`18.41M`, `137` tensors) | `fused=True` | "
+        "`adamw:AdamWLite x137` (in-backward hook steps & frees `.grad` immediately) | "
+        "`0` APOLLO tensors (all `100` norms are 1D & `37` loop adapters have `min_dim < 128` / excluded) | "
+        "`Measured` (`runs/s1_loop_a6b_run.log:55-58`) |"
+    )
+    a(
+        "| **`s1b_hssd_distill`** (`76.92M`, `807` tensors) | `True` (P1) → **`False`** (`3a17c0d`) | "
+        "Switched to `fused=False` at `3a17c0d` for atomic whole-step non-finite guard + true global "
+        "`clip_grad_norm_(1.0)` | "
+        "`0` APOLLO tensors (`hssd_adapter.`, `loop_adapters`, 1D norms excluded); `apollo.enabled: true` kept | "
+        "`Measured` (`s1b_hssd_distill_run.log:66`, `3a17c0d`) |"
+    )
+    a(
+        "| **`s3_long_1m_lsa` / `s3_v2_long_1m_lsa`** (`24.56M` v2) | `fused=False` | "
+        "Fused CUDA `torch.optim.AdamW` + batched `AdamWLite` (`max_grad_norm=1.0`, atomic guard) | "
+        "`0` APOLLO tensors (narrow `lsa_indexer`, `loop_adapters`, `q_norm`/`k_norm` only) | "
+        "`Measured` (`configs/stages/s3*_long_1m_lsa.yaml`) |"
+    )
+    a(
+        "| **`s2_joint_bptt`** (`897` tensors, `104.86M` 2D attn) | `fused=False` | "
+        "**`apollo_torch` `APOLLOAdamW` (`30` tensors)** + `767` fp32 fused `AdamW` + `100` bf16 `AdamWLite` | "
+        "**Active APOLLO (`rank=256`, channel-wise)** on all `30` large 2D full-attn weights (`k_proj` `[512,2048]`, "
+        "`v_proj` `[512,2048]`, `o_proj` `[2048,4096]` × `10L`): `0.156 GiB` moments (`+0.029` proj = `0.186 GiB`) "
+        "vs `0.781 GiB` AdamW (**`4.2×` smaller**, **`8×`** on `o_proj`) | "
+        "`Measured` (`docs/PERF_PROFILE_S2.md:59`) + `Derived Formula` |"
+    )
+    a(
+        "| **`s2_v2_joint_bptt`** (`~156.9M` trainable, queued) | `fused=False` | "
+        "**`APOLLOAdamW` (`30` tensors)** + fused `AdamW` / `AdamWLite` (`gdn2_adapter`, `loop`, `lsa`, `norms`) | "
+        "Identical active APOLLO coverage on all `30` large 2D `k/v/o` matrices (`104.86M` params, `-0.60 GiB` "
+        "moment savings vs AdamW) | "
+        "`Derived Formula` (`configs/stages/s2_v2_joint_bptt.yaml`) |"
+    )
+    a(
+        "| **`s4_v2_rl`** (`SI-RSI`, queued) | `fused=False` | "
+        "**`APOLLOAdamW` (`130` tensors)** + fused `AdamW` / `AdamWLite` (`max_grad_norm=0.5`, atomic guard) | "
+        "APOLLO covers **`10` `o_proj` (`83.89M`, `8×` savings: `0.625 → 0.078 GiB`) + `120` `shared_expert` 2D "
+        "matrices (`40L × {gate,up,down}`, `125.83M`, `2×` savings: `0.938 → 0.469 GiB`)** = `209.72M` 2D weights "
+        "(`~1.02 GiB` moments saved) | "
+        "`Derived Formula` (`configs/stages/s4_v2_rl.yaml`) |"
+    )
+    a("")
+
+    # 2.2 Hardware Spec & Three-Axis Architecture
+    a("### 2.2 Verified Blackwell Hardware Spec (`GDDR7 ECC`) & Three-Axis Looped Hybrid Architecture")
+    a("")
+    a(
+        "> [!NOTE]\n"
+        "> **Verified Hardware Specification (NVIDIA RTX PRO 6000 Blackwell Server Edition, `GB202`, `sm_120`):** "
+        "Official NVIDIA server-card specification: **`96 GB GDDR7 with ECC`** (`94.97 GiB` CUDA-usable) over a "
+        "**`512-bit` memory bus** at **`1,597 GB/s`** peak Server Edition bandwidth (vs. `1,792 GB/s` on the "
+        "active-cooled Workstation Edition), with **`24,064` CUDA cores**, **`600 W` configurable max TDP**, and "
+        "**passive server cooling**. Against this true `1,597 GB/s` GDDR7 ECC ceiling, our fused Triton NVFP4 "
+        "E2M1 dequantization kernel achieves **`1,144–1,148 GB/s` = `71.9%` of peak memory bandwidth** (Section 6)."
+    )
     a("")
     a(
         "`Qwen3.6-35B-A6B-Loop64` retrofits `unsloth/Qwen3.6-35B-A3B-NVFP4` (`40` physical layers = "
@@ -1795,10 +1918,11 @@ def render_experiment_report_md(
     )
     a(
         "2. **Clean v2 Linear-Attention Backbone — Native Qwen3.6 GDN → Step-0 Bit-Identical `GDN-2-1M + Bounded QED` "
-        "(Replacing HSSD v3.2):** Following our Phase-A forensics (Section 3.7), clean v2 **removes HSSD v3.2** "
-        "(saving `5.17 GiB` of 1M decode state, eliminating the `+0.79` nat non-identity shock, and restoring "
-        "native Blackwell decode latency). `s3_v2_long_1m_lsa` trains on 100% Native Qwen3.6 GDN (`0.33 GiB` across "
-        "`66` virtual linear passes); `s2_v2_joint_bptt` and `s4_v2_rl` enable **GDN-2-1M + Bounded QED + Soft "
+        "(Replacing HSSD v3.2):** Following our Phase-A forensics and HSSD post-mortem (Section 3.7), clean v2 "
+        "**removes HSSD v3.2** (saving `5.17 GiB` of 1M decode state, eliminating the `+0.79` nat non-identity "
+        "shock, and restoring native Blackwell decode latency). `s3_v2_long_1m_lsa` trains on 100% Native Qwen3.6 "
+        "GDN (`0.33 GiB` budget across `66` virtual linear passes); `s2_v2_joint_bptt` and `s4_v2_rl` enable "
+        "**NVIDIA GDN-2 (`arXiv:2605.22791`) + Bounded QED (`arXiv:2608.13668`) + 1M Asymmetric Slow-Decay + Soft "
         "Neg-Eigval** (`27.53M` params, `0.0` Step-0 diff, `0` extra recurrent state bytes; Section 4)."
     )
     a(
@@ -1809,9 +1933,11 @@ def render_experiment_report_md(
         "+ `512` local window + `64` sinks, `<= 768` packed remote keys/query)."
     )
     a("")
-    a(f"![1M Context Memory Breakdown vs Inkling 2 Mini]({chart_rel_dir}/kv_memory_vs_inkling.svg)")
+
+    # 2.3 Inference 1M-Context VRAM Footprint Ledger & Honest BucketIndex Audit
+    a("### 2.3 Inference `1M`-Context (`88L @ R=3`, `batch=1`) VRAM Footprint Ledger & `BucketIndex` Code Audit")
     a("")
-    a("### Exact 1M-Context (`1,048,576` Tokens) Analytical Memory Ledger *(Derived Closed-Form Formulas)*")
+    a(f"![1M Context Memory Breakdown vs Inkling 2 Mini]({chart_rel_dir}/kv_memory_vs_inkling.svg)")
     a("")
     a(
         "| Architecture | Virtual Depth | Stored Global KV Layers | KV Precision | Global KV (GiB) | "
@@ -1829,25 +1955,133 @@ def render_experiment_report_md(
         )
     a("")
     a(
-        "*Exact formula provenance:*\n"
-        "- **Clean v2 FP8 SharedKV (`10.65 GiB`):** "
+        "*Exact `Derived Formula` provenance & honest `src/qloop/model/lsa.py:743-768` "
+        "code audit (zero hidden costs):*\n"
+        "- **Clean v2 FP8 SharedKV (`10.65 GiB` budget / `10.45 GiB` exact raw GDN):** "
         "`10 × 2(K,V) × 2 KV heads × 256 dim × 1 B × 1,048,576 = 10.00 GiB` + `0.33 GiB` "
-        "(`66/30 × 0.15 GiB` stock GDN recurrent+conv budget; exact raw fp32 "
-        "`66 × [32×128×128×4B + 8192×4×2B] = 0.133 GiB`) + `0.32 GiB` D-LSA centroids = **`10.65 GiB`** "
-        "(**`3.02×` smaller** than Inkling 2 Mini's `32.16 GiB`, **`5.17 GiB` smaller** than HSSD v1's `15.82 GiB`). "
-        "Together with `~21.8 GiB` NVFP4 base weights, full `1M` serving fits in **`~32.5 GiB`** "
-        "(`34%` of a single `96 GiB` Blackwell card).\n"
-        "- **Block-64 Walsh-Hadamard INT4 Serving Projection (`~5.96–6.28 GiB` on table `0.33 GiB` GDN budget):** "
-        "Implemented in `src/qloop/infer/engine.py` (`_HadamardINT4Slot`: symmetric INT4 + `fp16` scale = "
-        "`34/64 = 0.53125 B/scalar` → `5.31 GiB` KV + `0.33` GDN + `0.32` D-LSA = **`5.96 GiB`**) "
-        "and `src/qloop/model/offload.py` (`Block64HadamardINT4Cache`: asymmetric `36/64 = 0.5625 B/scalar` "
-        "→ `5.625 GiB` KV + `0.33` GDN + `0.32` D-LSA = **`6.275 ≈ 6.28 GiB`**; "
-        "`53.64 GiB` Host-DDR5 at `10M` tokens). "
-        "Substituting exact raw fp32+conv GDN state (`0.133 GiB` instead of `0.33 GiB`) lowers the INT4 range to "
-        "`5.77–6.08 GiB` (and FP8 SharedKV to `10.45 GiB`).\n"
-        "- **Inkling 2 Mini (`32.16 GiB`):** Thinking Machines Lab (`24L → 48L`, `R=3`, `5:1` SWA:global, "
-        "`8` KV heads × `128` dim, unshared per-pass F16 KV across `8` logical global layers) "
+        "(`66/30 × 0.15 GiB` stock GDN recurrent+conv budget; exact raw fp32+conv "
+        "`66 × [32×128×128×4 B + 8192×4×2 B] = 0.133 GiB` → `10.45 GiB`) + `0.32 GiB` (`0.3125 GiB` bf16) D-LSA "
+        "Ward centroids = **`10.65 GiB`** (**`3.02×` smaller** than Inkling 2 Mini's `32.16 GiB`, **`5.17 GiB` "
+        "smaller** than HSSD v1's `15.82 GiB`).\n"
+        "- **Block-64 Walsh-Hadamard INT4 Serving Projection (`5.96–6.28 GiB` on `0.33 GiB` GDN budget / "
+        "`5.77–6.08 GiB` raw GDN):** Implemented in `src/qloop/infer/engine.py` (`_HadamardINT4Slot`: symmetric "
+        "`34/64 = 0.53125 B/scalar` → `5.31 GiB` KV + `0.33` + `0.32` = **`5.96 GiB`**) and "
+        "`src/qloop/model/offload.py` (`Block64HadamardINT4Cache`: asymmetric `36/64 = 0.5625 B/scalar` → "
+        "`5.625 GiB` KV + `0.33` + `0.32` = **`6.28 GiB`**; `53.64 GiB` Host-DDR5 at `10M` tokens).\n"
+        "- **Honest Code Audit of Current Eager `BucketIndex` (`src/qloop/model/lsa.py:743-768`):** Across `10` "
+        "full-attention layers at `1M` tokens (`nb = 2,048` blocks, `spb = 64` compacted slots/block, "
+        "`s_total = 131,072` slots), eager `_assemble()` currently retains `int64` index tables totaling "
+        "**`+1.04 GiB`** (`members` `[1,2,131072,32]` `0.625 GiB` + `key2slot` `[1,2,1048576]` `0.156 GiB` + "
+        "cached `unit_members` `[1,2,2048,64,8]` `0.156 GiB` + `labels`/`slot_labels` `2×[1,2,2048,128]` "
+        "`0.078 GiB` + `slot_counts`/`active`/misc `~0.025 GiB`, or `+1.08 GiB` incl. `counts`/`slot_end`/"
+        "`block_id`; plus eager `key_latent` upcasts centroids to `fp32` `+0.31 GiB` until cast to `bf16` at "
+        "inference). Including `~21.8 GiB` pure NVFP4 base weights + adapters, current eager `1M` serving totals "
+        "**`~33.54 GiB`** (or `~35.8 GiB` on the live-loaded `24.09 GiB` mixed-precision `32` NVFP4 + `8` FP8 "
+        "HF checkpoint, `s1_loop_a6b_run.log:24`). Storing `unit_members`/`labels`/`slot_counts` in `int8` "
+        "(`~0.03–0.04 GiB`), dropping training-only `key2slot`, and materializing `members` on-the-fly for the "
+        "selected `Top-64` buckets compacts the `+1.04 GiB` overhead down to **`~0.04 GiB`** → **`~32.5 GiB`** "
+        "total (`34%` of a single `96 GB` GDDR7 ECC card)!\n"
+        "- **Inkling 2 Mini (`32.16 GiB`, `Derived Formula`):** Thinking Machines Lab (`24L → 48L`, `R=3`, `5:1` "
+        "SWA:global, `8` KV heads × `128` dim, unshared per-pass F16 KV across `8` logical global layers) "
         "= `8 × 2 × 8 × 128 × 2 B × 1,048,576 = 32.00 GiB` + `0.16 GiB` across `40` `1,024`-window SWA layers."
+    )
+    a("")
+
+    # 2.4 Single-Card Training VRAM Footprint Ledger (96 GB GDDR7 ECC)
+    a("### 2.4 Single-Card Training VRAM Footprint Ledger (`96 GB GDDR7 ECC` / `94.97 GiB` Usable)")
+    a("")
+    a(
+        "To demonstrate exact memory headroom with zero hidden allocator surprises, Table 2.4A lists **measured "
+        "live VRAM peaks & post-step allocations** across all executed stages, and Table 2.4B decomposes the exact "
+        "component budget for queued `s2_v2_joint_bptt` (`GDN-2-1M + QED + D-LSA`, `4×32K`, `d=3` `88L`):"
+    )
+    a("")
+    a("#### Table 2.4A — Measured Training VRAM Across All Executed Stages (`Measured`)")
+    a("")
+    a(
+        "| Stage | Context / Batch | Post-Step Alloc (`GiB`) | Peak VRAM (`GiB`) | "
+        "Free Headroom (`94.97 GiB`) | Source |"
+    )
+    a("| :--- | :---: | :---: | :---: | :---: | :--- |")
+    a(
+        "| `s1_loop_a6b` (Native-GDN, `fused=True`) | `8K`, `mb=4` (`d=1..3`) | `28.0–28.4` | **`54.24`** | "
+        "`40.73 GiB` | `s1_loop_a6b_metrics.jsonl`, `colab_supervisor.log` |"
+    )
+    a(
+        "| `s1b_hssd_distill` (HSSD v3.2, Phase 1 / Phase 2) | `16K`, `mb=1` | `25.2–27.0` | "
+        "`48.41` / **`68.97`** | `26.00 GiB` | Hub `0ff9b537`, `2fb912db`, `colab_supervisor.log` |"
+    )
+    a(
+        "| `s3_long_1m_lsa` (v1 HSSD, `64K` + `1M` FP8) | `64K` / `1,048,576` | `24.9` | "
+        "**`81.23`** (`78.60` @ `1M`) | `13.74 GiB` | Hub `55c7a680`, `ad3542a6`, `colab_supervisor.log` |"
+    )
+    a(
+        "| `s2_joint_bptt` (v1 HSSD, `4×32K` BPTT) | `131K` (`4×32K`) | "
+        "`32.6` → `52.0` (leak) → **`25.3`** flat | **`70.1`** (`5a82677`) / **`78.42`** (TF5.24) | "
+        "`16.55–24.87 GiB` | Hub `91215ce1`, `colab_supervisor.log` |"
+    )
+    s3v2_sha_t24 = s3v2.get("latest_commit_sha") or "4bdaed40"
+    a(
+        f"| **`s3_v2_long_1m_lsa` (Clean v2 Native-GDN)** | `64K` / `934K–1M` FP8 | **`24.8`** | "
+        f"**`{_fmt_f(s3v2.get('mem_peak_max_gib'), 2)}`** (`69.52` @ `1M`) | **`25.01 GiB`** | "
+        f"Hub `ec34f825`, `{s3v2_sha_t24}`, `colab_supervisor_v2.log` |"
+    )
+    a(
+        "| `s2_v2_joint_bptt` Live Smoke (`2×16K`, `d=3`) | `32K` (`2×16K`) | `25.4` (`45.0` res.) | "
+        "**`43.13`** | `51.84 GiB` | `runs/bench_v2_smoke_dplr/summary.json` |"
+    )
+    a("")
+    a(
+        "#### Table 2.4B — Exact Component Breakdown for Queued `s2_v2_joint_bptt` "
+        "(`GDN-2-1M + QED + D-LSA`, `4×32K`, `d=3` `88L`)"
+    )
+    a("")
+    a("| Memory Component | Class | Size (`GiB`) | Exact Formula / Measurement Basis |")
+    a("| :--- | :---: | :---: | :--- |")
+    a(
+        "| Resident base weights (`24.09 GiB`) + adapters + APOLLO/AdamW states + grads | "
+        "`Measured` + `Derived Formula` | **`~25.50`** | "
+        "`24.09 GiB` loaded mixed NVFP4/FP8 base (`s1_loop_a6b_run.log:24`) + `~156.9M` adapters/attn + "
+        "APOLLO `rank=256` on `30` `k/v/o` matrices (`0.186 GiB` vs `0.781 GiB` AdamW, saving `-0.60 GiB`) |"
+    )
+    a(
+        "| `88` activation-checkpoint boundary tensors | `Derived Formula` | **`11.00`** | "
+        "`88 × [1, 32768, 2048] × 2 B` (`bf16`, exact `128 MiB/layer`) |"
+    )
+    a(
+        "| Prior-segment KV cache (`3` prior segs, `10` full-attn layers) | `Derived Formula` | **`1.88`** | "
+        "`10 × 2(K,V) × 2 heads × 256 dim × 98,304 tok × 2 B` (`1.875 GiB` bf16) |"
+    )
+    a(
+        "| D-LSA `128K` `BucketIndex` (`10` full-attn layers) | `Derived Formula` | **`0.17`** | "
+        "`1/8` of `1M` eager index footprint (`1.39 GiB / 8 = 0.174 GiB`) |"
+    )
+    a(
+        "| `u_seg` cached pre-attention hidden states (`3` prior segs × `10L`) | `Derived Formula` | **`3.75`** | "
+        "`3 × 10 × [1, 32768, 2048] × 2 B`; **spills to pinned CPU RAM via `offload_prior_hidden: auto`** "
+        "async DMA when free headroom `< 8 GiB` |"
+    )
+    a(
+        "| `66L` GDN-2 recurrent + conv states & segment snapshots | `Derived Formula` | **`~0.50`** | "
+        "GDN-2 adds `0` extra state bytes over Native GDN (`0.133 GiB` raw + checkpoint boundary copies) |"
+    )
+    a(
+        "| Single-layer un-segmented `T=32K` `GDN-2 + DPLR` transient | `Measured` + `Derived Formula` | "
+        "**`~19.5–20.5`** | **`11.63 GiB`** live-measured `chunk_dplr_delta_rule` delta (`11,904 MiB`, "
+        "`bench_v2_smoke_dplr/summary.json:1257`) + `~5.5–6.5 GiB` fp32 `compute_gates` (`gdn2.py:1602-1655`, "
+        "`11–13 × 0.50 GiB`) + `~2.5 GiB` `_TritonQEDDPLRPrepFn` fwd+bwd buffers |"
+    )
+    a(
+        "| **Total `s2_v2` Peak As-Is (`T=32K` un-segmented `GDN-2+DPLR`)** | "
+        "`Estimated (derived from measured rates)` | **`~62–68` alloc** (`~75–84` res.) | "
+        "Sum with `u_seg` spilled (`auto`) + `~3–5 GiB` CCE/MoE/LSA workspace; fits `94.97 GiB` usable "
+        "(`96 GB` GDDR7 ECC) |"
+    )
+    a(
+        "| **With Clean `8,192`-Token Sub-Segmenting (`4×` Transient Cut)** | "
+        "`Estimated (derived from measured rates)` | **`~49–55` alloc** | "
+        "Sub-segmenting `GDN-2 + DPLR` into `4 × 8,192`-tok sub-segments per `32K` chunk cuts the "
+        "`~19.5–20.5 GiB` transient **`4×` → `~5.1 GiB`**, freeing `> 40 GiB` single-card headroom |"
     )
     a("")
     a("---")
@@ -1953,10 +2187,19 @@ def render_experiment_report_md(
             f"`{gh.get('v2_smoke_part_a_h', 0.0):.2f} h` (+ Part B) | "
             "Live `s3_v2`/`s2_v2` smoke + `fla 0.6.0` parity/latency bench |"
         )
+        s3v2_sup_h = next(
+            (x for x in (sm.get("supervisor_stage_head_summary") or []) if x.get("stage") == "s3_v2_long_1m_lsa"),
+            None,
+        )
+        s3v2_sup_tps_s = (
+            f"`~{s3v2_sup_h['tok_per_s_mean']:,.0f} tok/s` sup. mean"
+            if (s3v2_sup_h and s3v2_sup_h.get("tok_per_s_mean"))
+            else "`~2,200 tok/s` sup. mean"
+        )
         a(
             f"| **`s3_v2_long_1m_lsa` (Clean v2, live through `s{s3v2_latest_step}`)** | `28b88e4` | "
             f"**`{gh.get('s3_v2_native_gdn_h', 0.0):.2f} h`** | "
-            "Live in progress (`0` skips, `~2,180 tok/s` sup. mean) |"
+            f"Live in progress (`0` skips, {s3v2_sup_tps_s}) |"
         )
         a(
             f"| **Total Measured Supervisor Active Single-GPU Time** | `colab_supervisor*.log` | "
@@ -2225,7 +2468,7 @@ def render_experiment_report_md(
     )
     sup_sp_lbl = f"{sup_sp:.2f}×" if sup_sp else "~2.0×"
     regime_defs = (
-        ("pre_opt_2e37bf6", "Pre-Opt Baseline (`2e37bf6`)", "Healthy baseline; HBM/sync-starved (~580 s/step)"),
+        ("pre_opt_2e37bf6", "Pre-Opt Baseline (`2e37bf6`)", "Healthy baseline; GDDR7/sync-starved (~580 s/step)"),
         (
             "post_opt_leaky_b2c5513",
             "Post-Opt Pre-Leak-Fix (`b2c5513`)",
@@ -2354,6 +2597,117 @@ def render_experiment_report_md(
         a("Truth-check summary (`truth_check_summary.json`) not present in this offline snapshot.")
         a("")
 
+    # Deep HSSD v3.2 Experimental Post-Mortem + Knowledge Gained -> Why GDN-2 Is the Principled Move
+    a("#### 3.7.1 Deep HSSD v3.2 Experimental Post-Mortem & Why `GDN-2` Is the Principled Move")
+    a("")
+    a(
+        "**(a) Why We Originally Built Custom HSSD v3.2 (`configs/stages/s1b_hssd_distill.yaml`):** "
+        "Stock Qwen3.6 Gated DeltaNet ties memory erasure and writing to a single scalar gate $\\beta_t \\in (0, 1)$ "
+        "with scalar exponential decay $g_t \\le 0$. We hypothesized that replacing all `30` physical (`66` virtual) "
+        "linear-attention layers with a bespoke **Horizon-Split Surprise-Gated Delta Memory (HSSD v3.2)** — "
+        "combining an exact disjoint `[513, 576]`-token local SWA window (`k_far = max(0, n - 8)`), `M = 8` "
+        "log-spaced multi-timescale vault pages with `Top-2` STE surprise-gated writes (`k_pages = 2`, "
+        "`write_mode = full`), and a low-rank 2D complex phase (`theta_low_rank = true`, `58.51M` params across "
+        "`30L`) — would overcome exponential memory decay across `1M`-token horizons."
+    )
+    a("")
+    a("**(b) Exhaustive Failure-Mode Audit (Every Exact Failure Observed in Authoritative Logs):**")
+    a("")
+    a(
+        "1. **$O(T)$ Cumulative-Phase Backward Jacobian Blowup (`s1b` steps `425–650`, `7a2d590a..dc7c4ad8`):** "
+        "In unscaled Phase-2 distillation, cumulative phase differentiation produced an $O(T)$ Jacobian explosion "
+        "reaching **`global_grad_norm = 6.12e+19`** and **`194,510` skipped parameter updates** (loss `12.0742`, "
+        "`s600` eval NLL `7.1876`). Scaling cumulative-phase backward by `chunk_size / T` + live blend + atomic "
+        "`fused=False` guard (`a0877a3` / `3a17c0d`) fully resolved numerical stability (`0 / 1,100` skips), "
+        "proving the remaining failures below were **architectural**, not numerical."
+    )
+    a(
+        "2. **Irreversible `+0.79` Nat Non-Identity Representation Shock (`s1b` → `s3`):** Even with `0` skips and "
+        "`distill_kl` falling `6.16 → 0.718`, swapping stock GDN for a structurally non-identical linear mechanism "
+        "under `< 0.3%` trainable params inflicted a permanent `+0.64` nat shock vs Phase-1 (`1.0657 → 1.7052`) "
+        "and **`+0.79` nats vs `s1_loop_a6b` (`0.9191 → 1.7052`)**. Downstream `s3_long_1m_lsa` never escaped "
+        "this degraded `1.8757` `64K` NLL floor and topped out at `0.4848` `512K–1M` D-LSA recall."
+    )
+    a(
+        "3. **Dead Long-Horizon Vault Pages (`hssd/vault_duty` Collapse):** Across `500` steps of `131K` "
+        "`s2_joint_bptt`, `hssd/vault_duty` collapsed to **`2e-4 → 3.26e-5`** (`1.14e-6` early, `~2` dead pages) "
+        "despite `budget_weight = 1.0` and `distill_kl = 0.72` — meaning the STE `Top-2` surprise router "
+        "effectively abandoned long-horizon pages and degenerated into a noisy local-window approximation."
+    )
+    a(
+        "4. **Generative & `18K` Needle Failure Even Under `LSA = dense`:** In `truth_check_summary.json`, EVERY "
+        "HSSD checkpoint (`s1b`, `s3`, `s2@500`) failed the `16K/18K` needle retrieval gate (`needle16k = False`) "
+        "even when D-LSA was forced **100% dense** (`s3_long_1m_lsa_dense`, "
+        "`s2_with_pristine_attn_norms_lsadense`). Swapping `s3` HSSD into `s2` collapsed `code_d3` from `0.9133` "
+        "to `0.1494`, whereas `s1_loop_a6b` (Native-GDN) passed `16K` needle (`True`) at both `d=1` and `d=3`."
+    )
+    a(
+        "5. **`+5.17 GiB` 1M State Overhead & `5.6×` Decode Speed Regression:** Storing `M = 8` lagged-replay "
+        "bf16 pages inflated `66L` linear state from `0.33 GiB` to **`~5.50 GiB` (`+5.17 GiB` at `1M`)**, and "
+        "eager `d=3` decode plunged to **`3.41 tok/s`** vs stock **`19.22 tok/s`** (**`5.6×` slower**), making "
+        "RL rollouts and full benchmark sweeps `~18–35 h` instead of `~1 h`."
+    )
+    a(
+        "6. **Compounded by Upstream `fable51` `100%` Redacted Tool-Argument Poisoning:** Raw `fable51` had "
+        "`100%` placeholder-redacted `tool_calls` (`<bash_command>` `6,098×`, `<file_path>` `5,972×`, "
+        "`<search_query>` `2,441×`), directly inducing `s1b` `d=3`'s literal `{\"query\": \"<search_query>\"}` "
+        "generation loops (fixed in `TassP0lar/Loop64-Fable-SIRSI-v1` `v1.2`, Section 5)."
+    )
+    a("")
+    a("**(c) Four Core Scientific & Engineering Lessons Gained:**")
+    a("")
+    a(
+        "1. **Step-0 IEEE-754 Bit-Identity Is Non-Negotiable:** Under `< 1%` parameter budgets, replacing a "
+        "pretrained recurrent layer's representation manifold creates a shock that distillation cannot erase; "
+        "every architectural extension MUST initialize at exact `0.0` Step-0 diff (`torch.equal`).\n"
+        "2. **Held-Out NLL Cannot Substitute for Generative & Needle Truth-Checks:** `s2_joint_bptt` lowered "
+        "`131K` held-out NLL (`1.3508 → 1.1872`) while failing `18K` needle and looping in greedy generation; "
+        "adversarial Phase-A generation + needle + parity gates before RL saved hundreds of GPU-hours.\n"
+        "3. **Audit Every Upstream Dataset Before Mixing:** Even popular public CoT corpora hide `100%` "
+        "redacted tool arguments and `85.7%` cross-repo duplication; deterministic streaming audits and live "
+        "13-gram decontam must precede training.\n"
+        "4. **Build on Mature Pretrained Linear Manifolds + Production Kernels:** Reinventing bespoke routed "
+        "linear-attention kernels from scratch creates severe optimization, state-footprint, and decode-latency "
+        "debt compared to strictly generalizing native DeltaNet onto production `fla` Triton kernels."
+    )
+    a("")
+    a(
+        "**(d) Why Upgrading Native GDN via NVIDIA GDN-2 (`arXiv:2605.22791`) + Bounded QED (`arXiv:2608.13668`) "
+        "+ 1M Asymmetric Slow-Decay (`20.1×`) + Soft Neg-Eigval on `fla 0.6.0` `DPLR` Is the Obvious, Principled "
+        "Move:**"
+    )
+    a("")
+    a(
+        "| Design & Systems Axis | Custom HSSD v3.2 *(v1 Negative Ablation)* | "
+        "**GDN-2-1M + Bounded QED (`fla` `DPLR`)** |"
+    )
+    a("| :--- | :---: | :---: |")
+    a(
+        "| **Step-0 Compatibility vs. Native GDN** | Non-identity (`+0.79` nat `s1b` shock) | "
+        "**`0.0` IEEE-754 bit-exact** (`torch.equal`) |"
+    )
+    a(
+        "| **Extra 1M Recurrent State VRAM (`66L`)** | `+5.17 GiB` (`5.50 GiB` lagged pages) | "
+        "**`0` extra bytes** (`0.33 GiB` budget / `0.133 GiB` raw) |"
+    )
+    a(
+        "| **Adapter Params (`30` Linear Layers)** | `58.51M` (`0.169%`) | "
+        "**`27.53M`** (`0.079%` — **`47.1%` of HSSD**) |"
+    )
+    a(
+        "| **`T=1` Autoregressive Decode Latency** | `3.41 tok/s` `d=3` (**`5.6×` slower** than stock) | "
+        "**`0.0430 ms = 1.02×`** native GDN (`0.0421 ms`) |"
+    )
+    a(
+        "| **Long-Horizon Mechanism** | STE `Top-2` vault pages (collapsed to `3.26e-5`) | "
+        "Smooth channel-wise `[-3.0, +0.5]` decay (**`20.1×`** horizon) + QED + soft neg-eigval |"
+    )
+    a(
+        "| **Kernel Ecosystem & Training Speed** | Bespoke custom Triton WY + ring compaction | "
+        "Production `fla 0.6.0` `DPLR`/`gdn2` (**`15.1×–18.5×`** vs PyTorch) + fused `tl.int64` Triton prep |"
+    )
+    a("")
+
     # 3.8 Controlled A/B Win: Clean s3_v2_long_1m_lsa
     a(
         f"### 3.8 Controlled A/B Win: Clean Native-GDN `s3_v2_long_1m_lsa` "
@@ -2466,7 +2820,8 @@ def render_experiment_report_md(
             a(
                 f"- **Verified Live `1,048,576`-Token Clean v2 Pass:** At `step 125` (`ec34f825`), `s3_v2_long_1m_lsa` "
                 f"streamed **`{s3v2_max_pfx:,}` prefix + `32,768` suffix = `{s3v2_max_pfx + 32768:,}` tokens** at "
-                "**`69.52 GiB` peak VRAM** (`25.45 GiB` headroom on a single 96 GiB card) and `0` non-finite steps."
+                "**`69.52 GiB` peak VRAM** (`25.45 GiB` headroom on a single `96 GB` GDDR7 ECC card) "
+                "and `0` non-finite steps."
             )
             a("")
     else:
@@ -2479,14 +2834,18 @@ def render_experiment_report_md(
     # ------------------------------------------------------------------
     # Section 4: GDN-2-1M + Bounded QED + Soft Neg-Eigval via fla 0.6.0 DPLR
     # ------------------------------------------------------------------
-    a("## 4. GDN-2-1M + Bounded QED (`arXiv:2608.13668`) + Soft Neg-Eigval via `fla 0.6.0` `DPLR`")
+    a(
+        "## 4. GDN-2-1M (`arXiv:2605.22791`) + Bounded QED (`arXiv:2608.13668`) + "
+        "Soft Neg-Eigval via `fla 0.6.0` `DPLR`"
+    )
     a("")
     a(
         "To upgrade Qwen3.6's stock scalar-gated DeltaNet linear layers **without repeating HSSD's non-identity "
-        "shock or decode bottleneck**, commits **`919f2b8`** and **`2c78ffc`** implement **GDN-2-1M + Bounded QED + "
-        "Soft Negative Eigenvalues** (`src/qloop/model/gdn2.py`, enabled cleanly in `s2_v2_joint_bptt` and `s4_v2_rl`, "
-        "`917,568` params/layer × `30` physical linear layers = **`27.53M` params**, `0.079%` of `34.661B` — "
-        "`47.1%` of HSSD's `58.51M` overhead, adding **`0` bytes** to the recurrent state):"
+        "shock or decode bottleneck**, commits **`919f2b8`** and **`2c78ffc`** implement NVIDIA **Gated DeltaNet-2 "
+        "(`arXiv:2605.22791`)** extended with **1M Asymmetric Slow-Decay + Bounded QED (`arXiv:2608.13668`) + "
+        "Soft Negative Eigenvalues** (`src/qloop/model/gdn2.py`, enabled cleanly in `s2_v2_joint_bptt` and "
+        "`s4_v2_rl`, `917,568` params/layer × `30` physical linear layers = **`27.53M` params**, `0.079%` of "
+        "`34.661B` — `47.1%` of HSSD's `58.51M` overhead, adding **`0` bytes** to the recurrent state):"
     )
     a("")
     a(
@@ -2711,16 +3070,127 @@ def render_experiment_report_md(
     a("")
 
     # ------------------------------------------------------------------
-    # Section 6: Blackwell sm_120 Systems & Kernel Engineering Ledger
+    # Section 6: Blackwell sm_120 Speedup Chronology & Kernel Engineering Ledger
     # ------------------------------------------------------------------
-    a("## 6. Blackwell `sm_120` Systems & Kernel Engineering Ledger")
+    a("## 6. Blackwell `sm_120` Speedup Chronology & Kernel Engineering Ledger")
     a("")
     a(
-        "Every kernel, cache proxy, and stability fix below was verified live on `loop64` (RTX PRO 6000 Blackwell, "
-        "`PyTorch 2.14.1+cu130`, `Triton 3.8.0`, `transformers 5.24.0`, `fla 0.6.0`) and locked behind **`709` "
-        "passing CPU unit/parity tests** (`749` total collected incl. `40` CUDA-only tests on `origin/main` `2c78ffc`, "
-        "`0` `ruff` errors, `0` Python 3.9 AST errors across `143` sources):"
+        "Every diagnosis, Triton kernel, cache proxy, and stability fix below was mined directly from "
+        "`docs/PERF_PROFILE_S2.md`, `git log`, and `runs/colab_supervisor*.log` on our single "
+        "**NVIDIA RTX PRO 6000 Blackwell Server Edition (`GB202`, `sm_120`, `96 GB GDDR7 ECC`, `1,597 GB/s`, "
+        "`600 W` TDP; `PyTorch 2.14.1+cu130`, `Triton 3.8.0`, `transformers 5.24.0`, `fla 0.6.0`)** and locked "
+        "behind **`709` passing CPU unit/parity tests** (`749` total incl. `40` CUDA-only tests on `origin/main` "
+        "`2c78ffc`, `0` `ruff` errors, `0` Python 3.9 AST errors across `143` sources)."
     )
+    a("")
+    a("### 6.1 Root-Cause Diagnosis: Why `s2_joint_bptt` Initially Starved at `280–360 W` (`~53%` TDP) & `453.5 tok/s`")
+    a("")
+    a(
+        "Live profiling of baseline `s2_joint_bptt` (`2e37bf6`, `~580 s/step` avg at `d=2.2`, `427–481 tok/s`, "
+        "`324.2 W` mean power — barely **`~53%` of `600 W` TDP**) proved that `131K` BPTT was **not** Tensor-Core "
+        "compute bound (`docs/PERF_PROFILE_S2.md:28-32`). Instead, three systems bottlenecks starved the GPU:"
+    )
+    a("")
+    a(
+        "1. **`~129 TB/step` Unfused GDDR7 Gather/Scatter & Dequant Thrashing (`< 300 GB/s` Effective = `< 19%` "
+        "of Peak `1,597 GB/s` GDDR7 ECC):** Nested checkpoint recomputation in D-LSA `_sparse_chunk` materialized "
+        "`402.6 MiB/chunk` (`~71 TB/step` GDDR7), while eager NVFP4 `dequantize_nvfp4_tensor` allocated `int64` "
+        "`nibbles.long()` + 3 fp32 intermediates (`39 GiB/layer pass`, `~55–65 TB/step`), stalling Tensor Cores.\n"
+        "2. **`~93,700+` Blocking GPU→CPU Host Synchronizations per Step:** `90,112` syncs in `_distill_kl` "
+        "(`22,528` chunks × `4` syncs), `2,772+` in HSSD `boundary_ring`, `792` in `p_val.all()`, `360` in BPTT "
+        "blocking `.to('cpu')`, and `60` in `replay_meta.cpu()` constantly drained the CUDA command queue.\n"
+        "3. **`9–41 s/step` Synchronous CPU Data & Filter Stalls:** Blocking `next(self.stream)` ran 13-gram "
+        "decontam, tokenization, and packing on the GPU thread (amplified by upstream filter drop rates: `72%` "
+        "`openthoughts3`, `49%` `nemotron_post`, `50%` `arc_agi2_train`), causing `41 s` post-eval and `9 s` "
+        "inter-step GPU-idle gaps."
+    )
+    a("")
+    a("### 6.2 Ranked Breakdown of All 7 Profiled Blackwell Optimizations (`docs/PERF_PROFILE_S2.md`)")
+    a("")
+    a(
+        "| Rank | Bottleneck & File | Baseline Traffic / Syncs | Optimization Implemented | "
+        "Verified Speedup & Bandwidth / Sync Impact | Est. Time Saved |"
+    )
+    a("| ---: | :--- | :--- | :--- | :--- | :---: |")
+    a(
+        "| **1** | **D-LSA Sparse-Gather FlashAttention** (`src/qloop/model/lsa.py`) | "
+        "`52.8K` fwd (`67.6K` @ `d=3`) + `17.6K` bwd dispatches; `~71 TB/step` GDDR7 | "
+        "Single-shot `_TritonSparseGatherAttnFn` (8-head GQA SRAM reuse, atomic-free window/split-Q sink `dkv`, "
+        "cached `BucketIndex`, `tl.int64`) | "
+        "**`9.32×` E2E / `12.99×` kernel** (`174.56 ms` / `125.30 ms` vs `1,627.16 ms`), "
+        "`~70 TB/step` GDDR7 eliminated, `cos >= 0.999973` | **`195–250 s`** |"
+    )
+    a(
+        "| **2** | **D-LSA 2-Pass Triton Distill KL** (`src/qloop/model/lsa.py`) | "
+        "`90,112` host syncs/step + `22.5K` `autograd.grad` + `3.0 TB/step` fp32 K | "
+        "Zero-atomic 2-pass Triton teacher bucket-mass (`tl.dot`) + exact analytic `(d_qz, d_cent)` + single "
+        "`autograd.grad`/layer | "
+        "**`5.83×`** (`46.42 ms` vs `270.49 ms`), `~90,000 → < 180` host syncs/step, `cos_wq/wk = 1.000000` | "
+        "**`55–85 s`** |"
+    )
+    a(
+        "| **3** | **NVFP4 E2M1 MoE Dequant** (`src/qloop/model/quant_autograd.py`) | "
+        "`~55–65 TB/step` eager `int64`+`fp32` intermediates + `index_select` copies | "
+        "Fused bitwise `_nvfp4_dequant_fused_kernel` (`tl.int64`) + zero-copy contiguous `_select_dim0` | "
+        "**`18.99×`** (`0.12 ms` vs `2.22–2.23 ms`), **`1,144–1,148 GB/s = 71.9%` of peak `1,597 GB/s` GDDR7 "
+        "ECC**, `18.5×` less traffic, `max_diff = 0.0` | **`38–55 s`** |"
+    )
+    a(
+        "| **4** | **BPTT Auto-GDDR7 / Async DMA & CCE** (`bptt.py`, `trainer.py`) | "
+        "`10.7 GiB/step` blocking PCIe (`360` syncs) + `254 GiB/step` chunked logits + `16K` hooks | "
+        "`offload_prior_hidden: auto` (GDDR7-resident when `>= 8 GiB` free, else pinned async DMA) + "
+        "`cut_cross_entropy` + `query_sim_chunk=1024` + `loss_scale` | "
+        "**`54.03×` vs blocking / `13.5×` DMA** (`0.64 ms` / `2.56 ms` vs `34.46 ms`), `420` syncs & `16K` hooks "
+        "eliminated | **`35–60 s`** |"
+    )
+    a(
+        "| **5** | **HSSD v3.2 Sync Removal & `ckpt_every=16`** (`src/qloop/model/hssd.py`) | "
+        "`2,772+` `boundary_ring` + `792` `p_val.all()` syncs/step; `64` segs `s_ckpts` | "
+        "Device-side `bm <= 32` guard + `_all_swa_valid` flag propagation + internal `ckpt_every=16` (preserving "
+        "YAML `segment_chunks: 4`) | "
+        "`~3,564 → 0` host syncs/step; `2×` fewer `s_ckpts` copies (`-0.5 GiB`) | **`12–22 s`** |"
+    )
+    a(
+        "| **6** | **Async Data Pipeline & Hash-First Decontam** (`trainer.py`, `decontam.py`, `packing.py`) | "
+        "`9–41 s/step` GPU-idle stalls; `~50K` `set()`/seq; `131K` Python packing loop | "
+        "Deterministic `_AsyncBatchPrefetcher` (exact per-row `state_dict` + `pin_memory` + `non_blocking` H2D) "
+        "+ hash-first decontam + vectorized `Packer._emit` | "
+        "100% CPU overlap with GPU compute; `~4×` faster 13-gram decontam | **`18–45 s`** |"
+    )
+    a(
+        "| **7** | **Batched APOLLO / AdamW Optimizer** (`src/qloop/train/optim.py`) | "
+        "Duplicate `897`-tensor norm pass + `100` Python `AdamWLite` loops + blocking APOLLO H2D | "
+        "`_batched_grad_norms` (`_foreach_norm(..., dtype=fp32)`), reused `_foreach_mul_` clip, "
+        "`_step_batched_adamw_lite`, pinned `non_blocking` APOLLO proj | "
+        "`897 → ~4` norm launches with `0.0` error (vs `0.24` bf16 error); atomic whole-step non-finite guard "
+        "intact | **`2–6 s`** |"
+    )
+    a("")
+    a("### 6.3 Four Production Hardening Commits (Multi-Day Single-Card Resiliency)")
+    a("")
+    a(
+        "1. **`2e37bf6` — `T=131K` Triton `tl.int64` Pointer Overflow Fix:** At `T = 131,072`, `t * 20480` "
+        "exceeded `2^31 - 1` at `t = 104,858`, causing step-0 NaNs. Chunking `all_up` and auditing `tl.int64` "
+        "offsets across `32` kernels yielded `0.00e+00` parity error and cut transient buffers "
+        "`10.74 GiB → <= 671 MiB`.\n"
+        "2. **`5a82677` — Zero-Label BPTT C++-Bridged Autograd Cycle Leak Fix:** Under `respect_doc_boundaries=True`, "
+        "padded `128K` rows produced all-`-100` Segment-3 targets that skipped `.backward()`, leaking `90` "
+        "`_CheckpointFrame` cycles (`+16–19 GiB` → `52.0 GiB` alloc OOM on `b2c5513`). Adding "
+        "`LoopContext.release_graph()`, `saved_tensors_hooks(lambda x: x.detach())`, `__slots__` state detaching, "
+        "and all-`-100` segment pre-checks dropped post-step alloc from `32.6 GiB` (baseline) / `52.0 GiB` (leaky) "
+        "to **`25.3–25.4 GiB` rock-flat (`-7.0 GiB` vs baseline, `32h+` zero OOMs)**.\n"
+        "3. **`2f5a6ba` (`5aaf55d` / `28b88e4`) — `transformers 5.24.0` Cache-Kwarg `10.6×` Recovery:** Upgrading "
+        "to `transformers 5.24.0` renamed `cache_params → cache`, silently falling out of `_chunk_hssd_triton_fast` "
+        "to `~89 tok/s` (`252 W`, `82.7 GiB` peak). Unifying `cache` kwargs and isolating conv/recurrent snapshots "
+        "in `_ReplayKVCacheProxy` recovered **`10.6×` throughput (`89 → 942.6 tok/s` avg, peak `1,109 tok/s`)** "
+        "with `0.000e+00` 1-token checkpoint grad parity.\n"
+        "4. **`2c78ffc` (`919f2b8`) — Fused `tl.int64` Triton QED+DPLR Prep & Zero-Sync Cached `is_zero()`:** "
+        "Fuses L2-norm + QED + DPLR prep and its exact analytical VJP (`gradcheck`-verified) into a single "
+        "`tl.int64` Triton kernel and caches `GDN2Adapter.is_zero()` by `(data_ptr, _version)` tuples, eliminating "
+        "repeat `.any()` host syncs during `T=1` decode (`15.1×–18.5×` training speedup, `1.02×` native decode)."
+    )
+    a("")
+    a("### 6.4 Complete 11-Milestone Verification Ledger & Autonomous Resiliency")
     a("")
     a(
         "| # | Engineering Milestone | Git Commit | Exact Blackwell `sm_120` Verification Measurement | "
@@ -2772,11 +3242,12 @@ def render_experiment_report_md(
         "for parity, speed, `T=4096` stability, and Step-0 bit-identity (`bench_v2_smoke_dplr/summary.json`, "
         "`2c78ffc`), but full 600-step `s2_v2` convergence and 400-step `s4_v2_rl` RL gains are **not yet measured**."
     )
+    s3v2_tps_lim = _fmt_f(s3v2.get("tok_per_s_mean"), 0) if s3v2.get("tok_per_s_mean") else "2,382"
     a(
         "4. **Single-GPU Autoregressive Rollout Bottleneck:** Single-GPU training handles `s1` (`~2,117 tok/s`) and "
-        "`s3_v2` (`~2,180–2,370 tok/s`) comfortably, but online `d=3` (`88L`) GRPO/SI-RSI rollouts (`8` prompts × "
-        "`group=8` × `8,192` tokens/step) and full 16-benchmark `d ∈ {1, 2, 3}` sweeps are throughput-bound without "
-        "multi-GPU rollout parallelism."
+        f"`s3_v2` (`~2,202–{s3v2_tps_lim} tok/s`) comfortably, but online `d=3` (`88L`) GRPO/SI-RSI rollouts "
+        "(`8` prompts × `group=8` × `8,192` tokens/step) and full 16-benchmark `d ∈ {1, 2, 3}` sweeps are "
+        "throughput-bound without multi-GPU rollout parallelism."
     )
     a("")
     a("### 7.2 Immediate Experimental Roadmap")

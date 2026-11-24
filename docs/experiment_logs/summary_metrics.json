@@ -1,11 +1,11 @@
 {
-  "generated_at_utc": "2026-11-24T07:01:52Z",
+  "generated_at_utc": "2026-11-24T07:40:49Z",
   "repo": "TassP0lar/Qwen3.6-35B-A3B-Loop64",
   "dataset_repo": "TassP0lar/Loop64-Fable-SIRSI-v1",
   "base_model": "unsloth/Qwen3.6-35B-A3B-NVFP4",
-  "hardware": "1x NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120, 96 GiB HBM)",
-  "total_hub_commits": 190,
-  "total_tokens_trained": 566378496,
+  "hardware": "1x NVIDIA RTX PRO 6000 Blackwell Server Edition (GB202, sm_120, 96 GB GDDR7 ECC, 512-bit, 1,597 GB/s, 24,064 CUDA cores, 600 W TDP)",
+  "total_hub_commits": 191,
+  "total_tokens_trained": 572194816,
   "gpu_hours": {
     "s0_probe_h": 0.05,
     "s1_loop_a6b_h": 18.25,
@@ -20,10 +20,10 @@
     "s2_hssd_tf524_slowdown_h": 9.54,
     "s2_hssd_2f5a6ba_post_fix_h": 14.26,
     "v2_smoke_part_a_h": 0.15,
-    "s3_v2_native_gdn_h": 10.99,
+    "s3_v2_native_gdn_h": 11.59,
     "supervisor_v1_active_h": 145.02,
-    "supervisor_v2_active_h": 10.99,
-    "supervisor_total_active_h": 156.01
+    "supervisor_v2_active_h": 11.59,
+    "supervisor_total_active_h": 156.61
   },
   "stages": {
     "s1_loop_a6b": {
@@ -233,22 +233,22 @@
     },
     "s3_v2_long_1m_lsa": {
       "status": "in_progress",
-      "latest_step": 425,
-      "latest_hub_step": 425,
+      "latest_step": 450,
+      "latest_hub_step": 450,
       "target_steps": 600,
-      "latest_commit_sha": "fd4efe81",
+      "latest_commit_sha": "4bdaed40",
       "n_params": 24556598,
       "pct_of_34_661b": 0.071,
-      "n_rows": 17,
-      "tokens_seen": 85147648,
-      "tok_per_s_mean": 2386.7,
+      "n_rows": 18,
+      "tokens_seen": 90963968,
+      "tok_per_s_mean": 2381.9,
       "tok_per_s_min": 1939.3,
       "tok_per_s_max": 2953.3,
       "mem_peak_max_gib": 69.96,
       "skipped_total_max": 0.0,
       "post_fix_skipped_max": 0.0,
-      "grad_norm_final": 5.9643,
-      "hub_span_hours": 10.19,
+      "grad_norm_final": 8.9069,
+      "hub_span_hours": 10.83,
       "eval_first": {
         "step": 200,
         "status": "in_progress",
@@ -831,20 +831,20 @@
     {
       "stage": "s3_v2_long_1m_lsa",
       "head": "28b88e4",
-      "n_samples": 34,
+      "n_samples": 36,
       "min_step": 1,
-      "max_step": 420,
+      "max_step": 440,
       "tok_per_s_min": 828.0,
       "tok_per_s_max": 2953.0,
-      "tok_per_s_mean": 2199.5,
+      "tok_per_s_mean": 2201.9,
       "alloc_min_gib": 24.7,
       "alloc_max_gib": 25.2,
       "peak_min_gib": 65.5,
       "peak_max_gib": 70.0,
-      "power_mean_w": 505.4,
+      "power_mean_w": 505.9,
       "util_mean_pct": 99.2,
-      "observed_span_hours": 10.75,
-      "active_gpu_hours": 10.99
+      "observed_span_hours": 11.26,
+      "active_gpu_hours": 11.59
     }
   ],
   "tf524_slowdown_window": {
@@ -954,7 +954,7 @@
       "total_gib": 176.0,
       "highlight": false,
       "is_projection": false,
-      "callout": "176.00 GiB (16.5\u00d7 Clean v2 \u00b7 OOM > 96 GiB)"
+      "callout": "176.00 GiB (16.5\u00d7 Clean v2 \u00b7 OOM > 96 GB)"
     }
   ],
   "probe_summary": {
@@ -2381,13 +2381,13 @@
       "component": "NVFP4 MoE Dequant (Triton E2M1)",
       "commit": "b2c5513 (41082e4)",
       "measurement": "0.12 ms (1,144\u20131,148 GB/s) vs 2.22\u20132.23 ms eager (E=64, M=512, K=2048)",
-      "impact": "18.99\u00d7 speedup, 18.5\u00d7 less HBM traffic, max_diff=0.000000 (bf16)"
+      "impact": "18.99\u00d7 speedup, saturates 71.9% of 1,597 GB/s GDDR7 ECC peak, 18.5\u00d7 less GDDR7 traffic, max_diff=0.000000 (bf16)"
     },
     {
       "component": "D-LSA Sparse FlashAttention (fwd+bwd)",
       "commit": "b2c5513 (ff27029)",
       "measurement": "174.56 ms (125.30 ms kernel) vs 1,627.16 ms ref (Tq=32K, Tk=131K, D=256)",
-      "impact": "9.32\u00d7 E2E / 12.99\u00d7 kernel speedup; ~70 TB/step HBM eliminated; cos >= 0.999973"
+      "impact": "9.32\u00d7 E2E / 12.99\u00d7 kernel speedup; ~70 TB/step GDDR7 eliminated; cos >= 0.999973"
     },
     {
       "component": "D-LSA 2-Pass Triton Distill KL",
@@ -2396,16 +2396,16 @@
       "impact": "5.83\u00d7 speedup; ~90,000 host syncs/step eliminated; cos_wq/wk = 1.000000"
     },
     {
-      "component": "BPTT Auto HBM-Resident / Async DMA",
+      "component": "BPTT Auto GDDR7-Resident / Async DMA",
       "commit": "b2c5513 (786fdeb)",
-      "measurement": "0.64 ms HBM-resident (2.56 ms async pinned DMA) vs 34.46 ms blocking",
-      "impact": "54.03\u00d7 vs blocking (13.5\u00d7 DMA); 10.7 GiB/step PCIe eliminated on 96 GiB G4"
+      "measurement": "0.64 ms GDDR7-resident (2.56 ms async pinned DMA) vs 34.46 ms blocking",
+      "impact": "54.03\u00d7 vs blocking (13.5\u00d7 DMA); 10.7 GiB/step PCIe eliminated on 96 GB GDDR7"
     },
     {
       "component": "HSSD v3.2 Triton WY & Scan Kernels",
       "commit": "fbd7a35 (f48dc72)",
       "measurement": "Fused Triton chunk_hssd fwd+bwd + 64\u00d764 block-doubling WY solver",
-      "impact": "28\u201333\u00d7 kernel acceleration; Phase-1/2 fits < 69.0 GiB on single 96 GiB G4"
+      "impact": "28\u201333\u00d7 kernel acceleration; Phase-1/2 fits < 69.0 GiB on single 96 GB GDDR7"
     },
     {
       "component": "Live 1,048,576-Token FP8 Calibration Pass",

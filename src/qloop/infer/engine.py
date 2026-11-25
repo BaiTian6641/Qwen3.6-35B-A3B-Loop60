@@ -7,9 +7,11 @@ Supports both `ToyForCausalLM` and `Qwen3.6-35B-A6B-LoopHSSD` Whole Model Packs 
     (`128K - 1M` tokens) chunk-by-chunk through hybrid KV + recurrent states, materializing
     `lm_head` logits **ONLY on the final token** of the prompt,
   * **Quantized `1.0x` SharedKV Cache**: `"native"`, `"fp8"` (`float8_e4m3fn` + `fp16` per-token-head
-    scale, ~50% full-attn KV HBM savings), and `"hadamard_int4"` (Block-64 orthogonal Walsh-Hadamard
-    packed `uint8` nibbles + `fp16` block scale, ~75% full-attn KV HBM savings), while preserving
-    `1.0x` SharedKV across passes `r >= 2`,
+    scale, ~50% resident full-attn KV HBM savings), and `"hadamard_int4"` (Block-64 orthogonal
+    Walsh-Hadamard packed `uint8` nibbles + `fp16` block scale, ~73% resident full-attn KV HBM
+    savings), while preserving `1.0x` SharedKV across passes `r >= 2`. Note: standard dense
+    `update()` currently materializes full dequantized K/V tensors for SDPA compatibility; sparse
+    consumers can use `gather_kv(layer_idx, token_indices)` to dequantize only selected tokens,
   * **Causal MoR Early Exit** (`mor_early_exit=True`) & optional **`torch.compile`** decode step
     acceleration (`compile_decode=True`),
   * Live hardware/routing telemetry (`GenerationMetrics`) and `benchmark(...)` across depths.
@@ -44,6 +46,11 @@ try:
     from transformers.cache_utils import Cache as _HFCacheBase  # type: ignore[import-not-found]
 except ImportError:
     _HFCacheBase = object  # type: ignore[assignment,misc]
+
+try:
+    from transformers.cache_utils import CacheLayerMixin as _HFCacheLayerBase  # type: ignore[import-not-found]
+except ImportError:
+    _HFCacheLayerBase = object  # type: ignore[assignment,misc]
 
 
 # ============================================================================ configs & telemetry
@@ -204,6 +211,13 @@ class _FP8Slot:
     def dequantize(self, dtype: torch.dtype) -> torch.Tensor:
         return (self.q_data.float() * self.scale.float()).to(dtype)
 
+    def dequantize_slice(self, token_indices: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Dequantize ONLY the requested `token_indices` along the sequence dimension (sparse read)."""
+        idx = token_indices.to(device=self.q_data.device, dtype=torch.long)
+        q_sel = self.q_data.index_select(-2, idx)
+        s_sel = self.scale.index_select(-2, idx)
+        return (q_sel.float() * s_sel.float()).to(dtype)
+
     @property
     def seq_len(self) -> int:
         return int(self.q_data.shape[-2])
@@ -211,10 +225,21 @@ class _FP8Slot:
     def nbytes(self) -> int:
         return _tensor_tree_bytes((self.q_data, self.scale), set())
 
+    def crop(self, max_length: int) -> None:
+        m = max(0, int(max_length))
+        if m < self.seq_len:
+            self.q_data = self.q_data[..., :m, :].contiguous()
+            self.scale = self.scale[..., :m, :].contiguous()
+
     def reorder_cache(self, beam_idx: torch.Tensor) -> None:
         idx = beam_idx.to(device=self.q_data.device, dtype=torch.long)
         self.q_data = self.q_data.index_select(0, idx).contiguous()
         self.scale = self.scale.index_select(0, idx).contiguous()
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        r = int(repeats)
+        self.q_data = self.q_data.repeat_interleave(r, dim=0).contiguous()
+        self.scale = self.scale.repeat_interleave(r, dim=0).contiguous()
 
 
 @dataclass
@@ -247,16 +272,26 @@ class _HadamardINT4Slot:
         self.packed = torch.cat([self.packed, nxt.packed], dim=2)
         self.scale = torch.cat([self.scale, nxt.scale], dim=2)
 
-    def dequantize(self, dtype: torch.dtype) -> torch.Tensor:
-        b, g, t, nb, half_bsz = self.packed.shape
-        hi = ((self.packed >> 4) & 0x0F).to(torch.int16) - 8
-        lo = (self.packed & 0x0F).to(torch.int16) - 8
+    def _dequantize_parts(self, packed: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        b, g, t, nb, half_bsz = packed.shape
+        hi = ((packed >> 4) & 0x0F).to(torch.int16) - 8
+        lo = (packed & 0x0F).to(torch.int16) - 8
         unpacked = torch.stack([hi, lo], dim=-1).reshape(b, g, t, nb, half_bsz * 2).float()
-        rot = unpacked * self.scale.float()
+        rot = unpacked * scale.float()
         rec = _fwht_pow2(rot).reshape(b, g, t, nb * self.block_sz)
         if rec.shape[-1] != self.orig_dim:
             rec = rec[..., : self.orig_dim]
         return rec.to(dtype)
+
+    def dequantize(self, dtype: torch.dtype) -> torch.Tensor:
+        return self._dequantize_parts(self.packed, self.scale, dtype)
+
+    def dequantize_slice(self, token_indices: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Dequantize ONLY the requested `token_indices` along the sequence dimension (sparse read)."""
+        idx = token_indices.to(device=self.packed.device, dtype=torch.long)
+        pk_sel = self.packed.index_select(2, idx)
+        sc_sel = self.scale.index_select(2, idx)
+        return self._dequantize_parts(pk_sel, sc_sel, dtype)
 
     @property
     def seq_len(self) -> int:
@@ -265,39 +300,391 @@ class _HadamardINT4Slot:
     def nbytes(self) -> int:
         return _tensor_tree_bytes((self.packed, self.scale), set())
 
+    def crop(self, max_length: int) -> None:
+        m = max(0, int(max_length))
+        if m < self.seq_len:
+            self.packed = self.packed[:, :, :m, :, :].contiguous()
+            self.scale = self.scale[:, :, :m, :, :].contiguous()
+
     def reorder_cache(self, beam_idx: torch.Tensor) -> None:
         idx = beam_idx.to(device=self.packed.device, dtype=torch.long)
         self.packed = self.packed.index_select(0, idx).contiguous()
         self.scale = self.scale.index_select(0, idx).contiguous()
 
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        r = int(repeats)
+        self.packed = self.packed.repeat_interleave(r, dim=0).contiguous()
+        self.scale = self.scale.repeat_interleave(r, dim=0).contiguous()
+
+
+class _QuantizedHasPreviousState:
+    """Dual-mode `has_previous_state`: truthy property (`HF 5.2-5.5`) and callable `(layer_idx)` (`HF 5.20+`)."""
+
+    def __init__(self, cache: QuantizedHybridCache) -> None:
+        self._cache = cache
+
+    def __bool__(self) -> bool:
+        return self()
+
+    def __call__(self, layer_idx: int | None = None, state_idx: int = 0) -> bool:
+        del state_idx
+        c = self._cache
+        if layer_idx is not None:
+            idx = int(layer_idx)
+            if not (0 <= idx < c.num_layers):
+                return False
+            return c.conv_states[idx] is not None or c.recurrent_states[idx] is not None
+        last_lin = c.last_linear_layer
+        if isinstance(last_lin, int) and 0 <= last_lin < c.num_layers:
+            return c.conv_states[last_lin] is not None or c.recurrent_states[last_lin] is not None
+        return any(x is not None for x in c.conv_states) or any(x is not None for x in c.recurrent_states)
+
+
+class _SingleSlotStateList:
+    """Mutable 1-element write-through proxy backed directly by `cache.<attr>[layer_idx]`."""
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __init__(self, cache: QuantizedHybridCache, attr: str, layer_idx: int) -> None:
+        self._cache = cache
+        self._attr = attr
+        self._layer_idx = int(layer_idx)
+
+    def _slot_list(self) -> list[Any]:
+        return getattr(self._cache, self._attr)
+
+    def __len__(self) -> int:
+        return 1
+
+    def __getitem__(self, idx: int) -> Any:
+        if idx in (0, -1):
+            return self._slot_list()[self._layer_idx]
+        raise IndexError(f"single-slot state list index out of range: {idx}")
+
+    def __setitem__(self, idx: int, value: Any) -> None:
+        if idx not in (0, -1):
+            raise IndexError(f"single-slot state list index out of range: {idx}")
+        self._slot_list()[self._layer_idx] = value
+
+    def __iter__(self) -> Any:
+        yield self[0]
+
+    def __repr__(self) -> str:
+        return f"[{self[0]!r}]"
+
+    @staticmethod
+    def _item_eq(a: Any, b: Any) -> bool:
+        if a is b:
+            return True
+        if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+            return a.shape == b.shape and a.dtype == b.dtype and a.device == b.device and bool(torch.equal(a, b))
+        if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+            return False
+        return bool(a == b)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, _SingleSlotStateList):
+            return self._item_eq(self[0], other[0])
+        if isinstance(other, list):
+            return len(other) == 1 and self._item_eq(self[0], other[0])
+        return NotImplemented
+
+
+class _LayerHasPreviousState:
+    """Per-layer dual-mode `has_previous_state` supporting `bool(x)`, `x[0]`, `x.get(0)`, `0 in x`, and `x()`."""
+
+    def __init__(self, cache: QuantizedHybridCache, layer_idx: int) -> None:
+        self._cache = cache
+        self._layer_idx = int(layer_idx)
+
+    def __bool__(self) -> bool:
+        return bool(self._cache.has_previous_state(self._layer_idx))
+
+    def __call__(self, state_idx: int = 0) -> bool:
+        return bool(self._cache.has_previous_state(self._layer_idx, state_idx))
+
+    def __getitem__(self, state_idx: int) -> bool:
+        idx = int(state_idx)
+        if idx != 0:
+            raise KeyError(state_idx)
+        return bool(self._cache.has_previous_state(self._layer_idx, idx))
+
+    def get(self, state_idx: int = 0, default: Any = False) -> Any:
+        if int(state_idx) == 0:
+            return bool(self._cache.has_previous_state(self._layer_idx, 0))
+        return default
+
+    def __contains__(self, state_idx: object) -> bool:
+        return state_idx == 0
+
+
+class _QuantizedCacheLayer(_HFCacheLayerBase):  # type: ignore[misc]
+    """HF 5.24+ `DynamicLayer` / `LinearAttentionLayer`-compatible per-layer view into `QuantizedHybridCache`."""
+
+    is_compileable = False
+    is_sliding = False
+    record_past = False
+
+    def __init__(self, cache: QuantizedHybridCache, layer_idx: int, layer_type: str) -> None:
+        # Bind backing cache attributes BEFORE super().__init__() so `CacheLayerMixin.__init__`'s
+        # `self.keys = None; self.values = None; self.is_initialized = False` succeeds cleanly.
+        self._cache = cache
+        self._layer_idx = int(layer_idx)
+        self.layer_type = str(layer_type)
+        self.supports_early_init = self.layer_type == "full_attention"
+        if _HFCacheLayerBase is not object:
+            try:
+                super().__init__()
+            except (TypeError, ValueError):
+                pass
+
+    @property
+    def is_croppable(self) -> bool:
+        return self.layer_type == "full_attention"
+
+    @property
+    def is_initialized(self) -> bool:
+        if self.layer_type == "full_attention":
+            return self._cache._kv_seq_len(self._layer_idx) > 0
+        return bool(self._cache.has_previous_state(self._layer_idx))
+
+    @is_initialized.setter
+    def is_initialized(self, _value: bool) -> None:
+        return None
+
+    def lazy_initialization(
+        self,
+        key_states: torch.Tensor | None = None,
+        value_states: torch.Tensor | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        del args, kwargs
+        if isinstance(key_states, torch.Tensor):
+            self._cache._k_dtypes[self._layer_idx] = key_states.dtype
+        if isinstance(value_states, torch.Tensor):
+            self._cache._v_dtypes[self._layer_idx] = value_states.dtype
+
+    def get_max_length(self) -> int:
+        return -1
+
+    @property
+    def keys(self) -> torch.Tensor | None:
+        c = self._cache
+        idx = self._layer_idx
+        if c.mode in ("fp8", "hadamard_int4"):
+            sl = c._k_slots[idx]
+            return None if sl is None else sl.dequantize(c._k_dtypes[idx])
+        return c.key_cache[idx]
+
+    @keys.setter
+    def keys(self, val: torch.Tensor | None) -> None:
+        c = self._cache
+        idx = self._layer_idx
+        if val is None:
+            c._k_slots[idx] = None
+            c.key_cache[idx] = None
+            return
+        c._k_dtypes[idx] = val.dtype
+        if c.mode in ("fp8", "hadamard_int4"):
+            c._k_slots[idx] = c._encode_slot(val)
+        else:
+            c.key_cache[idx] = c._encode_slot(val)
+
+    @property
+    def values(self) -> torch.Tensor | None:
+        c = self._cache
+        idx = self._layer_idx
+        if c.mode in ("fp8", "hadamard_int4"):
+            sl = c._v_slots[idx]
+            return None if sl is None else sl.dequantize(c._v_dtypes[idx])
+        return c.value_cache[idx]
+
+    @values.setter
+    def values(self, val: torch.Tensor | None) -> None:
+        c = self._cache
+        idx = self._layer_idx
+        if val is None:
+            c._v_slots[idx] = None
+            c.value_cache[idx] = None
+            return
+        c._v_dtypes[idx] = val.dtype
+        if c.mode in ("fp8", "hadamard_int4"):
+            c._v_slots[idx] = c._encode_slot(val)
+        else:
+            c.value_cache[idx] = c._encode_slot(val)
+
+    @property
+    def conv_states(self) -> _SingleSlotStateList:
+        return _SingleSlotStateList(self._cache, "conv_states", self._layer_idx)
+
+    @property
+    def recurrent_states(self) -> _SingleSlotStateList:
+        return _SingleSlotStateList(self._cache, "recurrent_states", self._layer_idx)
+
+    @property
+    def has_previous_state(self) -> _LayerHasPreviousState:
+        return _LayerHasPreviousState(self._cache, self._layer_idx)
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        cache_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._cache.update(key_states, value_states, self._layer_idx, cache_kwargs=cache_kwargs)
+
+    def update_conv_state(
+        self,
+        conv_states: torch.Tensor,
+        state_idx: int = 0,
+        conv_kernel_size: int | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        return self._cache.update_conv_state(
+            conv_states,
+            self._layer_idx,
+            state_idx=state_idx,
+            conv_kernel_size=conv_kernel_size,
+            **kwargs,
+        )
+
+    def get_conv_state(self, state_idx: int = 0) -> torch.Tensor | None:
+        return self._cache.get_conv_state(self._layer_idx, state_idx=state_idx)
+
+    def update_recurrent_state(
+        self,
+        recurrent_states: Any,
+        state_idx: int = 0,
+        **kwargs: Any,
+    ) -> Any:
+        return self._cache.update_recurrent_state(recurrent_states, self._layer_idx, state_idx=state_idx, **kwargs)
+
+    def get_recurrent_state(self, state_idx: int = 0) -> Any:
+        return self._cache.get_recurrent_state(self._layer_idx, state_idx=state_idx)
+
+    def get_seq_length(self) -> int:
+        return self._cache.get_seq_length(self._layer_idx)
+
+    def get_max_cache_shape(self) -> int | None:
+        return self._cache.get_max_cache_shape(self._layer_idx)
+
+    def get_mask_sizes(self, cache_position: torch.Tensor | int) -> tuple[int, int]:
+        return self._cache.get_mask_sizes(cache_position, self._layer_idx)
+
+    def crop(self, max_length: int) -> None:
+        self._cache._crop_layer(self._layer_idx, max_length)
+
+    def reset(self) -> None:
+        self._cache._reset_layer(self._layer_idx)
+
+    def reorder_cache(self, beam_idx: torch.Tensor) -> None:
+        self._cache._reorder_layer(self._layer_idx, beam_idx)
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        self._cache._reorder_layer(self._layer_idx, indices)
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        self._cache._repeat_layer(self._layer_idx, repeats)
+
 
 class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
     """Hybrid KV + recurrent state cache with FP8 / Block-64 Hadamard INT4 full-attn compression.
 
+    Compatible with both legacy Hugging Face `Cache` APIs (`transformers <= 5.23`) and modern
+    `transformers >= 5.24` hybrid `Cache(layers=...)` contracts (`layers[idx]`, `conv_states`,
+    `recurrent_states`, `has_previous_state`, `get_seq_length`, `get_max_cache_shape`,
+    `get_mask_sizes`, `reorder_cache`, `crop`, `reset`, `batch_repeat_interleave`,
+    `batch_select_indices`).
+
     Preserves `1.0x` SharedKV across Sandwich-Loop passes (`r >= 2` pass zero-length `k[..., :0, :]`
     via `SharedKVView` and read the pass-1 quantized slot directly with zero duplicate KV storage).
+
+    Memory note:
+      Resident KV storage is compressed in FP8 (`~50%` of BF16/FP16) or Block-64 Hadamard INT4
+      (`~27%` of BF16/FP16). However, standard dense `update()` currently materializes the full
+      dequantized `[B, G, T, D]` K/V tensors for the active layer on return so stock PyTorch/HF
+      attention implementations work unmodified. Sparse consumers (e.g. D-LSA top-K read paths)
+      can call `gather_kv(layer_idx, token_indices)` to dequantize ONLY selected token positions.
     """
 
     def __init__(self, num_layers: int, layer_types: Sequence[str], mode: str = "fp8") -> None:
-        if _HFCacheBase is not object:
-            try:
-                super().__init__()
-            except TypeError:
-                pass
         self.mode = mode
         self.num_layers = int(num_layers)
-        self.layer_types = list(layer_types)
-        self.first_full = (
-            self.layer_types.index("full_attention")
-            if "full_attention" in self.layer_types
-            else 0
-        )
+        ltypes = [str(x) for x in layer_types]
+        if len(ltypes) < self.num_layers:
+            ltypes.extend(["full_attention"] * (self.num_layers - len(ltypes)))
+        self.layer_types = ltypes[: self.num_layers]
+        self._has_full_attention = "full_attention" in self.layer_types
+        self.first_full = self.layer_types.index("full_attention") if self._has_full_attention else 0
+        lin_indices = [idx for idx, lt in enumerate(self.layer_types) if lt == "linear_attention"]
+        self.last_linear_layer: int | None = lin_indices[-1] if lin_indices else None
         self._k_slots: list[Any] = [None] * self.num_layers
         self._v_slots: list[Any] = [None] * self.num_layers
+        self._k_dtypes: list[torch.dtype] = [torch.float32] * self.num_layers
+        self._v_dtypes: list[torch.dtype] = [torch.float32] * self.num_layers
         self.key_cache: list[torch.Tensor | None] = [None] * self.num_layers
         self.value_cache: list[torch.Tensor | None] = [None] * self.num_layers
         self.conv_states: list[torch.Tensor | None] = [None] * self.num_layers
         self.recurrent_states: list[Any] = [None] * self.num_layers
+
+        layer_wrappers = [
+            _QuantizedCacheLayer(self, i, self.layer_types[i]) for i in range(self.num_layers)
+        ]
+        if _HFCacheBase is not object:
+            inited = False
+            # Attempt modern transformers 5.24+ Cache(layers=...) signature first
+            try:
+                super().__init__(layers=layer_wrappers)
+                inited = True
+            except (TypeError, ValueError):
+                pass
+            if not inited:
+                try:
+                    super().__init__(layers=[])
+                    inited = True
+                except (TypeError, ValueError):
+                    pass
+            if not inited:
+                try:
+                    super().__init__()
+                except (TypeError, ValueError):
+                    pass
+        if getattr(self, "layers", None) is not layer_wrappers:
+            self.layers: list[_QuantizedCacheLayer] = layer_wrappers
+
+    @property
+    def is_compileable(self) -> bool:
+        return False
+
+    @property
+    def is_sliding(self) -> list[bool]:
+        return [False] * self.num_layers
+
+    def is_recording_past(self, layer_idx: int = 0) -> bool:
+        del layer_idx
+        return False
+
+    @property
+    def has_previous_state(self) -> _QuantizedHasPreviousState:
+        return _QuantizedHasPreviousState(self)
+
+    @property
+    def is_initialized(self) -> bool:
+        if any(self._kv_seq_len(i) > 0 for i in range(self.num_layers)):
+            return True
+        return any(x is not None for x in self.conv_states) or any(x is not None for x in self.recurrent_states)
+
+    @property
+    def seen_tokens(self) -> int:
+        return self.get_seq_length()
+
+    def __len__(self) -> int:
+        return self.num_layers
+
+    def __getitem__(self, layer_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        idx = int(layer_idx)
+        return self.layers[idx].keys, self.layers[idx].values
 
     def _encode_slot(self, x: torch.Tensor) -> Any:
         if self.mode == "fp8":
@@ -310,6 +697,15 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
             return x.to(torch.float16)
         return x
 
+    def _kv_seq_len(self, layer_idx: int) -> int:
+        if not (0 <= layer_idx < self.num_layers):
+            return 0
+        if self.mode in ("fp8", "hadamard_int4"):
+            sl = self._k_slots[layer_idx]
+            return 0 if sl is None else int(sl.seq_len)
+        kc = self.key_cache[layer_idx]
+        return 0 if kc is None else int(kc.shape[-2])
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -317,8 +713,18 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
         layer_idx: int,
         cache_kwargs: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append new KV tokens (when `T_new > 0`) and return full layer `(K, V)`.
+
+        NOTE: For quantized modes (`"fp8"`, `"hadamard_int4"`), resident cache storage stays
+        compressed while `update()` materializes the full `[B, G, T_total, D]` K/V tensors on
+        return to satisfy standard dense/SDPA attention callers. Use `gather_kv()` for sparse
+        selected-token dequantization without full-sequence materialization.
+        """
         del cache_kwargs
         out_dt = key_states.dtype
+        v_dt = value_states.dtype
+        self._k_dtypes[layer_idx] = out_dt
+        self._v_dtypes[layer_idx] = v_dt
         t_new = int(key_states.shape[-2])
 
         if self.mode in ("fp8", "hadamard_int4"):
@@ -334,7 +740,7 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
                     ks.append(key_states)
                     vs.append(value_states)
             require(ks is not None and vs is not None, f"empty quantized KV slot at layer {layer_idx}")
-            return ks.dequantize(out_dt), vs.dequantize(value_states.dtype)
+            return ks.dequantize(out_dt), vs.dequantize(v_dt)
 
         # Native / explicit float dtype storage
         if t_new > 0:
@@ -350,57 +756,236 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
         vc = self.value_cache[layer_idx]
         require(kc is not None and vc is not None, f"empty KV slot at layer {layer_idx}")
         assert kc is not None and vc is not None
-        return kc.to(out_dt), vc.to(value_states.dtype)
+        return kc.to(out_dt), vc.to(v_dt)
+
+    def gather_kv(
+        self,
+        layer_idx: int,
+        token_indices: torch.Tensor,
+        *,
+        dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sparse-only read hook: gather & dequantize ONLY `token_indices` without full KV materialization."""
+        idx = int(layer_idx)
+        k_dt = dtype if dtype is not None else self._k_dtypes[idx]
+        v_dt = dtype if dtype is not None else self._v_dtypes[idx]
+        if self.mode in ("fp8", "hadamard_int4"):
+            ks = self._k_slots[idx]
+            vs = self._v_slots[idx]
+            require(ks is not None and vs is not None, f"empty quantized KV slot at layer {idx}")
+            return ks.dequantize_slice(token_indices, k_dt), vs.dequantize_slice(token_indices, v_dt)
+        kc = self.key_cache[idx]
+        vc = self.value_cache[idx]
+        require(kc is not None and vc is not None, f"empty KV slot at layer {idx}")
+        assert kc is not None and vc is not None
+        t_idx = token_indices.to(device=kc.device, dtype=torch.long)
+        return kc.index_select(-2, t_idx).to(k_dt), vc.index_select(-2, t_idx).to(v_dt)
+
+    def update_conv_state(
+        self,
+        conv_states: torch.Tensor,
+        layer_idx: int,
+        state_idx: int = 0,
+        conv_kernel_size: int | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Update short-conv state for a linear-attention layer (HF 5.20-5.24+ hybrid contract)."""
+        del kwargs
+        require(int(state_idx) == 0, f"QuantizedHybridCache only supports state_idx=0, got {state_idx}")
+        idx = int(layer_idx)
+        prev = self.conv_states[idx]
+        if prev is None:
+            full_conv = conv_states
+            if conv_kernel_size is not None and full_conv.shape[-1] < int(conv_kernel_size):
+                full_conv = F.pad(full_conv, (int(conv_kernel_size) - full_conv.shape[-1], 0), value=0)
+        else:
+            full_conv = torch.cat([prev, conv_states], dim=-1)
+        keep_w = int(conv_kernel_size) if conv_kernel_size is not None else full_conv.shape[-1]
+        self.conv_states[idx] = full_conv[..., -keep_w:].contiguous()
+        return full_conv
+
+    def get_conv_state(self, layer_idx: int, state_idx: int = 0) -> torch.Tensor | None:
+        require(int(state_idx) == 0, f"QuantizedHybridCache only supports state_idx=0, got {state_idx}")
+        idx = int(layer_idx)
+        return self.conv_states[idx] if 0 <= idx < self.num_layers else None
+
+    def update_recurrent_state(
+        self,
+        recurrent_states: Any,
+        layer_idx: int,
+        state_idx: int = 0,
+        **kwargs: Any,
+    ) -> Any:
+        """Update DeltaNet / HSSD recurrent state for a linear-attention layer (HF 5.20-5.24+ hybrid contract)."""
+        del kwargs
+        require(int(state_idx) == 0, f"QuantizedHybridCache only supports state_idx=0, got {state_idx}")
+        idx = int(layer_idx)
+        self.recurrent_states[idx] = recurrent_states
+        return recurrent_states
+
+    def get_recurrent_state(self, layer_idx: int, state_idx: int = 0) -> Any:
+        require(int(state_idx) == 0, f"QuantizedHybridCache only supports state_idx=0, got {state_idx}")
+        idx = int(layer_idx)
+        return self.recurrent_states[idx] if 0 <= idx < self.num_layers else None
 
     def get_seq_length(self, layer_idx: int | None = None) -> int:
-        idx = self.first_full if layer_idx is None else int(layer_idx)
-        if idx >= self.num_layers:
+        if layer_idx is None:
+            if self._has_full_attention:
+                seq_l = self._kv_seq_len(self.first_full)
+                if seq_l > 0:
+                    return seq_l
+                for i, lt in enumerate(self.layer_types):
+                    if lt == "full_attention":
+                        sl = self._kv_seq_len(i)
+                        if sl > 0:
+                            return sl
+            for rs in self.recurrent_states:
+                sc = getattr(rs, "step_count", None)
+                if isinstance(sc, torch.Tensor) and sc.numel() > 0:
+                    return int(sc.max().item())
             return 0
-        if self.mode in ("fp8", "hadamard_int4"):
-            sl = self._k_slots[idx]
-            return 0 if sl is None else int(sl.seq_len)
-        kc = self.key_cache[idx]
-        return 0 if kc is None else int(kc.shape[-2])
+
+        idx = int(layer_idx)
+        if not (0 <= idx < self.num_layers):
+            return 0
+        sl = self._kv_seq_len(idx)
+        if sl > 0:
+            return sl
+        if self.layer_types[idx] != "full_attention":
+            if self._has_full_attention:
+                return self._kv_seq_len(self.first_full)
+            rs = self.recurrent_states[idx]
+            sc = getattr(rs, "step_count", None)
+            if isinstance(sc, torch.Tensor) and sc.numel() > 0:
+                return int(sc.max().item())
+        return 0
+
+    def get_usable_length(self, new_seq_length: int, layer_idx: int | None = None) -> int:
+        del new_seq_length
+        return self.get_seq_length(layer_idx)
+
+    def get_max_cache_shape(self, layer_idx: int | None = None) -> int | None:
+        del layer_idx
+        return None
+
+    def get_mask_sizes(self, cache_position: torch.Tensor | int, layer_idx: int = 0) -> tuple[int, int]:
+        """Return `(kv_length, kv_offset)` for HF `create_causal_mask` (`transformers 5.x`)."""
+        if isinstance(cache_position, torch.Tensor):
+            q_len = int(cache_position.shape[0]) if cache_position.ndim > 0 else 1
+        else:
+            q_len = int(cache_position)
+        return self.get_seq_length(layer_idx) + q_len, 0
+
+    def _crop_layer(self, layer_idx: int, max_length: int) -> None:
+        m = max(0, int(max_length))
+        if m == 0:
+            self._reset_layer(layer_idx)
+            return
+        ks = self._k_slots[layer_idx]
+        if ks is not None:
+            ks.crop(m)
+        vs = self._v_slots[layer_idx]
+        if vs is not None:
+            vs.crop(m)
+        kt = self.key_cache[layer_idx]
+        if isinstance(kt, torch.Tensor) and kt.shape[-2] > m:
+            self.key_cache[layer_idx] = kt[..., :m, :].contiguous()
+        vt = self.value_cache[layer_idx]
+        if isinstance(vt, torch.Tensor) and vt.shape[-2] > m:
+            self.value_cache[layer_idx] = vt[..., :m, :].contiguous()
+
+    def crop(self, max_length: int) -> None:
+        """Crop cached KV sequences to at most `max_length` tokens (supports negative relative offsets)."""
+        cur = self.get_seq_length()
+        target = cur - abs(int(max_length)) if int(max_length) < 0 else int(max_length)
+        target = max(0, target)
+        if target == 0:
+            self.reset()
+            return
+        if cur <= target:
+            return
+        for i in range(self.num_layers):
+            self._crop_layer(i, target)
+
+    def _reorder_layer(self, i: int, beam_idx: torch.Tensor) -> None:
+        ks = self._k_slots[i]
+        if ks is not None:
+            ks.reorder_cache(beam_idx)
+        vs = self._v_slots[i]
+        if vs is not None:
+            vs.reorder_cache(beam_idx)
+        kt = self.key_cache[i]
+        if isinstance(kt, torch.Tensor):
+            self.key_cache[i] = kt.index_select(0, beam_idx.to(device=kt.device, dtype=torch.long)).contiguous()
+        vt = self.value_cache[i]
+        if isinstance(vt, torch.Tensor):
+            self.value_cache[i] = vt.index_select(0, beam_idx.to(device=vt.device, dtype=torch.long)).contiguous()
+        cs = self.conv_states[i]
+        if isinstance(cs, torch.Tensor):
+            self.conv_states[i] = cs.index_select(0, beam_idx.to(device=cs.device, dtype=torch.long)).contiguous()
+        rs = self.recurrent_states[i]
+        if rs is not None:
+            if hasattr(rs, "reorder_cache") and callable(rs.reorder_cache):
+                new_rs = rs.reorder_cache(beam_idx)
+                if new_rs is not None:
+                    self.recurrent_states[i] = new_rs
+            elif isinstance(rs, torch.Tensor):
+                self.recurrent_states[i] = rs.index_select(
+                    0, beam_idx.to(device=rs.device, dtype=torch.long)
+                ).contiguous()
+            else:
+                self.recurrent_states[i] = torch.index_select(rs, 0, beam_idx)
 
     def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
         """Reorder hybrid quantized KV slots, conv states, and recurrent (`HSSDCacheState`/Tensor) states."""
         for i in range(self.num_layers):
-            ks = self._k_slots[i]
-            if ks is not None:
-                ks.reorder_cache(beam_idx)
-            vs = self._v_slots[i]
-            if vs is not None:
-                vs.reorder_cache(beam_idx)
-            kt = self.key_cache[i]
-            if isinstance(kt, torch.Tensor):
-                self.key_cache[i] = kt.index_select(0, beam_idx.to(device=kt.device, dtype=torch.long)).contiguous()
-            vt = self.value_cache[i]
-            if isinstance(vt, torch.Tensor):
-                self.value_cache[i] = vt.index_select(0, beam_idx.to(device=vt.device, dtype=torch.long)).contiguous()
-            cs = self.conv_states[i]
-            if isinstance(cs, torch.Tensor):
-                self.conv_states[i] = cs.index_select(0, beam_idx.to(device=cs.device, dtype=torch.long)).contiguous()
-            rs = self.recurrent_states[i]
-            if rs is not None:
-                if hasattr(rs, "reorder_cache") and callable(rs.reorder_cache):
-                    new_rs = rs.reorder_cache(beam_idx)
-                    if new_rs is not None:
-                        self.recurrent_states[i] = new_rs
-                elif isinstance(rs, torch.Tensor):
-                    self.recurrent_states[i] = rs.index_select(
-                        0, beam_idx.to(device=rs.device, dtype=torch.long)
-                    ).contiguous()
-                else:
-                    self.recurrent_states[i] = torch.index_select(rs, 0, beam_idx)
+            self._reorder_layer(i, beam_idx)
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        """Select a subset/permutation of batch entries across all hybrid cache layers (HF 5.x)."""
+        self.reorder_cache(indices)  # type: ignore[arg-type]
+
+    def _repeat_layer(self, i: int, repeats: int) -> None:
+        r = int(repeats)
+        ks = self._k_slots[i]
+        if ks is not None:
+            ks.batch_repeat_interleave(r)
+        vs = self._v_slots[i]
+        if vs is not None:
+            vs.batch_repeat_interleave(r)
+        kt = self.key_cache[i]
+        if isinstance(kt, torch.Tensor):
+            self.key_cache[i] = kt.repeat_interleave(r, dim=0).contiguous()
+        vt = self.value_cache[i]
+        if isinstance(vt, torch.Tensor):
+            self.value_cache[i] = vt.repeat_interleave(r, dim=0).contiguous()
+        cs = self.conv_states[i]
+        if isinstance(cs, torch.Tensor):
+            self.conv_states[i] = cs.repeat_interleave(r, dim=0).contiguous()
+        rs = self.recurrent_states[i]
+        if rs is not None:
+            if hasattr(rs, "repeat_interleave") and callable(rs.repeat_interleave):
+                self.recurrent_states[i] = rs.repeat_interleave(r, dim=0)
+            elif isinstance(rs, torch.Tensor):
+                self.recurrent_states[i] = rs.repeat_interleave(r, dim=0).contiguous()
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        """Repeat batch entries `repeats` times across all hybrid cache layers (HF 5.x beam search)."""
+        for i in range(self.num_layers):
+            self._repeat_layer(i, repeats)
+
+    def _reset_layer(self, i: int) -> None:
+        self._k_slots[i] = None
+        self._v_slots[i] = None
+        self.key_cache[i] = None
+        self.value_cache[i] = None
+        self.conv_states[i] = None
+        self.recurrent_states[i] = None
 
     def reset(self) -> None:
         """Clear all cached KV slots, conv states, and recurrent states across all layers."""
-        self._k_slots = [None] * self.num_layers
-        self._v_slots = [None] * self.num_layers
-        self.key_cache = [None] * self.num_layers
-        self.value_cache = [None] * self.num_layers
-        self.conv_states = [None] * self.num_layers
-        self.recurrent_states = [None] * self.num_layers
+        for i in range(self.num_layers):
+            self._reset_layer(i)
 
     def kv_bytes(self) -> int:
         seen: set[int] = set()
@@ -462,6 +1047,17 @@ def _measure_any_cache_bytes(cache: Any) -> tuple[int, int]:
         seq = getattr(cache, attr, None)
         if isinstance(seq, (list, tuple)):
             rec_b += _tensor_tree_bytes(seq, seen_ptrs)
+    layers = getattr(cache, "layers", None)
+    if kv_b == 0 and rec_b == 0 and isinstance(layers, (list, tuple, nn.ModuleList)):
+        for lyr in layers:
+            for attr in ("keys", "values"):
+                val = getattr(lyr, attr, None)
+                if val is not None:
+                    kv_b += _tensor_tree_bytes(val, seen_ptrs)
+            for attr in ("conv_states", "recurrent_states"):
+                val = getattr(lyr, attr, None)
+                if val is not None:
+                    rec_b += _tensor_tree_bytes(val, seen_ptrs)
     return kv_b, rec_b
 
 
@@ -632,6 +1228,9 @@ class OptimizedLoopInferenceEngine:
 
     def set_active_passes(self, r: int) -> None:
         """Switch active core pass count (`r in {1, 2, 3}` -> `40L / 64L / 88L`) with zero weight reload."""
+        if isinstance(self.outer_model, Qwen36LoopHSSDForCausalLM):
+            self.outer_model.set_active_passes(int(r))
+            return
         if self.loop_controller is None:
             require(int(r) == 1, f"model is not Loop-wrapped; cannot set active_passes={r}")
             return

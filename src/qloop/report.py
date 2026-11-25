@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from qloop.report_charts import ALL_CHART_RENDERERS
@@ -37,7 +38,7 @@ from qloop.report_paper_zh import render_experiment_report_zh_md
 DEFAULT_REPO = "TassP0lar/Qwen3.6-35B-A3B-Loop64"
 DEFAULT_DATASET_REPO = "TassP0lar/Loop64-Fable-SIRSI-v1"
 DEFAULT_SESSION = "loop64"
-DEFAULT_COLAB_BIN = "/Users/tianrui6641/.local/bin/colab"
+DEFAULT_COLAB_BIN = shutil.which("colab") or str(Path.home() / ".local" / "bin" / "colab")
 STAGES: tuple[str, ...] = (
     "s1_loop_a6b",
     "s1b_hssd_distill",

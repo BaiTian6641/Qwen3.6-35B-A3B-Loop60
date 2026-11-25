@@ -48,10 +48,9 @@ DEFAULT_REMOTE_RUN_ROOT = "/content/runs"
 DEFAULT_STAGES: tuple[str, ...] = (
     "s0_probe",
     "s1_loop_a6b",
-    "s1b_hssd_distill",
-    "s3_long_1m_lsa",
-    "s2_joint_bptt",
-    "s4_rl",
+    "s3_v2_long_1m_lsa",
+    "s2_v2_joint_bptt",
+    "s4_v2_rl",
 )
 DEFAULT_TIME_BUDGET_HOURS = 21.5
 DEFAULT_DEBUG_LEVEL = 1

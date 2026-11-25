@@ -2,6 +2,18 @@
 
 Retrofits **`Qwen/Qwen3.6-35B-A3B`** (`40` physical layers = `10 × [3 Gated DeltaNet + 1 Gated Full Attention]`, `256` routed experts/layer, `~3B` single-pass active / `35B` total) into a **multi-tier Looped Hybrid MoE Reasoning & Ultra-Long-Context Backbone** (`40L ~2.95B` @ `R=1`, `64L ~4.46B` @ `R=2`, **`88L A6B ~5.97B` @ `R=3`**), synced stage-by-stage to **[`TassP0lar/Qwen3.6-35B-A3B-Loop64`](https://huggingface.co/TassP0lar/Qwen3.6-35B-A3B-Loop64)** and shipped as a self-contained Hugging Face **Whole Model Pack** at **[`TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack`](https://huggingface.co/TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack)**.
 
+### Current Status & Tracked Documentation
+
+> **Live Clean v2 Status (`1× NVIDIA RTX PRO 6000 Blackwell Server Edition`, `96 GB GDDR7 ECC, 1,597 GB/s`):** `s3_v2_long_1m_lsa@600` completed (`12/12` Gate 2 sharp, `7/7` `18K/64K` needles, `10.65 GiB` 1M FP8 state); `s2_v2_joint_bptt` (`GDN-2-1M + QED`, `4×8K` `fla 0.6.0` DPLR) is live (`67.8 GiB` peak, `0` skips); next-gen target is **`Qwen3.6-64L-CoMem`**.
+
+| Document | Role & Scope | Status |
+| :--- | :--- | :---: |
+| **[`docs/ROADMAP_NEXTGEN_LOOP64_COMEM.md`](docs/ROADMAP_NEXTGEN_LOOP64_COMEM.md)** | Next-Gen **`Qwen3.6-64L-CoMem`** 4-Timescale Memory + Elastic Active Compute Roadmap, `Inkling 2 Mini` comparison, `Qwen3.6`/`Qwen3.8` donor & tokenizer parity audit ([`scripts/verify_q36_q38_tokenizer_parity.py`](scripts/verify_q36_q38_tokenizer_parity.py)), phased kill-gates, & Paper 2 plan | **Active Roadmap** |
+| **[`docs/EXPERIMENT_REPORT.md`](docs/EXPERIMENT_REPORT.md)** | Full Empirical Technical Report (English): `167.60` GPU-h telemetry, HSSD v3.2 negative ablation, completed `s3_v2@600` + Gate 1/2/3, live `s2_v2` (`GDN-2-1M + QED`), Blackwell `sm_120` kernels, & IEEE refs | **Live v1.4** |
+| **[`docs/EXPERIMENT_REPORT_ZH.md`](docs/EXPERIMENT_REPORT_ZH.md)** | Full Empirical Technical Report (Simplified Chinese mirror of `EXPERIMENT_REPORT.md`) | **Live v1.4** |
+| **[`docs/COMPUTE_GRANT_PROPOSAL.md`](docs/COMPUTE_GRANT_PROPOSAL.md)** | Multi-GPU Compute Allocation Proposal (`400 / 2,500 / 6,000` GPU-h tiers) grounded in single-card telemetry | **Ready** |
+| **[`docs/papers/`](docs/papers/)** | Published US-Letter IEEE PDFs: [`Loop64_Technical_Report_EN.pdf`](docs/papers/Loop64_Technical_Report_EN.pdf) · [`Loop64_Technical_Report_ZH.pdf`](docs/papers/Loop64_Technical_Report_ZH.pdf) | **Published** |
+
 ### Architectural Highlights
 - **`Loop-HSSD v3.1` (`88L A6B`) Subspace-Aligned Sandwich Recursion**: Scales `Prelude [0,8) ×1 + Core [8,32) ×3 + Coda [32,40) ×1` to **88 virtual layers** (`22` virtual global-attention layers) via Procrustes-calibrated `ReEntryBridge` (`r=256`, `w_anchor=0.85`), zero-initialised `PassExitGate`, per-pass Q/O rank-64 LoRA adapters, and `PassRouterAdapters` — preserving `torch.equal` step-0 identity while keeping all `32.338B` routed MoE weights 100% frozen (SHA-256 verified).
 - **Horizon-Split Surprise-Gated Delta Memory (`HSSD v3.1`) & NVIDIA `GDN-2` (`arXiv:2605.22791`)**:

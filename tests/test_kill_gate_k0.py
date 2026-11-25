@@ -31,6 +31,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from qloop.eval.kill_gate_k0 import (
     CANONICAL_ARMS,
@@ -40,6 +41,8 @@ from qloop.eval.kill_gate_k0 import (
     K0EpisodeResult,
     K0Example,
     K0Report,
+    _clone_linear_states_into,
+    _clone_state_value,
     build_controlled_partial_rope_probe,
     build_corrected_partition_b_kv,
     decide_k0_verdict,
@@ -840,3 +843,176 @@ def test_k0_hf_evaluator_qwen36_loop_hssd_and_pos_aware_arm_d_alignment():
     )
     assert ep_map["arm_c"].extra["live_sink_tokens_prefilled"] == 4
     assert ep_map["arm_d"].refreshed_tokens == math.ceil(k0_cfg.refresh_frac * diag["part_b_tokens"])
+
+
+def test_k0_clone_linear_states_cyclic_quantized_cache_no_recursion():
+    """Verify Blocker R1: `_clone_linear_states_into` & `_clone_state_value` handle Track-C cyclic proxies safely."""
+    torch.manual_seed(31)
+
+    class _SingleSlotStateList:
+        """Mirrors Track-C `QuantizedHybridCache` proxy holding back-reference to parent cache."""
+
+        def __init__(self, cache: object, attr: str, layer_idx: int) -> None:
+            self._cache = cache
+            self._attr = attr
+            self._layer_idx = layer_idx
+
+        def __getitem__(self, idx: int) -> torch.Tensor | None:
+            assert idx == 0
+            return getattr(self._cache, self._attr)[self._layer_idx]
+
+    class _CyclicLayerProxy:
+        def __init__(self, cache: object, layer_idx: int) -> None:
+            self._cache = cache
+            self._layer_idx = layer_idx
+
+        @property
+        def conv_states(self) -> _SingleSlotStateList:
+            return _SingleSlotStateList(self._cache, "conv_states", self._layer_idx)
+
+        @property
+        def recurrent_states(self) -> _SingleSlotStateList:
+            return _SingleSlotStateList(self._cache, "recurrent_states", self._layer_idx)
+
+    layer_types = ["linear_attention", "full_attention"]
+    src = QuantizedHybridCache(num_layers=2, layer_types=layer_types, mode="fp8")
+    dst = QuantizedHybridCache(num_layers=2, layer_types=layer_types, mode="fp8")
+    src.layers = [_CyclicLayerProxy(src, 0), _CyclicLayerProxy(src, 1)]
+    dst.layers = [_CyclicLayerProxy(dst, 0), _CyclicLayerProxy(dst, 1)]
+
+    conv0 = torch.randn(1, 4, 3)
+    rec0 = torch.randn(1, 2, 4, 4)
+    src.conv_states[0] = conv0
+    src.recurrent_states[0] = rec0
+
+    # Must complete without RecursionError / stack overflow and clone tensors independently
+    _clone_linear_states_into(src, dst)
+    assert dst.conv_states[0] is not None and torch.equal(dst.conv_states[0], conv0)
+    assert dst.recurrent_states[0] is not None and torch.equal(dst.recurrent_states[0], rec0)
+    dst.conv_states[0].zero_()
+    dst.recurrent_states[0].zero_()
+    assert not torch.equal(src.conv_states[0], dst.conv_states[0])
+    assert not torch.equal(src.recurrent_states[0], dst.recurrent_states[0])
+
+    # Direct cyclic graph passed into `_clone_state_value` terminates cleanly via cycle memo
+    cloned_proxy = _clone_state_value(src.layers[0].conv_states)
+    assert isinstance(cloned_proxy, _SingleSlotStateList)
+    assert cloned_proxy._layer_idx == 0
+
+
+def test_k0_clone_linear_states_tf524_linear_attention_layer_metadata():
+    """Verify Blocker R2: TF 5.24 `LinearAttentionLayer` flags & metadata preserved across clone + update."""
+    torch.manual_seed(37)
+
+    class _TF524LinearAttentionLayer:
+        supports_early_init = False
+
+        def __init__(self) -> None:
+            self.conv_states: list[torch.Tensor | None] = [None]
+            self.recurrent_states: list[torch.Tensor | None] = [None]
+            self.conv_kernel_size: dict[int, int] = {}
+            self.is_conv_states_initialized: dict[int, bool] = {0: False}
+            self.is_recurrent_states_initialized: dict[int, bool] = {0: False}
+            self.has_previous_state: dict[int, bool] = {0: False}
+            self.batch_size: int | None = None
+
+        def update_conv_state(
+            self, conv_states: torch.Tensor, state_idx: int = 0, conv_kernel_size: int | None = None
+        ) -> torch.Tensor:
+            if not self.is_conv_states_initialized[state_idx]:
+                self.conv_kernel_size[state_idx] = (
+                    conv_states.shape[-1] if conv_kernel_size is None else int(conv_kernel_size)
+                )
+                self.conv_states[state_idx] = torch.zeros(
+                    (*conv_states.shape[:-1], self.conv_kernel_size[state_idx]),
+                    dtype=conv_states.dtype,
+                    device=conv_states.device,
+                )
+                self.is_conv_states_initialized[state_idx] = True
+                self.batch_size = int(conv_states.shape[0])
+            if not self.has_previous_state[state_idx]:
+                full_cs = conv_states
+                if full_cs.shape[-1] < self.conv_kernel_size[state_idx]:
+                    full_cs = F.pad(full_cs, (self.conv_kernel_size[state_idx] - full_cs.shape[-1], 0), value=0)
+                self.has_previous_state[state_idx] = True
+            else:
+                prev = self.conv_states[state_idx]
+                assert prev is not None
+                full_cs = torch.cat([prev, conv_states], dim=-1)
+            dst_buf = self.conv_states[state_idx]
+            assert dst_buf is not None
+            dst_buf.copy_(full_cs[..., -self.conv_kernel_size[state_idx] :])
+            return full_cs
+
+        def update_recurrent_state(self, recurrent_states: torch.Tensor, state_idx: int = 0) -> torch.Tensor:
+            if not self.is_recurrent_states_initialized[state_idx]:
+                self.recurrent_states[state_idx] = torch.zeros_like(recurrent_states)
+                self.is_recurrent_states_initialized[state_idx] = True
+            dst_buf = self.recurrent_states[state_idx]
+            assert dst_buf is not None
+            dst_buf.copy_(recurrent_states)
+            return dst_buf
+
+    class _TF524FullLayer:
+        supports_early_init = True
+
+        def __init__(self) -> None:
+            self.keys: torch.Tensor | None = None
+            self.values: torch.Tensor | None = None
+            self.is_initialized: bool = False
+
+    class _TF524DynamicCache:
+        def __init__(self) -> None:
+            self.layers: list[object] = [_TF524LinearAttentionLayer(), _TF524FullLayer()]
+
+        def has_previous_state(self, layer_idx: int) -> bool:
+            lyr = self.layers[layer_idx]
+            assert isinstance(lyr, _TF524LinearAttentionLayer)
+            return bool(lyr.has_previous_state[0])
+
+        def get_recurrent_state(self, layer_idx: int) -> torch.Tensor | None:
+            lyr = self.layers[layer_idx]
+            assert isinstance(lyr, _TF524LinearAttentionLayer)
+            return lyr.recurrent_states[0] if lyr.has_previous_state[0] else None
+
+        def update_conv_state(
+            self, conv_states: torch.Tensor, layer_idx: int, conv_kernel_size: int | None = None
+        ) -> torch.Tensor:
+            lyr = self.layers[layer_idx]
+            assert isinstance(lyr, _TF524LinearAttentionLayer)
+            return lyr.update_conv_state(conv_states, conv_kernel_size=conv_kernel_size)
+
+        def update_recurrent_state(self, recurrent_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
+            lyr = self.layers[layer_idx]
+            assert isinstance(lyr, _TF524LinearAttentionLayer)
+            return lyr.update_recurrent_state(recurrent_states)
+
+    src_524 = _TF524DynamicCache()
+    dst_524 = _TF524DynamicCache()
+    conv_init = torch.randn(1, 4, 3)
+    rec_init = torch.randn(1, 2, 4, 4)
+    src_524.update_conv_state(conv_init, 0, conv_kernel_size=3)
+    src_524.update_recurrent_state(rec_init, 0)
+
+    _clone_linear_states_into(src_524, dst_524)
+
+    # All LinearAttentionLayer flags & tensors must be faithfully cloned
+    assert dst_524.has_previous_state(0) is True
+    dst_rec = dst_524.get_recurrent_state(0)
+    assert dst_rec is not None and torch.equal(dst_rec, rec_init)
+    dst_lin = dst_524.layers[0]
+    src_lin = src_524.layers[0]
+    assert isinstance(dst_lin, _TF524LinearAttentionLayer) and isinstance(src_lin, _TF524LinearAttentionLayer)
+    assert dst_lin.is_conv_states_initialized == {0: True}
+    assert dst_lin.is_recurrent_states_initialized == {0: True}
+    assert dst_lin.conv_kernel_size == {0: 3}
+    assert dst_lin.batch_size == 1
+
+    # Subsequent update_conv_state(len=2) MUST concatenate prior 3 + new 2 = 5 (never overwrite with zeros!)
+    conv_next = torch.randn(1, 4, 2)
+    full_cs = dst_524.update_conv_state(conv_next, 0)
+    assert full_cs.shape == (1, 4, 5)
+    assert torch.equal(full_cs[..., :3], conv_init)
+    assert torch.equal(full_cs[..., 3:], conv_next)
+    # Source cache stays untouched (independent clone)
+    assert src_lin.conv_states[0] is not None and torch.equal(src_lin.conv_states[0], conv_init)

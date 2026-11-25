@@ -2172,54 +2172,95 @@ def run_smoke_cpu(cfg: K0Config | None = None) -> K0Report:
     )
 
 
-def _clone_state_value(val: Any) -> Any:
-    """Recursively clone cached linear-attention state tensors so Arms `c`/`d` never alias mutable buffers."""
+_LINEAR_LAYER_STATE_ATTRS: tuple[str, ...] = (
+    "conv_states",
+    "recurrent_states",
+    "has_previous_state",
+    "is_conv_states_initialized",
+    "is_recurrent_states_initialized",
+    "conv_kernel_size",
+    "batch_size",
+)
+
+
+def _clone_state_value(val: Any, _memo: dict[int, Any] | None = None) -> Any:
+    """Recursively clone cached linear-attention state tensors with cycle protection."""
     if val is None or isinstance(val, (bool, int, float, str)):
         return val
     if isinstance(val, torch.Tensor):
         return val.clone()
+    memo: dict[int, Any] = {} if _memo is None else _memo
+    vid = id(val)
+    if vid in memo:
+        return memo[vid]
     if hasattr(val, "clone") and callable(val.clone):
         try:
-            return val.clone()
+            cloned = val.clone()
+            memo[vid] = cloned
+            return cloned
         except Exception:
             pass
     if isinstance(val, list):
-        return [_clone_state_value(x) for x in val]
+        out_l: list[Any] = []
+        memo[vid] = out_l
+        out_l.extend(_clone_state_value(x, memo) for x in val)
+        return out_l
     if isinstance(val, tuple):
-        return tuple(_clone_state_value(x) for x in val)
+        out_t = tuple(_clone_state_value(x, memo) for x in val)
+        memo[vid] = out_t
+        return out_t
     if isinstance(val, dict):
-        return {k: _clone_state_value(v) for k, v in val.items()}
+        out_d: dict[Any, Any] = {}
+        memo[vid] = out_d
+        for k, v in val.items():
+            out_d[k] = _clone_state_value(v, memo)
+        return out_d
     if hasattr(val, "__dict__"):
         cls = type(val)
         try:
-            cloned_attrs = {k: _clone_state_value(v) for k, v in vars(val).items()}
             obj = cls.__new__(cls)
-            obj.__dict__.update(cloned_attrs)
+            memo[vid] = obj
+            for k, v in vars(val).items():
+                obj.__dict__[k] = _clone_state_value(v, memo)
             return obj
         except Exception:
+            memo[vid] = val
             return val
     return val
 
 
 def _clone_linear_states_into(src_cache: Any, dst_cache: Any) -> None:
-    """Copy ONLY Partition-A linear-attention (`GDN-2`) conv/recurrent states from `src_cache` to `dst_cache`."""
+    """Copy ONLY Partition-A linear-attention (`GDN-2`) states from `src_cache` to `dst_cache`."""
     if src_cache is None or dst_cache is None:
         return
+
+    # Path 1: Top-level `conv_states` / `recurrent_states` lists (`ToyHybridCache`, `HSSDHybridCache`,
+    # `QuantizedHybridCache` incl. Track-C). Return early so we never traverse cyclic `.layers` proxies.
+    copied_top_level = False
     for attr in ("conv_states", "recurrent_states"):
         src_list = getattr(src_cache, attr, None)
         dst_list = getattr(dst_cache, attr, None)
         if isinstance(src_list, list) and isinstance(dst_list, list):
+            copied_top_level = True
             for idx, item in enumerate(src_list):
                 if item is None:
                     continue
                 while len(dst_list) <= idx:
                     dst_list.append(None)
                 dst_list[idx] = _clone_state_value(item)
+    if copied_top_level:
+        return
+
+    # Path 2: `transformers >= 5.23/5.24` `DynamicCache.layers[i]` (`LinearAttentionLayer` state + flags)
     src_layers = getattr(src_cache, "layers", None)
     dst_layers = getattr(dst_cache, "layers", None)
     if isinstance(src_layers, (list, tuple)) and isinstance(dst_layers, (list, tuple)):
         for s_layer, d_layer in zip(src_layers, dst_layers):
-            for attr in ("conv_states", "recurrent_states"):
+            if not (hasattr(s_layer, "conv_states") or hasattr(s_layer, "recurrent_states")):
+                continue
+            for attr in _LINEAR_LAYER_STATE_ATTRS:
+                if not hasattr(s_layer, attr):
+                    continue
                 s_val = getattr(s_layer, attr, None)
                 if s_val is not None and hasattr(d_layer, attr):
                     try:

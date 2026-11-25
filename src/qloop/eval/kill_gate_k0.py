@@ -722,7 +722,10 @@ def inject_layer_kv_pairs(
                     if hasattr(layer_obj, "values"):
                         layer_obj.values = None
                     if hasattr(layer_obj, "is_initialized"):
-                        layer_obj.is_initialized = False
+                        try:
+                            layer_obj.is_initialized = False
+                        except AttributeError:
+                            pass
             if has_cache_update:
                 if k_b.shape[-2] > 0:
                     cache.update(k_b, v_b, idx)
@@ -735,7 +738,10 @@ def inject_layer_kv_pairs(
                     layer_obj.keys = k_b
                     layer_obj.values = v_b
                     if hasattr(layer_obj, "is_initialized"):
-                        layer_obj.is_initialized = k_b.shape[-2] > 0
+                        try:
+                            layer_obj.is_initialized = k_b.shape[-2] > 0
+                        except AttributeError:
+                            pass
             else:
                 raise IndexError(
                     f"layer_idx={idx} out of range for cache.layers (len={len(cache.layers)}) with no .update()"

@@ -1016,3 +1016,70 @@ def test_k0_clone_linear_states_tf524_linear_attention_layer_metadata():
     assert torch.equal(full_cs[..., 3:], conv_next)
     # Source cache stays untouched (independent clone)
     assert src_lin.conv_states[0] is not None and torch.equal(src_lin.conv_states[0], conv_init)
+
+
+def test_k0_tf524_readonly_is_initialized_property_inject_and_update():
+    """Verify `inject_layer_kv_pairs` handles read-only `@property def is_initialized` layers without `.reset()`."""
+    torch.manual_seed(41)
+
+    class _ReadOnlyInitDynamicLayer:
+        def __init__(self) -> None:
+            self.keys: torch.Tensor | None = None
+            self.values: torch.Tensor | None = None
+
+        @property
+        def is_initialized(self) -> bool:
+            return self.keys is not None and self.keys.numel() > 0
+
+        def update(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            if not self.is_initialized:
+                self.keys = k
+                self.values = v
+            else:
+                assert self.keys is not None and self.values is not None
+                self.keys = torch.cat([self.keys, k], dim=-2)
+                self.values = torch.cat([self.values, v], dim=-2)
+            return self.keys, self.values
+
+        def get_seq_length(self) -> int:
+            return int(self.keys.shape[-2]) if self.is_initialized and self.keys is not None else 0
+
+    class _ReadOnlyInitCache:
+        def __init__(self) -> None:
+            self.layers: list[_ReadOnlyInitDynamicLayer] = [_ReadOnlyInitDynamicLayer(), _ReadOnlyInitDynamicLayer()]
+
+        def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+            return self.layers[layer_idx].update(k, v)
+
+        def get_seq_length(self, layer_idx: int = 0) -> int:
+            return self.layers[layer_idx].get_seq_length()
+
+    cache = _ReadOnlyInitCache()
+    k10 = torch.randn(2, 2, 10, 64)
+    v10 = torch.randn(2, 2, 10, 64)
+    # Must NOT raise `AttributeError: can't set attribute` on read-only `@property def is_initialized`!
+    inject_layer_kv_pairs(cache, k10, v10, [0, 1])
+    assert cache.layers[0].is_initialized is True
+    assert cache.get_seq_length(0) == 10
+    assert cache.get_seq_length(1) == 10
+
+    k4 = torch.randn(1, 2, 4, 64)
+    v4 = torch.randn(1, 2, 4, 64)
+    k_cat, v_cat = cache.update(k4, v4, 0)
+    assert k_cat.shape == (1, 2, 14, 64) and v_cat.shape == (1, 2, 14, 64)
+    assert torch.equal(k_cat[:, :, :10], k10[0:1]) and torch.equal(k_cat[:, :, 10:], k4)
+
+    # Also test direct fallback branch (no `.update()` on cache or layer, read-only `@property def is_initialized`)
+    class _NoUpdateReadOnlyLayer:
+        def __init__(self) -> None:
+            self.keys: torch.Tensor | None = None
+            self.values: torch.Tensor | None = None
+
+        @property
+        def is_initialized(self) -> bool:
+            return self.keys is not None and self.keys.numel() > 0
+
+    stub_cache = SimpleNamespace(layers=[_NoUpdateReadOnlyLayer()])
+    inject_layer_kv_pairs(stub_cache, k10[:1], v10[:1], [0])
+    assert stub_cache.layers[0].is_initialized is True
+    assert stub_cache.layers[0].keys is not None and torch.equal(stub_cache.layers[0].keys, k10[:1])

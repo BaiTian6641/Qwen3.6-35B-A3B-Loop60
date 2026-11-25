@@ -812,6 +812,21 @@ class FusedStepOptimizer:
     def current_lr(self, name: str) -> float:
         return self.entries[name].base_lr * self.lr_factor
 
+    def sync_step(self, step: int) -> float:
+        """Synchronize schedule step counter (e.g. on weights-only resume) and refresh group LRs."""
+        self.step_count = max(0, int(step))
+        lrf = self.lr_factor
+        if self._torch_adamw is not None:
+            for pg in self._torch_adamw.param_groups:
+                pg["lr"] = float(pg.get("_qloop_base_lr", pg["lr"])) * lrf
+        for ent in self.entries.values():
+            if ent.opt is self._torch_adamw:
+                continue
+            lr = ent.base_lr * lrf
+            for g in ent.opt.param_groups:
+                g["lr"] = lr
+        return lrf
+
     def _accumulate_device_norm(self, ent_name: str, gnorm: torch.Tensor, finite: torch.Tensor) -> None:
         self._param_finite[ent_name] = finite
         g64 = gnorm.to(dtype=torch.float64)

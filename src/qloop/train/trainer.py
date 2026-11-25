@@ -33,7 +33,7 @@ import torch
 from ..debug import cuda_mem_brief, require, stage
 from ..utils.tf32 import configure_tf32
 from .bptt import BPTTConfig, SegmentedKVBPTTRunner
-from .checkpoint import CheckpointManager
+from .checkpoint import CheckpointManager, deserialize_py_rng_state, serialize_py_rng_state
 from .distill import (
     HSSDDistillConfig,
     SharedBackboneTeacher,
@@ -225,10 +225,12 @@ class LMTrainer:
         self.metrics = MetricsLogger(run_dir, cfg)
         self.step = 0
         self.tokens_seen = 0
+        self.resume_mode = "fresh"
         self._stop = False
         self.stream: Any = None
         self._prefetcher: _AsyncBatchPrefetcher | None = None
         self.eval_batches: list[dict[str, Any]] = []
+        self.ood_eval_batches: list[dict[str, Any]] = []
         self.shared_teacher: SharedBackboneTeacher | None = None
 
     def _next_stream_item(self) -> Any:
@@ -247,12 +249,121 @@ class LMTrainer:
             self._prefetcher.close()
 
     # ------------------------------------------------------------------ data
+    def _holdout_cfg(self) -> tuple[int, int, bool, bool]:
+        dcfg = dict(self.cfg.get("data") or {})
+        ecfg = dict(self.cfg.get("eval_quick") or {})
+        n_eval = int(ecfg.get("n_batches", 0))
+        explicit_holdout = (
+            "holdout_mod" in dcfg
+            or "holdout_eval_buckets" in dcfg
+            or "holdout_mod" in ecfg
+            or "holdout_eval_buckets" in ecfg
+        )
+        holdout_mod = int(dcfg.get("holdout_mod", ecfg.get("holdout_mod", 100)))
+        holdout_eval_buckets = int(dcfg.get("holdout_eval_buckets", ecfg.get("holdout_eval_buckets", 2)))
+        active = n_eval > 0 and holdout_mod > 0 and holdout_eval_buckets > 0
+        return holdout_mod, holdout_eval_buckets, active, explicit_holdout
+
+    @staticmethod
+    def _apply_holdout_to_cfg(
+        dcfg: dict[str, Any],
+        *,
+        role: str,
+        holdout_mod: int,
+        holdout_eval_buckets: int,
+        active: bool,
+        explicit_holdout: bool,
+    ) -> tuple[dict[str, Any], str]:
+        out = dict(dcfg)
+        out["holdout_mod"] = holdout_mod
+        out["holdout_eval_buckets"] = holdout_eval_buckets
+        if not active:
+            return out, str(out.get("split_role", "all"))
+        patched_sources: list[Any] = []
+        any_partitioned = False
+        for src in list(out.get("sources") or []):
+            if not isinstance(src, dict):
+                patched_sources.append(src)
+                continue
+            s = dict(src)
+            if "split_role" not in s:
+                src_explicit = "holdout_mod" in s or "holdout_eval_buckets" in s or explicit_holdout
+                src_mod = int(s.get("holdout_mod", holdout_mod))
+                is_synthetic_toy = s.get("name") in ("toy_text", "toy_cot")
+                if src_mod <= 0 or (is_synthetic_toy and not src_explicit):
+                    s["split_role"] = "all"
+                else:
+                    s["split_role"] = role
+            if s.get("split_role") == role:
+                any_partitioned = True
+            patched_sources.append(s)
+        out["sources"] = patched_sources
+        eff_role = role if any_partitioned else str(out.get("split_role", "all"))
+        return out, eff_role
+
     def _build_stream(self):
         from ..data.mixture import build_train_stream
 
         dcfg = dict(self.cfg.get("data") or {})
         require(bool(dcfg.get("sources")), "data.sources is empty")
-        return build_train_stream(dcfg, self.stack.tokenizer, seed=self.seed)
+        h_mod, h_eval, active, explicit_holdout = self._holdout_cfg()
+        stream_cfg, eff_role = self._apply_holdout_to_cfg(
+            dcfg,
+            role="train",
+            holdout_mod=h_mod,
+            holdout_eval_buckets=h_eval,
+            active=active,
+            explicit_holdout=explicit_holdout,
+        )
+        return build_train_stream(
+            stream_cfg,
+            self.stack.tokenizer,
+            seed=self.seed,
+            split_role=eff_role,
+            holdout_mod=h_mod,
+            holdout_eval_buckets=h_eval,
+        )
+
+    @staticmethod
+    def _collect_eval_batches(
+        stream: Any,
+        n: int,
+        *,
+        label: str,
+        split_role: str,
+        holdout_mod: int,
+        holdout_eval_buckets: int,
+    ) -> list[dict[str, Any]]:
+        batches: list[dict[str, Any]] = []
+        for _ in range(n):
+            try:
+                batches.append(next(stream))
+            except StopIteration:
+                break
+            except RuntimeError as exc:
+                if "produced no items" not in str(exc):
+                    raise
+                log.warning(
+                    "[eval] %s exhausted with empty split (%s; split=%s, holdout=%d/%d)",
+                    label,
+                    exc,
+                    split_role,
+                    holdout_eval_buckets,
+                    holdout_mod,
+                )
+                break
+        if len(batches) < n:
+            log.warning(
+                "[eval] %s produced %d/%d batches (split=%s, holdout=%d/%d); "
+                "using available held-out batches without wrapping",
+                label,
+                len(batches),
+                n,
+                split_role,
+                holdout_eval_buckets,
+                holdout_mod,
+            )
+        return batches
 
     def _eval_set(self) -> list[dict[str, Any]]:
         from ..data.mixture import build_train_stream
@@ -263,8 +374,89 @@ class LMTrainer:
             return []
         dcfg = dict(self.cfg.get("data") or {})
         dcfg.update(ecfg.get("data_overrides") or {})
-        stream = build_train_stream(dcfg, self.stack.tokenizer, seed=self.seed + 7_777_777)
-        return [next(stream) for _ in range(n)]
+        h_mod, h_eval, active, explicit_holdout = self._holdout_cfg()
+        eval_cfg, eff_role = self._apply_holdout_to_cfg(
+            dcfg,
+            role="eval",
+            holdout_mod=h_mod,
+            holdout_eval_buckets=h_eval,
+            active=active,
+            explicit_holdout=explicit_holdout,
+        )
+        stream = build_train_stream(
+            eval_cfg,
+            self.stack.tokenizer,
+            seed=self.seed + 7_777_777,
+            split_role=eff_role,
+            holdout_mod=h_mod,
+            holdout_eval_buckets=h_eval,
+            single_pass=True,
+            skip_empty_sources=True,
+        )
+        return self._collect_eval_batches(
+            stream,
+            n,
+            label="eval_quick",
+            split_role=eff_role,
+            holdout_mod=h_mod,
+            holdout_eval_buckets=h_eval,
+        )
+
+    def _ood_eval_set(self) -> list[dict[str, Any]]:
+        from ..data.mixture import build_train_stream
+
+        ecfg = dict(self.cfg.get("eval_quick") or {})
+        ood_sources = ecfg.get("ood_sources")
+        if not ood_sources:
+            return []
+        n = int(ecfg.get("ood_n_batches", ecfg.get("n_batches", 0)))
+        if n <= 0:
+            return []
+        dcfg = dict(self.cfg.get("data") or {})
+        dcfg.update(ecfg.get("data_overrides") or {})
+        dcfg["sources"] = [dict(s) if isinstance(s, dict) else s for s in ood_sources]
+        train_names = {
+            s.get("name") for s in (self.cfg.get("data") or {}).get("sources") or [] if isinstance(s, dict)
+        }
+        h_mod, h_eval, active, explicit_holdout = self._holdout_cfg()
+        patched: list[Any] = []
+        any_eval = False
+        for src in dcfg["sources"]:
+            if not isinstance(src, dict):
+                patched.append(src)
+                continue
+            s = dict(src)
+            if "split_role" not in s:
+                if s.get("name") in train_names and h_mod > 0 and h_eval > 0 and (
+                    active or explicit_holdout
+                ):
+                    s["split_role"] = "eval"
+                    any_eval = True
+                else:
+                    s["split_role"] = str(ecfg.get("ood_split_role", "all"))
+            elif s["split_role"] == "eval":
+                any_eval = True
+            patched.append(s)
+        dcfg["sources"] = patched
+        eff_role = "eval" if any_eval else str(ecfg.get("ood_split_role", "all"))
+        stream = build_train_stream(
+            dcfg,
+            self.stack.tokenizer,
+            seed=self.seed + 8_888_888,
+            split_role=eff_role,
+            holdout_mod=h_mod,
+            holdout_eval_buckets=h_eval,
+            single_pass=True,
+            skip_empty_sources=True,
+        )
+        return self._collect_eval_batches(
+            stream,
+            n,
+            label="eval_quick.ood",
+            split_role=eff_role,
+            holdout_mod=h_mod,
+            holdout_eval_buckets=h_eval,
+        )
 
     def _next_long_calib_batch(self, total_len: int, pass_pos: bool) -> dict[str, torch.Tensor]:
         id_parts: list[torch.Tensor] = []
@@ -305,6 +497,8 @@ class LMTrainer:
             "tokens_seen": self.tokens_seen,
             "stack": self.stack.describe(),
             "data": data_state,
+            "trainer_rng": serialize_py_rng_state(self.rng),
+            "resume_mode": self.resume_mode,
             "config": self.cfg.get("_meta_", {}),
         }
 
@@ -319,6 +513,7 @@ class LMTrainer:
             target_steps=int(self.tcfg.get("steps", 1000)),
             metrics=metrics,
             config_dict=raw_cfg,
+            extra_rng={"trainer_rng": self.rng.getstate()},
         )
 
     def maybe_resume(self) -> None:
@@ -327,20 +522,51 @@ class LMTrainer:
         run_root = os.path.dirname(os.path.abspath(self.run_dir))
         init = resolve_run_path(self.tcfg.get("init_from"), run_root=run_root)
         if self.tcfg.get("resume", True) and self.ckpt.latest():
-            ck = self.ckpt.load(map_location="cpu")
+            ck = self.ckpt.load(map_location="cpu", restore_rng=True)
             assert ck is not None
             st = ck["state"]
             smeta = st.get("stack") or {}
             sc = float((smeta.get("expert_delta_scale")) or 1.0)
             self.stack.restore_checkpoint(ck["params"], strict=True, expert_delta_scale=sc, prior_stack_meta=smeta)
+            self.step, self.tokens_seen = int(st["step"]), int(st.get("tokens_seen", 0))
             if ck["optim"] is not None:
                 self.opt.load_state_dict(ck["optim"])
-            self.step, self.tokens_seen = int(st["step"]), int(st.get("tokens_seen", 0))
+                self.resume_mode = "exact"
+            else:
+                self.resume_mode = "weights_only"
+                reset_lr = bool(self.tcfg.get("reset_lr_on_weights_only", False))
+                if not reset_lr:
+                    self.opt.sync_step(self.step)
+                log.warning(
+                    "weights-only resume at step %d (%s): optim.pt is absent - optimizer moments start fresh "
+                    "(resume_mode=%r, reset_lr_on_weights_only=%s, opt.step_count=%d, lr_factor=%.4f)",
+                    self.step,
+                    ck["path"],
+                    self.resume_mode,
+                    reset_lr,
+                    self.opt.step_count,
+                    self.opt.lr_factor,
+                )
+            trainer_rng = st.get("trainer_rng")
+            if trainer_rng is None and isinstance(ck.get("rng"), dict):
+                trainer_rng = ck["rng"].get("trainer_rng")
+            if trainer_rng is not None:
+                self.rng.setstate(deserialize_py_rng_state(trainer_rng))
             if st.get("data") is not None and self.stream is not None:
                 self.stream.load_state_dict(st["data"])
-            log.info("resumed at step %d (%.2fM tokens seen)", self.step, self.tokens_seen / 1e6)
+            log.info(
+                "resumed at step %d (%.2fM tokens seen, mode=%s, lr_factor=%.4f)",
+                self.step,
+                self.tokens_seen / 1e6,
+                self.resume_mode,
+                self.opt.lr_factor,
+            )
         elif init:
-            ck = CheckpointManager(init, keep_last=0).load(map_location="cpu") if os.path.isdir(init) else None
+            ck = (
+                CheckpointManager(init, keep_last=0).load(map_location="cpu", restore_rng=False)
+                if os.path.isdir(init)
+                else None
+            )
             require(ck is not None, "train.init_from: no checkpoint found", init_from=init)
             assert ck is not None
             smeta = (ck.get("state") or {}).get("stack") or {}
@@ -348,33 +574,48 @@ class LMTrainer:
             counts = self.stack.restore_checkpoint(
                 ck["params"], strict=False, expert_delta_scale=sc, prior_stack_meta=smeta
             )
+            self.resume_mode = "init_from"
             log.info("initialised from %s (%s; optimizer fresh)", ck["path"], counts)
 
     # ------------------------------------------------------------------ eval
     @torch.no_grad()
+    def _eval_batch_list(self, batches: list[dict[str, Any]], depths: list[int], prefix: str) -> dict[str, float]:
+        if not batches:
+            return {}
+        st, out = self.stack, {}
+        pass_pos = bool(self.tcfg.get("pass_position_ids", False))
+        for d in depths:
+            if st.loop is not None:
+                st.loop.set_active_passes(int(d))
+            elif d != 1:
+                continue
+            tot, ntok = 0.0, 0
+            for b in batches:
+                bt = _to_device([b], st.device, pass_pos)
+                h = st.hidden(bt["input_ids"], bt.get("position_ids"))
+                loss, n = lm_loss(h, st.lm_head_weight, bt["labels"], impl="chunked")
+                tot += float(loss) * int(n)
+                ntok += int(n)
+            out[f"{prefix}loss_d{d}"] = tot / max(ntok, 1)
+        if f"{prefix}loss_d1" in out and len(depths) > 1:
+            out[f"{prefix}depth_gain"] = out[f"{prefix}loss_d1"] - out[f"{prefix}loss_d{max(depths)}"]
+        return out
+
+    @torch.no_grad()
     def quick_eval(self) -> dict[str, float]:
-        if not self.eval_batches:
+        if not self.eval_batches and not self.ood_eval_batches:
             return {}
         st, out = self.stack, {}
         default_depths = [1, st.loop.spec.num_passes] if st.loop else [1]
-        depths = list((self.cfg.get("eval_quick") or {}).get("depths") or default_depths)
+        depths = [int(d) for d in ((self.cfg.get("eval_quick") or {}).get("depths") or default_depths)]
         was_training = st.model.training
         st.model.eval()
         prev = st.loop.active_passes if st.loop else None
         try:
-            for d in depths:
-                if st.loop is not None:
-                    st.loop.set_active_passes(int(d))
-                elif d != 1:
-                    continue
-                tot, ntok = 0.0, 0
-                for b in self.eval_batches:
-                    bt = _to_device([b], st.device, bool(self.tcfg.get("pass_position_ids", False)))
-                    h = st.hidden(bt["input_ids"], bt.get("position_ids"))
-                    loss, n = lm_loss(h, st.lm_head_weight, bt["labels"], impl="chunked")
-                    tot += float(loss) * int(n)
-                    ntok += int(n)
-                out[f"eval/loss_d{d}"] = tot / max(ntok, 1)
+            if self.eval_batches:
+                out.update(self._eval_batch_list(self.eval_batches, depths, "eval/"))
+            if self.ood_eval_batches:
+                out.update(self._eval_batch_list(self.ood_eval_batches, depths, "eval/ood_"))
         finally:
             if st.loop is not None:
                 if prev is not None:
@@ -388,8 +629,6 @@ class LMTrainer:
                 for ad in st.hssd.adapters.values():
                     ad.clear_aux()
             st.model.train(was_training)
-        if "eval/loss_d1" in out and len(depths) > 1:
-            out["eval/depth_gain"] = out["eval/loss_d1"] - out[f"eval/loss_d{max(depths)}"]
         log.info("eval: %s", {k: round(v, 4) for k, v in out.items()})
         return out
 
@@ -590,12 +829,24 @@ class LMTrainer:
                 for ad in st.hssd.adapters.values():
                     ad.clear_aux()
 
-        return {
-            "lm": float(res.total_loss),
+        out: dict[str, float] = {
+            "lm": float(res.ce_loss),
+            "aux": float(res.aux_loss),
+            "total": float(res.total_loss),
             "bptt_segments": float(res.num_segments),
             "bptt_replayed_tokens": float(res.stats.get("bptt/mean_replayed_tokens", 0.0)),
             "bptt_offload_to_cpu": float(res.stats.get("bptt/offload_to_cpu", 0.0)),
         }
+        for comp_k, stat_k in (
+            ("lsa_kl", "bptt/lsa_kl"),
+            ("loop_aux", "bptt/loop_aux"),
+            ("hssd_aux", "bptt/hssd_aux"),
+            ("replay_aux", "bptt/replay_aux"),
+        ):
+            val = float(res.stats.get(stat_k, 0.0))
+            if val != 0.0:
+                out[comp_k] = val
+        return out
 
     # ------------------------------------------------------------------ loop
     def _install_signal_handlers(self) -> None:
@@ -640,6 +891,7 @@ class LMTrainer:
         with stage("data:build"):
             self.stream = self._build_stream()
             self.eval_batches = self._eval_set()
+            self.ood_eval_batches = self._ood_eval_set()
         self.maybe_resume()
         if distill_on and distill_cfg is not None:
             self.shared_teacher = SharedBackboneTeacher(
@@ -655,7 +907,8 @@ class LMTrainer:
         max_step0_loss = float(t.get("max_step0_loss", 10.0))
         model_name = (self.cfg.get("model") or {}).get("name")
         check_step0 = max_step0_loss > 0.0 and model_name not in (None, "", "toy")
-        if self.step == 0 and (eval_every or (check_step0 and self.eval_batches)):
+        has_any_eval = bool(self.eval_batches or self.ood_eval_batches)
+        if self.step == 0 and (eval_every or (check_step0 and has_any_eval)):
             ev = self.quick_eval()
             if eval_every or ev:
                 self.metrics.log(0, ev)
@@ -719,19 +972,24 @@ class LMTrainer:
                             h = st.hidden(batch["input_ids"], batch.get("position_ids"))
                             loss, ntok = lm_loss(h, st.lm_head_weight, batch["labels"], impl=impl)
                             total = loss
+                            aux_total = 0.0
                             for name, a in st.aux_losses().items():
-                                total = total + float(aux_w.get(name, 1.0)) * a
-                                losses[name] = losses.get(name, 0.0) + float(a.detach()) / accum
+                                w_a = float(aux_w.get(name, 1.0))
+                                total = total + w_a * a
+                                a_val = float(a.detach())
+                                losses[name] = losses.get(name, 0.0) + a_val / accum
+                                aux_total += w_a * a_val
                             (total / accum).backward()
                             if st.loop is not None and callable(getattr(st.loop, "release_graph", None)):
                                 st.loop.release_graph()
                             losses["lm"] = losses.get("lm", 0.0) + float(loss.detach()) / accum
+                            losses["aux"] = losses.get("aux", 0.0) + aux_total / accum
                             n = int(ntok)
                         if lcalib_on:
                             losses["long_calib_active"] = 0.0
                         self.tokens_seen += int(batch["input_ids"].numel())
                         tok_log += int(batch["input_ids"].numel())
-                        if not math.isfinite(losses["lm"]):
+                        if not math.isfinite(losses["lm"]) or not math.isfinite(losses.get("aux", 0.0)):
                             raise FloatingPointError(f"non-finite LM loss at step {self.step} (micro {k}, {n} tokens)")
 
                 ostats = self.opt.step()
@@ -785,9 +1043,9 @@ class LMTrainer:
             self.stream.log_stats()
         if st.frozen_experts_sha256 is not None:
             st.verify_frozen_experts()
-        final = self.quick_eval() if self.eval_batches else {}
+        final = self.quick_eval() if (self.eval_batches or self.ood_eval_batches) else {}
         if final:
             self.metrics.log(self.step, final)
         path = self.save(completed=(self.step >= steps), metrics={**last, **final})
         self._prefetcher = None
-        return {"step": self.step, "checkpoint": path, "last": last, "eval": final}
+        return {"step": self.step, "checkpoint": path, "last": last, "eval": final, "resume_mode": self.resume_mode}

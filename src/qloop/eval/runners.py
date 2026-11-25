@@ -11,6 +11,7 @@ produces the same samples as an uninterrupted one.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -30,6 +31,271 @@ log = logging.getLogger("qloop")
 
 def _depth_label(d: int | None) -> str:
     return "native" if d is None else str(int(d))
+
+
+_RUN_IDENTITY_KEYS = ("model_id", "checkpoint_sha", "active_passes", "config_hash", "dataset_rev")
+
+
+def _unwrap_generator(generator: Any) -> tuple[Any, Any, Any]:
+    """Return `(core_generator, model, loop_controller)` unwrapping thin wrappers like `CountingGenerator`."""
+    core = generator
+    for _ in range(4):
+        if getattr(core, "model", None) is not None:
+            break
+        nxt = getattr(core, "inner", None)
+        if nxt is None or nxt is core:
+            break
+        core = nxt
+    model = getattr(generator, "model", None)
+    if model is None:
+        model = getattr(core, "model", None)
+    lc = getattr(generator, "loop_controller", None)
+    if lc is None:
+        lc = getattr(core, "loop_controller", None)
+    return core, model, lc
+
+
+def _checkpoint_path_digest(path: str) -> str:
+    """Deterministic fingerprint of a checkpoint file or directory (realpath + file stats + small-file hashes)."""
+    real = os.path.realpath(path)
+    h = hashlib.sha256()
+    h.update(real.encode("utf-8", "replace"))
+    max_hash_bytes = 16 * 1024 * 1024
+    if os.path.isdir(real):
+        target = real
+        latest_ptr = os.path.join(real, "checkpoints", "LATEST")
+        if os.path.isfile(latest_ptr):
+            try:
+                with open(latest_ptr, encoding="utf-8") as f:
+                    step_name = f.read().strip()
+                cand = os.path.join(real, "checkpoints", step_name)
+                if os.path.isdir(cand):
+                    target = os.path.realpath(cand)
+                    h.update(b"\x00latest:")
+                    h.update(target.encode("utf-8", "replace"))
+            except OSError:
+                pass
+        for fn in sorted(os.listdir(target)):
+            fp = os.path.join(target, fn)
+            if not os.path.isfile(fp):
+                continue
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            h.update(f"\x00{fn}:{st.st_size}:{st.st_mtime_ns}".encode("utf-8", "replace"))
+            if st.st_size <= max_hash_bytes:
+                try:
+                    with open(fp, "rb") as f:
+                        h.update(hashlib.sha256(f.read()).digest())
+                except OSError:
+                    pass
+    elif os.path.isfile(real):
+        st = os.stat(real)
+        h.update(f"\x00file:{st.st_size}:{st.st_mtime_ns}".encode("utf-8", "replace"))
+        if st.st_size <= max_hash_bytes:
+            with open(real, "rb") as f:
+                h.update(hashlib.sha256(f.read()).digest())
+    return f"path:{h.hexdigest()[:24]}"
+
+
+def _model_weights_digest(model: Any, generator: Any, core: Any) -> str:
+    """Fast O(1)-memory deterministic digest of model weights/script so distinct checkpoints cannot collide."""
+    h = hashlib.sha256()
+    if model is not None:
+        h.update(f"{type(model).__module__}.{type(model).__qualname__}".encode())
+        if hasattr(model, "script"):
+            script_payload = {
+                "script": list(getattr(model, "script", [])),
+                "vocab_size": getattr(model, "vocab_size", None),
+                "eos_id": getattr(model, "eos_id", None),
+                "margin": getattr(model, "margin", None),
+            }
+            h.update(json.dumps(script_payload, sort_keys=True, default=str).encode())
+        named_params = getattr(model, "named_parameters", None)
+        if callable(named_params):
+            import torch
+
+            with torch.no_grad():
+                for name, p in named_params():
+                    h.update(f"\x00{name}:{tuple(p.shape)}:{p.dtype}".encode())
+                    t = p.detach().reshape(-1)
+                    n = int(t.numel())
+                    if n == 0:
+                        continue
+                    if n <= 4096:
+                        sl = t
+                    else:
+                        step = max(1, n // 512)
+                        sl = torch.cat([t[::step][:512], t[-16:]], dim=0)
+                    sample = (
+                        sl.to(device="cpu", dtype=torch.float32)
+                        if sl.is_floating_point()
+                        else sl.to(device="cpu", dtype=torch.int64)
+                    )
+                    h.update(sample.contiguous().numpy().tobytes())
+        return f"weights:{h.hexdigest()[:24]}"
+
+    h.update(f"{type(core).__module__}.{type(core).__qualname__}".encode())
+    for attr in ("name", "tag", "version", "script", "response", "answer"):
+        for obj in (generator, core):
+            val = getattr(obj, attr, None)
+            if val is not None and isinstance(val, (str, int, float, bool, list, tuple)):
+                h.update(f"\x00{attr}:{json.dumps(val, sort_keys=True, default=str)}".encode())
+                break
+    return f"stub:{h.hexdigest()[:24]}"
+
+
+def _extract_model_id(generator: Any, core: Any, model: Any, explicit: str | None) -> str:
+    if explicit is not None and str(explicit).strip():
+        return str(explicit).strip()
+    for obj in (generator, core, model):
+        if obj is None:
+            continue
+        for attr in ("model_id", "model_name", "name_or_path"):
+            val = getattr(obj, attr, None)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    cfg = getattr(model, "config", None) if model is not None else None
+    if cfg is not None:
+        for attr in ("_name_or_path", "name_or_path"):
+            val = getattr(cfg, attr, None)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        mtype = getattr(cfg, "model_type", None)
+        if isinstance(mtype, str) and mtype.strip():
+            return f"{type(model).__module__}.{type(model).__qualname__}:{mtype.strip()}"
+    if model is not None:
+        return f"{type(model).__module__}.{type(model).__qualname__}"
+    return f"{type(core).__module__}.{type(core).__qualname__}"
+
+
+def _extract_active_passes(generator: Any, core: Any, model: Any, lc: Any) -> int | None:
+    if lc is not None and getattr(lc, "active_passes", None) is not None:
+        return int(lc.active_passes)
+    for obj in (generator, core, model):
+        if obj is None:
+            continue
+        ap = getattr(obj, "active_passes", None)
+        if ap is not None:
+            return int(ap)
+    return None
+
+
+def _extract_checkpoint_sha(
+    generator: Any,
+    core: Any,
+    model: Any,
+    explicit_sha: str | None,
+    explicit_path: str | None,
+) -> str:
+    if explicit_sha is not None and str(explicit_sha).strip():
+        return str(explicit_sha).strip()
+    for obj in (generator, core, model):
+        if obj is None:
+            continue
+        for attr in ("checkpoint_sha", "_qloop_checkpoint_sha"):
+            val = getattr(obj, attr, None)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+    ckpt_path = explicit_path
+    if not ckpt_path:
+        for obj in (generator, core, model):
+            if obj is None:
+                continue
+            for attr in ("checkpoint_path", "_qloop_checkpoint_path", "ckpt_path"):
+                val = getattr(obj, attr, None)
+                if isinstance(val, str) and val.strip():
+                    ckpt_path = val.strip()
+                    break
+            if ckpt_path:
+                break
+    if ckpt_path:
+        p_dig = (
+            _checkpoint_path_digest(ckpt_path)
+            if os.path.exists(ckpt_path)
+            else f"ref:{hashlib.sha256(ckpt_path.encode('utf-8')).hexdigest()[:24]}"
+        )
+        if model is not None:
+            return f"{p_dig}|{_model_weights_digest(model, generator, core)}"
+        return p_dig
+    return _model_weights_digest(model, generator, core)
+
+
+def _compute_config_hash(cfg: dict[str, Any], core: Any, model: Any, lc: Any) -> str:
+    payload: dict[str, Any] = {
+        k: v for k, v in cfg.items() if k not in ("depths", "run_identity")
+    }
+    ctk = getattr(core, "chat_template_kwargs", None)
+    if isinstance(ctk, dict) and ctk:
+        payload["chat_template_kwargs"] = ctk
+    if lc is not None and getattr(lc, "spec", None) is not None:
+        sp = lc.spec
+        payload["loop_spec"] = {
+            k: getattr(sp, k, None)
+            for k in ("prelude_end", "core_end", "num_passes", "kv_share", "bridge_mode", "per_pass_router", "mor")
+        }
+    mcfg = getattr(model, "config", None) if model is not None else None
+    if mcfg is not None:
+        if callable(getattr(mcfg, "to_dict", None)):
+            try:
+                payload["model_config"] = mcfg.to_dict()
+            except Exception:
+                payload["model_config"] = repr(mcfg)
+        else:
+            payload["model_config"] = {
+                k: getattr(mcfg, k, None)
+                for k in ("model_type", "vocab_size", "hidden_size", "num_hidden_layers", "num_attention_heads")
+                if hasattr(mcfg, k)
+            }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:24]
+
+
+def build_run_identity(
+    spec: BenchmarkSpec,
+    generator: Any,
+    cfg: dict[str, Any],
+    *,
+    model_id: str | None = None,
+    checkpoint_sha: str | None = None,
+    checkpoint_path: str | None = None,
+    dataset_rev: str | None = None,
+) -> dict[str, Any]:
+    """Build a canonical model-bound eval cache identity fingerprint."""
+    core, model, lc = _unwrap_generator(generator)
+    resolved_model_id = _extract_model_id(generator, core, model, model_id)
+    resolved_ckpt_sha = _extract_checkpoint_sha(generator, core, model, checkpoint_sha, checkpoint_path)
+    resolved_passes = _extract_active_passes(generator, core, model, lc)
+    resolved_cfg_hash = _compute_config_hash(cfg, core, model, lc)
+    if dataset_rev is not None:
+        resolved_rev = str(dataset_rev)
+    elif spec.revision is not None:
+        resolved_rev = str(spec.revision)
+    else:
+        resolved_rev = f"{spec.hf_id}:{spec.config or ''}:{spec.split}"
+    return {
+        "model_id": resolved_model_id,
+        "checkpoint_sha": resolved_ckpt_sha,
+        "active_passes": resolved_passes,
+        "config_hash": resolved_cfg_hash,
+        "dataset_rev": resolved_rev,
+    }
+
+
+def _existing_depth_caches(bdir: str) -> list[str]:
+    if not os.path.isdir(bdir):
+        return []
+    out: list[str] = []
+    for fn in sorted(os.listdir(bdir)):
+        if fn.startswith("depth_") and fn.endswith(".jsonl"):
+            fp = os.path.join(bdir, fn)
+            try:
+                if os.path.getsize(fp) > 0:
+                    out.append(fn)
+            except OSError:
+                continue
+    return out
 
 
 def _read_jsonl(path: str) -> dict[str, dict[str, Any]]:
@@ -108,7 +374,9 @@ def run_benchmark(spec: BenchmarkSpec | str, generator: Any, limit: int | None =
                   out_dir: str = "runs/eval", *, temperature: float | None = None, top_p: float | None = None,
                   top_k: int = 0, seed: int = 0, offline_items: list[dict[str, Any]] | None = None,
                   items: list[dict[str, Any]] | None = None, capabilities: Iterable[str] | None = None,
-                  chunk_size: int | None = None) -> dict[str, Any]:
+                  chunk_size: int | None = None, allow_mixed_cache: bool = False,
+                  model_id: str | None = None, checkpoint_sha: str | None = None,
+                  checkpoint_path: str | None = None, dataset_rev: str | None = None) -> dict[str, Any]:
     spec = get_spec(spec) if isinstance(spec, str) else spec
     require(spec.scorer is not None, f"benchmark {spec.name} has no local scorer; use qloop.eval.external "
             f"(harness={spec.harness})")
@@ -139,21 +407,80 @@ def run_benchmark(spec: BenchmarkSpec | str, generator: Any, limit: int | None =
         elif limit is not None:
             items = items[:limit]
         require(len(items) > 0, f"{spec.name}: no items to evaluate", limit=limit)
-        cfg = {"benchmark": spec.name, "hf_id": spec.hf_id, "config": spec.config, "split": spec.split,
-               "n_samples": n_samples, "max_new_tokens": max_new, "temperature": temperature, "top_p": top_p,
-               "top_k": top_k, "seed": seed, "depths": [_depth_label(d) for d in depths]}
+        cfg: dict[str, Any] = {
+            "benchmark": spec.name, "hf_id": spec.hf_id, "config": spec.config, "split": spec.split,
+            "n_samples": n_samples, "max_new_tokens": max_new, "temperature": temperature, "top_p": top_p,
+            "top_k": top_k, "seed": seed, "depths": [_depth_label(d) for d in depths],
+        }
         if spec.revision is not None:
             cfg["revision"] = spec.revision
+        run_identity = build_run_identity(
+            spec,
+            generator,
+            cfg,
+            model_id=model_id,
+            checkpoint_sha=checkpoint_sha,
+            checkpoint_path=checkpoint_path,
+            dataset_rev=dataset_rev,
+        )
+        cfg["run_identity"] = run_identity
         cfg_path = os.path.join(bdir, "run_config.json")
         if os.path.exists(cfg_path):
             with open(cfg_path, encoding="utf-8") as f:
                 old = json.load(f)
-            diff = {k: (old.get(k), v) for k, v in cfg.items() if k != "depths" and old.get(k) != v}
-            if diff:
-                log.warning("%s: resuming with different parameters than the existing run: %s (old, new). Records "
-                            "from both runs will be mixed - use a fresh out_dir for a clean comparison.",
-                            spec.name, diff)
+            old_id = old.get("run_identity")
+            if not isinstance(old_id, dict):
+                if not allow_mixed_cache:
+                    raise ValueError(
+                        f"{spec.name}: existing eval cache in {bdir!r} lacks `run_identity` metadata "
+                        "(cannot verify checkpoint/model identity). Use a fresh out_dir or pass "
+                        "allow_mixed_cache=True to override."
+                    )
+                log.warning(
+                    "%s: allow_mixed_cache=True: resuming legacy cache in %s without run_identity metadata",
+                    spec.name,
+                    bdir,
+                )
+            else:
+                id_diff = {
+                    k: (old_id.get(k), run_identity.get(k))
+                    for k in _RUN_IDENTITY_KEYS
+                    if old_id.get(k) != run_identity.get(k)
+                }
+                param_diff = {
+                    k: (old.get(k), v)
+                    for k, v in cfg.items()
+                    if k not in ("depths", "run_identity") and old.get(k) != v
+                }
+                if id_diff or param_diff:
+                    if not allow_mixed_cache:
+                        raise ValueError(
+                            f"{spec.name}: eval cache identity mismatch in {bdir!r} "
+                            f"(identity_diff={id_diff}, config_diff={param_diff}). "
+                            "Refusing silent reuse across different checkpoint/model/config identities - "
+                            "use a fresh out_dir or pass allow_mixed_cache=True."
+                        )
+                    log.warning(
+                        "%s: allow_mixed_cache=True: resuming with different identity/parameters: "
+                        "identity=%s config=%s (old, new). Records from both runs will be mixed.",
+                        spec.name,
+                        id_diff,
+                        param_diff,
+                    )
         else:
+            existing_caches = _existing_depth_caches(bdir)
+            if existing_caches and not allow_mixed_cache:
+                raise ValueError(
+                    f"{spec.name}: existing cached records {existing_caches} in {bdir!r} without "
+                    "run_config.json run_identity metadata. Use a fresh out_dir or pass allow_mixed_cache=True."
+                )
+            if existing_caches:
+                log.warning(
+                    "%s: allow_mixed_cache=True: reusing unattributed depth caches %s in %s",
+                    spec.name,
+                    existing_caches,
+                    bdir,
+                )
             with open(cfg_path, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2)
 
@@ -201,7 +528,8 @@ def run_benchmark(spec: BenchmarkSpec | str, generator: Any, limit: int | None =
             log.info("%s depth=%s: mean=%.4f %s", spec.name, label, summ.get("mean_score", float("nan")),
                      {k: round(v, 4) for k, v in summ.items() if k.startswith(("pass@", "maj@"))})
         summary = {"benchmark": spec.name, "kind": spec.kind, "scorer": spec.scorer,
-                   "contamination_group": spec.contamination_group, "config": cfg, "depths": per_depth,
+                   "contamination_group": spec.contamination_group, "run_identity": run_identity,
+                   "config": cfg, "depths": per_depth,
                    "depth_curve": {k: v.get("mean_score") for k, v in per_depth.items()}}
         with open(os.path.join(bdir, "summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, default=str)
@@ -213,7 +541,9 @@ def _as_dict(x: Any) -> dict[str, Any]:
 
 
 def run_suite(suite_cfg: dict[str, Any], generator: Any, out_dir: str,
-              offline_items: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
+              offline_items: dict[str, list[dict[str, Any]]] | None = None, *,
+              allow_mixed_cache: bool | None = None, model_id: str | None = None,
+              checkpoint_sha: str | None = None, checkpoint_path: str | None = None) -> dict[str, Any]:
     """suite_cfg:
         benchmarks: [aime_2026, {name: gpqa_diamond, limit: 50, n_samples: 4}, ...]
         defaults: {depths: [1, 2], n_samples: 1, max_new_tokens: null, limit: null, temperature: null}
@@ -227,10 +557,16 @@ def run_suite(suite_cfg: dict[str, Any], generator: Any, out_dir: str,
     caps = cfg.get("capabilities")
     trained = set(cfg.get("trained_contamination_groups") or [])
     fail_fast = bool(cfg.get("fail_fast", False))
+    suite_allow_mixed = (
+        bool(allow_mixed_cache) if allow_mixed_cache is not None else bool(cfg.get("allow_mixed_cache", False))
+    )
+    suite_model_id = model_id if model_id is not None else cfg.get("model_id")
+    suite_ckpt_sha = checkpoint_sha if checkpoint_sha is not None else cfg.get("checkpoint_sha")
+    suite_ckpt_path = checkpoint_path if checkpoint_path is not None else cfg.get("checkpoint_path")
     os.makedirs(out_dir, exist_ok=True)
     results: dict[str, Any] = {}
     allowed = {"limit", "depths", "n_samples", "max_new_tokens", "temperature", "top_p", "top_k", "seed",
-               "chunk_size"}
+               "chunk_size", "allow_mixed_cache", "model_id", "checkpoint_sha", "checkpoint_path", "dataset_rev"}
     for entry in cfg["benchmarks"]:
         e = {"name": entry} if isinstance(entry, str) else _as_dict(entry)
         name = e.get("name")
@@ -250,7 +586,15 @@ def run_suite(suite_cfg: dict[str, Any], generator: Any, out_dir: str,
             results[name] = {"status": "skipped", "reason": f"not locally scorable: {why}"}
             log.info("suite: skip %s (%s)", name, why)
             continue
-        params = {k: v for k, v in {**defaults, **e}.items() if k in allowed and v is not None}
+        merged = {
+            "allow_mixed_cache": suite_allow_mixed,
+            "model_id": suite_model_id,
+            "checkpoint_sha": suite_ckpt_sha,
+            "checkpoint_path": suite_ckpt_path,
+            **defaults,
+            **e,
+        }
+        params = {k: v for k, v in merged.items() if k in allowed and v is not None}
         try:
             summ = run_benchmark(spec, generator, out_dir=out_dir, capabilities=caps,
                                  offline_items=(offline_items or {}).get(name), **params)

@@ -59,6 +59,10 @@ def _n_positional(fn: Callable[..., Any]) -> int:
     return sum(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty for p in params)
 
 
+class _SourceExhausted(Exception):
+    """Internal signal that a single source has finished (single_pass or skip_empty_sources)."""
+
+
 class MixtureStream:
     """Infinite weighted interleaving of `(name, weight, iterator_factory)` sources.
 
@@ -67,7 +71,14 @@ class MixtureStream:
     position (items expose `.row_index`/`.sub_index`, like `Example`). Yields `(name, item)`.
     """
 
-    def __init__(self, sources: list[tuple[str, float, SourceFactory]], seed: int = 0):
+    def __init__(
+        self,
+        sources: list[tuple[str, float, SourceFactory]],
+        seed: int = 0,
+        *,
+        single_pass: bool = False,
+        skip_empty_sources: bool = False,
+    ):
         require(len(sources) > 0, "MixtureStream: no sources")
         names = [s[0] for s in sources]
         require(len(set(names)) == len(names), "MixtureStream: duplicate source names", names=names)
@@ -78,6 +89,8 @@ class MixtureStream:
         self.factories = [s[2] for s in sources]
         self.probs = weights / weights.sum()
         self.seed = int(seed)
+        self.single_pass = bool(single_pass)
+        self.skip_empty_sources = bool(skip_empty_sources)
         self.rng = np.random.Generator(np.random.PCG64(self.seed))
         self.draws = 0
         n = len(sources)
@@ -86,6 +99,7 @@ class MixtureStream:
         self.total = [0] * n             # items consumed over all epochs
         self.cursor: list[tuple[int, int] | None] = [None] * n
         self._iters: list[Iterator[Any] | None] = [None] * n
+        self._exhausted: list[bool] = [False] * n
         log.info("[mixture] %s", ", ".join(f"{a}={p:.3f}" for a, p in zip(names, self.probs)))
 
     def _open(self, i: int) -> Iterator[Any]:
@@ -116,9 +130,23 @@ class MixtureStream:
                 item = next(it)
             except StopIteration:
                 if self.consumed[i] == 0:
+                    if self.skip_empty_sources:
+                        log.warning(
+                            "[mixture] source '%s' produced no items in epoch %d; skipping this source",
+                            self.names[i],
+                            self.epoch[i],
+                        )
+                        raise _SourceExhausted from None
                     raise RuntimeError(
                         f"[mixture] source '{self.names[i]}' produced no items in epoch {self.epoch[i]} "
                         "(empty dataset, everything filtered, holdout split matched 0 rows, or max_rows=0?)") from None
+                if self.single_pass:
+                    log.info(
+                        "[mixture] source %s completed single pass after %d items",
+                        self.names[i],
+                        self.consumed[i],
+                    )
+                    raise _SourceExhausted from None
                 log.info("[mixture] source %s exhausted after %d items -> epoch %d", self.names[i],
                          self.consumed[i], self.epoch[i] + 1)
                 self.epoch[i] += 1
@@ -138,10 +166,24 @@ class MixtureStream:
         return self
 
     def __next__(self) -> tuple[str, Any]:
-        i = int(self.rng.choice(len(self.names), p=self.probs))
-        item = self._next_from(i)
-        self.draws += 1
-        return self.names[i], item
+        while True:
+            active = [j for j in range(len(self.names)) if not self._exhausted[j]]
+            if not active:
+                raise StopIteration
+            if len(active) == len(self.names):
+                i = int(self.rng.choice(len(self.names), p=self.probs))
+            else:
+                p_act = self.probs[active]
+                p_act = p_act / p_act.sum()
+                i = active[int(self.rng.choice(len(active), p=p_act))]
+            try:
+                item = self._next_from(i)
+            except _SourceExhausted:
+                self._exhausted[i] = True
+                self._iters[i] = None
+                continue
+            self.draws += 1
+            return self.names[i], item
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -175,6 +217,7 @@ class MixtureStream:
                 c = st.get("cursor")
                 self.cursor[i] = (int(c[0]), int(c[1])) if c is not None else None
             self._iters[i] = None
+            self._exhausted[i] = False
 
     def stats(self) -> dict[str, Any]:
         return {n: {"epoch": self.epoch[i], "total": self.total[i],
@@ -559,6 +602,9 @@ class TrainStream:
         self.holdout_eval_buckets = int(holdout_eval_buckets)
         self.doc_counter = 0
         self._queue: list[dict[str, Any]] = []
+        self._exhausted = False
+        self._epochs_at_last_doc: list[int] = list(getattr(mixture, "epoch", []))
+        self._draws_since_doc = 0
         self.counters: collections.Counter[str] = collections.Counter()
         # len(tok) counts added tokens; HF `vocab_size` excludes them
         self.vocab = len(tokenizer) if hasattr(tokenizer, "__len__") else int(getattr(tokenizer, "vocab_size", 0) or 0)
@@ -566,19 +612,19 @@ class TrainStream:
     def __iter__(self) -> TrainStream:
         return self
 
-    def _process(self, name: str, ex: Example) -> None:
+    def _process(self, name: str, ex: Example) -> bool:
         if self.decontam is not None:
             hit, group = self.decontam.check(ex.plain_text(), source=name)
             if hit:
                 self.counters["decontaminated"] += 1
                 self.drops.drop(name, f"contaminated:{group}", ex.row_index, "")
-                return
+                return False
         if self.dedupe:
             k = _dedupe_key(ex)
             if k in self._seen:
                 self.counters["duplicates"] += 1
                 self.drops.drop(name, "duplicate", ex.row_index, "")
-                return
+                return False
             if len(self._seen) < self.dedupe_max:
                 self._seen.add(k)
             elif self.counters["dedupe_full_warned"] == 0:
@@ -592,7 +638,7 @@ class TrainStream:
                                f"example={describe(ex, 400)}") from e
         if self.max_doc_tokens is not None and len(ids) > self.max_doc_tokens:
             self.drops.drop(name, "too_long", ex.row_index, f"{len(ids)} tokens > {self.max_doc_tokens}")
-            return
+            return False
         if verify and self.vocab:
             bad = [t for t in ids if t < 0 or t >= self.vocab]
             require(not bad, f"[{name}] row {ex.row_index}: token ids outside vocab", bad=bad[:8], vocab=self.vocab)
@@ -601,11 +647,52 @@ class TrainStream:
         self.counters["loss_tokens"] += sum(1 for x in labels if x != -100)
         self._queue.extend(self.packer.add(ids, labels, self.doc_counter))
         self.doc_counter += 1
+        self._epochs_at_last_doc = list(getattr(self.mixture, "epoch", []))
+        self._draws_since_doc = 0
+        return True
+
+    def _all_sources_wrapped_without_progress(self) -> bool:
+        epochs = getattr(self.mixture, "epoch", None)
+        if not isinstance(epochs, list) or len(epochs) != len(self._epochs_at_last_doc) or not epochs:
+            return False
+        exhausted = getattr(self.mixture, "_exhausted", [False] * len(epochs))
+        active = [j for j in range(len(epochs)) if not exhausted[j]]
+        if not active:
+            return True
+        return all(epochs[j] >= self._epochs_at_last_doc[j] + 2 for j in active)
 
     def __next__(self) -> dict[str, Any]:
         while not self._queue:
-            name, ex = next(self.mixture)
-            self._process(name, ex)
+            if self._exhausted:
+                raise StopIteration
+            try:
+                name, ex = next(self.mixture)
+            except StopIteration:
+                self._exhausted = True
+                flushed = self.packer.flush()
+                if flushed is not None:
+                    self._queue.append(flushed)
+                    break
+                raise StopIteration from None
+            accepted = self._process(name, ex)
+            if not accepted:
+                self._draws_since_doc += 1
+                if self._all_sources_wrapped_without_progress():
+                    log.warning(
+                        "[data] all active sources wrapped an entire epoch with 0 newly accepted docs "
+                        "(split=%s, draws_since_doc=%d, docs=%d, dup=%d, decontam=%d); flushing buffered tokens",
+                        self.split_role,
+                        self._draws_since_doc,
+                        self.counters["docs"],
+                        self.counters["duplicates"],
+                        self.counters["decontaminated"],
+                    )
+                    self._exhausted = True
+                    flushed = self.packer.flush()
+                    if flushed is not None:
+                        self._queue.append(flushed)
+                        break
+                    raise StopIteration
         row = self._queue.pop(0)
         self.counters["rows"] += 1
         if self.log_every and self.counters["rows"] % self.log_every == 0:
@@ -649,6 +736,9 @@ class TrainStream:
         self.doc_counter = int(sd.get("doc_counter", 0))
         self._seen = set(int(x) for x in sd.get("seen", []))
         self.counters = collections.Counter(sd.get("counters", {}))
+        self._exhausted = False
+        self._epochs_at_last_doc = list(getattr(self.mixture, "epoch", []))
+        self._draws_since_doc = 0
         log.info("[data] resumed stream: %d rows emitted, %d docs, %d buffered tokens, mixture draws %d",
                  self.counters["rows"], self.doc_counter, len(self.packer._ids), self.mixture.draws)
 
@@ -683,7 +773,8 @@ def resolve_source_spec(src: dict[str, Any]) -> DatasetSpec:
 def build_train_stream(data_cfg: dict[str, Any], tokenizer: Any, seed: int = 0,
                        eval_providers: dict[str, EvalTextProvider] | None = None, *,
                        split_role: str | None = None, holdout_mod: int | None = None,
-                       holdout_eval_buckets: int | None = None) -> TrainStream:
+                       holdout_eval_buckets: int | None = None, single_pass: bool = False,
+                       skip_empty_sources: bool = False) -> TrainStream:
     """Build the packed training stream from the `data:` config section (or a cfg containing it).
 
     eval_providers: {group: callable -> iterable of eval texts}; overrides registry eval sets (tests).
@@ -729,7 +820,12 @@ def build_train_stream(data_cfg: dict[str, Any], tokenizer: Any, seed: int = 0,
             log.info("[data] source %-16s w=%.3f %s role=%s format=%s split=%s(%d/%d)%s%s", spec.name,
                      float(src.get("weight", 1.0)), spec.hf_id, spec.role, spec.format, s_role, s_eval, s_mod,
                      " gated" if spec.gated else "", "" if spec.verified else " (UNVERIFIED spec)")
-        mixture = MixtureStream(sources, seed=seed)
+        mixture = MixtureStream(
+            sources,
+            seed=seed,
+            single_pass=single_pass,
+            skip_empty_sources=skip_empty_sources,
+        )
 
         dc = cfg.get("decontaminate") or {}
         decontaminator = None

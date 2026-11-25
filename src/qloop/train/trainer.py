@@ -289,7 +289,8 @@ class LMTrainer:
             if "split_role" not in s:
                 src_explicit = "holdout_mod" in s or "holdout_eval_buckets" in s or explicit_holdout
                 src_mod = int(s.get("holdout_mod", holdout_mod))
-                if src_mod <= 0 or (s.get("name") == "toy_text" and not src_explicit):
+                is_synthetic_toy = s.get("name") in ("toy_text", "toy_cot")
+                if src_mod <= 0 or (is_synthetic_toy and not src_explicit):
                     s["split_role"] = "all"
                 else:
                     s["split_role"] = role
@@ -323,6 +324,47 @@ class LMTrainer:
             holdout_eval_buckets=h_eval,
         )
 
+    @staticmethod
+    def _collect_eval_batches(
+        stream: Any,
+        n: int,
+        *,
+        label: str,
+        split_role: str,
+        holdout_mod: int,
+        holdout_eval_buckets: int,
+    ) -> list[dict[str, Any]]:
+        batches: list[dict[str, Any]] = []
+        for _ in range(n):
+            try:
+                batches.append(next(stream))
+            except StopIteration:
+                break
+            except RuntimeError as exc:
+                if "produced no items" not in str(exc):
+                    raise
+                log.warning(
+                    "[eval] %s exhausted with empty split (%s; split=%s, holdout=%d/%d)",
+                    label,
+                    exc,
+                    split_role,
+                    holdout_eval_buckets,
+                    holdout_mod,
+                )
+                break
+        if len(batches) < n:
+            log.warning(
+                "[eval] %s produced %d/%d batches (split=%s, holdout=%d/%d); "
+                "using available held-out batches without wrapping",
+                label,
+                len(batches),
+                n,
+                split_role,
+                holdout_eval_buckets,
+                holdout_mod,
+            )
+        return batches
+
     def _eval_set(self) -> list[dict[str, Any]]:
         from ..data.mixture import build_train_stream
 
@@ -348,8 +390,17 @@ class LMTrainer:
             split_role=eff_role,
             holdout_mod=h_mod,
             holdout_eval_buckets=h_eval,
+            single_pass=True,
+            skip_empty_sources=True,
         )
-        return [next(stream) for _ in range(n)]
+        return self._collect_eval_batches(
+            stream,
+            n,
+            label="eval_quick",
+            split_role=eff_role,
+            holdout_mod=h_mod,
+            holdout_eval_buckets=h_eval,
+        )
 
     def _ood_eval_set(self) -> list[dict[str, Any]]:
         from ..data.mixture import build_train_stream
@@ -395,8 +446,17 @@ class LMTrainer:
             split_role=eff_role,
             holdout_mod=h_mod,
             holdout_eval_buckets=h_eval,
+            single_pass=True,
+            skip_empty_sources=True,
         )
-        return [next(stream) for _ in range(n)]
+        return self._collect_eval_batches(
+            stream,
+            n,
+            label="eval_quick.ood",
+            split_role=eff_role,
+            holdout_mod=h_mod,
+            holdout_eval_buckets=h_eval,
+        )
 
     def _next_long_calib_batch(self, total_len: int, pass_pos: bool) -> dict[str, torch.Tensor]:
         id_parts: list[torch.Tensor] = []

@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from typing import Any
 
 import pytest
@@ -107,7 +108,6 @@ def test_ql60_003_eight_doc_finite_dataset_zero_overlap(monkeypatch: pytest.Monk
             "seq_len": 128,
             "holdout_mod": h_mod,
             "holdout_eval_buckets": h_eval,
-            "dedupe": False,
             "sources": [
                 {
                     "name": "finite8",
@@ -125,9 +125,17 @@ def test_ql60_003_eight_doc_finite_dataset_zero_overlap(monkeypatch: pytest.Monk
     eval_batches = tr._eval_set()
 
     assert train_stream.split_role == "train"
+    assert len(eval_batches) >= 1
     tok = tr.stack.tokenizer
 
-    train_batches = [next(train_stream) for _ in range(16)]
+    # Collect all unique train batches under default `dedupe=True` (must terminate finitely, never hang!)
+    train_batches = []
+    for _ in range(32):
+        try:
+            train_batches.append(next(train_stream))
+        except StopIteration:
+            break
+    assert len(train_batches) >= 1
     train_text = "\n".join(tok.decode(b["input_ids"], skip_special_tokens=False) for b in train_batches)
     eval_text = "\n".join(tok.decode(b["input_ids"], skip_special_tokens=False) for b in eval_batches)
 
@@ -274,7 +282,6 @@ def test_ql60_003_eval_quick_ood_sources(monkeypatch: pytest.MonkeyPatch, tmp_pa
             "seq_len": 64,
             "holdout_mod": h_mod,
             "holdout_eval_buckets": h_eval,
-            "dedupe": False,
             "sources": [{"name": "id_ds", "hf_id": "local/id", "role": "pretrain", "format": "text", "weight": 1.0}],
         },
         "eval_quick": {
@@ -287,7 +294,7 @@ def test_ql60_003_eval_quick_ood_sources(monkeypatch: pytest.MonkeyPatch, tmp_pa
     }
     tr = LMTrainer(cfg, str(tmp_path / "ood_run"))
     res = tr.train()
-    assert len(tr.eval_batches) == 2
+    assert len(tr.eval_batches) >= 1
     assert len(tr.ood_eval_batches) == 2
 
     tok = tr.stack.tokenizer
@@ -306,6 +313,169 @@ def test_ql60_003_eval_quick_ood_sources(monkeypatch: pytest.MonkeyPatch, tmp_pa
     )
     for key in expected_eval_keys:
         assert key in ev and torch.isfinite(torch.tensor(ev[key]))
+
+
+def test_ql60_003_default_dedupe_tiny_finite_eval_terminates_without_hang(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Blocker 2a regression: default `dedupe=True` on a tiny finite dataset with `< seq_len` unique eval tokens
+    flushes buffered eval tokens and terminates finitely (`< 1s`), NEVER spinning infinitely.
+    """
+    import qloop.data.mixture as mix_mod
+
+    docs = _make_eight_docs()
+    h_mod, h_eval = _pick_nonempty_holdout_params(docs)
+    orig_raw_rows = mix_mod.raw_rows
+
+    def _patched(spec, seed, epoch, skip=0, src_cfg=None, streaming=True):
+        if spec.name == "finite8_tiny":
+            yield from docs[skip:]
+            return
+        yield from orig_raw_rows(spec, seed, epoch, skip=skip, src_cfg=src_cfg, streaming=streaming)
+
+    monkeypatch.setattr(mix_mod, "raw_rows", _patched)
+
+    # `seq_len=2048` is much larger than the total tokens of the 1-2 held-out docs -> packer has `< seq_len` tokens!
+    dcfg = {
+        "seq_len": 2048,
+        "holdout_mod": h_mod,
+        "holdout_eval_buckets": h_eval,
+        "sources": [
+            {"name": "finite8_tiny", "hf_id": "local/finite8_tiny", "role": "pretrain", "format": "text", "weight": 1.0}
+        ],
+    }
+
+    # 1. Direct `build_train_stream` with default `dedupe=True` and `single_pass=False`
+    tok = ToyTokenizer()
+    t0 = time.monotonic()
+    direct_eval = build_train_stream(dcfg, tok, seed=0, split_role="eval")
+    flushed_rows = list(direct_eval)
+    elapsed_direct = time.monotonic() - t0
+    assert elapsed_direct < 1.0, f"direct eval stream took too long: {elapsed_direct:.2f}s"
+    assert len(flushed_rows) == 1
+    assert flushed_rows[0]["input_ids"].shape == (2048,)
+    assert flushed_rows[0]["n_loss_tokens"] > 0
+
+    # 2. `LMTrainer._eval_set()` with default `dedupe=True` (`single_pass=True`) + train/eval 0 overlap
+    cfg = {
+        "seed": 0,
+        "stage": "tiny_dedupe_test",
+        "model": {"name": "toy", "dtype": "float32", "device_map": "cpu", "toy": {"seed": 0}},
+        "loop": {"enabled": False},
+        "train": {"steps": 1, "trainable": [r"input_layernorm"], "optim": {"lr": 1e-3}},
+        "data": dcfg,
+        "eval_quick": {"n_batches": 4, "depths": [1]},
+    }
+    tr = LMTrainer(cfg, str(tmp_path / "tiny_dedupe"))
+    t1 = time.monotonic()
+    ev_batches = tr._eval_set()
+    tr_batches = list(tr._build_stream())
+    elapsed_tr = time.monotonic() - t1
+    assert elapsed_tr < 1.0, f"LMTrainer stream collection took too long: {elapsed_tr:.2f}s"
+    assert len(ev_batches) == 1
+    assert len(tr_batches) == 1
+    ev_txt = tok.decode(ev_batches[0]["input_ids"], skip_special_tokens=False)
+    tr_txt = tok.decode(tr_batches[0]["input_ids"], skip_special_tokens=False)
+    ev_markers = {m for m in _EIGHT_DOC_MARKERS if m in ev_txt}
+    tr_markers = {m for m in _EIGHT_DOC_MARKERS if m in tr_txt}
+    assert ev_markers and tr_markers and (ev_markers & tr_markers == set())
+
+
+def test_ql60_003_zero_eval_bucket_tiny_dataset_multisource_and_toy_cot_no_crash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Blocker 2b regression:
+    1) 8-doc finite dataset under default 100/2 (0 docs in eval bucket) warns and returns `[]` without crashing train().
+    2) Multi-source mixture where one tiny source has 0 eval docs skips it cleanly and evaluates the non-empty source.
+    3) Synthetic `toy_cot` with `toy_rows=8` (default config) is exempted alongside `toy_text` and runs cleanly.
+    """
+    import qloop.data.mixture as mix_mod
+
+    docs_8 = _make_eight_docs()
+    # Confirm 0 of `_make_eight_docs()` land in default 100/2 eval buckets
+    assert not any(
+        is_eval_holdout_doc(Example("finite8_zero", "text", text=d["text"]), holdout_mod=100, holdout_eval_buckets=2)
+        for d in docs_8
+    )
+    docs_big = [
+        {"id": f"big-{i}", "text": f"BIG_CORPUS_DOC_{i:04d} " + "sufficient text payload for eval holdout. " * 3}
+        for i in range(200)
+    ]
+    orig_raw_rows = mix_mod.raw_rows
+
+    def _patched(spec, seed, epoch, skip=0, src_cfg=None, streaming=True):
+        if spec.name == "finite8_zero":
+            yield from docs_8[skip:]
+            return
+        if spec.name == "big_corpus":
+            yield from docs_big[skip:]
+            return
+        yield from orig_raw_rows(spec, seed, epoch, skip=skip, src_cfg=src_cfg, streaming=streaming)
+
+    monkeypatch.setattr(mix_mod, "raw_rows", _patched)
+
+    # 1. Single 8-doc source with default 100/2 (0 eval docs) + default dedupe=True -> warns, returns [], train() OK!
+    cfg_zero = {
+        "seed": 1,
+        "stage": "zero_eval_8doc",
+        "model": {"name": "toy", "dtype": "float32", "device_map": "cpu", "toy": {"seed": 1}},
+        "loop": {"enabled": False},
+        "train": {
+            "steps": 1,
+            "log_every": 1,
+            "ckpt_every": 10,
+            "trainable": [r"input_layernorm"],
+            "optim": {"lr": 1e-3},
+        },
+        "data": {
+            "seq_len": 64,
+            "sources": [
+                {"name": "finite8_zero", "hf_id": "local/f8z", "role": "pretrain", "format": "text", "weight": 1.0}
+            ],
+        },
+        "eval_quick": {"n_batches": 2, "depths": [1]},
+    }
+    tr_zero = LMTrainer(cfg_zero, str(tmp_path / "zero_eval"))
+    with caplog.at_level(logging.WARNING, logger="qloop"):
+        res_zero = tr_zero.train()
+    assert res_zero["step"] == 1
+    assert tr_zero.eval_batches == []
+    assert any("0/2 batches" in rec.message for rec in caplog.records)
+
+    # 2. Multi-source `[big_corpus, finite8_zero]` under default 100/2 -> skips empty source, returns eval batches!
+    cfg_mix = copy.deepcopy(cfg_zero)
+    cfg_mix["data"]["sources"] = [
+        {"name": "big_corpus", "hf_id": "local/big", "role": "pretrain", "format": "text", "weight": 0.5},
+        {"name": "finite8_zero", "hf_id": "local/f8z", "role": "pretrain", "format": "text", "weight": 0.5},
+    ]
+    tr_mix = LMTrainer(cfg_mix, str(tmp_path / "mix_eval"))
+    mix_eval = tr_mix._eval_set()
+    assert len(mix_eval) == 2
+    tok = tr_mix.stack.tokenizer
+    mix_eval_txt = "\n".join(tok.decode(b["input_ids"], skip_special_tokens=False) for b in mix_eval)
+    assert "BIG_CORPUS_DOC_" in mix_eval_txt
+
+    # 3. Synthetic `toy_cot` with `toy_rows=8` under default config (no explicit `holdout_mod`) -> exempted & runs!
+    cfg_cot = {
+        "seed": 2,
+        "stage": "toy_cot_small",
+        "model": {"name": "toy", "dtype": "float32", "device_map": "cpu", "toy": {"seed": 2}},
+        "loop": {"enabled": False},
+        "train": {
+            "steps": 1,
+            "log_every": 1,
+            "ckpt_every": 10,
+            "trainable": [r"input_layernorm"],
+            "optim": {"lr": 1e-3},
+        },
+        "data": {"seq_len": 32, "sources": [{"name": "toy_cot", "weight": 1.0, "toy_rows": 8}]},
+        "eval_quick": {"n_batches": 2, "depths": [1]},
+    }
+    tr_cot = LMTrainer(cfg_cot, str(tmp_path / "toy_cot8"))
+    assert tr_cot._build_stream().split_role == "all"
+    res_cot = tr_cot.train()
+    assert res_cot["step"] == 1
+    assert len(tr_cot.eval_batches) == 2
 
 
 # ==============================================================================

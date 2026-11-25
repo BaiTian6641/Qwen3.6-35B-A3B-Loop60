@@ -117,6 +117,7 @@ class KVBlobConfig:
     min_retention: float = 0.15
     initial_stability: float = 1.0
     hardening_factor: float = 2.0
+    max_stability: float = 1e6
     graduation_hits: int = 4
     graduation_min_stability: float = 8.0
 
@@ -144,20 +145,27 @@ class KVBlobConfig:
             )
         if self.sink_tokens < 0 or self.boundary_header_tokens < 0 or self.index_dim < 1:
             raise ValueError("sink_tokens, boundary_header_tokens must be >= 0 and index_dim >= 1")
-        if self.rope_theta <= 0.0:
-            raise ValueError(f"rope_theta must be > 0, got {self.rope_theta}")
-        if self.salience_threshold < 0.0:
-            raise ValueError(f"salience_threshold must be >= 0, got {self.salience_threshold}")
-        if not (-1.0 <= self.dedup_cos_threshold <= 1.0):
-            raise ValueError(f"dedup_cos_threshold must be in [-1, 1], got {self.dedup_cos_threshold}")
-        if not (0.0 < self.min_retention <= 1.0):
-            raise ValueError(f"min_retention must be in (0, 1], got {self.min_retention}")
-        if self.initial_stability <= 0.0:
-            raise ValueError(f"initial_stability must be > 0, got {self.initial_stability}")
-        if self.hardening_factor < 1.0:
-            raise ValueError(f"hardening_factor must be >= 1.0, got {self.hardening_factor}")
-        if self.graduation_hits < 1 or self.graduation_min_stability <= 0.0:
-            raise ValueError("graduation_hits must be >= 1 and graduation_min_stability > 0")
+        if not math.isfinite(self.rope_theta) or self.rope_theta <= 0.0:
+            raise ValueError(f"rope_theta must be finite and > 0, got {self.rope_theta}")
+        if not math.isfinite(self.salience_threshold) or self.salience_threshold < 0.0:
+            raise ValueError(f"salience_threshold must be finite and >= 0, got {self.salience_threshold}")
+        if not math.isfinite(self.dedup_cos_threshold) or not (-1.0 <= self.dedup_cos_threshold <= 1.0):
+            raise ValueError(f"dedup_cos_threshold must be finite and in [-1, 1], got {self.dedup_cos_threshold}")
+        if not math.isfinite(self.min_retention) or not (0.0 < self.min_retention <= 1.0):
+            raise ValueError(f"min_retention must be finite and in (0, 1], got {self.min_retention}")
+        if not math.isfinite(self.initial_stability) or self.initial_stability <= 0.0:
+            raise ValueError(f"initial_stability must be finite and > 0, got {self.initial_stability}")
+        if not math.isfinite(self.hardening_factor) or self.hardening_factor < 1.0:
+            raise ValueError(f"hardening_factor must be finite and >= 1.0, got {self.hardening_factor}")
+        if not math.isfinite(self.max_stability) or self.max_stability < self.initial_stability:
+            raise ValueError(
+                f"max_stability must be finite and >= initial_stability ({self.initial_stability}), "
+                f"got {self.max_stability}"
+            )
+        if self.graduation_hits < 1 or not math.isfinite(self.graduation_min_stability) or (
+            self.graduation_min_stability <= 0.0
+        ):
+            raise ValueError("graduation_hits must be >= 1 and graduation_min_stability must be finite and > 0")
 
     def header_wire_bytes(self) -> int:
         return theoretical_header_wire_bytes(self.num_global_layers, self.index_dim)
@@ -196,8 +204,8 @@ class KVBlobHeader:
             raise ValueError(
                 f"coarse_centroid must have shape [L, d_idx], got {tuple(self.coarse_centroid.shape)}"
             )
-        if self.stability <= 0.0:
-            raise ValueError(f"stability must be > 0, got {self.stability}")
+        if not math.isfinite(self.stability) or self.stability <= 0.0:
+            raise ValueError(f"stability must be finite and > 0, got {self.stability}")
         if self.hit_count < 0 or self.n_tokens < 0:
             raise ValueError("hit_count and n_tokens must be >= 0")
         self.coarse_centroid = _unit_normalize_rows(self.coarse_centroid.detach()).to(torch.float16).contiguous()
@@ -617,12 +625,15 @@ class DynamicLatentMemoryGraph:
                 self.hebbian_edges[v][u] = nxt
 
     def remove_node(self, blob_id: str) -> None:
-        """Remove a node and all incident edges from the graph."""
+        """Remove a node and all incident edges (including dangling supersession targets) from the graph."""
         if blob_id not in self.nodes:
             return
         self.nodes.pop(blob_id, None)
         self._mean_centroids.pop(blob_id, None)
         self.supersession_edges.pop(blob_id, None)
+        dangling = [old_id for old_id, dst_id in self.supersession_edges.items() if dst_id == blob_id]
+        for old_id in dangling:
+            self.supersession_edges.pop(old_id, None)
         for adj in (self.semantic_edges, self.temporal_edges, self.hebbian_edges):
             nbrs = adj.pop(blob_id, {})
             for nb in nbrs:
@@ -630,9 +641,15 @@ class DynamicLatentMemoryGraph:
                     adj[nb].pop(blob_id, None)
 
     def merge_node_into(self, dup_id: str, keeper_id: str) -> None:
-        """Transfer active incident edges from `dup_id` onto `keeper_id` and remove `dup_id`."""
+        """Transfer active incident edges and supersession targets from `dup_id` onto `keeper_id`."""
         if dup_id not in self.nodes or keeper_id not in self.nodes or dup_id == keeper_id:
             return
+        for old_id, dst_id in list(self.supersession_edges.items()):
+            if dst_id == dup_id:
+                if old_id == keeper_id:
+                    self.supersession_edges.pop(old_id, None)
+                else:
+                    self.supersession_edges[old_id] = keeper_id
         for adj in (self.semantic_edges, self.temporal_edges, self.hebbian_edges):
             for nb, w in list(adj.get(dup_id, {}).items()):
                 if nb == keeper_id or nb not in self.nodes:
@@ -872,7 +889,7 @@ class SplitHorizonKVBlobStore:
         t_now = float(now)
         if not hdr.is_active(t_now):
             raise ValueError(f"cannot record hit on inactive/tombstoned blob {blob_id!r} at t={t_now}")
-        hdr.stability *= self.config.hardening_factor
+        hdr.stability = min(self.config.max_stability, hdr.stability * self.config.hardening_factor)
         hdr.hit_count += 1
         hdr.t_last_access = t_now
         if co_accessed:

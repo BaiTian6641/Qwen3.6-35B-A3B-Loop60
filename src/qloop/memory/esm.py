@@ -5,6 +5,12 @@ Implements vertical horizontal-KV -> weight episodic compilation strictly isolat
   * **Core-Only Anchor Placement (`LoopSpec` `[12, 36)`):** Default anchors `(15, 19, 23, 27, 31, 35)`
     attach strictly to the `6` core full-attention boundaries and reject Coda layers (`>= 36`, e.g.,
     `L39`) with `ValueError` unless explicitly overridden via `allow_coda=True` (`Spark-X2.6` `S2` rule).
+  * **Exact `Spark-X2.6 §C5.2` Architecture & `144.0 MiB` Footprint:** Single fixed orthogonal input
+    projection `w_in` (`[r_hidden, d_model]`, stored in `torch.bfloat16`, `requires_grad=False`) with
+    normalized `GELU` features `phi(h) = F.normalize(F.gelu(F.linear(h, w_in)), dim=-1, eps=1e-6)`,
+    paired with zero-initialized `w_down` (`[r_hidden, d_model]`, `torch.float32`). Across `6` anchors
+    at `r_hidden=2048, d_model=2048`, actual `state_dict()` bytes for `(w_in, w_down)` equal
+    `150,994,944 B = 144.0 MiB` (`50.3M` params) byte-for-byte.
   * **Step-0 IEEE-754 Bit-Identity & `WISE` Scope Gate:** Zero-initialized `w_down` + empty
     `scope_prototypes` returns exact `zeros_like(h)` (`torch.equal`). After writes, out-of-scope
     tokens (`max_p cos(h, p) < scope_threshold`) yield exact `0.0` drift.
@@ -13,13 +19,12 @@ Implements vertical horizontal-KV -> weight episodic compilation strictly isolat
   * **AlphaEdit Null-Space Projection + Row-Normalized DGKS Double Gram-Schmidt (`float64`):**
     Projects trigger features `A_perp = A @ (I - U^T U)` against general-corpus + prior-write basis
     `U` in `torch.float64`, solves `(A_perp A_perp^T + alpha I)^{-1} delta_z`, guarantees `< 1e-12`
-    null-space leakage across sequential writes, and records every delta in a reversible undo ledger
-    (`rollback_entry`).
-  * **Exact Shard Footprint:** `144.0 MiB` (`150,994,944 B`) at `6` anchors, `r_hidden=2048`,
-    `d_model=2048` (`w_in` in `bf16` [`2 B`] + `w_down` in `fp32` [`4 B`]).
+    null-space leakage across sequential writes, and supports exact arbitrary/out-of-order
+    transactional rollback via deterministic replay from the pre-session base snapshot.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, fields
 from typing import Any
 
@@ -37,12 +42,12 @@ DEFAULT_CORE_LOOP_SPEC = LoopSpec(
     target_virtual_layers=64,
 )
 
-W_IN_DTYPE_BYTES = 2   # bf16 input projection footprint in serialized/served ESM shard
-W_DOWN_DTYPE_BYTES = 4  # fp32 compiled episodic projection buffer
+W_IN_DTYPE_BYTES = 2    # bf16 w_in buffer
+W_DOWN_DTYPE_BYTES = 4  # fp32 w_down buffer
 
 
-def _orthogonal_matrix(rows: int, cols: int, seed: int) -> torch.Tensor:
-    """Deterministic semi-orthogonal/orthogonal `[rows, cols]` `float32` matrix via QR."""
+def _orthogonal_matrix(rows: int, cols: int, seed: int, *, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """Deterministic semi-orthogonal/orthogonal `[rows, cols]` matrix via float32 QR cast to `dtype`."""
     gen = torch.Generator(device="cpu").manual_seed(int(seed))
     n_big, n_small = max(rows, cols), min(rows, cols)
     mat = torch.randn((n_big, n_small), generator=gen, dtype=torch.float32)
@@ -52,7 +57,7 @@ def _orthogonal_matrix(rows: int, cols: int, seed: int) -> torch.Tensor:
     q = q * diag_sign.unsqueeze(0)
     if rows < cols:
         q = q.T
-    return q.contiguous()
+    return q.to(dtype=dtype).contiguous()
 
 
 def project_orthogonal_dgks(x: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
@@ -176,12 +181,12 @@ class ESMConfig:
             raise ValueError(f"duplicate anchor_layers found: {self.anchor_layers}")
         if any(lyr < 0 for lyr in self.anchor_layers):
             raise ValueError(f"anchor_layers must be >= 0, got {self.anchor_layers}")
-        if not (-1.0 <= self.scope_threshold <= 1.0):
-            raise ValueError(f"scope_threshold must be in [-1, 1], got {self.scope_threshold}")
-        if self.ridge_alpha <= 0.0:
-            raise ValueError(f"ridge_alpha must be > 0, got {self.ridge_alpha}")
-        if self.max_rel_delta_norm <= 0.0:
-            raise ValueError(f"max_rel_delta_norm must be > 0, got {self.max_rel_delta_norm}")
+        if not math.isfinite(self.scope_threshold) or not (0.0 < self.scope_threshold <= 1.0):
+            raise ValueError(f"scope_threshold must be finite and in (0, 1], got {self.scope_threshold}")
+        if not math.isfinite(self.ridge_alpha) or self.ridge_alpha <= 0.0:
+            raise ValueError(f"ridge_alpha must be finite and > 0, got {self.ridge_alpha}")
+        if not math.isfinite(self.max_rel_delta_norm) or self.max_rel_delta_norm <= 0.0:
+            raise ValueError(f"max_rel_delta_norm must be finite and > 0, got {self.max_rel_delta_norm}")
 
         coda_boundary = self.coda_start if loop_spec is None else int(loop_spec.core_end)
         coda_layers = [lyr for lyr in self.anchor_layers if lyr >= coda_boundary]
@@ -198,7 +203,7 @@ class ESMConfig:
 
 @dataclass
 class ESMLedgerEntry:
-    """Transactional audit & rollback record for one compiled null-space episodic write."""
+    """Transactional audit & deterministic-replay rollback record for one compiled null-space write."""
 
     entry_id: str
     anchor_layer: int
@@ -207,20 +212,23 @@ class ESMLedgerEntry:
     pre_leakage: float
     post_leakage: float
     active: bool = True
+    h_triggers_f32: torch.Tensor | None = None
+    y_targets_f32: torch.Tensor | None = None
     prototypes: torch.Tensor | None = None
     basis_rows: torch.Tensor | None = None
 
 
 class NullSpaceESMAnchor(nn.Module):
-    """Single-layer AlphaEdit null-space episodic memory anchor with `WISE` scope gating and undo ledger."""
+    """Single-layer `Spark-X2.6 §C5.2` AlphaEdit null-space episodic memory anchor with `WISE` scope gate."""
 
-    w_gate: torch.Tensor
-    w_up: torch.Tensor
+    w_in: torch.Tensor
     w_down: torch.Tensor
     _w_down_f64: torch.Tensor
     active_basis: torch.Tensor
-    _general_basis: torch.Tensor
     scope_prototypes: torch.Tensor
+    _base_w_down_f64: torch.Tensor
+    _base_active_basis: torch.Tensor
+    _base_scope_prototypes: torch.Tensor
 
     def __init__(self, config: ESMConfig, anchor_layer: int) -> None:
         super().__init__()
@@ -228,19 +236,33 @@ class NullSpaceESMAnchor(nn.Module):
         self.anchor_layer = int(anchor_layer)
 
         seed_base = config.seed + 131 * self.anchor_layer
-        w_gate = _orthogonal_matrix(config.r_hidden, config.d_model, seed=seed_base + 1)
-        w_up = _orthogonal_matrix(config.r_hidden, config.d_model, seed=seed_base + 2)
-        self.register_buffer("w_gate", w_gate)
-        self.register_buffer("w_up", w_up)
+        w_in = _orthogonal_matrix(config.r_hidden, config.d_model, seed=seed_base + 1, dtype=torch.bfloat16)
+        self.register_buffer("w_in", w_in)
         self.register_buffer("w_down", torch.zeros((config.r_hidden, config.d_model), dtype=torch.float32))
+        self.register_buffer("active_basis", torch.empty((0, config.r_hidden), dtype=torch.float64))
+        self.register_buffer("scope_prototypes", torch.empty((0, config.d_model), dtype=torch.float32))
+
+        # High-precision runtime accumulator + pre-session base snapshot (preserved across rollbacks/reloads)
         self.register_buffer(
             "_w_down_f64",
             torch.zeros((config.r_hidden, config.d_model), dtype=torch.float64),
             persistent=False,
         )
-        self.register_buffer("active_basis", torch.empty((0, config.r_hidden), dtype=torch.float64))
-        self.register_buffer("_general_basis", torch.empty((0, config.r_hidden), dtype=torch.float64), persistent=False)
-        self.register_buffer("scope_prototypes", torch.empty((0, config.d_model), dtype=torch.float32))
+        self.register_buffer(
+            "_base_w_down_f64",
+            torch.zeros((config.r_hidden, config.d_model), dtype=torch.float64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_base_active_basis",
+            torch.empty((0, config.r_hidden), dtype=torch.float64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_base_scope_prototypes",
+            torch.empty((0, config.d_model), dtype=torch.float32),
+            persistent=False,
+        )
 
         self.ledger: list[ESMLedgerEntry] = []
 
@@ -264,19 +286,23 @@ class NullSpaceESMAnchor(nn.Module):
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
         )
+        # Preserve pre-reload weights, basis, and prototypes as the immutable rollback base snapshot
         self._w_down_f64.copy_(self.w_down.to(torch.float64))
+        self._base_w_down_f64 = self._w_down_f64.detach().clone()
+        self._base_active_basis = self.active_basis.detach().to(torch.float64).clone()
+        self._base_scope_prototypes = self.scope_prototypes.detach().to(torch.float32).clone()
+        self.ledger.clear()
+
+    def weight_bytes(self) -> int:
+        """Exact served/persisted weight bytes for `w_in` (`bf16`) + `w_down` (`fp32`)."""
+        return int(self.w_in.numel() * self.w_in.element_size() + self.w_down.numel() * self.w_down.element_size())
 
     def compute_features(self, h: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
-        """Compute normalized SwiGLU features `phi(h) = norm(SiLU(h W_gate^T) * (h W_up^T))`."""
+        """Compute normalized `GELU` features `phi(h) = F.normalize(F.gelu(F.linear(h, w_in)), dim=-1, eps=1e-6)`."""
         work_dt = upcast(h).dtype if dtype is None else dtype
-        h_w = h.to(device=self.w_gate.device, dtype=work_dt)
-        wg = self.w_gate.to(dtype=work_dt)
-        wu = self.w_up.to(dtype=work_dt)
-        gate = F.silu(h_w @ wg.T)
-        up = h_w @ wu.T
-        raw = gate * up
-        norms = raw.norm(dim=-1, keepdim=True)
-        return torch.where(norms > 1e-12, raw / norms.clamp(min=1e-12), torch.zeros_like(raw))
+        h_w = h.to(device=self.w_in.device, dtype=work_dt)
+        w_in_w = self.w_in.to(dtype=work_dt)
+        return F.normalize(F.gelu(F.linear(h_w, w_in_w)), dim=-1, eps=1e-6)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """Compute gated episodic residual `delta(h)`.
@@ -300,7 +326,10 @@ class NullSpaceESMAnchor(nn.Module):
 
         p_work = self.scope_prototypes.to(device=h.device, dtype=h_work.dtype)
         p_norm = p_work.norm(dim=-1, keepdim=True)
-        p_unit = torch.where(p_norm > 1e-12, p_work / p_norm.clamp(min=1e-12), torch.zeros_like(p_work))
+        p_valid = p_norm.squeeze(-1) > 1e-12
+        if not bool(p_valid.any()):
+            return torch.zeros_like(h)
+        p_unit = p_work[p_valid] / p_norm[p_valid]
 
         max_cos = (h_unit @ p_unit.T).amax(dim=-1)
         in_scope = (h_norm.squeeze(-1) > 1e-12) & (max_cos >= self.config.scope_threshold)
@@ -330,8 +359,8 @@ class NullSpaceESMAnchor(nn.Module):
         """Extract orthonormal basis `U_gen` via SVD in `float64` to protect general-corpus features."""
         if not (0.0 < energy_threshold <= 1.0):
             raise ValueError(f"energy_threshold must be in (0, 1], got {energy_threshold}")
-        if h_general.shape[-1] != self.config.d_model:
-            raise ValueError(f"expected last dim d_model={self.config.d_model}, got {h_general.shape[-1]}")
+        if h_general.ndim < 1 or h_general.shape[-1] != self.config.d_model:
+            raise ValueError(f"expected last dim d_model={self.config.d_model}, got shape {tuple(h_general.shape)}")
 
         h_flat = h_general.reshape(-1, self.config.d_model)
         if h_flat.shape[0] == 0:
@@ -351,48 +380,27 @@ class NullSpaceESMAnchor(nn.Module):
         k = max(1, min(k_energy, non_zero))
 
         u_cand = vh[:k].to(device=self.active_basis.device, dtype=torch.float64)
-        q_gen = dgks_orthonormalize_rows(u_cand, self._general_basis)
-        if q_gen.shape[0] > 0:
-            self._general_basis = torch.cat([self._general_basis, q_gen], dim=0)
+        q_base = dgks_orthonormalize_rows(u_cand, self._base_active_basis)
+        if q_base.shape[0] > 0:
+            self._base_active_basis = torch.cat([self._base_active_basis, q_base], dim=0)
 
         q_add = dgks_orthonormalize_rows(u_cand, self.active_basis)
         if q_add.shape[0] > 0:
             self.active_basis = torch.cat([self.active_basis, q_add], dim=0)
         return u_cand
 
-    @torch.no_grad()
-    def compile_nullspace_ridge(
+    def _apply_compile_step(
         self,
-        h_triggers: torch.Tensor,
-        y_targets: torch.Tensor,
-        entry_id: str,
-    ) -> tuple[ESMLedgerEntry, float]:
-        """Compile a closed-form AlphaEdit null-space ridge update via `float64` DGKS.
-
-        Steps:
-          1. Computes normalized SwiGLU features `A = phi(h_triggers)` in `torch.float64`.
-          2. Measures unprojected `pre_leakage` against `active_basis` (`U`).
-          3. Projects `A_perp = A @ (I - U^T U)` via two-pass DGKS in `torch.float64`.
-          4. Solves `(A_perp A_perp^T + alpha I)^{-1} delta_z` in `torch.float64` and polishes
-             `delta_w_down` orthogonally against `U`.
-          5. Updates `w_down`, appends newly spanned DGKS orthonormal rows to `active_basis`, adds
-             unit-normalized trigger prototypes to `scope_prototypes`, and logs an `ESMLedgerEntry`.
-        """
-        if not entry_id:
-            raise ValueError("entry_id must be a non-empty string")
-        if any(e.entry_id == entry_id and e.active for e in self.ledger):
-            raise ValueError(f"active entry_id {entry_id!r} already exists on layer {self.anchor_layer}")
-
-        h_in = h_triggers.unsqueeze(0) if h_triggers.ndim == 1 else h_triggers.reshape(-1, self.config.d_model)
-        y_in = y_targets.unsqueeze(0) if y_targets.ndim == 1 else y_targets.reshape(-1, self.config.d_model)
-        if h_in.shape != y_in.shape:
-            raise ValueError(f"h_triggers {tuple(h_in.shape)} and y_targets {tuple(y_in.shape)} must match")
-        if h_in.shape[0] == 0:
-            raise ValueError("h_triggers must contain at least one probe")
-
+        h_in_f32: torch.Tensor,
+        y_in_f32: torch.Tensor,
+    ) -> tuple[torch.Tensor, float, float, torch.Tensor, torch.Tensor]:
+        """Run one `float64` AlphaEdit + DGKS ridge update against current live anchor state."""
         dev = self.w_down.device
-        a = self.compute_features(h_in, dtype=torch.float64).to(device=dev)  # [m, r_hidden]
-        y_f64 = y_in.to(device=dev, dtype=torch.float64)                     # [m, d_model]
+        h_dev = h_in_f32.to(device=dev, dtype=torch.float32)
+        y_dev = y_in_f32.to(device=dev, dtype=torch.float32)
+
+        a = self.compute_features(h_dev, dtype=torch.float64).to(device=dev)  # [m, r_hidden]
+        y_f64 = y_dev.to(dtype=torch.float64)                                # [m, d_model]
         delta_z = y_f64 - a @ self._w_down_f64                               # [m, d_model]
 
         m = int(a.shape[0])
@@ -408,6 +416,13 @@ class NullSpaceESMAnchor(nn.Module):
             pre_leakage = 0.0
 
         a_perp = project_orthogonal_dgks(a, u_prev)
+        q_new = dgks_orthonormalize_rows(a_perp, u_prev)
+        if q_new.shape[0] == 0:
+            # Null space is completely exhausted for these triggers: exact zero update, no prototypes added
+            dw_f64 = torch.zeros_like(self._w_down_f64)
+            empty_protos = torch.empty((0, self.config.d_model), dtype=torch.float32, device=dev)
+            return dw_f64, pre_leakage, 0.0, empty_protos, q_new
+
         gram = a_perp @ a_perp.T + alpha * eye_m
         coeff = torch.linalg.solve(gram, delta_z)
         dw_f64 = a_perp.T @ coeff
@@ -422,24 +437,64 @@ class NullSpaceESMAnchor(nn.Module):
 
         self._w_down_f64.add_(dw_f64)
         self.w_down.copy_(self._w_down_f64.to(torch.float32))
+        self.active_basis = torch.cat([u_prev, q_new], dim=0)
 
-        q_new = dgks_orthonormalize_rows(a_perp, u_prev)
-        if q_new.shape[0] > 0:
-            self.active_basis = torch.cat([u_prev, q_new], dim=0)
+        # Only register unit-normalized prototypes for strictly non-zero triggers with active null-space span
+        h_nrm = h_dev.norm(dim=-1, keepdim=True)
+        valid_mask = h_nrm.squeeze(-1) > 1e-12
+        if bool(valid_mask.any()):
+            protos = h_dev[valid_mask] / h_nrm[valid_mask]
+            self.scope_prototypes = torch.cat([self.scope_prototypes, protos], dim=0)
+        else:
+            protos = torch.empty((0, self.config.d_model), dtype=torch.float32, device=dev)
 
-        h_f32 = h_in.detach().to(device=dev, dtype=torch.float32)
-        h_nrm = h_f32.norm(dim=-1, keepdim=True)
-        protos = torch.where(h_nrm > 1e-12, h_f32 / h_nrm.clamp(min=1e-12), torch.zeros_like(h_f32))
-        self.scope_prototypes = torch.cat([self.scope_prototypes, protos], dim=0)
+        return dw_f64, pre_leakage, post_leakage, protos, q_new
+
+    @torch.no_grad()
+    def compile_nullspace_ridge(
+        self,
+        h_triggers: torch.Tensor,
+        y_targets: torch.Tensor,
+        entry_id: str,
+    ) -> tuple[ESMLedgerEntry, float]:
+        """Compile a closed-form AlphaEdit null-space ridge update via `float64` DGKS."""
+        if not entry_id:
+            raise ValueError("entry_id must be a non-empty string")
+        if any(e.entry_id == entry_id and e.active for e in self.ledger):
+            raise ValueError(f"active entry_id {entry_id!r} already exists on layer {self.anchor_layer}")
+
+        if h_triggers.ndim < 1 or h_triggers.shape[-1] != self.config.d_model:
+            raise ValueError(
+                f"h_triggers last dim must equal d_model={self.config.d_model}, got shape {tuple(h_triggers.shape)}"
+            )
+        if y_targets.ndim < 1 or y_targets.shape[-1] != self.config.d_model:
+            raise ValueError(
+                f"y_targets last dim must equal d_model={self.config.d_model}, got shape {tuple(y_targets.shape)}"
+            )
+
+        h_in = h_triggers.reshape(-1, self.config.d_model)
+        y_in = y_targets.reshape(-1, self.config.d_model)
+        if h_in.shape != y_in.shape:
+            raise ValueError(f"h_triggers {tuple(h_in.shape)} and y_targets {tuple(y_in.shape)} must match")
+        if h_in.shape[0] == 0:
+            raise ValueError("h_triggers must contain at least one probe")
+
+        dev = self.w_down.device
+        h_f32 = h_in.detach().to(device=dev, dtype=torch.float32).clone()
+        y_f32 = y_in.detach().to(device=dev, dtype=torch.float32).clone()
+
+        dw_f64, pre_leakage, post_leakage, protos, q_new = self._apply_compile_step(h_f32, y_f32)
 
         entry = ESMLedgerEntry(
             entry_id=entry_id,
             anchor_layer=self.anchor_layer,
             delta_w_down=dw_f64.detach().clone(),
-            n_probes=m,
+            n_probes=int(h_f32.shape[0]),
             pre_leakage=pre_leakage,
             post_leakage=post_leakage,
             active=True,
+            h_triggers_f32=h_f32,
+            y_targets_f32=y_f32,
             prototypes=protos.detach().clone(),
             basis_rows=q_new.detach().clone(),
         )
@@ -448,7 +503,12 @@ class NullSpaceESMAnchor(nn.Module):
 
     @torch.no_grad()
     def rollback_entry(self, entry_id: str) -> ESMLedgerEntry:
-        """Exact transactional undo of `entry_id`: subtracts `delta_w_down` and restores prototypes/basis."""
+        """Exact transactional undo of `entry_id` (LIFO or out-of-order) via deterministic replay.
+
+        Marks `entry_id` inactive, restores `(w_down, _w_down_f64, active_basis, scope_prototypes)`
+        to the pre-session base snapshot (preserving `U_gen` and any pre-reload state), and
+        deterministically replays all surviving `active=True` ledger entries in insertion order.
+        """
         target: ESMLedgerEntry | None = None
         for entry in reversed(self.ledger):
             if entry.entry_id == entry_id:
@@ -459,38 +519,28 @@ class NullSpaceESMAnchor(nn.Module):
         if not target.active:
             raise ValueError(f"entry_id {entry_id!r} on layer {self.anchor_layer} is already rolled back")
 
-        dev = self.w_down.device
-        self._w_down_f64.sub_(target.delta_w_down.to(device=dev, dtype=torch.float64))
         target.active = False
 
-        # Snap to exact zero when no active entries remain so Step-0 bit-identity holds after full undo
-        active_entries = [e for e in self.ledger if e.active]
-        if not active_entries:
-            self._w_down_f64.zero_()
-            self.w_down.zero_()
-            self.scope_prototypes = torch.empty((0, self.config.d_model), dtype=torch.float32, device=dev)
-            self.active_basis = self._general_basis.to(device=dev, dtype=torch.float64).clone()
-            return target
-
+        dev = self.w_down.device
+        self._w_down_f64.copy_(self._base_w_down_f64.to(device=dev, dtype=torch.float64))
         self.w_down.copy_(self._w_down_f64.to(torch.float32))
+        self.active_basis = self._base_active_basis.to(device=dev, dtype=torch.float64).clone()
+        self.scope_prototypes = self._base_scope_prototypes.to(device=dev, dtype=torch.float32).clone()
 
-        proto_chunks = [
-            e.prototypes.to(device=dev, dtype=torch.float32)
-            for e in active_entries
-            if e.prototypes is not None and e.prototypes.numel() > 0
-        ]
-        if proto_chunks:
-            self.scope_prototypes = torch.cat(proto_chunks, dim=0)
-        else:
-            self.scope_prototypes = torch.empty((0, self.config.d_model), dtype=torch.float32, device=dev)
+        for entry in self.ledger:
+            if not entry.active:
+                continue
+            if entry.h_triggers_f32 is None or entry.y_targets_f32 is None:
+                raise RuntimeError(f"ledger entry {entry.entry_id!r} lacks replay tensors for deterministic rollback")
+            dw_f64, pre_leak, post_leak, protos, q_new = self._apply_compile_step(
+                entry.h_triggers_f32, entry.y_targets_f32
+            )
+            entry.delta_w_down = dw_f64.detach().clone()
+            entry.pre_leakage = pre_leak
+            entry.post_leakage = post_leak
+            entry.prototypes = protos.detach().clone()
+            entry.basis_rows = q_new.detach().clone()
 
-        rebuilt_basis = self._general_basis.to(device=dev, dtype=torch.float64).clone()
-        for e in active_entries:
-            if e.basis_rows is not None and e.basis_rows.numel() > 0:
-                q_add = dgks_orthonormalize_rows(e.basis_rows, rebuilt_basis)
-                if q_add.shape[0] > 0:
-                    rebuilt_basis = torch.cat([rebuilt_basis, q_add], dim=0)
-        self.active_basis = rebuilt_basis
         return target
 
 
@@ -543,8 +593,12 @@ class EpisodicSideMemoryBank(nn.Module):
         return self.anchor(layer_idx).rollback_entry(entry_id)
 
     def shard_bytes(self) -> int:
-        """Exact shard byte footprint (`w_in` bf16 + `w_down` fp32 = `144.0 MiB` at `6` anchors, `2048x2048`)."""
-        return len(self.anchors) * self.config.r_hidden * self.config.d_model * (W_IN_DTYPE_BYTES + W_DOWN_DTYPE_BYTES)
+        """Exact weight bytes (`w_in` bf16 + `w_down` fp32 = `144.0 MiB` at `6` anchors, `2048x2048`)."""
+        total = 0
+        for anchor in self.anchors.values():
+            mod: NullSpaceESMAnchor = anchor  # type: ignore[assignment]
+            total += mod.weight_bytes()
+        return total
 
     def shard_mib(self) -> float:
         return self.shard_bytes() / float(1024**2)

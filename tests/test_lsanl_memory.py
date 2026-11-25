@@ -269,6 +269,47 @@ def test_split_horizon_store_4stage_lifecycle():
     with pytest.raises(ValueError, match="unknown"):
         KVBlobConfig.from_dict({"not_a_real_key": 1})
 
+    # Verify NaN/non-finite stability rejection, stability upper cap (`max_stability`), and
+    # supersession_edges remapping/pruning on `compact_duplicates` & `remove_node`
+    with pytest.raises(ValueError, match="finite"):
+        KVBlobConfig(initial_stability=float("nan"))
+    with pytest.raises(ValueError, match="finite"):
+        KVBlobHeader(blob_id="nan_hdr", coarse_centroid=torch.ones(2, 32), stability=float("nan"))
+
+    # Repeated hardening saturates cleanly at `max_stability` without overflowing to `inf`
+    cap_cfg = KVBlobConfig(
+        num_global_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        rotary_dim=64,
+        blob_tokens=4,
+        index_dim=32,
+        max_stability=1e6,
+    )
+    cap_store = SplitHorizonKVBlobStore(config=cap_cfg)
+    b_cap = _make_synthetic_blob("cap_ep", basis[6], cfg=cap_cfg, salience=0.9)
+    assert cap_store.admit(b_cap) is True
+    for i in range(1200):
+        hdr_cap = cap_store.record_hit("cap_ep", now=float(i) * 0.01)
+    assert math.isfinite(hdr_cap.stability)
+    assert hdr_cap.stability == cap_cfg.max_stability
+
+    # Supersession remapping on duplicate merge: `old -> dup` remaps to `old -> keeper`, zero dangling IDs!
+    b_old = _make_synthetic_blob("sup_old", basis[7], cfg=cap_cfg, t_created=0.0, salience=0.5)
+    b_keep = _make_synthetic_blob("sup_keep", basis[8], cfg=cap_cfg, t_created=1.0, salience=0.95)
+    b_dup_new = _make_synthetic_blob("sup_dup", basis[8] + 0.02 * basis[9], cfg=cap_cfg, t_created=1.1, salience=0.6)
+    assert cap_store.admit(b_old) is True
+    assert cap_store.admit(b_keep) is True
+    assert cap_store.admit(b_dup_new) is True
+    cap_store.supersede("sup_old", "sup_dup", now=2.0)
+    assert cap_store.graph.supersession_edges["sup_old"] == "sup_dup"
+    merged_sup = cap_store.compact_duplicates(cos_threshold=0.90)
+    assert ("sup_dup", "sup_keep") in merged_sup
+    assert cap_store.graph.supersession_edges["sup_old"] == "sup_keep"
+    assert all(dst in cap_store.graph.nodes for dst in cap_store.graph.supersession_edges.values())
+    cap_store.graph.remove_node("sup_keep")
+    assert "sup_old" not in cap_store.graph.supersession_edges
+
 
 # ==============================================================================
 # 3. `DynamicLatentMemoryGraph` (`DLMG`) 2-Hop Personalized PageRank Test
@@ -336,9 +377,20 @@ def test_esm_coda_guard_and_shard_bytes_formula():
     full_bank = EpisodicSideMemoryBank(cfg_default)
     assert full_bank.shard_bytes() == 150_994_944
     assert full_bank.shard_mib() == 144.0
+    # Verify actual `state_dict()` weight bytes (`w_in` bf16 + `w_down` fp32) match `shard_bytes()` byte-for-byte!
+    actual_sd_bytes = sum(
+        t.numel() * t.element_size()
+        for k, t in full_bank.state_dict().items()
+        if k.endswith(("w_in", "w_down"))
+    )
+    assert actual_sd_bytes == full_bank.shard_bytes() == 150_994_944 == 144 * 1024 * 1024
     assert ESMConfig.from_dict({"anchor_layers": [15, 19], "scope_threshold": 0.70}).anchor_layers == (15, 19)
     with pytest.raises(ValueError, match="unknown"):
         ESMConfig.from_dict({"bad_key": 42})
+    with pytest.raises(ValueError, match="scope_threshold"):
+        ESMConfig(d_model=32, r_hidden=64, scope_threshold=0.0)
+    with pytest.raises(ValueError, match="scope_threshold"):
+        ESMConfig(d_model=32, r_hidden=64, scope_threshold=-0.2)
 
     cfg_from_spec = ESMConfig.from_loop_spec(DEFAULT_CORE_LOOP_SPEC)
     assert cfg_from_spec.anchor_layers == (15, 19, 23, 27, 31, 35)
@@ -377,8 +429,9 @@ def test_esm_step0_dgks_nullspace_wise_normcap_and_rollback():
     bank = EpisodicSideMemoryBank(cfg)
     assert bank.shard_bytes() == 6 * r_hidden * d_model * 6
     anchor = bank.anchor(15)
-    assert anchor.w_gate.requires_grad is False
-    assert anchor.w_up.requires_grad is False
+    assert anchor.w_in.dtype == torch.bfloat16
+    assert anchor.w_in.requires_grad is False
+    assert not hasattr(anchor, "w_gate") and not hasattr(anchor, "w_up")
     assert anchor.w_down.dtype == torch.float32
     assert anchor.active_basis.dtype == torch.float64
 
@@ -473,24 +526,77 @@ def test_esm_step0_dgks_nullspace_wise_normcap_and_rollback():
     assert bool((d_norms <= (cfg.max_rel_delta_norm * h_norms + 1e-5)).all())
     assert bool((d_norms > 0.02 * h_norms).all())
 
-    # Verify `state_dict` / `load_state_dict` round-trip preserves outputs exactly
+    # Verify `load_state_dict` -> `compile` -> `rollback` restores EXACT pre-reload state (Blocker 3)
     sd = {k: v.clone() for k, v in bank.state_dict().items()}
+    pre_reload_out = bank(15, trigger_sets[0]).clone()
+    pre_reload_w_down = anchor.w_down.clone()
+    pre_reload_basis = anchor.active_basis.clone()
+    pre_reload_protos = anchor.scope_prototypes.clone()
+
     reloaded = EpisodicSideMemoryBank(cfg)
     reloaded.load_state_dict(sd)
-    assert torch.equal(reloaded(15, trigger_sets[0]), bank(15, trigger_sets[0]))
+    assert torch.equal(reloaded(15, trigger_sets[0]), pre_reload_out)
     assert torch.equal(reloaded(15, h_general), torch.zeros_like(h_general))
 
-    # Out-of-order rollback (`ep_1` rolled back while `ep_2` stays active): exact subtraction of `dw_1`!
-    out_w2_before_ooo = bank(15, trigger_sets[1]).clone()
-    bank.rollback_entry(15, "ep_1")
-    out_w2_after_ooo = bank(15, trigger_sets[1])
-    phi_w2 = anchor.compute_features(trigger_sets[1], dtype=torch.float64)
-    expected_ep1_contrib = (phi_w2 @ entries[0].delta_w_down).float()
-    assert float(((out_w2_before_ooo - out_w2_after_ooo) - expected_ep1_contrib).abs().max().item()) < 1e-6
-    assert entries[0].active is False
+    h_post = torch.zeros(2, d_model, dtype=torch.float32)
+    h_post[:, 32:] = F.normalize(torch.randn(2, 32), dim=-1) * 10.0
+    y_post = F.normalize(torch.randn(2, d_model), dim=-1) * 0.15
+    _, post_reload_leak = reloaded.compile_nullspace_ridge(15, h_post, y_post, entry_id="ep_post_reload")
+    assert post_reload_leak < 1e-12
+    assert reloaded.anchor(15).active_basis.shape[0] > pre_reload_basis.shape[0]
+    reloaded.rollback_entry(15, "ep_post_reload")
+    assert torch.equal(reloaded.anchor(15).w_down, pre_reload_w_down)
+    assert torch.equal(reloaded.anchor(15).active_basis, pre_reload_basis)
+    assert torch.equal(reloaded.anchor(15).scope_prototypes, pre_reload_protos)
+    assert torch.equal(reloaded(15, trigger_sets[0]), pre_reload_out)
+
+    # Exact Out-of-Order `rollback_entry` via Deterministic Replay (Blocker 2):
+    # Write `ep_1`, `ep_2`, roll back `ep_1`, then write `ep_3_ooo` ->
+    #   (a) `ep_2` recall stays exact (not degraded!), and
+    #   (b) `ep_3_ooo`'s actual leakage onto `ep_2`'s features & `U_gen` is strictly `< 1e-12`!
+    ooo_bank = EpisodicSideMemoryBank(cfg)
+    u_gen_ooo = ooo_bank.register_general_subspace(15, h_general, energy_threshold=0.995)
+    ooo_bank.compile_nullspace_ridge(15, trigger_sets[0], target_sets[0], entry_id="ep_1")
+    ooo_bank.compile_nullspace_ridge(15, trigger_sets[1], target_sets[1], entry_id="ep_2")
+
+    ooo_bank.rollback_entry(15, "ep_1")
+    out_ep2_after_ooo = ooo_bank(15, trigger_sets[1])
+    ep2_rel_err = float((out_ep2_after_ooo - target_sets[1]).norm() / target_sets[1].norm())
+    assert ep2_rel_err < 0.05, f"ep_2 recall degraded after rolling back ep_1: rel_err={ep2_rel_err}"
+
+    ep3_entry, ep3_leak = ooo_bank.compile_nullspace_ridge(15, trigger_sets[2], target_sets[2], entry_id="ep_3_ooo")
+    assert ep3_leak < 1e-12
+    phi_ep2 = ooo_bank.anchor(15).compute_features(trigger_sets[1], dtype=torch.float64)
+    ep3_leak_on_ep2 = float((phi_ep2 @ ep3_entry.delta_w_down).abs().max().item())
+    ep3_leak_on_gen = float((u_gen_ooo @ ep3_entry.delta_w_down).abs().max().item())
+    assert ep3_leak_on_ep2 < 1e-12, f"post-rollback ep_3 leaked onto ep_2: {ep3_leak_on_ep2}"
+    assert ep3_leak_on_gen < 1e-12, f"post-rollback ep_3 leaked onto U_gen: {ep3_leak_on_gen}"
+    out_ep2_after_ep3 = ooo_bank(15, trigger_sets[1])
+    assert float((out_ep2_after_ep3 - out_ep2_after_ooo).abs().max().item()) < 1e-6
+
+    # Edge-case guards: shape[-1] mismatch raises ValueError; exhausted null space & zero-norm
+    # triggers do NOT pollute `scope_prototypes`
+    with pytest.raises(ValueError, match="d_model"):
+        ooo_bank.compile_nullspace_ridge(15, torch.randn(2, 4), torch.randn(2, 4), entry_id="bad_shape")
+
+    tiny_cfg = ESMConfig(d_model=8, r_hidden=4, anchor_layers=(15,), scope_threshold=0.65)
+    tiny_bank = EpisodicSideMemoryBank(tiny_cfg)
+    # Zero-norm trigger produces zero update and appends 0 prototypes
+    tiny_bank.compile_nullspace_ridge(15, torch.zeros(1, 8), torch.ones(1, 8), entry_id="zero_trig")
+    assert tiny_bank.anchor(15).scope_prototypes.shape[0] == 0
+    # Exhaust all 4 dimensions of `r_hidden=4`
+    tiny_bank.compile_nullspace_ridge(15, torch.randn(4, 8), torch.randn(4, 8) * 0.01, entry_id="fill_4")
+    protos_before_exhaust = tiny_bank.anchor(15).scope_prototypes.shape[0]
+    assert tiny_bank.anchor(15).active_basis.shape[0] == 4
+    exh_entry, exh_leak = tiny_bank.compile_nullspace_ridge(
+        15, torch.randn(2, 8), torch.randn(2, 8) * 0.01, entry_id="exhausted"
+    )
+    assert exh_leak == 0.0
+    assert float(exh_entry.delta_w_down.abs().max().item()) == 0.0
+    assert tiny_bank.anchor(15).scope_prototypes.shape[0] == protos_before_exhaust
 
     # Full rollback of all remaining active entries restores exact Step-0 `torch.equal` zeros!
-    for eid in ("ep_huge", "ep_2"):
+    for eid in ("ep_huge", "ep_2", "ep_1"):
         bank.rollback_entry(15, eid)
     assert anchor.scope_prototypes.shape[0] == 0
     assert torch.equal(bank(15, trigger_sets[0]), torch.zeros_like(trigger_sets[0]))

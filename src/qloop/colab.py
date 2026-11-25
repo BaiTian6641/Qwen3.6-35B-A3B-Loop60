@@ -1182,28 +1182,8 @@ def _meta_proves_completion(meta: dict[str, Any] | None) -> bool:
     return False
 
 
-def _meta_contradicts_completion(meta: dict[str, Any] | None) -> bool:
-    if not isinstance(meta, dict):
-        return False
-    if meta.get("completed") is False:
-        return True
-    status = str(meta.get("status") or "").strip().lower()
-    if status in ("in_progress", "running", "paused", "failed", "aborted"):
-        return True
-    raw_step = meta.get("step")
-    raw_target = meta.get("target_steps")
-    return (
-        isinstance(raw_step, int)
-        and not isinstance(raw_step, bool)
-        and isinstance(raw_target, int)
-        and not isinstance(raw_target, bool)
-        and raw_target > 0
-        and raw_step < raw_target
-    )
-
-
 def _local_stage_done(run_root: str, stage_name: str) -> bool:
-    """Verify strict local stage completion; mere `checkpoints/LATEST` presence is NEVER sufficient."""
+    """Verify strict local stage completion; bare `LATEST` or mid-run `PROMOTED` is NEVER sufficient."""
     stage_dir = os.path.join(run_root, stage_name)
     if stage_name == "s0_probe":
         return (
@@ -1216,28 +1196,18 @@ def _local_stage_done(run_root: str, stage_name: str) -> bool:
     if os.path.isfile(os.path.join(ck_dir, "COMPLETED")) or os.path.isfile(os.path.join(stage_dir, "COMPLETED")):
         return True
 
-    promoted_ptr = os.path.join(ck_dir, "PROMOTED")
-    if os.path.isfile(promoted_ptr):
-        try:
-            with open(promoted_ptr, encoding="utf-8") as f:
-                step_name = f.read().strip()
-        except OSError:
-            step_name = ""
-        step_meta = _read_json_file(os.path.join(ck_dir, step_name, "state.json")) if step_name else None
-        if not _meta_contradicts_completion(step_meta):
-            return True
-
-    latest_ptr = os.path.join(ck_dir, "LATEST")
-    if os.path.isfile(latest_ptr):
-        try:
-            with open(latest_ptr, encoding="utf-8") as f:
-                step_name = f.read().strip()
-        except OSError:
-            step_name = ""
-        if step_name:
-            step_meta = _read_json_file(os.path.join(ck_dir, step_name, "state.json"))
-            if _meta_proves_completion(step_meta):
-                return True
+    for ptr_name in ("PROMOTED", "LATEST"):
+        ptr_path = os.path.join(ck_dir, ptr_name)
+        if os.path.isfile(ptr_path):
+            try:
+                with open(ptr_path, encoding="utf-8") as f:
+                    step_name = f.read().strip()
+            except OSError:
+                step_name = ""
+            if step_name:
+                step_meta = _read_json_file(os.path.join(ck_dir, step_name, "state.json"))
+                if _meta_proves_completion(step_meta):
+                    return True
 
     for cand in (
         os.path.join(stage_dir, "state.json"),

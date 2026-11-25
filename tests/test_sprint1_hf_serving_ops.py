@@ -23,6 +23,7 @@ Covers:
 """
 from __future__ import annotations
 
+import abc
 import ast
 import dataclasses
 import importlib
@@ -186,11 +187,46 @@ def _make_mock_tf524_modules(*, strict_cache_init: bool = True) -> dict[str, typ
     cu_mod = types.ModuleType("transformers.cache_utils")
     mo_mod = types.ModuleType("transformers.modeling_outputs")
 
-    class _MockCacheLayerMixin:
-        pass
+    class _MockCacheLayerMixin(abc.ABC):
+        """Mirrors real HF 5.24+ `CacheLayerMixin(ABC)` abstract methods, read-only `is_croppable`, and `__init__`."""
+
+        is_compileable = False
+        is_sliding = False
+
+        def __init__(self) -> None:
+            self.keys: torch.Tensor | None = None
+            self.values: torch.Tensor | None = None
+            self.is_initialized = False
+
+        @property
+        def is_croppable(self) -> bool:
+            return False
+
+        @abc.abstractmethod
+        def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None: ...
+
+        @abc.abstractmethod
+        def update(
+            self,
+            key_states: torch.Tensor,
+            value_states: torch.Tensor,
+            cache_kwargs: dict[str, Any] | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+        @abc.abstractmethod
+        def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]: ...
+
+        @abc.abstractmethod
+        def get_seq_length(self) -> int: ...
+
+        @abc.abstractmethod
+        def get_max_cache_shape(self) -> int | None: ...
+
+        @abc.abstractmethod
+        def get_max_length(self) -> int: ...
 
     class _MockTF524Cache:
-        """Simulates `transformers 5.24.1` `Cache.__init__` raising ValueError without layers/layer_class."""
+        """Simulates HF 5.24.1 `Cache` with strict `__init__` and read-only `is_compileable`/`is_sliding`."""
 
         init_calls: ClassVar[list[dict[str, Any]]] = []
 
@@ -199,34 +235,93 @@ def _make_mock_tf524_modules(*, strict_cache_init: bool = True) -> dict[str, typ
             if strict_cache_init and ((layers is None) == (layer_class_to_replicate is None)):
                 raise ValueError("You should provide exactly one of layers or layer_class_to_replicate")
             self.layers = list(layers) if layers is not None else []
+            # Touch properties during __init__ just like real TF 5.24 Cache
+            _ = self.is_sliding
+            _ = self.is_compileable
+
+        @property
+        def is_compileable(self) -> bool:
+            return bool(self.layers) and all(bool(getattr(lyr, "is_compileable", False)) for lyr in self.layers)
+
+        @property
+        def is_sliding(self) -> list[bool]:
+            return [bool(getattr(lyr, "is_sliding", False)) for lyr in self.layers]
+
+        def is_recording_past(self, layer_idx: int) -> bool:
+            return bool(getattr(self.layers[layer_idx], "record_past", False))
 
     class _MockDynamicLayer(_MockCacheLayerMixin):
         supports_early_init = True
 
         def __init__(self) -> None:
-            self.keys: torch.Tensor | None = None
-            self.values: torch.Tensor | None = None
-            self.is_initialized = False
+            super().__init__()
 
-        def update(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        @property
+        def is_croppable(self) -> bool:
+            return True
+
+        def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+            del key_states, value_states
+
+        def update(
+            self,
+            key_states: torch.Tensor,
+            value_states: torch.Tensor,
+            cache_kwargs: dict[str, Any] | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del cache_kwargs
             if self.keys is None:
-                self.keys, self.values = k, v
+                self.keys, self.values = key_states, value_states
             else:
-                self.keys = torch.cat([self.keys, k], dim=-2)
-                self.values = torch.cat([self.values, v], dim=-2)  # type: ignore[list-item]
+                self.keys = torch.cat([self.keys, key_states], dim=-2)
+                self.values = torch.cat([self.values, value_states], dim=-2)  # type: ignore[list-item]
             self.is_initialized = True
             return self.keys, self.values  # type: ignore[return-value]
 
+        def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+            return self.get_seq_length() + int(cache_position.shape[0]), 0
+
         def get_seq_length(self) -> int:
             return 0 if self.keys is None else int(self.keys.shape[-2])
+
+        def get_max_cache_shape(self) -> int | None:
+            return None
+
+        def get_max_length(self) -> int:
+            return -1
 
     class _MockLinearAttentionLayer(_MockCacheLayerMixin):
         supports_early_init = False
 
         def __init__(self) -> None:
+            super().__init__()
             self.conv_states: list[torch.Tensor | None] = [None]
             self.recurrent_states: list[Any] = [None]
             self.has_previous_state = {0: False}
+
+        def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+            del key_states, value_states
+
+        def update(
+            self,
+            key_states: torch.Tensor,
+            value_states: torch.Tensor,
+            cache_kwargs: dict[str, Any] | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del cache_kwargs
+            return key_states, value_states
+
+        def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+            return int(cache_position.shape[0]), 0
+
+        def get_seq_length(self) -> int:
+            return 0
+
+        def get_max_cache_shape(self) -> int | None:
+            return None
+
+        def get_max_length(self) -> int:
+            return -1
 
     class _MockHybridDynamicCache(_MockTF524Cache):
         """Simulates HF 5.24 `DynamicCache(config)` checking `config.layer_types` strictly."""
@@ -506,7 +601,28 @@ def test_ql60_001_quantized_hybrid_cache_init_tf524_and_legacy(monkeypatch: pyte
         assert all(isinstance(lyr, tf_layer_cls) for lyr in qc.layers)
         assert qc.layers[0].supports_early_init is False
         assert qc.layers[2].supports_early_init is True
+        assert qc.layers[0].is_croppable is False
+        assert qc.layers[2].is_croppable is True
+        assert qc.layers[0].get_max_length() == -1
+        assert qc.layers[2].get_max_length() == -1
+        qc.layers[2].lazy_initialization(torch.randn(1, 2, 1, 16), torch.randn(1, 2, 1, 16))
+        assert qc.is_compileable is False
+        assert qc.is_sliding == [False, False, False, False]
+        assert qc.is_recording_past(0) is False
+        assert qc.is_recording_past(2) is False
         assert qc.last_linear_layer == 3
+
+        # Write-through on per-layer conv_states / recurrent_states proxy
+        c_init = torch.randn(1, 8, 4)
+        r_init = torch.randn(1, 2, 4, 4)
+        qc.layers[0].conv_states[0] = c_init
+        qc.layers[0].recurrent_states[0] = r_init
+        assert qc.conv_states[0] is c_init
+        assert qc.recurrent_states[0] is r_init
+        assert qc.has_previous_state(0) is True
+        assert qc.layers[0].has_previous_state.get(0) is True
+        assert 0 in qc.layers[0].has_previous_state
+        assert 1 not in qc.layers[0].has_previous_state
 
         # 2) Simulated legacy transformers 4.x/5.0 `Cache.__init__(self)` raising `TypeError` on `layers=...`
         legacy_calls: list[int] = []
@@ -566,12 +682,33 @@ def test_ql60_001_hybrid_cache_contract_methods_and_sparse_gather(mode: str) -> 
     assert cache.get_seq_length(0) == 0
     assert cache.get_mask_sizes(torch.arange(0, 6), layer_idx=1) == (6, 0)
 
-    # Update conv & recurrent state on linear layers via HF 5.24+ methods
+    # Update conv & recurrent state on linear layers via HF 5.24+ methods (including positional conv_kernel_size
+    # AND direct `cache.layers[idx].{conv,recurrent}_states[0] = ...` write-through!)
     conv0 = torch.randn(2, 16, 4)
     rec0 = torch.randn(2, 4, 8, 8)
-    full_conv = cache.update_conv_state(conv0, layer_idx=0, conv_kernel_size=4)
-    assert full_conv.shape == (2, 16, 4)
-    assert torch.equal(cache.get_conv_state(0), conv0)  # type: ignore[arg-type]
+    cache.layers[0].conv_states[0] = conv0
+    assert cache.conv_states[0] is conv0
+    assert cache.layers[0].conv_states == [conv0]
+    cache.layers[0].recurrent_states[0] = rec0
+    assert cache.recurrent_states[0] is rec0
+    assert cache.layers[0].recurrent_states == [rec0]
+    assert cache.has_previous_state(0) is True
+    assert cache.layers[0].has_previous_state[0] is True
+    assert cache.layers[0].has_previous_state.get(0) is True
+    assert cache.layers[0].has_previous_state.get(1, "missing") == "missing"
+    assert 0 in cache.layers[0].has_previous_state
+    assert 1 not in cache.layers[0].has_previous_state
+    with pytest.raises(KeyError):
+        _ = cache.layers[0].has_previous_state[1]
+
+    # Positional `conv_kernel_size` argument matches real HF `Qwen3_5GatedDeltaNet` call convention
+    conv_step = torch.randn(2, 16, 1)
+    full_conv = cache.update_conv_state(conv_step, 0, 0, 4)
+    assert full_conv.shape == (2, 16, 5)
+    assert cache.conv_states[0] is not None and cache.conv_states[0].shape == (2, 16, 4)
+    expected_conv0 = torch.cat([conv0, conv_step], dim=-1)[..., -4:]
+    assert torch.equal(cache.get_conv_state(0), expected_conv0)  # type: ignore[arg-type]
+    conv0 = expected_conv0
     cache.update_recurrent_state(rec0, layer_idx=0)
     assert torch.equal(cache.get_recurrent_state(0), rec0)
     assert cache.has_previous_state(0) is True
@@ -720,11 +857,24 @@ def test_ql60_002_causal_lm_pack_output_model_output_contract(
     assert out_with_loss.to_tuple() == (loss, logits, dummy_cache)
     assert out_with_loss[0] is loss and out_with_loss[1] is logits
 
-    # Dynamic attribute update stays synced in OrderedDict
+    # Dynamic attribute update AND dict `__setitem__`/`__delitem__` stay synced in OrderedDict
     new_cache = {"seq": 5}
     out.past_key_values = new_cache
     assert out.get("past_key_values") is new_cache
     assert out["past_key_values"] is new_cache
+
+    logits2 = torch.randn(1, 4, 16)
+    cache2 = {"seq": 6}
+    out["logits"] = logits2
+    assert out.logits is logits2 and out.get("logits") is logits2
+    out["cache"] = cache2
+    assert out.past_key_values is cache2 and out.cache is cache2 and out["past_key_values"] is cache2
+    out["custom_meta"] = 123
+    assert out["custom_meta"] == 123 and out.custom_meta == 123
+    del out["custom_meta"]
+    assert "custom_meta" not in out and not hasattr(out, "custom_meta")
+    del out["past_key_values"]
+    assert out.past_key_values is None and "past_key_values" not in out
 
     # 2) With mock HF `transformers.modeling_outputs.ModelOutput` (both in-package and standalone!)
     tf_mods = _make_mock_tf524_modules()
@@ -745,6 +895,12 @@ def test_ql60_002_causal_lm_pack_output_model_output_contract(
     assert sa_out[0] is logits
     assert list(sa_out.keys()) == ["logits", "past_key_values"]
     assert sa_out.to_tuple() == (logits, dummy_cache)
+    sa_out["logits"] = logits2
+    assert sa_out.logits is logits2 and sa_out["logits"] is logits2
+    sa_out["cache"] = cache2
+    assert sa_out.past_key_values is cache2 and sa_out["past_key_values"] is cache2
+    del sa_out["past_key_values"]
+    assert sa_out.past_key_values is None and "past_key_values" not in sa_out
 
     import qloop.infer.hf_custom_modeling as hcm_mod
 
@@ -758,6 +914,12 @@ def test_ql60_002_causal_lm_pack_output_model_output_contract(
         assert inpkg_out.get("logits") is logits
         assert inpkg_out.get("past_key_values") is dummy_cache
         assert inpkg_out.to_tuple() == (logits, dummy_cache)
+        inpkg_out["logits"] = logits2
+        assert inpkg_out.logits is logits2 and inpkg_out["logits"] is logits2
+        inpkg_out["cache"] = cache2
+        assert inpkg_out.past_key_values is cache2 and inpkg_out["past_key_values"] is cache2
+        del inpkg_out["past_key_values"]
+        assert inpkg_out.past_key_values is None and "past_key_values" not in inpkg_out
     finally:
         for mname in tuple(tf_mods):
             monkeypatch.delitem(sys.modules, mname, raising=False)
@@ -888,6 +1050,33 @@ def test_ql60_002_outer_config_virtual_layers_logits_to_keep_zero_and_hf_generat
                 gen_explicit_toy = sa_model.generate(prompt, max_new_tokens=3, past_key_values=toy_c, logits_to_keep=1)
                 assert torch.equal(gen_explicit_toy, ref_seq)
 
+        # (e) `prepare_inputs_for_generation` slices 2D `[B, T]` and 3D `[3, B, T]` MRoPE `position_ids`
+        #     whenever `past_length > 0` on BOTH in-package and standalone models.
+        class _PastLenCache:
+            def get_seq_length(self) -> int:
+                return 5
+
+        full_ids = torch.tensor([[11, 22, 33, 44, 55, 66]], dtype=torch.long)
+        pos_2d = torch.arange(6, dtype=torch.long).unsqueeze(0)
+        pos_3d = torch.arange(6, dtype=torch.long).view(1, 1, 6).expand(3, 1, 6).clone()
+        cpos = torch.tensor([5], dtype=torch.long)
+        for mdl in (hf_model, sa_model):
+            mi_2d = mdl.prepare_inputs_for_generation(
+                full_ids, past_key_values=_PastLenCache(), cache_position=cpos, position_ids=pos_2d
+            )
+            assert mi_2d["input_ids"].shape == (1, 1)
+            assert torch.equal(mi_2d["position_ids"], torch.tensor([[5]]))
+            mi_3d = mdl.prepare_inputs_for_generation(
+                full_ids, past_key_values=_PastLenCache(), cache_position=cpos, position_ids=pos_3d
+            )
+            assert mi_3d["position_ids"].shape == (3, 1, 1)
+            assert torch.equal(mi_3d["position_ids"], torch.full((3, 1, 1), 5, dtype=torch.long))
+            mi_nocp = mdl.prepare_inputs_for_generation(
+                full_ids, past_key_values=_PastLenCache(), position_ids=pos_2d
+            )
+            assert mi_nocp["input_ids"].shape == (1, 1)
+            assert torch.equal(mi_nocp["position_ids"], torch.tensor([[5]]))
+
     # 3b) In-package `Qwen36LoopHSSDForCausalLM.generate()` under mock HF `GenerationMixin` + hybrid `DynamicCache`
     import qloop.infer.hf_custom_modeling as hcm_mod
 
@@ -1015,18 +1204,72 @@ def test_ql60_005_local_stage_done_strict_markers_and_metadata(tmp_path: Path) -
     (ck2 / "COMPLETED").write_text("step000050\n", encoding="utf-8")
     assert _local_stage_done(run_root, "s2_v2_joint_bptt") is True
 
-    # 7) PROMOTED marker: accepted when finalized, rejected when explicitly contradicted by incomplete state.json
+    # 7) PROMOTED marker: MUST NOT treat bare or mid-run RL `PROMOTED` as stage completion!
+    #    Real `CheckpointManager.save()` writes `{stage, step, saved_at, n_params}` (no status/target_steps),
+    #    and RL mid-run promotion (`trainer.py` -> `PROMOTED`) happens every eval cadence while training continues.
     ck3 = tmp_path / "s4_rl" / "checkpoints"
-    (ck3 / "step000025").mkdir(parents=True)
-    (ck3 / "PROMOTED").write_text("step000025\n", encoding="utf-8")
-    (ck3 / "step000025" / "state.json").write_text(
+    (ck3 / "step_0000025").mkdir(parents=True)
+    (ck3 / "PROMOTED").write_text("step_0000025\n", encoding="utf-8")
+    assert _local_stage_done(run_root, "s4_rl") is False
+    (ck3 / "step_0000025" / "state.json").write_text(
+        json.dumps({"stage": "s4_rl", "step": 25, "saved_at": 1700000000.0, "n_params": 1234}),
+        encoding="utf-8",
+    )
+    assert _local_stage_done(run_root, "s4_rl") is False
+    (ck3 / "step_0000025" / "state.json").write_text(
         json.dumps({"step": 25, "target_steps": 400, "status": "in_progress"}), encoding="utf-8"
     )
     assert _local_stage_done(run_root, "s4_rl") is False
-    (ck3 / "step000025" / "state.json").write_text(
+    (ck3 / "step_0000025" / "state.json").write_text(
         json.dumps({"step": 400, "target_steps": 400, "status": "completed"}), encoding="utf-8"
     )
     assert _local_stage_done(run_root, "s4_rl") is True
+
+
+def test_ql60_005_midrun_rl_promoted_blocks_pack_shipping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mid-run RL `checkpoints/PROMOTED` with `CheckpointManager.save()` state.json MUST NOT ship pack."""
+    monkeypatch.setenv("QLOOP_RUN_ROOT", str(tmp_path))
+
+    s4_ck_dir = tmp_path / "s4_v2_rl" / "checkpoints"
+    step_dir = s4_ck_dir / "step_0000025"
+    step_dir.mkdir(parents=True, exist_ok=True)
+    (s4_ck_dir / "LATEST").write_text("step_0000025\n", encoding="utf-8")
+    (s4_ck_dir / "PROMOTED").write_text("step_0000025\n", encoding="utf-8")
+    (step_dir / "state.json").write_text(
+        json.dumps({"stage": "s4_v2_rl", "step": 25, "saved_at": 1700000000.0, "n_params": 1234}),
+        encoding="utf-8",
+    )
+
+    class _PausedS4Manifest:
+        def is_completed(self, stage: str) -> bool:
+            return stage != "s4_v2_rl"
+
+    monkeypatch.setattr("qloop.hub.HubSyncManager.fetch_manifest", lambda self: _PausedS4Manifest())
+    monkeypatch.setattr(
+        "qloop.colab.ensure_quant_runtime_packages",
+        lambda base_precision="nvfp4", *, auto_install=True: {
+            "precision": str(base_precision),
+            "package": "stub",
+            "pip_spec": "",
+            "status": "ready",
+        },
+    )
+    issued_cmds: list[str] = []
+    monkeypatch.setattr("qloop.colab.q", lambda cmd, check=True: issued_cmds.append(cmd) or 0)
+
+    res = run_v3_e2e_and_ship_pack(
+        hf_repo="test/repo",
+        pack_repo="test/pack",
+        stages=DEFAULT_V2_STAGES,
+    )
+    assert res["pipeline_rc"] == 0
+    assert res["all_stages_completed"] is False
+    assert res["pack_shipped"] is False
+    assert not any(c.startswith("export-pack") for c in issued_cmds)
+    assert not any(c.startswith("sync disk") for c in issued_cmds)
+    assert len(issued_cmds) == 1 and issued_cmds[0].startswith("sync pipeline")
 
 
 # ============================================================================ 4. QL60-006

@@ -611,6 +611,30 @@ class CausalLMPackOutput(_ModelOutputBase):  # type: ignore[misc]
             raise KeyError(key)
         return self.to_tuple()[key]
 
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key == "cache":
+            self.past_key_values = value
+            return
+        if key in _PACK_OUTPUT_ORDER:
+            setattr(self, key, value)
+            return
+        OrderedDict.__setitem__(self, key, value)
+        if isinstance(key, str) and key.isidentifier():
+            object.__setattr__(self, key, value)
+
+    def __delitem__(self, key: str) -> None:
+        if key == "cache":
+            object.__setattr__(self, "past_key_values", None)
+            self._sync_mapping()
+            return
+        if key in _PACK_OUTPUT_ORDER:
+            object.__setattr__(self, key, None)
+            self._sync_mapping()
+            return
+        OrderedDict.__delitem__(self, key)
+        if key in self.__dict__:
+            object.__delattr__(self, key)
+
 
 def _materialize_non_moe_meta_backbone(backbone: nn.Module, fallback_cfg: Any) -> None:
     """Materialize rotary & non-MoE-expert tensors on CPU while keeping 3D `mlp.experts` weights on `meta`."""
@@ -1032,6 +1056,23 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
             model_inputs["input_ids"] = None
         else:
             model_inputs["input_ids"] = input_ids
+        pos_ids = model_inputs.get("position_ids")
+        if (
+            past_length > 0
+            and isinstance(pos_ids, torch.Tensor)
+            and input_ids is not None
+            and pos_ids.ndim >= 2
+            and pos_ids.shape[-1] > input_ids.shape[1]
+        ):
+            if (
+                isinstance(cache_position, torch.Tensor)
+                and cache_position.numel() > 0
+                and int(cache_position.shape[0]) == input_ids.shape[1]
+                and int(cache_position.max().item()) < pos_ids.shape[-1]
+            ):
+                model_inputs["position_ids"] = pos_ids[..., cache_position]
+            else:
+                model_inputs["position_ids"] = pos_ids[..., -input_ids.shape[1] :]
         model_inputs["past_key_values"] = eff_cache
         model_inputs["use_cache"] = bool(use_cache)
         if attention_mask is not None:
@@ -7104,6 +7145,30 @@ else:
                 raise KeyError(key)
             return self.to_tuple()[key]
 
+        def __setitem__(self, key: str, value: Any) -> None:
+            if key == "cache":
+                self.past_key_values = value
+                return
+            if key in _ST_OUT_ORDER:
+                setattr(self, key, value)
+                return
+            OrderedDict.__setitem__(self, key, value)
+            if isinstance(key, str) and key.isidentifier():
+                object.__setattr__(self, key, value)
+
+        def __delitem__(self, key: str) -> None:
+            if key == "cache":
+                object.__setattr__(self, "past_key_values", None)
+                self._sync_mapping()
+                return
+            if key in _ST_OUT_ORDER:
+                object.__setattr__(self, key, None)
+                self._sync_mapping()
+                return
+            OrderedDict.__delitem__(self, key)
+            if key in self.__dict__:
+                object.__delattr__(self, key)
+
     CausalLMPackOutput = _StandaloneCausalLMOutput  # type: ignore[misc,assignment]
 
     _SA_CACHE_KWARGS: tuple[str, ...] = ("cache", "cache_params", "past_key_values", "past_key_value")
@@ -9331,6 +9396,23 @@ else:
                 model_inputs["input_ids"] = None
             else:
                 model_inputs["input_ids"] = input_ids
+            pos_ids = model_inputs.get("position_ids")
+            if (
+                past_length > 0
+                and isinstance(pos_ids, torch.Tensor)
+                and input_ids is not None
+                and pos_ids.ndim >= 2
+                and pos_ids.shape[-1] > input_ids.shape[1]
+            ):
+                if (
+                    isinstance(cache_position, torch.Tensor)
+                    and cache_position.numel() > 0
+                    and int(cache_position.shape[0]) == input_ids.shape[1]
+                    and int(cache_position.max().item()) < pos_ids.shape[-1]
+                ):
+                    model_inputs["position_ids"] = pos_ids[..., cache_position]
+                else:
+                    model_inputs["position_ids"] = pos_ids[..., -input_ids.shape[1] :]
             model_inputs["past_key_values"] = eff_cache
             model_inputs["use_cache"] = bool(use_cache)
             if attention_mask is not None:

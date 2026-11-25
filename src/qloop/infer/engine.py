@@ -340,8 +340,58 @@ class _QuantizedHasPreviousState:
         return any(x is not None for x in c.conv_states) or any(x is not None for x in c.recurrent_states)
 
 
+class _SingleSlotStateList:
+    """Mutable 1-element write-through proxy backed directly by `cache.<attr>[layer_idx]`."""
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __init__(self, cache: QuantizedHybridCache, attr: str, layer_idx: int) -> None:
+        self._cache = cache
+        self._attr = attr
+        self._layer_idx = int(layer_idx)
+
+    def _slot_list(self) -> list[Any]:
+        return getattr(self._cache, self._attr)
+
+    def __len__(self) -> int:
+        return 1
+
+    def __getitem__(self, idx: int) -> Any:
+        if idx in (0, -1):
+            return self._slot_list()[self._layer_idx]
+        raise IndexError(f"single-slot state list index out of range: {idx}")
+
+    def __setitem__(self, idx: int, value: Any) -> None:
+        if idx not in (0, -1):
+            raise IndexError(f"single-slot state list index out of range: {idx}")
+        self._slot_list()[self._layer_idx] = value
+
+    def __iter__(self) -> Any:
+        yield self[0]
+
+    def __repr__(self) -> str:
+        return f"[{self[0]!r}]"
+
+    @staticmethod
+    def _item_eq(a: Any, b: Any) -> bool:
+        if a is b:
+            return True
+        if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+            return a.shape == b.shape and a.dtype == b.dtype and a.device == b.device and bool(torch.equal(a, b))
+        if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+            return False
+        return bool(a == b)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, _SingleSlotStateList):
+            return self._item_eq(self[0], other[0])
+        if isinstance(other, list):
+            return len(other) == 1 and self._item_eq(self[0], other[0])
+        return NotImplemented
+
+
 class _LayerHasPreviousState:
-    """Per-layer dual-mode `has_previous_state` supporting `bool(x)`, `x[0]`, and `x()`."""
+    """Per-layer dual-mode `has_previous_state` supporting `bool(x)`, `x[0]`, `x.get(0)`, `0 in x`, and `x()`."""
 
     def __init__(self, cache: QuantizedHybridCache, layer_idx: int) -> None:
         self._cache = cache
@@ -354,29 +404,69 @@ class _LayerHasPreviousState:
         return bool(self._cache.has_previous_state(self._layer_idx, state_idx))
 
     def __getitem__(self, state_idx: int) -> bool:
-        return bool(self._cache.has_previous_state(self._layer_idx, int(state_idx)))
+        idx = int(state_idx)
+        if idx != 0:
+            raise KeyError(state_idx)
+        return bool(self._cache.has_previous_state(self._layer_idx, idx))
+
+    def get(self, state_idx: int = 0, default: Any = False) -> Any:
+        if int(state_idx) == 0:
+            return bool(self._cache.has_previous_state(self._layer_idx, 0))
+        return default
+
+    def __contains__(self, state_idx: object) -> bool:
+        return state_idx == 0
 
 
 class _QuantizedCacheLayer(_HFCacheLayerBase):  # type: ignore[misc]
     """HF 5.24+ `DynamicLayer` / `LinearAttentionLayer`-compatible per-layer view into `QuantizedHybridCache`."""
 
+    is_compileable = False
+    is_sliding = False
+    record_past = False
+
     def __init__(self, cache: QuantizedHybridCache, layer_idx: int, layer_type: str) -> None:
+        # Bind backing cache attributes BEFORE super().__init__() so `CacheLayerMixin.__init__`'s
+        # `self.keys = None; self.values = None; self.is_initialized = False` succeeds cleanly.
+        self._cache = cache
+        self._layer_idx = int(layer_idx)
+        self.layer_type = str(layer_type)
+        self.supports_early_init = self.layer_type == "full_attention"
         if _HFCacheLayerBase is not object:
             try:
                 super().__init__()
             except (TypeError, ValueError):
                 pass
-        self._cache = cache
-        self._layer_idx = int(layer_idx)
-        self.layer_type = str(layer_type)
-        self.is_sliding = False
-        self.supports_early_init = self.layer_type == "full_attention"
+
+    @property
+    def is_croppable(self) -> bool:
+        return self.layer_type == "full_attention"
 
     @property
     def is_initialized(self) -> bool:
         if self.layer_type == "full_attention":
             return self._cache._kv_seq_len(self._layer_idx) > 0
         return bool(self._cache.has_previous_state(self._layer_idx))
+
+    @is_initialized.setter
+    def is_initialized(self, _value: bool) -> None:
+        return None
+
+    def lazy_initialization(
+        self,
+        key_states: torch.Tensor | None = None,
+        value_states: torch.Tensor | None = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        del args, kwargs
+        if isinstance(key_states, torch.Tensor):
+            self._cache._k_dtypes[self._layer_idx] = key_states.dtype
+        if isinstance(value_states, torch.Tensor):
+            self._cache._v_dtypes[self._layer_idx] = value_states.dtype
+
+    def get_max_length(self) -> int:
+        return -1
 
     @property
     def keys(self) -> torch.Tensor | None:
@@ -425,12 +515,12 @@ class _QuantizedCacheLayer(_HFCacheLayerBase):  # type: ignore[misc]
             c.value_cache[idx] = c._encode_slot(val)
 
     @property
-    def conv_states(self) -> list[torch.Tensor | None]:
-        return [self._cache.conv_states[self._layer_idx]]
+    def conv_states(self) -> _SingleSlotStateList:
+        return _SingleSlotStateList(self._cache, "conv_states", self._layer_idx)
 
     @property
-    def recurrent_states(self) -> list[Any]:
-        return [self._cache.recurrent_states[self._layer_idx]]
+    def recurrent_states(self) -> _SingleSlotStateList:
+        return _SingleSlotStateList(self._cache, "recurrent_states", self._layer_idx)
 
     @property
     def has_previous_state(self) -> _LayerHasPreviousState:
@@ -537,8 +627,6 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
         self.value_cache: list[torch.Tensor | None] = [None] * self.num_layers
         self.conv_states: list[torch.Tensor | None] = [None] * self.num_layers
         self.recurrent_states: list[Any] = [None] * self.num_layers
-        self.is_compileable = False
-        self.is_sliding: list[bool] = [False] * self.num_layers
 
         layer_wrappers = [
             _QuantizedCacheLayer(self, i, self.layer_types[i]) for i in range(self.num_layers)
@@ -564,6 +652,18 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
                     pass
         if getattr(self, "layers", None) is not layer_wrappers:
             self.layers: list[_QuantizedCacheLayer] = layer_wrappers
+
+    @property
+    def is_compileable(self) -> bool:
+        return False
+
+    @property
+    def is_sliding(self) -> list[bool]:
+        return [False] * self.num_layers
+
+    def is_recording_past(self, layer_idx: int = 0) -> bool:
+        del layer_idx
+        return False
 
     @property
     def has_previous_state(self) -> _QuantizedHasPreviousState:
@@ -686,7 +786,6 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
         conv_states: torch.Tensor,
         layer_idx: int,
         state_idx: int = 0,
-        *,
         conv_kernel_size: int | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:

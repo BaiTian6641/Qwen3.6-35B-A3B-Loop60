@@ -1,7 +1,7 @@
 # Loop64-Fable-SIRSI-v1 — Live Streaming Dataset Audit & Triage Report
 
 > **Target Dataset:** `TassP0lar/Loop64-Fable-SIRSI-v1` (local build validated via `--push-to-hub --dry-run`; **not pushed publicly yet** pending review)
-> **Local Persisted Path:** `/Users/tianrui6641/Qwen3.6-35B-A3B-Loop60/runs/datasets/Loop64-Fable-SIRSI-v1/`
+> **Local Persisted Path:** `runs/datasets/Loop64-Fable-SIRSI-v1/` (repo-relative)
 > **Pipeline Implementation:** [`src/qloop/data/sirsi_dataset.py`](../src/qloop/data/sirsi_dataset.py) · [`scripts/build_sirsi_dataset.py`](../scripts/build_sirsi_dataset.py) · [`configs/data/sirsi_golden_seeds.json`](../configs/data/sirsi_golden_seeds.json)
 > **Audit Scope:** Live streaming inspection of `9,418` raw items (`1,200` rows streamed per HF source + all `1,000` ARC-AGI-2 training tasks expanding to `1,076` test pairs + `18` author-original golden seeds; `0` full-dataset downloads), live HF Hub license verification across `10` candidate repositories, and live 13-gram decontamination against `12` accessible 2026 held-out benchmark suites (`1,889,432` unique 13-grams indexed).
 
@@ -178,12 +178,12 @@ Because `hf_router` requires HF Inference Provider credits / PRO subscription, l
 # Option A: Funded HF Router / HF PRO
 python scripts/build_sirsi_dataset.py --synthesize --teacher-provider hf_router \
   --teacher-model Qwen/Qwen2.5-72B-Instruct --max-synth 20 \
-  --out-dir /Users/tianrui6641/Qwen3.6-35B-A3B-Loop60/runs/datasets/Loop64-Fable-SIRSI-v1
+  --out-dir runs/datasets/Loop64-Fable-SIRSI-v1
 
 # Option B: Gemini / OpenAI / OpenRouter / Local vLLM
 GEMINI_API_KEY=... python scripts/build_sirsi_dataset.py --synthesize \
   --teacher-provider gemini --teacher-model gemini-2.5-pro --max-synth 20 \
-  --out-dir /Users/tianrui6641/Qwen3.6-35B-A3B-Loop60/runs/datasets/Loop64-Fable-SIRSI-v1
+  --out-dir runs/datasets/Loop64-Fable-SIRSI-v1
 ```
 
 ---
@@ -207,5 +207,5 @@ python scripts/build_sirsi_dataset.py \
   --push-to-hub \
   --repo-id TassP0lar/Loop64-Fable-SIRSI-v1 \
   --public \
-  --out-dir /Users/tianrui6641/Qwen3.6-35B-A3B-Loop60/runs/datasets/Loop64-Fable-SIRSI-v1
+  --out-dir runs/datasets/Loop64-Fable-SIRSI-v1
 ```

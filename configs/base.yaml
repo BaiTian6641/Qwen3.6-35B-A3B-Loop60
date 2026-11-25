@@ -31,10 +31,10 @@ loop:
   checkpoint: true            # activation checkpointing per virtual layer (non-reentrant)
   train_pass_probs: [0.25, 0.75]   # sample depth 1 sometimes: keeps the stock-graph path (vLLM-servable) healthy
 
-# ---------------------------------------------------------------- Legacy GDN-2 (retired; off by default)
-# Active v3.2 pipeline heals the loop directly over fast stock Qwen3.6 linear attention (`s0_probe`, `s1_loop_a6b`)
-# and upgrades all 30 linear layers to HSSD v3.2 + D-LSA (`s1b_hssd_distill` -> `s3_long_1m_lsa` -> `s2_joint_bptt` -> `s4_rl`).
-# Kept in schema (`enabled: false`) only for backward compatibility with legacy v2 GDN-2 checkpoints/tests.
+# ---------------------------------------------------------------- GDN-2-1M + QED (off in base; enabled in Clean v2 S2/S4)
+# Active Clean v2 pipeline heals the 88L loop (`s1_loop_a6b`) and calibrates 1M D-LSA (`s3_v2_long_1m_lsa`) over
+# stock Qwen3.6 native GDN (`gdn2.enabled: false`), then enables Step-0 bit-identical `GDN-2-1M + QED + Soft Neg-Eigval`
+# over `fla 0.6.0` DPLR (`gdn2.enabled: true`) in `s2_v2_joint_bptt` and `s4_v2_rl`. HSSD v3.1/v3.2 is retired.
 gdn2:
   enabled: false
   rank: 64

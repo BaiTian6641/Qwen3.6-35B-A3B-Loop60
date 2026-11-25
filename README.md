@@ -1,95 +1,109 @@
-# Qwen3.6-35B-A3B-Loop60 → `Qwen3.6-35B-A6B-LoopHSSD` (`v3.1` · `40L / 64L / 88L A6B`)
+# `Qwen3.6-35B-A3B-Loop64` — Clean v2 Looped Hybrid MoE & `1M`-Context Backbone (`40L / 64L / 88L`)
 
-Retrofits **`Qwen/Qwen3.6-35B-A3B`** (`40` physical layers = `10 × [3 Gated DeltaNet + 1 Gated Full Attention]`, `256` routed experts/layer, `~3B` single-pass active / `35B` total) into a **multi-tier Looped Hybrid MoE Reasoning & Ultra-Long-Context Backbone** (`40L ~2.95B` @ `R=1`, `64L ~4.46B` @ `R=2`, **`88L A6B ~5.97B` @ `R=3`**), synced stage-by-stage to **[`TassP0lar/Qwen3.6-35B-A3B-Loop64`](https://huggingface.co/TassP0lar/Qwen3.6-35B-A3B-Loop64)** and shipped as a self-contained Hugging Face **Whole Model Pack** at **[`TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack`](https://huggingface.co/TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack)**.
+Retrofits **`Qwen/Qwen3.6-35B-A3B`** (`40` physical layers = `10 × [3 Gated DeltaNet + 1 Gated Full Attention]`, `256` routed experts/layer, `34.661B` stored decoder parameters with `32.212B` routed MoE weights 100% frozen and SHA-256 verified) into a **Clean v2 Looped Hybrid MoE Backbone** with a calibrated **`[12, 36)` core** (`Prelude [0,12)×1 + Core [12,36)×R + Coda [36,40)×1` $\to$ `40L / 64L / 88L` virtual layers), **`GDN-2-1M + Bounded QED`** over `fla 0.6.0` DPLR kernels, **`1M` `FP8` `1.0×` `SharedKV` + per-pass `D-LSA`**, and low-rank **`APOLLO`** optimization on a single **`NVIDIA RTX PRO 6000 Blackwell Server Edition`** (`96 GB GDDR7 ECC` [`94.97 GiB` usable], `1,597 GB/s`, `sm_120`). Stage checkpoints sync to **[`TassP0lar/Qwen3.6-35B-A3B-Loop64`](https://huggingface.co/TassP0lar/Qwen3.6-35B-A3B-Loop64)** (with Whole Model Pack export targeting **[`TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack`](https://huggingface.co/TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack)** after Sprint 1/2 validation gates pass). **`HSSD v3.1/v3.2`** is explicitly retained in-repo solely as a **Retired Negative Ablation** (`docs/EXPERIMENT_REPORT.md §III-E`).
 
 ### Current Status & Tracked Documentation
 
-> **Live Clean v2 Status (`1× NVIDIA RTX PRO 6000 Blackwell Server Edition`, `96 GB GDDR7 ECC, 1,597 GB/s`):** `s3_v2_long_1m_lsa@600` completed (`12/12` Gate 2 sharp, `7/7` `18K/64K` needles, `10.65 GiB` 1M FP8 state); `s2_v2_joint_bptt` (`GDN-2-1M + QED`, `4×8K` `fla 0.6.0` DPLR) is live past `step 340/600` (`67.8 GiB` peak, `0` skips); next-gen target is **`Qwen3.6-64L-CoMem` (`LSA-NL` v2.0)**.
+> **Live Clean v2 Status (`1× NVIDIA RTX PRO 6000 Blackwell Server Edition`, `96 GB GDDR7 ECC` [`94.97 GiB` usable], `1,597 GB/s`, `sm_120`):** `s1_loop_a6b@1000` and `s3_v2_long_1m_lsa@600` completed (`12/12` Gate 2 checks sharp, `7/7` `18K/64K` needle hits, `10.65 GiB` analytical `1M` FP8 state); `s2_v2_joint_bptt` (`GDN-2-1M + QED`, `4×8K` `fla 0.6.0` DPLR) reached Hub commit `a5b20b20` (`step 450/600`, `117.96M` tokens, `0` skips). Following two independent mid-way audits, **further `LSA-NL`/`CoMem` expansion and `s4_v2_rl` are frozen** pending **Sprint 1** (CPU correctness/hygiene fixes) and **Sprint 2** (`~25–35` GPU-h leak-free holdout + `d=1` LoRA control validation; see [`docs/MIDWAY_REVIEW_AND_ACTION_PLAN.md`](docs/MIDWAY_REVIEW_AND_ACTION_PLAN.md)).
 
 | Document | Role & Scope | Status |
 | :--- | :--- | :---: |
-| **[`docs/PROPOSAL_LSA_NESTED_LEARNING.md`](docs/PROPOSAL_LSA_NESTED_LEARNING.md)** | Flagship Research Proposal (`v2.0`): **Latent-Sparse Nested Learning (`LSA-NL`)** 5-Frequency CMS (`L0 → L4`), Split-Horizon `3M–4M` (`100M+` cold SSD) + `10B`-token Forgetting/Graduation Funnel, 6 Original-LSA Upgrades, 3-Axis Dynamic Compute (`MoR` + lossless `L35` `EAGLE-3`/`TreeWY` drafting), `<= 24 GB` consumer profiles, `K0–K4`, & Phase-5 VLM blobs | **Flagship v2.0** |
-| **[`docs/PROPOSAL_LSA_NESTED_LEARNING_ZH.md`](docs/PROPOSAL_LSA_NESTED_LEARNING_ZH.md)** | Flagship Research Proposal (`v2.0`, Simplified Chinese companion of `PROPOSAL_LSA_NESTED_LEARNING.md` with 1-to-1 math, tables, Mermaid & `[1]..[50]` IEEE citation parity) | **Flagship v2.0** |
-| **[`docs/ARCHITECTURE_NEXTGEN_LOOP64_LSANL.md`](docs/ARCHITECTURE_NEXTGEN_LOOP64_LSANL.md)** | Engineer-Ready Component-by-Component Architecture & Implementation Specification (`v1.0`): **How It Works / Design / Implement** for all **7 Components (`C0–C6`)** with `7` dedicated Mermaid diagrams, exact `src/qloop/` anchors, `<= 24 GB` serving ledger, & `K0–K4` build order | **Spec v1.0** |
-| **[`docs/ARCHITECTURE_NEXTGEN_LOOP64_LSANL_ZH.md`](docs/ARCHITECTURE_NEXTGEN_LOOP64_LSANL_ZH.md)** | Component-by-Component Architecture & Implementation Specification (`v1.0`, Simplified Chinese companion of `ARCHITECTURE_NEXTGEN_LOOP64_LSANL.md` with exact 1-to-1 diagrams, tables & `[1]..[52]` IEEE citation parity) | **Spec v1.0** |
-| **[`docs/ROADMAP_NEXTGEN_LOOP64_COMEM.md`](docs/ROADMAP_NEXTGEN_LOOP64_COMEM.md)** | Next-Gen **`Qwen3.6-64L-CoMem` (`LSA-NL` v2.0)** Phased Execution Plan (`Phases 0–5` incl. Phase 2C `MoR`+`L35`/`TreeWY` & Phase 5 VLM), `Inkling 2 Mini` comparison, `Qwen3.6`/`Qwen3.8` tokenizer parity audit ([`scripts/verify_q36_q38_tokenizer_parity.py`](scripts/verify_q36_q38_tokenizer_parity.py)), & 3-Paper Publication Ladder | **Active v2.0** |
-| **[`docs/ROADMAP_NEXTGEN_LOOP64_COMEM_ZH.md`](docs/ROADMAP_NEXTGEN_LOOP64_COMEM_ZH.md)** | Next-Gen **`Qwen3.6-64L-CoMem` (`LSA-NL` v2.0)** Phased Execution Plan (Simplified Chinese companion of `ROADMAP_NEXTGEN_LOOP64_COMEM.md` with exact 1-to-1 tables, Mermaid & `[1]..[43]` IEEE citation parity) | **Active v2.0** |
-| **[`docs/COMPUTE_GRANT_PROPOSAL.md`](docs/COMPUTE_GRANT_PROPOSAL.md)** | Professor / Lab Cooperation & Multi-GPU Compute Allocation Proposal (`v2.0`, `400 / 2,500 / 6,000` GPU-h tiers with `K0–K4` kill-gates & 3-Paper Ladder) grounded in `167.60+` GPU-h single-card telemetry | **Ready v2.0** |
-| **[`docs/COMPUTE_GRANT_PROPOSAL_ZH.md`](docs/COMPUTE_GRANT_PROPOSAL_ZH.md)** | Professor / Lab Cooperation & Multi-GPU Compute Allocation Proposal (`v2.0`, Simplified Chinese companion of `COMPUTE_GRANT_PROPOSAL.md` with 1-to-1 numerical & `[1]..[54]` IEEE citation parity) | **Ready v2.0** |
-| **[`docs/EXPERIMENT_REPORT.md`](docs/EXPERIMENT_REPORT.md)** | Full Empirical Technical Report (English): `167.60` GPU-h telemetry, HSSD v3.2 negative ablation, completed `s3_v2@600` + Gate 1/2/3, live `s2_v2` (`GDN-2-1M + QED`), Blackwell `sm_120` kernels, & IEEE refs | **Live v1.4** |
+| **[`docs/MIDWAY_REVIEW_AND_ACTION_PLAN.md`](docs/MIDWAY_REVIEW_AND_ACTION_PLAN.md)** | **Mid-Way External Audit Cross-Verification Ledger & 2-Sprint Action Plan (`v1.0`):** Full verification of `QL60-001..010` + `A1–A3, B1–B5, C1–C3, D1–D5` against live `s2_v2@450` (`a5b20b20`), Canonical Parameter Accounting Table, literature diagnosis, data provenance policy, & Sprint 1/2 freeze gates | **Active v1.0** |
+| **[`docs/MIDWAY_REVIEW_AND_ACTION_PLAN_ZH.md`](docs/MIDWAY_REVIEW_AND_ACTION_PLAN_ZH.md)** | Mid-Way External Audit Cross-Verification Ledger & 2-Sprint Action Plan (`v1.0`, exact 1-to-1 Simplified Chinese companion with identical IEEE citation parity) | **Active v1.0** |
+| **[`docs/EXPERIMENT_REPORT.md`](docs/EXPERIMENT_REPORT.md)** | Full Empirical Technical Report (English): `167.60` GPU-h telemetry, Retired HSSD v3.2 negative ablation, completed `s3_v2@600` + Gate 1/2/3, live `s2_v2` (`GDN-2-1M + QED`), Blackwell `sm_120` kernels, & IEEE refs | **Live v1.4** |
 | **[`docs/EXPERIMENT_REPORT_ZH.md`](docs/EXPERIMENT_REPORT_ZH.md)** | Full Empirical Technical Report (Simplified Chinese mirror of `EXPERIMENT_REPORT.md`) | **Live v1.4** |
-| **[`docs/papers/`](docs/papers/)** | Published US-Letter IEEE PDFs: [`Loop64_Technical_Report_EN.pdf`](docs/papers/Loop64_Technical_Report_EN.pdf) · [`Loop64_Technical_Report_ZH.pdf`](docs/papers/Loop64_Technical_Report_ZH.pdf) | **Published** |
+| **[`docs/PROPOSAL_LSA_NESTED_LEARNING.md`](docs/PROPOSAL_LSA_NESTED_LEARNING.md)** | Next-Gen Research Proposal (`v2.0`, *frozen pending Sprint 1/2 + `K0` oracle*): **Latent-Sparse Nested Learning (`LSA-NL`)** 5-Frequency CMS (`L0 → L4`), Split-Horizon `3M–4M` (`100M+` cold SSD) + `10B`-token funnel, 6 Original-LSA upgrades, 3-Axis Dynamic Compute, `<= 24 GB` profiles, `K0–K4` | **Frozen v2.0** |
+| **[`docs/PROPOSAL_LSA_NESTED_LEARNING_ZH.md`](docs/PROPOSAL_LSA_NESTED_LEARNING_ZH.md)** | Next-Gen Research Proposal (`v2.0`, Simplified Chinese companion with 1-to-1 math, tables, Mermaid & `[1]..[50]` IEEE citation parity) | **Frozen v2.0** |
+| **[`docs/ARCHITECTURE_NEXTGEN_LOOP64_LSANL.md`](docs/ARCHITECTURE_NEXTGEN_LOOP64_LSANL.md)** | Component-by-Component Architecture & Implementation Spec (`v1.0`, *frozen pending Sprint 1/2 + `K0`*): `C0–C6` diagrams, `src/qloop/` anchors, `<= 24 GB` serving ledger, & `K0–K4` build order | **Frozen v1.0** |
+| **[`docs/ARCHITECTURE_NEXTGEN_LOOP64_LSANL_ZH.md`](docs/ARCHITECTURE_NEXTGEN_LOOP64_LSANL_ZH.md)** | Component-by-Component Architecture & Implementation Spec (`v1.0`, Simplified Chinese companion with exact 1-to-1 diagrams, tables & `[1]..[52]` IEEE citation parity) | **Frozen v1.0** |
+| **[`docs/ROADMAP_NEXTGEN_LOOP64_COMEM.md`](docs/ROADMAP_NEXTGEN_LOOP64_COMEM.md)** | Next-Gen **`Qwen3.6-64L-CoMem` (`LSA-NL` v2.0)** Phased Execution Plan (*gated by Sprint 1/2*), `Inkling 2 Mini` comparison, `Qwen3.6`/`Qwen3.8` tokenizer parity audit ([`scripts/verify_q36_q38_tokenizer_parity.py`](scripts/verify_q36_q38_tokenizer_parity.py)), & 3-Paper Ladder | **Gated v2.0** |
+| **[`docs/ROADMAP_NEXTGEN_LOOP64_COMEM_ZH.md`](docs/ROADMAP_NEXTGEN_LOOP64_COMEM_ZH.md)** | Next-Gen **`Qwen3.6-64L-CoMem` (`LSA-NL` v2.0)** Phased Execution Plan (Simplified Chinese companion with exact 1-to-1 tables, Mermaid & `[1]..[43]` IEEE citation parity) | **Gated v2.0** |
+| **[`docs/COMPUTE_GRANT_PROPOSAL.md`](docs/COMPUTE_GRANT_PROPOSAL.md)** | Professor / Lab Cooperation & Multi-GPU Compute Allocation Proposal (`v2.0`, `400 / 2,500 / 6,000` GPU-h tiers with `K0–K4` kill-gates & 3-Paper Ladder; update post-Sprint 2) | **Draft v2.0** |
+| **[`docs/COMPUTE_GRANT_PROPOSAL_ZH.md`](docs/COMPUTE_GRANT_PROPOSAL_ZH.md)** | Professor / Lab Cooperation & Multi-GPU Compute Allocation Proposal (`v2.0`, Simplified Chinese companion with 1-to-1 numerical & `[1]..[54]` IEEE citation parity) | **Draft v2.0** |
+| **[`docs/papers/`](docs/papers/)** | US-Letter IEEE PDFs: [`Loop64_Technical_Report_EN.pdf`](docs/papers/Loop64_Technical_Report_EN.pdf) · [`Loop64_Technical_Report_ZH.pdf`](docs/papers/Loop64_Technical_Report_ZH.pdf) | **Snapshot v1.4** |
 
-### Architectural Highlights
-- **`Loop-HSSD v3.1` (`88L A6B`) Subspace-Aligned Sandwich Recursion**: Scales `Prelude [0,8) ×1 + Core [8,32) ×3 + Coda [32,40) ×1` to **88 virtual layers** (`22` virtual global-attention layers) via Procrustes-calibrated `ReEntryBridge` (`r=256`, `w_anchor=0.85`), zero-initialised `PassExitGate`, per-pass Q/O rank-64 LoRA adapters, and `PassRouterAdapters` — preserving `torch.equal` step-0 identity while keeping all `32.338B` routed MoE weights 100% frozen (SHA-256 verified).
-- **Horizon-Split Surprise-Gated Delta Memory (`HSSD v3.1`) & NVIDIA `GDN-2` (`arXiv:2605.22791`)**:
-  - **Track B (`HSSD v3.1`, Audit-Hardened)**: Upgrades all 30 linear-attention layers with pure-linear low-rank `theta` projections (`~1.95M/layer`, `~57.5M–58.5M` across 30L vs `176.5M` dense), disjoint `[513, 576]` local SWA (`0` overlap with `[1, 512]` `D-LSA`), `PeakBoltzmannGate`, post-rotation 2D phase WY `chunk_kda` with cloned `float64` `theta_cum` (`< 2e-6 rad` @ `1M` steps), linear-`beta` write scaling, multi-page `routed` chunk-start root-surprise `s = g^2` on `boundary_ring[-1]`, `M=8` sparse Top-`2` STE write-budgeted pages, factored `8 KiB/tok/layer` decay (`16×` smaller), and compact `81–89 MiB/layer` `bfloat16` decode caches (`HSSDHybridCache` / HF beam-search ready).
-  - **Track A (`GDN-2`)**: Decoupled channel-wise erase/write/log-decay WY parallelization (`chunk_gdn2`) + `O(1)` recurrent decode (`recurrent_gdn2`).
-- **Cross-Pass Dynamic Expert Re-Routing (Beyond 3B Active Params)**: Per-pass router residual adapters recruit distinct Top-8 experts on Passes 2 and 3, consulting `~4.46B–5.97B` unique parameters per token from the frozen `32.3B` MoE pool with zero base-weight duplication.
-- **Two-Tier `1M–10M` Ultra-Long Context + `4×32K` K/V-Replay BPTT**:
-  - **Tier 1 (`1M` GPU-Resident Primary)**: `10.00 GiB` `FP8` `SharedKV` (`1.0×` KV across `R=1..3`) + untied per-pass `D-LSA` query indexers (`num_query_passes=3`) + `ReRoPE` relative distance clamping.
-  - **Tier 2 (`10M` Host-DDR5 Stretch)**: `Block64HadamardINT4Cache` (`2,304 B` 4-token micro-page, `53.64 GiB` pinned DDR5 @ `10M`) keeping `[0:64]` mRoPE strictly orthogonal to `[64:256]` NoPE for exact `ReRoPE` commutativity, prefetched 3 layers ahead.
-  - **`SegmentedKVBPTTRunner` (`128K` Differentiable Retrieval)**: Streams `4 × 32K` segments while differentiably re-projecting Top-`2,048` selected prior-segment K/V tokens.
-- **Blackwell `FP8` & `NVFP4` Quantized Base Checkpoints (`sm_120` · `96 GiB` VRAM / `230 GB` SSD)**:
-  - **Default `FP8` (`Qwen/Qwen3.6-35B-A3B-FP8`, `configs/model/qwen36_fp8.yaml`)**: Official `[128, 128]` block-scaled `e4m3` checkpoint requiring **`~35 GiB` VRAM & SSD** (vs `64.6 GiB` weights / `85.1 GiB` peak VRAM for `BF16`), accelerated by native `transformers>=5` `FineGrainedFP8` Blackwell kernels via `kernels>=0.18.2,<0.19.0` (auto-installed and verified by `scripts/colab_setup.sh` and `setup_env`, with a zero-crash PyTorch fallback if unavailable).
-  - **1-Line `NVFP4` Option (`unsloth/Qwen3.6-35B-A3B-NVFP4-Fast`, `configs/model/qwen36_nvfp4.yaml`)**: Set `BASE_PRECISION = "nvfp4"` (`base_precision="nvfp4"`) for **`~21 GiB` VRAM & SSD** via `compressed-tensors` group-16 `nvfp4-pack-quantized` weights (`BASE_PRECISION = "bf16"` remains available via `qwen36_bf16.yaml`).
-  - **Full Backward & Training Support (`quant_autograd`)**: Transient on-the-fly dequantizing `dL/dx` autograd bridge preserves native Blackwell forward speed under `no_grad()` while propagating exact input & router gradients across all probing and training stages (`S0`, `S1`, `S1b`, `S2`, `S3`, `S4`), `HotExpertDeltas`, and Whole Model Pack export with zero persistent `BF16` weight copies.
-- **Self-Contained Whole Model Pack & `OptimizedLoopInferenceEngine`**: Streams sharded `model-00001-of-NNNNN.safetensors` one `~4.5 GB` shard at a time (`< 6 GB` peak temporary SSD on Colab's `230 GB` disk) alongside standalone `configuration_qwen36_loophssd.py` & `modeling_qwen36_loophssd.py`, loadable via both `OptimizedLoopInferenceEngine.from_pretrained(...)` and standard `transformers.AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)`.
+### Canonical Parameter Accounting (`Qwen3.6-35B-A3B-Loop64`, `[12, 36)` Core)
 
-📄 **Formal Architecture, Implementation Plan & Research Documentation (`docs/`):**
-- 📘 **[Backbone Architecture Specification (`Loop-HSSD v3` / `35B-A6B`)](docs/ARCHITECTURE_SPEC.md)** — Definitive backbone modification blueprint closing all `v1` and `v2 Final-Pass Review` findings (`A1–A6, B1–B6, C1–C2, E1–E3`), scaling `Qwen3.6-35B-A3B` to `64L (~A4.5B)` and `88L (~A6.0B)` while reusing `>98.5%` frozen base weights.
-- 🛠️ **[Comprehensive Implementation & Kill-Gate Plan](docs/IMPLEMENTATION_PLAN.md)** — Module-by-module engineering roadmap (`M1–M6`), `Gate -1 -> Gate 4` falsification criteria, and calibrated Colab G4 (`96 GB` VRAM / `230 GB` SSD) budgets.
-- 📜 **[Formal Research Essay](docs/RESEARCH_ESSAY.md)** — Academic monograph with full proofs of Complex-to-Real `chunk_kda` Isomorphism, Cumulative Write-Mass Retention ($\exp(-\mathcal{B}/d_k)$), and `1-bit QJL` Variance Amplification vs. Block-64 Hadamard `INT4`.
-- 🧭 **[Baseline Engineering Review (Chinese)](docs/ANALYSIS.md)** — Detailed engineering audit of the foundation stack.
+To prevent conflating stored capacity, unique parameters consulted per token, and compute-equivalent parameter applications across looped passes, every report and card in this repository uses the exact closed-form ledger below (`expert = 3 × 2048 × 512 = 3,145,728`; `40 × 256 = 32.212B` routed; `40 × 1 = 0.126B` shared; `routed + shared = 32.338B`; `dense_unique ex-input-embed/norms = 1.9396B`):
+
+| Accounting Metric | Definition / Regime | Parameter Count | Notes & Caveats |
+| :--- | :--- | :---: | :--- |
+| **Stored Base Parameters** | Total `Qwen3.6-35B-A3B` decoder weights (`40L`) | **`34.661B`** | `32.212B` frozen routed MoE (SHA-256 verified) + `0.126B` shared + `2.323B` mixers/routers/untied embed+head |
+| **Unique Consulted / Token** *(ex-input-embed/norms)* | `d=1` (`U=8`) / `s2_v2@450` (`U=14.96`) / `s1` (`U=17.36`) / max (`U=24`) | **`2.947B` / `3.472B` / `3.653B` / `4.154B`** | Unique weights touched across `16` prelude+coda (`K=8`) and `24` core layers (`U` distinct experts/tok) |
+| **Compute-Equivalent Applications** *(incl. untied embed+head)* | `40L (d=1)` / `64L (d=2)` / `88L (d=3)` | **`3.454B` / `4.916B` / `6.378B`** | Re-executed weight applications (`2.946B / 4.409B / 5.871B` ex-input-embed); actual live `s2_v2@450` exit-gate blend magnitude is $\lvert g \rvert = 0.022\text{–}0.058$ |
+| **Trainable Delta Parameters** | `s1_loop_a6b` / `s3_v2_long_1m_lsa` / `s2_v2_joint_bptt` | **`18.41M` / `24.56M` / `156.94M`** | `0.053%` / `0.071%` / `0.453%` of stored decoder parameters; `0` routed MoE params trained |
+
+### Architectural Highlights (Clean v2 Active Stack)
+- **Calibrated `[12, 36)` Sandwich Recurrence (`40L / 64L / 88L`)**: Loops `Prelude [0,12)×1 + Core [12,36)×R + Coda [36,40)×1` (`R ∈ {1, 2, 3}`) via rank-256 subspace `ReEntryBridge`, zero-initialized `PassExitGate` (`torch.equal` Step-0 identity on unquantized paths), rank-64 per-pass Q/O LoRA adapters, and rank-32 `PassRouterAdapters` — keeping all `32.212B` routed MoE weights 100% frozen (SHA-256 verified).
+- **Clean v2 Linear Backbone (`Native-GDN → GDN-2-1M + Bounded QED`)**:
+  - **Active Clean v2 (`s3_v2_long_1m_lsa` → `s2_v2_joint_bptt` → `s4_v2_rl`)**: Uses stock Qwen3.6 Gated DeltaNet during `1M` `D-LSA` calibration (`s3_v2`), then enables Step-0 bit-identical **`GDN-2-1M + Bounded QED + Soft Neg-Eigval`** (`27.53M` params, `0` extra recurrent state bytes) mapped onto production `fla 0.6.0` DPLR Triton kernels with checkpointed `4×8K` macro-segmenting (`574898d`, cutting `T=32K` peak transient VRAM `3.28×` from `23.051 → 7.032 GiB`).
+  - **Retired Negative Ablation (`HSSD v3.1/v3.2`)**: Retained in `src/qloop/model/hssd.py` and `configs/stages/{s1b_hssd_distill,s3_long_1m_lsa,s2_joint_bptt,s4_rl}.yaml` strictly for audit/reproducibility; retired after 4-stage causal swap proved HSSD caused a `+0.79`-nat shock, dead vault pages (`3.26e-05`), `18K` needle failure, `+5.17 GiB` extra 1M state, and `5.6×` slower decode.
+- **Cross-Pass Dynamic Expert Re-Routing**: Per-pass router residual adapters recruit distinct Top-8 experts on Passes 2 and 3 (`U=14.96` core unique experts/tok in `s2_v2@450`, `U=17.36` in `s1`), expanding unique parameters consulted per token from `2.947B` (`d=1`) to `3.472B–3.653B` (`4.154B` theoretical max at `U=24`) with zero base-weight duplication.
+- **Memory-Feasible `1M` `FP8` `1.0×` `SharedKV` + Per-Pass `D-LSA` & `4×32K` K/V-Replay BPTT**:
+  - **Tier 1 (`1M` GPU-Resident Analytical State)**: Pure `4.0×` YaRN + `10.00 GiB` `FP8` `1.0×` `SharedKV` across `R=1..3` + `0.33 GiB` GDN state + `0.32 GiB` Ward centroids = **`10.65 GiB`** (`+1.04 GiB` current eager `int64` `BucketIndex` compactable to `~0.04 GiB`), with untied per-pass `D-LSA` query indexers (`num_query_passes=3`). End-to-end `128K–1M` generation/NLL capability validation is gated in Sprint 2 (`B3`).
+  - **Tier 2 (`10M` Host-DDR5 Stretch, Analytical)**: `Block64HadamardINT4Cache` (`2,304 B` 4-token micro-page, `53.64 GiB` pinned DDR5 @ `10M`) keeping `[0:64)` mRoPE orthogonal to `[64:256)` NoPE for exact `ReRoPE` commutativity.
+  - **`SegmentedKVBPTTRunner` (`4×32K = 128K`)**: Streams `4 × 32K` segments while differentiably re-projecting Top-`2,048` selected prior-segment K/V tokens.
+- **Single-GPU `APOLLO` Optimization & Blackwell Quantized Base (`sm_120` · `96 GB GDDR7 ECC` / `230 GB` SSD)**:
+  - **`APOLLO` (`rank=256, channel`) inside `FusedStepOptimizer`**: Compresses optimizer moments on large 2D `k/v/o` (`104.86M` params in `s2_v2`, `-0.60 GiB` net) and `shared_expert` (`209.72M` in `s4_v2_rl`, `-0.94 GiB` net) while preserving exact `AdamW` on narrow adapters and 1D norms.
+  - **`NVFP4` (`unsloth/Qwen3.6-35B-A3B-NVFP4`, `configs/model/qwen36_nvfp4.yaml`) & `FP8` (`Qwen/Qwen3.6-35B-A3B-FP8`, `configs/model/qwen36_fp8.yaml`)**: `~21–24 GiB` (`NVFP4`) or `~35 GiB` (`FP8`) VRAM & SSD footprint with Blackwell `sm_120` kernels (`kernels>=0.18.2,<0.19.0`, auto-installed and verified by `scripts/colab_setup.sh` and `setup_env`, with a zero-crash PyTorch fallback if unavailable) plus transient on-the-fly dequantizing `quant_autograd` for full backward support without persistent `BF16` weight copies.
+- **Self-Contained Whole Model Pack & `OptimizedLoopInferenceEngine`**: Streams sharded `model-00001-of-NNNNN.safetensors` one `~4.5 GB` shard at a time (`< 6 GB` peak temporary SSD on Colab's `230 GB` disk) alongside standalone `configuration_qwen36_loophssd.py` & `modeling_qwen36_loophssd.py` (HF `.generate()` + `QuantizedHybridCache` modern `transformers 5.24+` fixes tracked in Sprint 1 Track C).
+
+📄 **Historical Design & Audit Documentation (`docs/`):**
+- 📘 **[Backbone Architecture Specification (`Loop-HSSD v3`, Historical)](docs/ARCHITECTURE_SPEC.md)** — Original `v3` blueprint (HSSD portion now retired as negative ablation; `[12, 36)` loop & `D-LSA` carried into Clean v2).
+- 🛠️ **[Implementation & Kill-Gate Plan (Historical)](docs/IMPLEMENTATION_PLAN.md)** — Original `M1–M6` work packages and `Gate -1 -> Gate 4` schedule.
+- 📜 **[Formal Research Essay (Historical)](docs/RESEARCH_ESSAY.md)** — Proofs of Complex-to-Real `chunk_kda`, Write-Mass Retention, and Block-64 Hadamard `INT4`.
+- 🧪 **[Dataset Audit Report (`Loop64-Fable-SIRSI-v1`)](docs/DATASET_AUDIT_REPORT.md)** — Live streaming triage, dedup, and 13-gram decontamination audit (see `MIDWAY_REVIEW_AND_ACTION_PLAN.md §5` for public-release data provenance policy).
+- 🧭 **[Baseline Engineering Review (Chinese)](docs/ANALYSIS.md)** — Initial engineering audit of the foundation stack.
 
 ## Specialized Google Colab Notebooks (`notebooks/`)
 
 | Notebook | Role & Workflow |
 | :--- | :--- |
-| **[`notebooks/colab_probe.ipynb`](notebooks/colab_probe.ipynb)** | **Zero-Training Diagnostic & Calibration Suite**: Executes `Gate -1` (`fp64` math proofs), `Gate 0a` (hardware backward & step-0 surgery), `Gate 0p-1..4` (expert headroom, Procrustes subspace re-entry sweep, `native` vs `yarn` vs `rerope` extrapolation, single-layer `profile_hssd_layer` storage/throughput audit) + `Gate 1-Ablate` (`hssd_ablation_matrix`), writes `probe_report.{json,md}`, and prints calibrated `-s` overrides. |
-| **[`notebooks/colab_train_e2e.ipynb`](notebooks/colab_train_e2e.ipynb)** | **Self-Resuming `Loop-HSSD v3.1` E2E Training & Whole-Model Pack Release**: Runs/resumes `s0_probe → s1_loop_a6b → s1b_hssd_distill → s3_long_1m_lsa → s2_joint_bptt → s4_rl` across 24h Colab sessions and streams the sharded `safetensors` **Whole Model Pack** (`< 6 GB` temp SSD) to `TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack`. |
-| **[`notebooks/colab_infer_eval.ipynb`](notebooks/colab_infer_eval.ipynb)** | **Shipped On-Weight Inference & Frontier `R=1/2/3` Evaluation**: Loads the Whole Model Pack into `OptimizedLoopInferenceEngine` (`40L / 64L / 88L A6B`), demos `1M FP8` + `10M H_64 INT4` offload, and runs the held-out frontier depth-curve suite (`ARC-AGI-2`, `AIME 2026`, `LongBench v2`, `KernelBench`). |
-| **[`notebooks/colab_train.ipynb`](notebooks/colab_train.ipynb)** | **Track-A `64L` Baseline Single-Notebook Pipeline**: Resumable `GDN-2` + `mHC` + `D-LSA` + `GRPO` single-notebook workflow. |
+| **[`notebooks/colab_probe.ipynb`](notebooks/colab_probe.ipynb)** | **Zero-Training Diagnostic & Calibration Suite**: Executes `Gate -1` (`fp64` math proofs), `Gate 0a` (hardware backward & step-0 surgery), `Gate 0p-1..4` (expert headroom, Procrustes subspace re-entry sweep, `native` vs `yarn` vs `rerope` extrapolation, single-layer profiler), writes `probe_report.{json,md}`, and prints calibrated `-s` overrides. |
+| **[`notebooks/colab_train_e2e.ipynb`](notebooks/colab_train_e2e.ipynb)** | **Self-Resuming E2E Training & Whole-Model Pack Release**: Runs/resumes Clean v2 stages (`s0_probe → s1_loop_a6b → s3_v2_long_1m_lsa → s2_v2_joint_bptt → s4_v2_rl`, with `s4_v2_rl` and pack export gated by Sprint 1/2 completion checks) across 24h Colab sessions and streams sharded `safetensors` (`< 6 GB` temp SSD). |
+| **[`notebooks/colab_infer_eval.ipynb`](notebooks/colab_infer_eval.ipynb)** | **Shipped On-Weight Inference & Frontier `R=1/2/3` Evaluation**: Loads the exported pack into `OptimizedLoopInferenceEngine` (`40L / 64L / 88L`), demos `1M FP8` + `10M H_64 INT4` offload, and runs held-out depth-curve evaluation suites (`ARC-AGI-2`, `AIME 2026`, `LongBench v2`, `KernelBench`). |
+| **[`notebooks/colab_train.ipynb`](notebooks/colab_train.ipynb)** | **Single-Notebook Pipeline**: Resumable `GDN-2` + `mHC` + `D-LSA` + `GRPO` single-notebook workflow. |
 
 ## Guarantees Enforced by Unit Tests (`make check`)
 
 | Invariant | Test Suite |
 |---|---|
-| `Loop-HSSD v3.1` (`Gate -1`): Post-rotation 2D phase WY isomorphism, disjoint `[513, 576]` horizon (`0` overlap), multi-page `routed` `s = g^2` chunk-start WY equivalence, write-budget law, `ReEntryBridge` + router unlock, QJL variance & Block-64 Hadamard-ReRoPE commutativity, and `34.661B` ledger (`fp64`) | `tests/test_loop_hssd_v3_math.py` |
-| `HSSD v3.1` runtime & audit regressions (`3A` compact `81–89 MiB/layer` `bf16` cache, `3B` factored decay, `3C` sparse Top-`k` STE write budget, `3D` HF cache/beam ops, `3E` `cu_seqlens`/`seq_idx` isolation, `4.1` 2D padding logical clock, `4.2` `boundary_ring[-1]` & `state_equal`, `4.3` `1M`-step `fp64` `theta_cum`, `5–6` standalone parity) | `tests/test_hssd.py`, `tests/test_hssd_audit_regressions.py` |
-| Per-pass `D-LSA` (`num_query_passes=3`), `ReRoPE` distance clamping, `FP8KVCacheQuantizer`, `Block64HadamardINT4Cache` (`2,304 B` micro-page + `H_64` ReRoPE commutativity), and `SegmentedKVBPTTRunner` cross-segment K/V gradients | `tests/test_longctx_v3.py` |
-| Sharded `safetensors` Whole Model Pack export, low-disk `< 6 GB` shard streaming, standalone HF `AutoModelForCausalLM` loading (`HSSD v3.1` parity), and `OptimizedLoopInferenceEngine` (`R=1/2/3`, chunked prefill, `1.0×` FP8/INT4 SharedKV) | `tests/test_pack_infer.py`, `tests/test_v3_integration_e2e.py` |
-| Zero-training `Gate 0p-1..4` & `Gate 1-Ablate` structured probe suite (`probe_expert_headroom`, `probe_reentry_anchors`, `probe_positional_extrapolation`, `profile_hssd_layer`, `hssd_ablation_matrix`) & frozen MoE SHA-256 invariance | `tests/test_probes_v3.py`, `tests/test_loop_v3.py`, `tests/test_v3_integration_e2e.py` |
-| Loop-wrapped + GDN-2 / Subspace-Sandwich model is **bit-identical** to stock Qwen3.6 at step 0 (including `PassRouterAdapters`, `ReEntryBridge`, `PassExitGate`, per-pass Q/O LoRA) | `tests/test_loop.py`, `tests/test_loop_v3.py`, `tests/test_gdn2.py` |
-| NVIDIA GDN-2 chunkwise WY (`chunk_gdn2`) == sequential `recurrent_gdn2` in `fp64` (`1e-10` fwd / `1e-9` bwd) + MoR write-masked decode | `tests/test_gdn2.py` |
-| D-LSA with all buckets == dense attention; sparse decode == sparse full forward (flat + causal tree search) | `tests/test_lsa.py` |
-| Fused in-backward APOLLO/AdamW optimizer & chunked CE / log-probs == reference values & grads | `tests/test_optim_loss.py` |
-| Cross-session HF Hub commit resume, cumulative stage delta handoff, quota squash, & 230 GB disk cleanup | `tests/test_hub_sync.py` |
-| Exact trainer resume (trainables + optimizer + data stream + RNG) & GRPO verifiable-reward promote/rollback gate | `tests/test_trainer_e2e.py`, `tests/test_rl.py` |
-| All shipped v2 (`64L`) & v3.1 (`88L`) YAML configs + all 4 Colab notebooks validate on Python 3.9 AST grammar | `tests/test_configs_cli.py`, `scripts/ast_check.py` |
+| `GDN-2-1M + Bounded QED + Soft Neg-Eigval` Step-0 identity, `fla 0.6.0` DPLR equivalence, `4×8K` macro-segmenting, & Clean v2 stage wiring | `tests/test_gdn2.py`, `tests/test_gdn2_1m_qed_dplr.py`, `tests/test_v2_gdn_dlsa_pipeline.py` |
+| Loop-wrapped model is **bit-identical** to stock Qwen3.6 at step 0 in unquantized precision (`PassRouterAdapters`, `ReEntryBridge`, `PassExitGate`, per-pass Q/O LoRA) | `tests/test_loop.py`, `tests/test_loop_v3.py`, `tests/test_gdn2.py` |
+| Per-pass `D-LSA` (`num_query_passes=3`), `ReRoPE` distance clamping, `FP8KVCacheQuantizer`, `Block64HadamardINT4Cache` (`2,304 B` micro-page + `H_64` ReRoPE commutativity), and `SegmentedKVBPTTRunner` cross-segment K/V gradients | `tests/test_lsa.py`, `tests/test_longctx_v3.py` |
+| Sharded `safetensors` Whole Model Pack export, low-disk `< 6 GB` shard streaming, standalone HF `AutoModelForCausalLM` loading, and `OptimizedLoopInferenceEngine` (`R=1/2/3`, chunked prefill, `1.0×` FP8/INT4 SharedKV) | `tests/test_pack_infer.py`, `tests/test_v3_integration_e2e.py` |
+| Zero-training `Gate 0p-1..4` structured probe suite & frozen MoE SHA-256 invariance | `tests/test_probes_v3.py`, `tests/test_loop_v3.py`, `tests/test_v3_integration_e2e.py` |
+| Retired `HSSD v3.1/v3.2` math & audit regression suite (preserved for negative-ablation reproducibility) | `tests/test_loop_hssd_v3_math.py`, `tests/test_hssd.py`, `tests/test_hssd_audit_regressions.py` |
+| Isolated `LSA-NL` memory primitives (`kv_blob.py`, `esm.py` — frozen pending Sprint 1/2 + `K0`) | `tests/test_lsanl_memory.py` |
+| Fused in-backward `APOLLO`/`AdamW` optimizer & chunked CE / log-probs == reference values & grads | `tests/test_optim_loss.py` |
+| Cross-session HF Hub commit resume, cumulative stage delta handoff, quota squash, & `230 GB` disk cleanup | `tests/test_hub_sync.py` |
+| Exact trainer resume & GRPO verifiable-reward promote/rollback gate | `tests/test_trainer_e2e.py`, `tests/test_rl.py` |
+| All shipped Clean v2 & historical v3 YAML configs + all 4 Colab notebooks validate on Python 3.9 AST grammar | `tests/test_configs_cli.py`, `scripts/ast_check.py` |
 
 ## Repository Layout
 
 ```text
 src/qloop/
-  model/  loop.py (64L/88L ETD + ReEntryBridge + PassExitGate + PassRouterAdapters + MoR)
-          hssd.py (HSSD v3.1: chunk_kda + [513,576] SWA + PeakBoltzmannGate + M=8 STE pages + HSSDHybridCache)
-          gdn2.py (NVIDIA GDN-2 WY + recurrent)   mhc.py   lsa.py (per-pass D-LSA + YaRN)
+  model/  loop.py (40L/64L/88L ETD + ReEntryBridge + PassExitGate + PassRouterAdapters + MoR)
+          gdn2.py (Clean v2: GDN-2-1M + Bounded QED + Soft Neg-Eigval + fla DPLR 4x8K)
+          mhc.py   lsa.py (per-pass D-LSA + YaRN)
           pos_rerope.py (ReRoPE + LongPrefixCalibrator)   offload.py (FP8 + Block-64 H_64 INT4)
-          experts.py (ESFT scan + HotExpertDeltas + SHA-256 guard)   probes.py (Gate 0a / 0p-1..4 / 1-Ablate)
+          experts.py (ESFT scan + HotExpertDeltas + SHA-256 guard)   probes.py (Gate 0a / 0p-1..4)
+          hssd.py (Retired HSSD v3.1/v3.2 negative ablation — kept for audit reproducibility)
           loading.py   introspect.py   toy.py
+  memory/ kv_blob.py   esm.py (Isolated LSA-NL primitives — frozen pending Sprint 1/2 + K0)
   train/  stack.py (cumulative v2/v3 delta stack)   trainer.py (LM + long-prefix + BPTT)
           bptt.py (SegmentedKVBPTTRunner 4x32K)     rl.py (GRPO/RSI)
           optim.py (fused APOLLO)   loss.py (CCE/chunked)   checkpoint.py
   infer/  engine.py (OptimizedLoopInferenceEngine: R=1/2/3, chunked prefill, FP8/INT4 SharedKV)
           hf_custom_modeling.py (standalone Qwen36LoopHSSDConfig & Qwen36LoopHSSDForCausalLM)
   export_pack.py (Whole Model Pack sharded safetensors exporter & low-disk HF Hub streamer)
-  data/   registry.py  adapters.py  packing.py  mixture.py  decontam.py (13-gram)
+  data/   registry.py  adapters.py  packing.py  mixture.py  decontam.py (13-gram)  sirsi_dataset.py
   eval/   generate.py  scorers.py  registry.py (16 frontier benchmarks)  runners.py
           kernelbench.py  external.py (Harbor / tau-bench)  server.py
   hub.py (HF commit sync, 230 GB disk guard, Hub loader)
   env/doctor.py   debug.py (structured crash reports)   colab.py   cli.py
-configs/  base.yaml, model/, stages/ (v2 64L & v3.1 88L Loop-HSSD), eval/suite.yaml, local/
+configs/  base.yaml, model/, stages/ (Clean v2 & historical v3), eval/suite.yaml, local/
 notebooks/colab_probe.ipynb  colab_train_e2e.ipynb  colab_infer_eval.ipynb  colab_train.ipynb
 ```
 
@@ -103,33 +117,33 @@ make check    # Python 3.9 AST check (.py + .ipynb) + ruff lint + full pytest su
 .venv/bin/python -m qloop train -c configs/local/toy_rl.yaml   # smoke-test looped GRPO + gate
 ```
 
-## End-to-End `Loop-HSSD v3.1` Colab Workflow (`Probe → Train & Ship Pack → Infer & Eval`)
+## End-to-End Clean v2 Colab Workflow (`Probe → Train & Validate → Ship Pack`)
 
-1. **Calibrate (`notebooks/colab_probe.ipynb`)**: Run zero-training `Gate -1` + `Gate 0a` + `Gate 0p-1..4` + `Gate 1-Ablate` probes (`BASE_PRECISION = "fp8"` default `~35 GiB`, or `"nvfp4"` `~21 GiB`):
+1. **Calibrate (`notebooks/colab_probe.ipynb`)**: Run zero-training `Gate -1` + `Gate 0a` + `Gate 0p-1..4` probes (`BASE_PRECISION = "nvfp4"` `~21–24 GiB`, or `"fp8"` `~35 GiB`):
    ```python
    from qloop.colab import setup_env, run_probe_notebook_suite
-   setup_env(hf_repo="TassP0lar/Qwen3.6-35B-A3B-Loop64", base_precision="fp8")  # sets HF_XET_HIGH_PERFORMANCE=1 & verifies kernels>=0.18.2,<0.19.0
+   setup_env(hf_repo="TassP0lar/Qwen3.6-35B-A3B-Loop64", base_precision="nvfp4")  # sets HF_XET_HIGH_PERFORMANCE=1 & verifies kernels>=0.18.2,<0.19.0
    report = run_probe_notebook_suite(
        config_path="configs/stages/s0_probe.yaml",
-       base_precision="fp8",  # "fp8" | "nvfp4" | "bf16"
+       base_precision="nvfp4",  # "nvfp4" | "fp8" | "bf16"
        push_to_hub=True,
    )
    ```
-2. **Train & Stream Whole Model Pack (`notebooks/colab_train_e2e.ipynb`)**: Self-resumes across Colab 24h sessions and streams sharded `safetensors` (`< 6 GB` peak temporary SSD) to Hugging Face Hub upon final stage completion:
+2. **Train Clean v2 Stages (`notebooks/colab_train_e2e.ipynb`)**: Self-resumes across Colab 24h sessions (`s0_probe → s1_loop_a6b → s3_v2_long_1m_lsa → s2_v2_joint_bptt → s4_v2_rl`) and streams sharded `safetensors` (`< 6 GB` peak temporary SSD) only after verified completion gates pass:
    ```python
    from qloop.colab import setup_env, run_v3_e2e_and_ship_pack
-   setup_env(hf_repo="TassP0lar/Qwen3.6-35B-A3B-Loop64", base_precision="fp8")
+   setup_env(hf_repo="TassP0lar/Qwen3.6-35B-A3B-Loop64", base_precision="nvfp4")
    run_v3_e2e_and_ship_pack(
        hf_repo="TassP0lar/Qwen3.6-35B-A3B-Loop64",
        pack_repo="TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack",
-       base_precision="fp8",  # "fp8" | "nvfp4" | "bf16"
+       base_precision="nvfp4",  # "nvfp4" | "fp8" | "bf16"
        time_budget_hours=21.5,
        stream_low_disk=True,
    )
    ```
-   Or export / stream any promoted stage checkpoint directly via CLI:
+   Or export / stream a validated stage checkpoint directly via CLI:
    ```bash
-   python -m qloop export-pack -c configs/stages/s2_joint_bptt.yaml --ckpt runs/s4_rl \
+   python -m qloop export-pack -c configs/stages/s2_v2_joint_bptt.yaml --ckpt runs/s2_v2_joint_bptt \
        --push-repo TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack --stream-low-disk
    ```
 
@@ -142,7 +156,7 @@ engine = OptimizedLoopInferenceEngine.from_pretrained(
     "TassP0lar/Qwen3.6-35B-A6B-LoopHSSD-Pack",
     cfg=InferenceConfig(prefill_chunk_size=4096, fp8_kv_cache=True),
 )
-# Switch dynamically per request: R=1 (40L ~2.95B) | R=2 (64L ~4.46B) | R=3 (88L A6B ~5.97B)
+# Switch dynamically per request: R=1 (40L, 3.454B eq.) | R=2 (64L, 4.916B eq.) | R=3 (88L, 6.378B eq.)
 with engine.depth(3):
     out = engine.generate(
         "Prove that there are infinitely many primes p = 1 (mod 4).",

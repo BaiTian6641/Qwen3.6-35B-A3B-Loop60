@@ -61,12 +61,78 @@ def _in_backward() -> bool:
     return fn is not None and fn() != -1
 
 
+_LOGIT_ROUTER_CLASS_NAMES: frozenset[str] = frozenset(
+    {
+        "Qwen3_5MoeTopKRouter",
+        "Qwen3MoeTopKRouter",
+        "Qwen2MoeTopKRouter",
+        "Qwen3NextTopKRouter",
+        "MixtralTopKRouter",
+        "DeepseekV3TopkRouter",
+        "Glm4MoeTopKRouter",
+        "Llama4TextRouter",
+    }
+)
+
+_PROB_ROUTER_CLASS_SUFFIXES: tuple[str, ...] = (
+    "ProbRouter",
+    "ProbsRouter",
+    "ProbTopKRouter",
+    "ProbsTopKRouter",
+    "ProbabilityRouter",
+    "ProbabilityTopKRouter",
+)
+
+
+def _detect_router_returns_probs(router: nn.Module) -> bool | None:
+    """Deterministically detect at install time whether `router`'s full `[..., E]` output is probabilities.
+
+    Returns `False` for logit-returning routers (`nn.Linear`, quantized linear projections, HF
+    `Qwen3_5MoeTopKRouter` / `Qwen3MoeTopKRouter` / etc., or modules declaring logit output),
+    `True` for probability-returning routers/wrappers, and `None` only for unknown custom test mocks
+    (which fall back to a one-time `_looks_like_probs` check).
+    """
+    for attr in ("returns_probs", "return_probs", "_returns_probs"):
+        val = getattr(router, attr, None)
+        if isinstance(val, bool):
+            return val
+    for attr in ("returns_logits", "return_logits", "_returns_logits"):
+        val = getattr(router, attr, None)
+        if isinstance(val, bool):
+            return not val
+    for attr in ("router_output_kind", "output_kind"):
+        kind = getattr(router, attr, None)
+        if isinstance(kind, str):
+            k_low = kind.strip().lower()
+            if k_low in ("probs", "prob", "probabilities", "probability"):
+                return True
+            if k_low in ("logits", "logit"):
+                return False
+
+    if isinstance(router, nn.Linear):
+        return False
+
+    cls_name = type(router).__name__
+    if cls_name in _LOGIT_ROUTER_CLASS_NAMES:
+        return False
+    if cls_name.endswith(_PROB_ROUTER_CLASS_SUFFIXES):
+        return True
+
+    if is_quantized_module(router) and not any(
+        hasattr(router, a) for a in ("top_k", "num_experts_per_tok")
+    ):
+        return False
+
+    return None
+
+
 def _looks_like_probs(t: torch.Tensor) -> bool:
     with torch.no_grad():
         f = upcast(t.detach())
         if f.numel() == 0:
             return False
-        return bool((f >= 0).all() and ((f.sum(-1) - 1.0).abs() < 1e-3).all())
+        tol = 2e-2 if t.dtype == torch.bfloat16 else (5e-3 if t.dtype == torch.float16 else 1e-3)
+        return bool((f >= 0).all() and ((f.sum(-1) - 1.0).abs() < tol).all())
 
 
 # ============================================================================ spec / schedule
@@ -788,6 +854,9 @@ class LoopController:
             for phys in range(spec.prelude_end, spec.core_end):
                 router = router_of(self._orig["layers"][phys])
                 if router is not None:
+                    detected = _detect_router_returns_probs(router)
+                    if detected is not None:
+                        self._is_probs_cache[phys] = detected
                     # prepend=True guarantees per-pass routing executes BEFORE HotExpertDeltas / scan hooks
                     fn = self._pass_router_hook(phys, phys - spec.prelude_end)
                     self._hooks.append(router.register_forward_hook(fn, prepend=True))
@@ -797,6 +866,9 @@ class LoopController:
             for phys in range(spec.prelude_end, spec.core_end):
                 router = router_of(self._orig["layers"][phys])
                 if router is not None:
+                    detected = _detect_router_returns_probs(router)
+                    if detected is not None:
+                        self._is_probs_cache[phys] = detected
                     self._hooks.append(router.register_forward_hook(self._route_hook(phys, k, e)))
 
     def _wrap_kv_cache_submodule(self, phys: int, kvc_mod: nn.Module) -> None:
@@ -928,8 +1000,13 @@ class LoopController:
             delta = pr_mod.delta_logits(flat_x, p_idx, core_idx, prev_mask)
 
             if not isinstance(out, (tuple, list)):
-                new_out = out + delta.to(out.dtype).view_as(out)
-                probs_r = F.softmax(upcast(new_out.reshape(-1, e)), dim=-1)
+                if is_probs:
+                    base_l = upcast(out.reshape(-1, e)).clamp_min(1e-30).log()
+                    probs_r = F.softmax(base_l + delta.to(base_l.dtype), dim=-1)
+                    new_out = probs_r.to(out.dtype).view_as(out)
+                else:
+                    new_out = out + delta.to(out.dtype).view_as(out)
+                    probs_r = F.softmax(upcast(new_out.reshape(-1, e)), dim=-1)
                 if not _in_backward():
                     ctx.routing[(phys, r)] = probs_r.detach().topk(k, dim=-1).indices
                     if div_w > 0:
@@ -1026,7 +1103,9 @@ class LoopController:
                          (n_experts is None or o.shape[-1] == n_experts)), None)
             if full is not None:
                 e = full.shape[-1]
-                is_probs = isinstance(out, (tuple, list)) and _looks_like_probs(full)
+                if phys not in self._is_probs_cache:
+                    self._is_probs_cache[phys] = isinstance(out, (tuple, list)) and _looks_like_probs(full)
+                is_probs = self._is_probs_cache[phys]
                 probs = upcast(full.reshape(-1, e)) if is_probs else F.softmax(upcast(full.reshape(-1, e)), dim=-1)
                 if not _in_backward():
                     ctx.routing[(phys, r)] = probs.detach().topk(k, dim=-1).indices

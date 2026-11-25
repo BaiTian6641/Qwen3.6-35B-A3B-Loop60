@@ -48,7 +48,7 @@ from qloop.memory.kv_blob import (
     strip_sinks_and_unrotate_k,
 )
 from qloop.model._cache_compat import cache_kwarg_name, extract_output_cache
-from qloop.model.pos_rerope import apply_partial_rope_k, build_rope_inv_freq
+from qloop.model.pos_rerope import apply_partial_rope_k, build_rope_inv_freq, clamped_relative_distance
 
 CANONICAL_ARMS: tuple[str, str, str, str] = ("arm_a", "arm_b", "arm_c", "arm_d")
 
@@ -355,6 +355,37 @@ def decide_k0_verdict(report: K0Report, cfg: K0Config | None = None) -> K0Verdic
     if arm_a is not None and arm_d is not None and gap_d == 0.0 and arm_d.answer_nll != arm_a.answer_nll:
         gap_d = float(arm_d.answer_nll - arm_a.answer_nll)
 
+    # Guard against degenerate 0.0-recall Oracle baselines (never award GREEN or YELLOW_A!)
+    oracle_is_degenerate = arm_a is not None and (
+        (float(arm_a.exact_match) <= 0.0 and float(arm_a.token_acc) <= 0.0)
+        or float(arm_a.oracle_retention_ratio) <= 0.0
+    )
+    if oracle_is_degenerate:
+        assert arm_a is not None
+        verdict_obj = K0Verdict(
+            verdict="RED",
+            sub_verdict="INVALID_ORACLE",
+            rationale=(
+                f"Degenerate Oracle Arm (a) achieved 0.0% baseline recall (EM={arm_a.exact_match:.3f}, "
+                f"token_acc={arm_a.token_acc:.3f}, NLL={arm_a.answer_nll:.4f}); cannot award GREEN/YELLOW_A "
+                "retention against a zero-recall reference."
+            ),
+            recommended_action=(
+                "Verify checkpoint loading, tokenization, and prompt formatting until Oracle Arm (a) "
+                "achieves non-zero recall before interpreting Kill-Gate K0."
+            ),
+            arm_c_retention=0.0,
+            arm_d_retention=0.0,
+            arm_b_retention=0.0,
+            arm_c_nll_gap=gap_c,
+            arm_d_nll_gap=gap_d,
+        )
+        report.verdict = verdict_obj.verdict
+        report.sub_verdict = verdict_obj.sub_verdict
+        report.rationale = verdict_obj.rationale
+        report.recommended_action = verdict_obj.recommended_action
+        return verdict_obj
+
     g_thr = float(eff_cfg.green_threshold)
     y_thr = float(eff_cfg.yellow_threshold)
     nll_thr = eff_cfg.max_green_nll_gap
@@ -364,7 +395,17 @@ def decide_k0_verdict(report: K0Report, cfg: K0Config | None = None) -> K0Verdic
         or r_c > r_b
         or (math.isclose(r_c, r_b, abs_tol=1e-9) and arm_c.answer_nll < arm_b.answer_nll)
     )
+    beats_naive_d = (
+        arm_b is None
+        or r_d > r_b
+        or (
+            math.isclose(r_d, r_b, abs_tol=1e-9)
+            and arm_d is not None
+            and arm_d.answer_nll < arm_b.answer_nll
+        )
+    )
     nll_ok_c = nll_thr is None or gap_c <= float(nll_thr)
+    nll_ok_d = nll_thr is None or gap_d <= float(nll_thr)
 
     if r_c >= g_thr and beats_naive_c and nll_ok_c:
         verdict_obj = K0Verdict(
@@ -385,14 +426,16 @@ def decide_k0_verdict(report: K0Report, cfg: K0Config | None = None) -> K0Verdic
             arm_c_nll_gap=gap_c,
             arm_d_nll_gap=gap_d,
         )
-    elif r_d >= g_thr and (arm_d is not None):
+    elif arm_d is not None and r_d >= g_thr and beats_naive_d and nll_ok_d:
         verdict_obj = K0Verdict(
             verdict="YELLOW",
             sub_verdict="YELLOW_A_SELECTIVE_REFRESH",
             rationale=(
                 f"Arm (c) achieved {r_c:.1%} oracle retention (NLL gap {gap_c:+.4f} nats), while Arm (d) "
-                f"(+{eff_cfg.refresh_frac:.0%} CacheBlend selective refresh) crossed {r_d:.1%} (>= {g_thr:.0%}, "
-                f"NLL gap {gap_d:+.4f} nats), isolating Dynamic Error (D) to high-HKVD tokens."
+                f"(+{eff_cfg.refresh_frac:.0%} CacheBlend selective refresh) crossed {r_d:.1%} (>= {g_thr:.0%}), "
+                f"beat Arm (b) ({r_b:.1%}), with NLL gap {gap_d:+.4f} nats"
+                + (f" (<= {nll_thr:.3f} nats), " if nll_thr is not None else ", ")
+                + "isolating Dynamic Error (D) to high-HKVD tokens."
             ),
             recommended_action=(
                 f"Enable {eff_cfg.refresh_frac:.0%} CacheBlend selective token refresh on multi-hop "
@@ -405,11 +448,16 @@ def decide_k0_verdict(report: K0Report, cfg: K0Config | None = None) -> K0Verdic
             arm_d_nll_gap=gap_d,
         )
     elif r_c >= y_thr or r_d >= y_thr:
-        extra_note = ""
+        notes: list[str] = []
         if r_c >= g_thr and not beats_naive_c:
-            extra_note = f" (Arm c {r_c:.1%} did not beat naive Arm b {r_b:.1%}; verify probe separation)"
-        elif r_c >= g_thr and not nll_ok_c:
-            extra_note = f" (NLL gap {gap_c:+.4f} exceeded green limit {nll_thr:.3f} nats)"
+            notes.append(f"Arm c {r_c:.1%} did not beat naive Arm b {r_b:.1%}; verify probe separation")
+        if r_c >= g_thr and not nll_ok_c and nll_thr is not None:
+            notes.append(f"Arm c NLL gap {gap_c:+.4f} exceeded green limit {nll_thr:.3f} nats")
+        if arm_d is not None and r_d >= g_thr and not beats_naive_d:
+            notes.append(f"Arm d {r_d:.1%} did not beat naive Arm b {r_b:.1%}; verify probe separation")
+        if arm_d is not None and r_d >= g_thr and not nll_ok_d and nll_thr is not None:
+            notes.append(f"Arm d NLL gap {gap_d:+.4f} exceeded green limit {nll_thr:.3f} nats")
+        extra_note = f" ({'; '.join(notes)})" if notes else ""
         verdict_obj = K0Verdict(
             verdict="YELLOW",
             sub_verdict="YELLOW_B_BLOCK_ATTN_CALIB",
@@ -511,13 +559,42 @@ def extract_layer_kv_pairs(
         v_sel = v_all[idxs]
         return (k_sel.clone(), v_sel.clone(), idxs) if clone else (k_sel, v_sel, idxs)
 
-    # Case 2: `.key_cache` / `.value_cache` (Qwen3_5DynamicCache, ToyCache, HSSDCache, DynamicCache)
-    if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
-        kc_list = cache.key_cache
-        vc_list = cache.value_cache
-        for idx, (k_t, v_t) in enumerate(zip(kc_list, vc_list)):
+    # Case 2: `QuantizedHybridCache` (`_k_slots`/`_v_slots` for fp8/hadamard_int4 + `key_cache` for bf16/fp16)
+    if hasattr(cache, "_k_slots") and hasattr(cache, "_v_slots"):
+        k_slots = cache._k_slots
+        v_slots = cache._v_slots
+        kc_list = getattr(cache, "key_cache", ())
+        vc_list = getattr(cache, "value_cache", ())
+        k_dtypes = getattr(cache, "_k_dtypes", ())
+        v_dtypes = getattr(cache, "_v_dtypes", ())
+        n_total = max(len(k_slots), len(kc_list))
+        for idx in range(n_total):
             if wanted is not None and idx not in wanted:
                 continue
+            ks = k_slots[idx] if idx < len(k_slots) else None
+            vs = v_slots[idx] if idx < len(v_slots) else None
+            if ks is not None and vs is not None:
+                k_dt = k_dtypes[idx] if idx < len(k_dtypes) else torch.float32
+                v_dt = v_dtypes[idx] if idx < len(v_dtypes) else torch.float32
+                if hasattr(ks, "dequantize") and hasattr(vs, "dequantize"):
+                    k_t = ks.dequantize(k_dt)
+                    v_t = vs.dequantize(v_dt)
+                elif hasattr(cache, "gather_kv") and hasattr(ks, "seq_len"):
+                    t_idx = torch.arange(int(ks.seq_len), dtype=torch.long)
+                    k_t, v_t = cache.gather_kv(idx, t_idx, dtype=k_dt)
+                else:
+                    continue
+                if isinstance(k_t, torch.Tensor) and isinstance(v_t, torch.Tensor):
+                    raw_pairs.append(
+                        (
+                            idx,
+                            _normalize_layer_kv_tensor(k_t, batch_index),
+                            _normalize_layer_kv_tensor(v_t, batch_index),
+                        )
+                    )
+                continue
+            k_t = kc_list[idx] if idx < len(kc_list) else None
+            v_t = vc_list[idx] if idx < len(vc_list) else None
             if isinstance(k_t, torch.Tensor) and isinstance(v_t, torch.Tensor):
                 raw_pairs.append(
                     (idx, _normalize_layer_kv_tensor(k_t, batch_index), _normalize_layer_kv_tensor(v_t, batch_index))
@@ -527,13 +604,26 @@ def extract_layer_kv_pairs(
         for idx, layer_obj in enumerate(cache.layers):
             if wanted is not None and idx not in wanted:
                 continue
+            if hasattr(layer_obj, "is_initialized") and not bool(layer_obj.is_initialized):
+                continue
             k_t = getattr(layer_obj, "keys", None)
             v_t = getattr(layer_obj, "values", None)
             if isinstance(k_t, torch.Tensor) and isinstance(v_t, torch.Tensor):
                 raw_pairs.append(
                     (idx, _normalize_layer_kv_tensor(k_t, batch_index), _normalize_layer_kv_tensor(v_t, batch_index))
                 )
-    # Case 4: Mapping `layer_idx -> (k, v)`
+    # Case 4: `.key_cache` / `.value_cache` (Qwen3_5DynamicCache, ToyHybridCache, HSSDHybridCache, legacy DynamicCache)
+    elif hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
+        kc_list = cache.key_cache
+        vc_list = cache.value_cache
+        for idx, (k_t, v_t) in enumerate(zip(kc_list, vc_list)):
+            if wanted is not None and idx not in wanted:
+                continue
+            if isinstance(k_t, torch.Tensor) and isinstance(v_t, torch.Tensor):
+                raw_pairs.append(
+                    (idx, _normalize_layer_kv_tensor(k_t, batch_index), _normalize_layer_kv_tensor(v_t, batch_index))
+                )
+    # Case 5: Mapping `layer_idx -> (k, v)`
     elif isinstance(cache, Mapping):
         for idx in sorted(cache):
             idx_int = int(idx)
@@ -551,7 +641,7 @@ def extract_layer_kv_pairs(
                         _normalize_layer_kv_tensor(v_t, batch_index),
                     )
                 )
-    # Case 5: Legacy tuple/list of `(k, v)` pairs
+    # Case 6: Legacy tuple/list of `(k, v)` pairs
     elif isinstance(cache, (list, tuple)):
         for idx, item in enumerate(cache):
             if wanted is not None and idx not in wanted:
@@ -585,8 +675,10 @@ def inject_layer_kv_pairs(
 ) -> Any:
     """Write `[L_full, H_kv, T, D]` `(K, V)` tensors into a cache's full-attention layer slots.
 
-    Leaves all linear-attention (`GDN-2`) `recurrent_states` and `conv_states` untouched so
-    Partition-B KV blobs never pollute Partition-A recurrent streams.
+    Supports `QuantizedHybridCache` (`bf16`/`fp16`/`fp8`/`hadamard_int4`), `transformers >= 5.20/5.24`
+    `DynamicCache` (with pre-populated uninitialized `DynamicLayer`s or dynamic `.update()`),
+    `ToyHybridCache` / `HSSDHybridCache`, and plain dicts. Always leaves linear-attention (`GDN-2`)
+    `recurrent_states` and `conv_states` untouched so Partition-B blobs never pollute Partition-A.
     """
     if k_layers.shape != v_layers.shape or k_layers.ndim != 4:
         raise ValueError(
@@ -597,6 +689,60 @@ def inject_layer_kv_pairs(
             f"layer_indices length ({len(layer_indices)}) must match k_layers.shape[0] ({k_layers.shape[0]})"
         )
 
+    # Case 1: `QuantizedHybridCache` (route through `.update()` so fp8/hadamard_int4 `_k_slots` stay synced)
+    if hasattr(cache, "_k_slots") and hasattr(cache, "_v_slots") and hasattr(cache, "update"):
+        for slot, phys_idx in enumerate(layer_indices):
+            idx = int(phys_idx)
+            k_b = k_layers[slot].unsqueeze(0).contiguous()
+            v_b = v_layers[slot].unsqueeze(0).contiguous()
+            if idx < len(cache._k_slots):
+                cache._k_slots[idx] = None
+                cache._v_slots[idx] = None
+            if hasattr(cache, "key_cache") and idx < len(cache.key_cache):
+                cache.key_cache[idx] = None
+                cache.value_cache[idx] = None
+            if k_b.shape[-2] > 0:
+                cache.update(k_b, v_b, idx)
+        return cache
+
+    # Case 2: `transformers >= 5.20/5.24` `DynamicCache.layers` (handles uninitialized `DynamicLayer`s!)
+    if hasattr(cache, "layers") and isinstance(cache.layers, (list, tuple)):
+        has_cache_update = hasattr(cache, "update") and callable(cache.update)
+        for slot, phys_idx in enumerate(layer_indices):
+            idx = int(phys_idx)
+            k_b = k_layers[slot].unsqueeze(0).contiguous()
+            v_b = v_layers[slot].unsqueeze(0).contiguous()
+            if idx < len(cache.layers):
+                layer_obj = cache.layers[idx]
+                if hasattr(layer_obj, "reset") and callable(layer_obj.reset):
+                    layer_obj.reset()
+                else:
+                    if hasattr(layer_obj, "keys"):
+                        layer_obj.keys = None
+                    if hasattr(layer_obj, "values"):
+                        layer_obj.values = None
+                    if hasattr(layer_obj, "is_initialized"):
+                        layer_obj.is_initialized = False
+            if has_cache_update:
+                if k_b.shape[-2] > 0:
+                    cache.update(k_b, v_b, idx)
+            elif idx < len(cache.layers):
+                layer_obj = cache.layers[idx]
+                if hasattr(layer_obj, "update") and callable(layer_obj.update):
+                    if k_b.shape[-2] > 0:
+                        layer_obj.update(k_b, v_b)
+                else:
+                    layer_obj.keys = k_b
+                    layer_obj.values = v_b
+                    if hasattr(layer_obj, "is_initialized"):
+                        layer_obj.is_initialized = k_b.shape[-2] > 0
+            else:
+                raise IndexError(
+                    f"layer_idx={idx} out of range for cache.layers (len={len(cache.layers)}) with no .update()"
+                )
+        return cache
+
+    # Case 3: `.key_cache` / `.value_cache` (`ToyHybridCache`, `HSSDHybridCache`, legacy HF 4.x `DynamicCache`)
     if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
         for slot, phys_idx in enumerate(layer_indices):
             idx = int(phys_idx)
@@ -605,23 +751,6 @@ def inject_layer_kv_pairs(
                 cache.value_cache.append(None)
             cache.key_cache[idx] = k_layers[slot].unsqueeze(0).contiguous()
             cache.value_cache[idx] = v_layers[slot].unsqueeze(0).contiguous()
-        return cache
-
-    if hasattr(cache, "layers") and isinstance(cache.layers, (list, tuple)):
-        for slot, phys_idx in enumerate(layer_indices):
-            idx = int(phys_idx)
-            k_b = k_layers[slot].unsqueeze(0).contiguous()
-            v_b = v_layers[slot].unsqueeze(0).contiguous()
-            if idx < len(cache.layers):
-                layer_obj = cache.layers[idx]
-                layer_obj.keys = k_b
-                layer_obj.values = v_b
-            elif hasattr(cache, "update") and callable(cache.update):
-                cache.update(k_b, v_b, idx)
-            else:
-                raise IndexError(
-                    f"layer_idx={idx} out of range for cache.layers (len={len(cache.layers)}) with no .update()"
-                )
         return cache
 
     if isinstance(cache, dict):
@@ -690,6 +819,7 @@ class MountedPartitionBKV:
     kv_bytes_mounted: int
     stripped_sinks: int
     boundary_header_tokens: int
+    effective_positions: torch.Tensor | None = None
 
     def __iter__(self) -> Iterator[torch.Tensor]:
         yield self.k
@@ -813,6 +943,17 @@ def build_corrected_partition_b_kv(
     mount_start = max(int(virtual_offset), int(live_sink_len))
     vpos = torch.arange(mount_start, mount_start + n_tok, device=k4.device, dtype=torch.float64)
     eff_clamp = eff_cfg.clamp_relative_to_q_pos if clamp_relative_to_q_pos is None else clamp_relative_to_q_pos
+    if eff_clamp is not None:
+        q_p = float(eff_clamp)
+        delta_eff = clamped_relative_distance(
+            q_p - vpos,
+            linear_ceil=eff_cfg.linear_ceil,
+            log_scale=eff_cfg.log_scale,
+            max_pos=eff_cfg.max_pos,
+        )
+        eff_pos = q_p - delta_eff
+    else:
+        eff_pos = vpos
 
     k_mnt, v_mnt = mount_kv_blob(
         blob,
@@ -833,6 +974,7 @@ def build_corrected_partition_b_kv(
         kv_bytes_mounted=blob.payload_bytes() + blob.header_wire_bytes(),
         stripped_sinks=sink_n,
         boundary_header_tokens=hdr_applied,
+        effective_positions=eff_pos,
     )
 
 
@@ -922,9 +1064,14 @@ def selective_cacheblend_refresh(
 
     reduce_lead = tuple(range(k_mounted.ndim - 2))
     if score_mode == "first_layer_hkvd" and k_mounted.ndim >= 4:
-        dk0 = dk[0]
-        dv0 = dv[0]
-        per_tok = (dk0.pow(2).sum(dim=-1) + dv0.pow(2).sum(dim=-1))
+        # 5D `[B, L, H, T, D]` slices layer 0 (`[:, 0]`); 4D `[L, H, T, D]` slices layer 0 (`[0]`)
+        if k_mounted.ndim == 5:
+            dk0 = dk[:, 0]
+            dv0 = dv[:, 0]
+        else:
+            dk0 = dk[0]
+            dv0 = dv[0]
+        per_tok = dk0.pow(2).sum(dim=-1) + dv0.pow(2).sum(dim=-1)
         if per_tok.ndim > 1:
             per_tok = per_tok.mean(dim=tuple(range(per_tok.ndim - 1)))
     elif score_mode == "value_variance":
@@ -1590,10 +1737,14 @@ def run_k0_supersession_probe(
     mounted_v_parts = [live_sinks_v]
     cursor = mount_start
     upd_slot_sg = -1
+    stale_slot_sg = -1
     for blob in active_blobs:
         bk, bv = store.mount_blob(blob.blob_id, virtual_positions=cursor)
+        offset_before = sum(int(t.shape[-2]) for t in mounted_k_parts)
         if blob.blob_id == "session_2_updated":
-            upd_slot_sg = sum(int(t.shape[-2]) for t in mounted_k_parts) + (upd_fact_idx - sink_n)
+            upd_slot_sg = offset_before + (upd_fact_idx - sink_n)
+        elif blob.blob_id == "session_1_stale":
+            stale_slot_sg = offset_before + (stale_fact_idx - sink_n)
         mounted_k_parts.append(bk)
         mounted_v_parts.append(bv)
         cursor += blob.n_tokens
@@ -1602,7 +1753,7 @@ def run_k0_supersession_probe(
     v_sg = torch.cat(mounted_v_parts, dim=-2)
     out_sg, w_sg = _gqa_attention(q_rot, k_sg, v_sg)
     sg_upd_mass = float(w_sg[..., upd_slot_sg].mean().item()) if upd_slot_sg >= 0 else 0.0
-    sg_stale_mass = 0.0  # superseded Session-1 blob was excluded by SleepGate!
+    sg_stale_mass = float(w_sg[..., stale_slot_sg].mean().item()) if stale_slot_sg >= 0 else 0.0
     sg_logits = prototypes @ out_sg.float().mean(dim=(0, 1, 2))
     sg_pred = int(torch.argmax(sg_logits).item())
     sg_nll = float(F.cross_entropy(sg_logits.unsqueeze(0), torch.tensor([updated_class])).item())
@@ -1673,7 +1824,7 @@ def _compute_retention_ratio(
 ) -> float:
     def _safe_ratio(val: float, ref: float) -> float:
         if ref <= 0.0:
-            return 1.0 if val <= 0.0 else 0.0
+            return 0.0
         return float(val) / float(ref)
 
     if metric == "token_acc":
@@ -1740,12 +1891,13 @@ def run_k0_suite(
         return mean_nll, mean_acc, mean_em, tot_bytes, tot_ref, tot_ms
 
     ora_nll, ora_acc, ora_em, _, _, _ = _agg(per_arm_rows["arm_a"])
+    ora_has_signal = (ora_acc > 0.0) if eff_cfg.retention_metric == "token_acc" else (ora_em > 0.0 or ora_acc > 0.0)
     arms_out: dict[str, K0ArmMetrics] = {}
     for arm in CANONICAL_ARMS:
         rows = per_arm_rows[arm]
         nll, acc, em, tot_bytes, tot_ref, tot_ms = _agg(rows)
         ret = (
-            1.0
+            (1.0 if ora_has_signal else 0.0)
             if arm == "arm_a"
             else _compute_retention_ratio(em, acc, ora_em, ora_acc, eff_cfg.retention_metric)
         )
@@ -1769,11 +1921,14 @@ def run_k0_suite(
     per_category_summary: dict[str, dict[str, dict[str, float]]] = {}
     for cat, arm_dict in sorted(per_cat_rows.items()):
         c_ora_nll, c_ora_acc, c_ora_em, _, _, _ = _agg(arm_dict["arm_a"])
+        c_ora_ok = (
+            (c_ora_acc > 0.0) if eff_cfg.retention_metric == "token_acc" else (c_ora_em > 0.0 or c_ora_acc > 0.0)
+        )
         per_category_summary[cat] = {}
         for arm in CANONICAL_ARMS:
             c_nll, c_acc, c_em, _, c_ref, _ = _agg(arm_dict[arm])
             c_ret = (
-                1.0
+                (1.0 if c_ora_ok else 0.0)
                 if arm == "arm_a"
                 else _compute_retention_ratio(c_em, c_acc, c_ora_em, c_ora_acc, eff_cfg.retention_metric)
             )
@@ -2017,15 +2172,102 @@ def run_smoke_cpu(cfg: K0Config | None = None) -> K0Report:
     )
 
 
+def _clone_state_value(val: Any) -> Any:
+    """Recursively clone cached linear-attention state tensors so Arms `c`/`d` never alias mutable buffers."""
+    if val is None or isinstance(val, (bool, int, float, str)):
+        return val
+    if isinstance(val, torch.Tensor):
+        return val.clone()
+    if hasattr(val, "clone") and callable(val.clone):
+        try:
+            return val.clone()
+        except Exception:
+            pass
+    if isinstance(val, list):
+        return [_clone_state_value(x) for x in val]
+    if isinstance(val, tuple):
+        return tuple(_clone_state_value(x) for x in val)
+    if isinstance(val, dict):
+        return {k: _clone_state_value(v) for k, v in val.items()}
+    if hasattr(val, "__dict__"):
+        cls = type(val)
+        try:
+            cloned_attrs = {k: _clone_state_value(v) for k, v in vars(val).items()}
+            obj = cls.__new__(cls)
+            obj.__dict__.update(cloned_attrs)
+            return obj
+        except Exception:
+            return val
+    return val
+
+
+def _clone_linear_states_into(src_cache: Any, dst_cache: Any) -> None:
+    """Copy ONLY Partition-A linear-attention (`GDN-2`) conv/recurrent states from `src_cache` to `dst_cache`."""
+    if src_cache is None or dst_cache is None:
+        return
+    for attr in ("conv_states", "recurrent_states"):
+        src_list = getattr(src_cache, attr, None)
+        dst_list = getattr(dst_cache, attr, None)
+        if isinstance(src_list, list) and isinstance(dst_list, list):
+            for idx, item in enumerate(src_list):
+                if item is None:
+                    continue
+                while len(dst_list) <= idx:
+                    dst_list.append(None)
+                dst_list[idx] = _clone_state_value(item)
+    src_layers = getattr(src_cache, "layers", None)
+    dst_layers = getattr(dst_cache, "layers", None)
+    if isinstance(src_layers, (list, tuple)) and isinstance(dst_layers, (list, tuple)):
+        for s_layer, d_layer in zip(src_layers, dst_layers):
+            for attr in ("conv_states", "recurrent_states"):
+                s_val = getattr(s_layer, attr, None)
+                if s_val is not None and hasattr(d_layer, attr):
+                    try:
+                        setattr(d_layer, attr, _clone_state_value(s_val))
+                    except (AttributeError, TypeError):
+                        pass
+
+
+def _resolve_text_configs(model: Any) -> list[Any]:
+    """Collect candidate model/text configs in priority order (handles `Qwen36LoopHSSDForCausalLM` & VLMs)."""
+    raw_candidates: list[Any] = []
+    for owner_attr in ("_text_model", "model", "backbone"):
+        owner = getattr(model, owner_attr, None)
+        if owner is not None:
+            cfg_c = getattr(owner, "config", None)
+            if cfg_c is not None:
+                raw_candidates.append(cfg_c)
+    top_cfg = getattr(model, "config", None)
+    if top_cfg is not None:
+        text_cfg = getattr(top_cfg, "text_config", None)
+        if text_cfg is not None:
+            raw_candidates.append(text_cfg)
+        raw_candidates.append(top_cfg)
+
+    seen_ids: set[int] = set()
+    unique: list[Any] = []
+    for c in raw_candidates:
+        cid = id(c)
+        if cid not in seen_ids:
+            seen_ids.add(cid)
+            unique.append(c)
+
+    # Prefer configs carrying `layer_types` (hybrid full/linear attention metadata) first
+    unique.sort(key=lambda c: (0 if hasattr(c, "layer_types") else 1, 0 if hasattr(c, "num_hidden_layers") else 1))
+    return unique
+
+
 class HFCheckpointK0Evaluator:
     """Real HF / `Qwen3.6-64L` Kill-Gate `K0` evaluator ready for single-GPU execution (`~30 min`).
 
     Executes Arms `a`, `b`, `c`, `d` with zero gradient updates:
-      * Arm `a`: Full contiguous prefill of active sessions + live prompt + answer span.
+      * Arm `a`: Full contiguous prefill of live Partition-A sinks + active sessions + live prompt + answer.
       * Arm `b`: Independent session prefills spliced directly via `splice_naive_kv`.
-      * Arm `c`: Independent session prefills processed through `build_corrected_partition_b_kv`
-        (Pre-RoPE un-rotation, `[0:sink_tokens)` strip, `H64-INT4` pack/mount, `GDN-2` isolated).
-      * Arm `d`: Arm `c` + `selective_cacheblend_refresh` (`5%` top-HKVD tokens).
+      * Arm `c`: Prefills live Partition-A `[0:live_sink_n)` sinks (`PROPOSAL §3.3 Defense 1`), processes
+        active sessions through `build_corrected_partition_b_kv` (Pre-RoPE un-rotation, `[0:sink_tokens)`
+        strip, `H64-INT4` pack/mount), and keeps `GDN-2` recurrent states strictly isolated to Partition A.
+      * Arm `d`: Aligns each Oracle session slice's RoPE phase to `mnt.effective_positions` and applies
+        `selective_cacheblend_refresh` (`5%` top-HKVD tokens) cleanly on Partition-B tokens.
     """
 
     def __init__(
@@ -2045,13 +2287,30 @@ class HFCheckpointK0Evaluator:
                 self.device = torch.device("cpu")
         else:
             self.device = torch.device(device)
-        self.live_sink_len = int(live_sink_len)
+        self.live_sink_len = max(0, int(live_sink_len))
         self._cache_kw = cache_kwarg_name(model)
+        self._accepts_pos_ids = self._detect_position_ids_support(model)
+        self.last_diagnostics: dict[str, Any] = {}
+
+    @staticmethod
+    def _detect_position_ids_support(model: Any) -> bool:
+        """Return True iff the model (and its inner text model, if wrapped) explicitly accepts `position_ids`."""
         try:
-            params = inspect.signature(model.forward).parameters
+            top_params = inspect.signature(model.forward).parameters
         except (TypeError, ValueError, AttributeError):
-            params = {}
-        self._accepts_pos_ids = "position_ids" in params
+            return False
+        if "position_ids" not in top_params:
+            return False
+        inner = getattr(model, "_text_model", None)
+        if inner is None:
+            inner = getattr(model, "model", None)
+        if inner is not None and inner is not model:
+            try:
+                inner_params = inspect.signature(inner.forward).parameters
+            except (TypeError, ValueError, AttributeError):
+                return True
+            return "position_ids" in inner_params
+        return True
 
     def _encode(self, text: str) -> list[int]:
         if callable(self.tokenizer):
@@ -2114,19 +2373,44 @@ class HFCheckpointK0Evaluator:
 
     def _fresh_cache_from(self, ref_cache: Any) -> Any:
         cls = type(ref_cache)
-        cfg_obj = getattr(self.model, "config", None)
-        if cfg_obj is not None:
+        # 1. `QuantizedHybridCache(num_layers, layer_types, mode=...)`
+        if hasattr(ref_cache, "_k_slots") and hasattr(ref_cache, "num_layers") and hasattr(ref_cache, "layer_types"):
             try:
-                return cls(cfg_obj)
-            except TypeError:
+                return cls(
+                    int(ref_cache.num_layers),
+                    list(ref_cache.layer_types),
+                    mode=str(getattr(ref_cache, "mode", "fp8")),
+                )
+            except (TypeError, AttributeError, ValueError):
                 pass
+
+        # 2. Config-accepting hybrid / HF 5.x caches (`ToyHybridCache`, `HSSDHybridCache`, `DynamicCache(config=...)`)
+        text_cfgs = _resolve_text_configs(self.model)
+        for cfg_c in text_cfgs:
+            try:
+                return cls(cfg_c)
+            except (TypeError, AttributeError, ValueError):
+                pass
+            try:
+                return cls(config=cfg_c)
+            except (TypeError, AttributeError, ValueError):
+                pass
+
+        # 3. No-arg constructor
         try:
             return cls()
-        except TypeError:
+        except (TypeError, AttributeError, ValueError):
             pass
+
+        # 4. HF `DynamicCache(config=text_cfg)` / `DynamicCache()` / `cls(num_layers)` fallbacks
         try:
             from transformers.cache_utils import DynamicCache
 
+            for cfg_c in text_cfgs:
+                try:
+                    return DynamicCache(config=cfg_c)
+                except (TypeError, AttributeError, ValueError):
+                    pass
             return DynamicCache()
         except Exception:
             if hasattr(ref_cache, "key_cache"):
@@ -2147,13 +2431,20 @@ class HFCheckpointK0Evaluator:
         if not ans_ids:
             ans_ids = [0]
 
-        # Arm (a): Contiguous Oracle on active sessions + live_prompt + answer
+        # Split live Partition-A `[0:live_sink_n)` sinks (Defense 1) from remaining live query tokens
+        live_sink_n = min(self.live_sink_len, max(0, len(live_ids) - 1))
+        live_sink_ids = live_ids[:live_sink_n]
+        live_rest_ids = live_ids[live_sink_n:]
+
+        # Arm (a): Contiguous Oracle on `[live_sinks + active_sessions + live_rest + answer]`
         t0_a = time.perf_counter()
         flat_active = [tid for seq in active_sess_ids for tid in seq]
-        full_ids_a = torch.tensor([flat_active + live_ids + ans_ids], dtype=torch.long, device=self.device)
+        full_ids_a = torch.tensor(
+            [live_sink_ids + flat_active + live_rest_ids + ans_ids], dtype=torch.long, device=self.device
+        )
         out_a = self._forward(full_ids_a)
         nll_a, acc_a, em_a, pred_a = self._score_answer_from_logits(
-            out_a.logits, ans_ids, len(flat_active) + len(live_ids)
+            out_a.logits, ans_ids, live_sink_n + len(flat_active) + len(live_rest_ids)
         )
         oracle_k_full, oracle_v_full, layer_indices = extract_layer_kv_pairs(out_a)
         ms_a = (time.perf_counter() - t0_a) * 1000.0
@@ -2162,6 +2453,17 @@ class HFCheckpointK0Evaluator:
             oracle_k_full.numel() * oracle_k_full.element_size()
             + oracle_v_full.numel() * oracle_v_full.element_size()
         )
+
+        # Prefill live Partition-A `[0:live_sink_n)` sinks at `pos = 0..live_sink_n-1` (`PROPOSAL §3.3 Defense 1`)
+        live_sink_k: torch.Tensor | None = None
+        live_sink_v: torch.Tensor | None = None
+        live_sink_cache: Any = None
+        if live_sink_n > 0:
+            sink_t = torch.tensor([live_sink_ids], dtype=torch.long, device=self.device)
+            sink_pos = torch.arange(0, live_sink_n, dtype=torch.long, device=self.device).unsqueeze(0)
+            sink_out = self._forward(sink_t, position_ids=sink_pos)
+            live_sink_k, live_sink_v, _ = extract_layer_kv_pairs(sink_out, layer_indices=layer_indices)
+            live_sink_cache = extract_output_cache(sink_out)
 
         # Independent session prefills (shared across Arms b, c, d)
         raw_sessions_kv: list[tuple[torch.Tensor, torch.Tensor, list[int]]] = []
@@ -2175,28 +2477,35 @@ class HFCheckpointK0Evaluator:
             raw_sessions_kv.append((sk, sv, s_ids))
 
         live_and_ans = torch.tensor([live_ids + ans_ids], dtype=torch.long, device=self.device)
-        live_sink_n = min(self.live_sink_len, len(live_ids))
+        live_rest_and_ans = torch.tensor([live_rest_ids + ans_ids], dtype=torch.long, device=self.device)
 
         # Arm (b): Naive Spliced KV (raw post-RoPE + original sinks + stale sessions unmasked)
         t0_b = time.perf_counter()
         k_b_sess = torch.cat([sk for sk, _, _ in raw_sessions_kv], dim=-2)
         v_b_sess = torch.cat([sv for _, sv, _ in raw_sessions_kv], dim=-2)
-        cache_b = inject_layer_kv_pairs(self._fresh_cache_from(ref_cache), k_b_sess, v_b_sess, layer_indices)
+        cache_b = self._fresh_cache_from(ref_cache)
+        if k_b_sess.shape[-2] > 0:
+            inject_layer_kv_pairs(cache_b, k_b_sess, v_b_sess, layer_indices)
         out_b = self._forward(live_and_ans, cache=cache_b)
         nll_b, acc_b, em_b, pred_b = self._score_answer_from_logits(out_b.logits, ans_ids, len(live_ids))
         ms_b = (time.perf_counter() - t0_b) * 1000.0
         bytes_b = int(k_b_sess.numel() * k_b_sess.element_size() + v_b_sess.numel() * v_b_sess.element_size())
 
-        # Arm (c): Training-Free Pre-RoPE + Sink-Strip + H64-INT4 + Virtual Mount (active sessions only)
+        # Arm (c): Live Partition-A sinks + Training-Free Pre-RoPE + Sink-Strip + H64-INT4 + Virtual Mount
         t0_c = time.perf_counter()
-        base_mount_offset = max(int(cfg.virtual_offset), live_sink_n) if self._accepts_pos_ids else 0
+        base_mount_offset = max(int(cfg.virtual_offset), live_sink_n) if self._accepts_pos_ids else live_sink_n
         cursor = base_mount_offset
         mnt_k_list: list[torch.Tensor] = []
         mnt_v_list: list[torch.Tensor] = []
-        oracle_k_slices: list[torch.Tensor] = []
+        oracle_k_aligned_slices: list[torch.Tensor] = []
         oracle_v_slices: list[torch.Tensor] = []
         bytes_c = 0
-        ora_cursor = 0
+        ora_cursor = live_sink_n
+        inv_freq = (
+            build_rope_inv_freq(cfg.rotary_dim, rope_theta=cfg.rope_theta, device=self.device, dtype=torch.float64)
+            if cfg.rotary_dim > 0
+            else None
+        )
         for idx, (sk, sv, s_ids) in enumerate(raw_sessions_kv):
             if idx in superseded or not s_ids:
                 continue
@@ -2208,7 +2517,7 @@ class HFCheckpointK0Evaluator:
                 sk,
                 sv,
                 s_pos,
-                live_sink_n if self._accepts_pos_ids else 0,
+                live_sink_n,
                 cursor,
                 local_cfg,
                 blob_id=f"{example.example_id}_s{idx}",
@@ -2217,55 +2526,153 @@ class HFCheckpointK0Evaluator:
             mnt_v_list.append(mnt.v)
             bytes_c += mnt.kv_bytes_mounted
             cursor += int(mnt.k.shape[-2])
-            # Align corresponding Oracle KV slice (after stripped sinks) for Arm (d) HKVD refresh
-            oracle_k_slices.append(oracle_k_full[..., ora_cursor + eff_sink : ora_cursor + s_len, :])
-            oracle_v_slices.append(oracle_v_full[..., ora_cursor + eff_sink : ora_cursor + s_len, :])
+
+            # Blocker 4A fix: un-rotate Oracle session slice from its contiguous Oracle positions
+            # `[ora_cursor + eff_sink .. ora_cursor + s_len)` and re-rotate to `mnt.effective_positions`
+            # so Arm (d) HKVD scores true semantic/dynamic KV drift (NOT bogus RoPE position offsets!).
+            ora_k_raw = oracle_k_full[..., ora_cursor + eff_sink : ora_cursor + s_len, :]
+            ora_v_raw = oracle_v_full[..., ora_cursor + eff_sink : ora_cursor + s_len, :]
+            ora_pos = torch.arange(
+                ora_cursor + eff_sink, ora_cursor + s_len, dtype=torch.long, device=self.device
+            )
+            target_vpos = mnt.effective_positions if mnt.effective_positions is not None else mnt.virtual_positions
+            if cfg.rotary_dim > 0 and ora_k_raw.shape[-2] > 0:
+                ora_k_pre = strip_sinks_and_unrotate_k(
+                    ora_k_raw,
+                    ora_pos,
+                    rotary_dim=cfg.rotary_dim,
+                    rope_theta=cfg.rope_theta,
+                    sink_tokens=0,
+                    inv_freq=inv_freq,
+                    interleaved=cfg.interleaved,
+                )
+                ora_k_aligned = apply_partial_rope_k(
+                    ora_k_pre,
+                    target_vpos,
+                    inv_freq=inv_freq,
+                    rotary_dim=cfg.rotary_dim,
+                    rope_theta=cfg.rope_theta,
+                    interleaved=cfg.interleaved,
+                )
+            else:
+                ora_k_aligned = ora_k_raw
+            oracle_k_aligned_slices.append(ora_k_aligned)
+            oracle_v_slices.append(ora_v_raw)
             ora_cursor += s_len
 
         if mnt_k_list:
             k_c_partb = torch.cat(mnt_k_list, dim=-2)
             v_c_partb = torch.cat(mnt_v_list, dim=-2)
-            cache_c = inject_layer_kv_pairs(self._fresh_cache_from(ref_cache), k_c_partb, v_c_partb, layer_indices)
-            live_pos_ids: torch.Tensor | None = (
-                torch.arange(
-                    cursor, cursor + len(live_ids) + len(ans_ids), dtype=torch.long, device=self.device
-                ).unsqueeze(0)
-                if self._accepts_pos_ids
-                else None
-            )
         else:
             k_c_partb = oracle_k_full[..., :0, :]
             v_c_partb = oracle_v_full[..., :0, :]
-            cache_c = self._fresh_cache_from(ref_cache)
-            live_pos_ids = None
 
-        out_c = self._forward(live_and_ans, cache=cache_c, position_ids=live_pos_ids)
-        nll_c, acc_c, em_c, pred_c = self._score_answer_from_logits(out_c.logits, ans_ids, len(live_ids))
+        if live_sink_k is not None and live_sink_v is not None:
+            k_c_mount = torch.cat([live_sink_k, k_c_partb], dim=-2)
+            v_c_mount = torch.cat([live_sink_v, v_c_partb], dim=-2)
+        else:
+            k_c_mount = k_c_partb
+            v_c_mount = v_c_partb
+
+        cache_c = self._fresh_cache_from(ref_cache)
+        _clone_linear_states_into(live_sink_cache, cache_c)
+        if k_c_mount.shape[-2] > 0:
+            inject_layer_kv_pairs(cache_c, k_c_mount, v_c_mount, layer_indices)
+
+        live_pos_ids: torch.Tensor | None = (
+            torch.arange(
+                cursor, cursor + len(live_rest_ids) + len(ans_ids), dtype=torch.long, device=self.device
+            ).unsqueeze(0)
+            if self._accepts_pos_ids
+            else None
+        )
+        out_c = self._forward(live_rest_and_ans, cache=cache_c, position_ids=live_pos_ids)
+        nll_c, acc_c, em_c, pred_c = self._score_answer_from_logits(out_c.logits, ans_ids, len(live_rest_ids))
         ms_c = (time.perf_counter() - t0_c) * 1000.0
 
-        # Arm (d): Arm (c) + CacheBlend 5% Selective Refresh
+        # Arm (d): Live Partition-A sinks + Arm (c) + RoPE-Aligned CacheBlend 5% Selective Refresh
         t0_d = time.perf_counter()
+        rot_l2_pre = 0.0
+        nope_l2_pre = 0.0
+        pre_kv_l2 = 0.0
+        post_kv_l2 = 0.0
         if mnt_k_list:
-            ora_k_cat = torch.cat(oracle_k_slices, dim=-2)
+            ora_k_cat = torch.cat(oracle_k_aligned_slices, dim=-2)
             ora_v_cat = torch.cat(oracle_v_slices, dim=-2)
+            dk_aligned = ora_k_cat.float() - k_c_partb.float()
+            if cfg.rotary_dim > 0 and cfg.rotary_dim < dk_aligned.shape[-1]:
+                rot_l2_pre = float(dk_aligned[..., : cfg.rotary_dim].norm().item())
+                nope_l2_pre = float(dk_aligned[..., cfg.rotary_dim :].norm().item())
             ref_d = selective_cacheblend_refresh(
                 k_c_partb, v_c_partb, ora_k_cat, ora_v_cat, refresh_frac=cfg.refresh_frac
             )
-            cache_d = inject_layer_kv_pairs(self._fresh_cache_from(ref_cache), ref_d.k, ref_d.v, layer_indices)
+            pre_kv_l2 = ref_d.pre_refresh_kv_l2
+            post_kv_l2 = ref_d.post_refresh_kv_l2
+            if live_sink_k is not None and live_sink_v is not None:
+                k_d_mount = torch.cat([live_sink_k, ref_d.k], dim=-2)
+                v_d_mount = torch.cat([live_sink_v, ref_d.v], dim=-2)
+            else:
+                k_d_mount = ref_d.k
+                v_d_mount = ref_d.v
+            cache_d = self._fresh_cache_from(ref_cache)
+            _clone_linear_states_into(live_sink_cache, cache_d)
+            inject_layer_kv_pairs(cache_d, k_d_mount, v_d_mount, layer_indices)
             refreshed_d = ref_d.refreshed_tokens
         else:
             cache_d = self._fresh_cache_from(ref_cache)
+            _clone_linear_states_into(live_sink_cache, cache_d)
+            if live_sink_k is not None and live_sink_v is not None:
+                inject_layer_kv_pairs(cache_d, live_sink_k, live_sink_v, layer_indices)
             refreshed_d = 0
-        out_d = self._forward(live_and_ans, cache=cache_d, position_ids=live_pos_ids)
-        nll_d, acc_d, em_d, pred_d = self._score_answer_from_logits(out_d.logits, ans_ids, len(live_ids))
+
+        out_d = self._forward(live_rest_and_ans, cache=cache_d, position_ids=live_pos_ids)
+        nll_d, acc_d, em_d, pred_d = self._score_answer_from_logits(out_d.logits, ans_ids, len(live_rest_ids))
         ms_d = ms_c + (time.perf_counter() - t0_d) * 1000.0
+
+        self.last_diagnostics = {
+            "live_sink_tokens_prefilled": live_sink_n,
+            "base_mount_offset": base_mount_offset,
+            "part_b_tokens": int(k_c_partb.shape[-2]),
+            "mounted_total_tokens_arm_c": int(k_c_mount.shape[-2]),
+            "rot_l2_pre": rot_l2_pre,
+            "nope_l2_pre": nope_l2_pre,
+            "pre_refresh_kv_l2": pre_kv_l2,
+            "post_refresh_kv_l2": post_kv_l2,
+            "accepts_position_ids": self._accepts_pos_ids,
+        }
 
         return {
             "arm_a": K0EpisodeResult("arm_a", example.example_id, nll_a, acc_a, em_a, bytes_a, 0, ms_a, pred_a),
             "arm_b": K0EpisodeResult("arm_b", example.example_id, nll_b, acc_b, em_b, bytes_b, 0, ms_b, pred_b),
-            "arm_c": K0EpisodeResult("arm_c", example.example_id, nll_c, acc_c, em_c, bytes_c, 0, ms_c, pred_c),
+            "arm_c": K0EpisodeResult(
+                "arm_c",
+                example.example_id,
+                nll_c,
+                acc_c,
+                em_c,
+                bytes_c,
+                0,
+                ms_c,
+                pred_c,
+                extra={"live_sink_tokens_prefilled": live_sink_n, "base_mount_offset": base_mount_offset},
+            ),
             "arm_d": K0EpisodeResult(
-                "arm_d", example.example_id, nll_d, acc_d, em_d, bytes_c, refreshed_d, ms_d, pred_d
+                "arm_d",
+                example.example_id,
+                nll_d,
+                acc_d,
+                em_d,
+                bytes_c,
+                refreshed_d,
+                ms_d,
+                pred_d,
+                extra={
+                    "live_sink_tokens_prefilled": live_sink_n,
+                    "rot_l2_pre": rot_l2_pre,
+                    "nope_l2_pre": nope_l2_pre,
+                    "pre_refresh_kv_l2": pre_kv_l2,
+                    "post_refresh_kv_l2": post_kv_l2,
+                },
             ),
         }
 
@@ -2342,8 +2749,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Path or HF Hub ID of a Qwen3.6-64L checkpoint for zero-training GPU Kill-Gate K0 evaluation.",
     )
     ap.add_argument("--dataset", type=str, default=None, help="Optional JSON/JSONL file of K0Example episodes.")
-    ap.add_argument("--output-json", type=str, default=None, help="Optional path to write deterministic JSON report.")
-    ap.add_argument("--output-md", type=str, default=None, help="Optional path to write Markdown report.")
+    ap.add_argument(
+        "--output-json",
+        "--out-json",
+        dest="output_json",
+        type=str,
+        default=None,
+        help="Optional path to write deterministic JSON report.",
+    )
+    ap.add_argument(
+        "--output-md",
+        "--out-md",
+        dest="output_md",
+        type=str,
+        default=None,
+        help="Optional path to write Markdown report.",
+    )
     ap.add_argument("--green-threshold", type=float, default=0.92, help="Oracle retention threshold for GREEN.")
     ap.add_argument("--yellow-threshold", type=float, default=0.75, help="Oracle retention threshold for YELLOW.")
     ap.add_argument("--refresh-frac", type=float, default=0.05, help="Arm (d) CacheBlend selective refresh fraction.")

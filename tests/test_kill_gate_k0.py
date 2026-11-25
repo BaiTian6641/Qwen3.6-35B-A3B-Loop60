@@ -56,7 +56,9 @@ from qloop.eval.kill_gate_k0 import (
     splice_naive_kv,
 )
 from qloop.eval.testing import ByteTokenizer
-from qloop.model.toy import ToyConfig, ToyForCausalLM
+from qloop.infer.engine import QuantizedHybridCache
+from qloop.infer.hf_custom_modeling import Qwen36LoopHSSDConfig, Qwen36LoopHSSDForCausalLM
+from qloop.model.toy import ToyCausalLMOutput, ToyConfig, ToyForCausalLM, ToyHybridCache
 
 
 # ==============================================================================
@@ -232,6 +234,20 @@ def test_k0_partition_b_nope_orthogonality_rerope_clamp_and_boundary_header():
     assert r_zero.refreshed_tokens == 0
     assert torch.equal(r_zero.k, mnt_10k.k)
 
+    # 5D `[B, L, H, T, D]` `first_layer_hkvd` MUST slice layer 0 (`[:, 0]`), NOT batch 0 (`[0]`)!
+    k5_mnt = torch.zeros(2, 3, 2, 20, 64, dtype=torch.float32)
+    v5_mnt = torch.zeros_like(k5_mnt)
+    k5_ora = torch.zeros_like(k5_mnt)
+    v5_ora = torch.zeros_like(k5_mnt)
+    # Batch 0, Layer 0: small drift at t=5; Batch 1, Layer 0: large drift at t=11;
+    # Batch 0, Layer 1: huge drift at t=17 (must be ignored by `first_layer_hkvd`!).
+    k5_ora[0, 0, :, 5, :] = 0.5
+    k5_ora[1, 0, :, 11, :] = 4.0
+    k5_ora[0, 1, :, 17, :] = 100.0
+    r5 = selective_cacheblend_refresh(k5_mnt, v5_mnt, k5_ora, v5_ora, refresh_frac=0.05, score_mode="first_layer_hkvd")
+    assert r5.refreshed_tokens == 1
+    assert r5.refreshed_indices.tolist() == [11]
+
 
 # ==============================================================================
 # 2. Decision Tree Tests (`GREEN`, `YELLOW`, `RED` + Boundary Edge Cases)
@@ -302,6 +318,35 @@ def test_k0_decision_tree_boundary_verdicts():
     v_nosep = decide_k0_verdict(rep_no_sep)
     assert v_nosep.verdict == "YELLOW"
     assert "did not beat" in v_nosep.rationale.lower()
+
+    # Edge Case 7 (Blocker 4C): YELLOW_A requires BOTH `nll_ok_d` AND `beats_naive_d`
+    rep_ya_nll_fail = _make_report_for_ratios(r_b=0.20, r_c=0.80, r_d=0.95, nll_a=0.20, nll_c=0.35, nll_d=1.50)
+    v_ya_nll = decide_k0_verdict(rep_ya_nll_fail)
+    assert v_ya_nll.verdict == "YELLOW"
+    assert v_ya_nll.sub_verdict == "YELLOW_B_BLOCK_ATTN_CALIB"
+    assert "arm d nll gap" in v_ya_nll.rationale.lower()
+
+    rep_ya_naive_fail = _make_report_for_ratios(
+        r_b=0.98, r_c=0.95, r_d=0.96, nll_a=0.20, nll_b=0.205, nll_c=0.21, nll_d=0.21
+    )
+    v_ya_naive = decide_k0_verdict(rep_ya_naive_fail)
+    assert v_ya_naive.verdict == "YELLOW"
+    assert v_ya_naive.sub_verdict == "YELLOW_B_BLOCK_ATTN_CALIB"
+    assert "arm d" in v_ya_naive.rationale.lower() and "did not beat" in v_ya_naive.rationale.lower()
+
+    # Edge Case 8 (Blocker 4C): Degenerate 0.0-recall Oracle MUST NEVER pass GREEN or YELLOW_A!
+    zero_ex = [K0Example("zero_1", ["s1"], "q1", "a1")]
+
+    def all_zero_eval(ex: K0Example, arm_name: str, cfg: K0Config) -> K0EpisodeResult:
+        nlls = {"arm_a": 5.00, "arm_b": 5.10, "arm_c": 5.02, "arm_d": 5.01}
+        return K0EpisodeResult(arm_name, ex.example_id, nlls[arm_name], 0.0, 0.0)
+
+    rep_zero = run_k0_suite(zero_ex, all_zero_eval, K0Config())
+    assert rep_zero.verdict == "RED"
+    assert rep_zero.sub_verdict == "INVALID_ORACLE"
+    for arm_k in CANONICAL_ARMS:
+        assert rep_zero.arms[arm_k].oracle_retention_ratio == 0.0
+    assert "0.0%" in rep_zero.rationale
 
     # Config validation checks
     assert K0Config.from_dict({"green_threshold": 0.90, "refresh_frac": 0.10}).green_threshold == 0.90
@@ -499,13 +544,20 @@ def test_k0_report_json_markdown_and_cli_smoke_cpu(tmp_path: Path):
     loaded = load_examples_from_file(ds_jsonl)
     assert len(loaded) == 1 and loaded[0].example_id == "j1"
 
-    # In-process `main(["--smoke-cpu", ...])` check
+    # In-process `main(["--smoke-cpu", ...])` check (verifying both `--output-*` and `--out-*` aliases!)
     out_json = tmp_path / "k0_report.json"
     out_md = tmp_path / "k0_report.md"
     rc = main(["--smoke-cpu", "--output-json", str(out_json), "--output-md", str(out_md)])
     assert rc == 0
     assert out_json.exists() and json.loads(out_json.read_text(encoding="utf-8"))["verdict"] == "GREEN"
     assert out_md.exists() and "Kill-Gate `K0` Report" in out_md.read_text(encoding="utf-8")
+
+    out_json_alias = tmp_path / "k0_report_alias.json"
+    out_md_alias = tmp_path / "k0_report_alias.md"
+    rc_alias = main(["--smoke-cpu", "--out-json", str(out_json_alias), "--out-md", str(out_md_alias)])
+    assert rc_alias == 0
+    assert out_json_alias.exists() and json.loads(out_json_alias.read_text(encoding="utf-8"))["verdict"] == "GREEN"
+    assert out_md_alias.exists() and "Kill-Gate `K0` Report" in out_md_alias.read_text(encoding="utf-8")
 
     # Subprocess CLI entrypoint check (`python3 -m qloop.eval.kill_gate_k0 --smoke-cpu`)
     env = dict(os.environ)
@@ -521,3 +573,270 @@ def test_k0_report_json_markdown_and_cli_smoke_cpu(tmp_path: Path):
     assert proc.returncode == 0, f"CLI failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     assert "Kill-Gate `K0` Report" in proc.stdout
     assert "`GREEN`" in proc.stdout
+
+
+# ==============================================================================
+# 6. Audit Regressions: QuantizedHybridCache, TF 5.24 DynamicLayer, LoopHSSD & PosAware
+# ==============================================================================
+@pytest.mark.parametrize("mode", ["fp8", "hadamard_int4", "bf16"])
+def test_k0_quantized_hybrid_cache_fp8_and_hadamard_int4_extract_inject_update(mode: str):
+    torch.manual_seed(11)
+    layer_types = [
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+    ]
+    qc = QuantizedHybridCache(num_layers=8, layer_types=layer_types, mode=mode)
+    k3 = torch.randn(1, 2, 12, 128, dtype=torch.float32)
+    v3 = torch.randn(1, 2, 12, 128, dtype=torch.float32)
+    k7 = torch.randn(1, 2, 12, 128, dtype=torch.float32)
+    v7 = torch.randn(1, 2, 12, 128, dtype=torch.float32)
+    qc.update(k3, v3, 3)
+    qc.update(k7, v7, 7)
+    qc.conv_states[0] = torch.ones(1, 4, 3)
+    qc.recurrent_states[1] = torch.full((1, 2, 8, 8), 2.5)
+
+    # Extract must succeed cleanly across all QuantizedHybridCache modes (`fp8`, `hadamard_int4`, `bf16`)
+    ks, vs, idxs = extract_layer_kv_pairs(qc)
+    assert idxs == [3, 7]
+    assert ks.shape == (2, 2, 12, 128)
+    assert vs.shape == (2, 2, 12, 128)
+    assert float((ks[0] - k3[0]).norm() / k3[0].norm()) < 0.15
+
+    # Inject into a fresh QuantizedHybridCache preserving GDN-2 linear states & supporting subsequent `.update()`
+    qc_fresh = QuantizedHybridCache(num_layers=8, layer_types=layer_types, mode=mode)
+    conv_sentinel = torch.full((1, 4, 3), 7.0)
+    rec_sentinel = torch.full((1, 2, 8, 8), -3.0)
+    qc_fresh.conv_states[0] = conv_sentinel
+    qc_fresh.recurrent_states[1] = rec_sentinel
+
+    inject_layer_kv_pairs(qc_fresh, ks, vs, idxs)
+    assert qc_fresh.get_seq_length() == 12
+    assert qc_fresh.get_seq_length(3) == 12
+    assert qc_fresh.get_seq_length(7) == 12
+
+    # Subsequent live decode/prefill update MUST append cleanly to T = 12 + 4 = 16 (never silently drop!)
+    k_live = torch.randn(1, 2, 4, 128, dtype=torch.float32)
+    v_live = torch.randn(1, 2, 4, 128, dtype=torch.float32)
+    k_cat, v_cat = qc_fresh.update(k_live, v_live, 3)
+    qc_fresh.update(k_live, v_live, 7)
+    assert k_cat.shape == (1, 2, 16, 128)
+    assert v_cat.shape == (1, 2, 16, 128)
+    assert qc_fresh.get_seq_length(3) == 16
+    assert qc_fresh.get_seq_length(7) == 16
+    # GDN-2 linear states strictly isolated and untouched
+    assert torch.equal(qc_fresh.conv_states[0], conv_sentinel)
+    assert torch.equal(qc_fresh.recurrent_states[1], rec_sentinel)
+
+    # Verify HFCheckpointK0Evaluator._fresh_cache_from reconstructs QuantizedHybridCache cleanly
+    toy_m = ToyForCausalLM(ToyConfig(num_hidden_layers=8, head_dim=128, partial_rotary_factor=0.5))
+    ev = HFCheckpointK0Evaluator(toy_m, ByteTokenizer(), device="cpu")
+    qc_new = ev._fresh_cache_from(qc)
+    assert isinstance(qc_new, QuantizedHybridCache)
+    assert qc_new.mode == mode and qc_new.num_layers == 8 and qc_new.get_seq_length() == 0
+
+    # Also verify Track-C style QuantizedHybridCache (with `.layers` + `._k_dtypes` present simultaneously)
+    qc_fresh.layers = [SimpleNamespace(keys=None, values=None, is_initialized=False) for _ in range(8)]
+    qc_fresh._k_dtypes = [torch.float32] * 8
+    qc_fresh._v_dtypes = [torch.float32] * 8
+    ks_tc, vs_tc, idxs_tc = extract_layer_kv_pairs(qc_fresh)
+    assert idxs_tc == [3, 7] and ks_tc.shape[0] == 2 and vs_tc.shape[0] == 2
+    inject_layer_kv_pairs(qc_fresh, ks, vs, idxs)
+    assert qc_fresh.get_seq_length(3) == 12
+    k_cat2, _ = qc_fresh.update(k_live, v_live, 3)
+    assert k_cat2.shape == (1, 2, 16, 128)
+
+
+def test_k0_tf524_dynamic_layer_uninitialized_inject_and_update():
+    """Verify Blocker 2B: HF 5.20/5.24 pre-populated `DynamicLayer(is_initialized=False)` inject + update."""
+    torch.manual_seed(17)
+
+    class _TF524DynamicLayer:
+        def __init__(self) -> None:
+            self.keys: torch.Tensor | None = None
+            self.values: torch.Tensor | None = None
+            self.is_initialized: bool = False
+
+        def update(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            if not self.is_initialized:
+                self.keys = k
+                self.values = v
+                self.is_initialized = True
+            else:
+                assert self.keys is not None and self.values is not None
+                self.keys = torch.cat([self.keys, k], dim=-2)
+                self.values = torch.cat([self.values, v], dim=-2)
+            return self.keys, self.values
+
+        def get_seq_length(self) -> int:
+            return int(self.keys.shape[-2]) if (self.is_initialized and self.keys is not None) else 0
+
+        def reset(self) -> None:
+            self.keys = None
+            self.values = None
+            self.is_initialized = False
+
+    class _TF524LinearLayer:
+        def __init__(self) -> None:
+            self.conv_states: list[torch.Tensor | None] = [torch.ones(1, 4, 3)]
+            self.recurrent_states: list[torch.Tensor | None] = [torch.full((1, 2, 4, 4), 5.0)]
+
+    class _TF524HybridDynamicCache:
+        def __init__(self) -> None:
+            self.layers: list[object] = [
+                _TF524LinearLayer(),
+                _TF524LinearLayer(),
+                _TF524LinearLayer(),
+                _TF524DynamicLayer(),
+                _TF524LinearLayer(),
+                _TF524LinearLayer(),
+                _TF524LinearLayer(),
+                _TF524DynamicLayer(),
+            ]
+
+        def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+            layer = self.layers[layer_idx]
+            assert isinstance(layer, _TF524DynamicLayer)
+            return layer.update(k, v)
+
+        def get_seq_length(self, layer_idx: int = 3) -> int:
+            layer = self.layers[layer_idx]
+            return layer.get_seq_length() if isinstance(layer, _TF524DynamicLayer) else 0
+
+    cache = _TF524HybridDynamicCache()
+    k12 = torch.randn(2, 2, 12, 64)
+    v12 = torch.randn(2, 2, 12, 64)
+
+    inject_layer_kv_pairs(cache, k12, v12, [3, 7])
+    layer3 = cache.layers[3]
+    layer7 = cache.layers[7]
+    assert isinstance(layer3, _TF524DynamicLayer) and isinstance(layer7, _TF524DynamicLayer)
+    assert layer3.is_initialized is True and layer7.is_initialized is True
+    assert cache.get_seq_length(3) == 12
+    assert cache.get_seq_length(7) == 12
+
+    # Subsequent live update MUST concatenate to T = 12 + 4 = 16 (never overwrite!)
+    k4 = torch.randn(1, 2, 4, 64)
+    v4 = torch.randn(1, 2, 4, 64)
+    k_cat, v_cat = cache.update(k4, v4, 3)
+    assert k_cat.shape == (1, 2, 16, 64)
+    assert torch.equal(k_cat[:, :, :12], k12[0:1])
+    assert torch.equal(k_cat[:, :, 12:], k4)
+    assert cache.get_seq_length(3) == 16
+
+    # Extract cleanly recovers initialized full-attention slots while ignoring linear layers
+    ks_out, vs_out, idxs_out = extract_layer_kv_pairs(cache, layer_indices=[3])
+    assert idxs_out == [3] and ks_out.shape == (1, 2, 16, 64) and torch.equal(vs_out[0], v_cat[0])
+    # Linear layers remain strictly untouched
+    lin0 = cache.layers[0]
+    assert isinstance(lin0, _TF524LinearLayer)
+    assert lin0.conv_states[0] is not None and torch.equal(lin0.conv_states[0], torch.ones(1, 4, 3))
+
+
+def test_k0_hf_evaluator_qwen36_loop_hssd_and_pos_aware_arm_d_alignment():
+    """Verify Blockers 4A, 4B, and Issue 4D on `Qwen36LoopHSSDForCausalLM` and a `position_ids`-aware model."""
+    torch.manual_seed(23)
+    tok = ByteTokenizer()
+
+    # Part A (Blocker 4B): `Qwen36LoopHSSDForCausalLM` end-to-end (outer pack config != inner `_text_model.config`)
+    toy_cfg = ToyConfig(
+        vocab_size=260,
+        hidden_size=32,
+        num_hidden_layers=8,
+        full_attention_interval=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=128,
+        partial_rotary_factor=0.5,  # rotary_dim = 64
+        rope_theta=10_000.0,
+    )
+    backbone = ToyForCausalLM(toy_cfg).eval()
+    pack_cfg = Qwen36LoopHSSDConfig(
+        base_config={
+            "model_type": "toy",
+            "num_hidden_layers": 8,
+            "hidden_size": 32,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+        },
+        qloop_v3_arch={},
+    )
+    wrapper = Qwen36LoopHSSDForCausalLM(pack_cfg).eval()
+    wrapper.backbone = backbone
+
+    k0_cfg = K0Config(rotary_dim=64, rope_theta=10_000.0, sink_tokens=2, refresh_frac=0.10, virtual_offset=10_000)
+    ev_wrap = HFCheckpointK0Evaluator(wrapper, tok, device="cpu", live_sink_len=2)
+    ex = K0Example(
+        example_id="loop_hssd_e2e",
+        sessions=["session one defines target_key = 42 in alpha.py"],
+        live_prompt="Live sink prefix. Query target_key: ",
+        answer="42",
+    )
+    rep_wrap = run_k0_suite([ex], ev_wrap, k0_cfg)
+    assert set(rep_wrap.arms) == set(CANONICAL_ARMS)
+    assert rep_wrap.arms["arm_c"].kv_bytes_mounted > 0
+    assert rep_wrap.arms["arm_d"].refreshed_tokens >= 1
+    assert ev_wrap.last_diagnostics["live_sink_tokens_prefilled"] == 2
+    assert ev_wrap.last_diagnostics["post_refresh_kv_l2"] < ev_wrap.last_diagnostics["pre_refresh_kv_l2"]
+
+    # Part B (Blocker 4A + Issue 4D): `position_ids`-aware wrapper verifying RoPE re-alignment at virtual_offset=10_000
+    class _PosAwareToyCausalLM(torch.nn.Module):
+        """Toy causal LM whose forward honors explicit `position_ids` identically to HF `Qwen3.6`."""
+
+        def __init__(self, inner: ToyForCausalLM) -> None:
+            super().__init__()
+            self.inner = inner
+            self.config = inner.config
+
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            position_ids: torch.Tensor | None = None,
+            past_key_values: ToyHybridCache | None = None,
+            use_cache: bool = False,
+        ) -> ToyCausalLMOutput:
+            tm = self.inner.model
+            h = tm.embed_tokens(input_ids)
+            if use_cache and past_key_values is None:
+                past_key_values = ToyHybridCache(self.config)
+            start = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(start, start + h.shape[1], device=h.device)
+            pos_ids = cache_position[None].expand(h.shape[0], -1) if position_ids is None else position_ids
+            pos_emb = tm.rotary_emb(h, pos_ids)
+            for layer in tm.layers[: self.config.num_hidden_layers]:
+                h = layer(
+                    h,
+                    position_embeddings=pos_emb,
+                    attention_mask=None,
+                    position_ids=pos_ids,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                )
+            h = tm.norm(h)
+            return ToyCausalLMOutput(self.inner.lm_head(h), None, past_key_values)
+
+    pos_model = _PosAwareToyCausalLM(backbone).eval()
+    ev_pos = HFCheckpointK0Evaluator(pos_model, tok, device="cpu", live_sink_len=4)
+    assert ev_pos._accepts_pos_ids is True
+
+    # Verify Arm (d) RoPE re-alignment + live Partition-A sinks at `virtual_offset = 10_000`
+    ep_map = ev_pos(ex, k0_cfg)
+    diag = ev_pos.last_diagnostics
+    assert diag["live_sink_tokens_prefilled"] == 4
+    assert diag["base_mount_offset"] == 10_000
+    assert diag["mounted_total_tokens_arm_c"] == 4 + diag["part_b_tokens"]
+    assert diag["post_refresh_kv_l2"] < diag["pre_refresh_kv_l2"]
+    # Without Blocker 4A's RoPE re-alignment, `rot_l2_pre` is ~14x larger than `nope_l2_pre`!
+    # With proper un-rotate + re-rotate to `mnt.effective_positions`, rotary and NoPE discrepancies match scale:
+    assert diag["rot_l2_pre"] <= 2.5 * diag["nope_l2_pre"] + 1e-3, (
+        f"Arm (d) rotary error swamped NoPE error (unaligned RoPE!): "
+        f"rot={diag['rot_l2_pre']}, nope={diag['nope_l2_pre']}"
+    )
+    assert ep_map["arm_c"].extra["live_sink_tokens_prefilled"] == 4
+    assert ep_map["arm_d"].refreshed_tokens == math.ceil(k0_cfg.refresh_frac * diag["part_b_tokens"])

@@ -179,7 +179,8 @@ class LSAConfig:
     recall_threshold: float = 0.70      # D1: recall threshold to unlock hybrid sparse steps
     hybrid_sparse_every: int = 2        # D1: run sparse+KL every N steps in hybrid mode
     hybrid_warmup_steps: int = 0        # D1: optional step ceiling to activate hybrid mode
-    recall_check_every: int = 5         # D1: cadence for sampled recall checks before recall_ready
+    recall_check_every: int = 5         # D1: cadence for sampled recall checks
+    aux_reduction: str = "mean"         # C2: "mean" | "sum" reduction in LSAManager.aux_loss()
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> LSAConfig:
@@ -220,6 +221,8 @@ class LSAConfig:
             raise ValueError("lsa.window must be >= lsa.block_size (it must cover the unclustered tail)")
         if self.hybrid_sparse_every < 0:
             raise ValueError(f"lsa.hybrid_sparse_every must be >= 0, got {self.hybrid_sparse_every}")
+        if self.aux_reduction not in ("mean", "sum"):
+            raise ValueError(f"lsa.aux_reduction must be 'mean' or 'sum', got {self.aux_reduction!r}")
 
 
 # ============================================================================ clustering
@@ -416,17 +419,25 @@ class LSAIndexer(nn.Module):
             )
         self._current_pass = int(r)
 
-    def _current_loop_ctx(self) -> tuple[Any | None, int | None]:
+    def _current_loop_state(self) -> tuple[Any | None, int | None, bool]:
+        """Return `(loop_ctx, raw_pass, kv_share)` from the active `LoopController`, if present."""
         tm_ref = getattr(self, "_tm_ref", None)
         tm = tm_ref() if callable(tm_ref) else None
         if tm is not None:
             layers = getattr(tm, "layers", None)
             if layers is not None and len(layers) > 0:
                 ctl = getattr(layers[0], "_ctl", None)
-                cur = getattr(ctl, "_cur", None) if ctl is not None else None
-                if cur is not None:
-                    return cur[0], int(cur[1])
-        return None, None
+                if ctl is not None:
+                    kv_share = bool(getattr(getattr(ctl, "spec", None), "kv_share", True))
+                    cur = getattr(ctl, "_cur", None)
+                    if cur is not None:
+                        return cur[0], int(cur[1]), kv_share
+                    return None, None, kv_share
+        return None, None, True
+
+    def _current_loop_ctx(self) -> tuple[Any | None, int | None]:
+        loop_ctx, loop_r, _kv_share = self._current_loop_state()
+        return loop_ctx, loop_r
 
     def _resolve_pass(self, module: nn.Module | None = None, pass_idx: int | None = None) -> int:
         cap = max(1, self.cfg.num_query_passes)
@@ -558,6 +569,8 @@ class LSAIndexer(nn.Module):
         nb: int,
         grad_mode: bool,
         cache_key: Hashable | None,
+        *,
+        masked: bool = False,
     ) -> tuple[
         tuple[Any, ...] | None,
         _CacheEntry | None,
@@ -565,17 +578,21 @@ class LSAIndexer(nn.Module):
         weakref.ReferenceType[Any] | None,
         weakref.ReferenceType[Any] | None,
     ]:
-        """Resolve zero-sync cache key and safe block-reuse count (`D8`)."""
+        """Resolve zero-sync cache key and safe block-reuse count (`D8`, `QL60-008`)."""
         b, g, tk, _ = k.shape
         dev_s = str(k.device)
         k_ident = (int(kin.data_ptr()), int(kin._version))
-        loop_ctx, _ = self._current_loop_ctx()
+        loop_ctx, loop_r, kv_share = self._current_loop_state()
         loop_ref = _weakref_or_none(loop_ctx)
+        # Preserve single shared BucketIndex when `kv_share=True`; isolate per pass when `kv_share=False`!
+        pass_cache_key = 0 if (kv_share or loop_r is None) else loop_r
+        owners = getattr(self, "_owners", None)
+        slot_id = int(getattr(owners[0], "layer_idx", self.layer_id)) if owners else self.layer_id
 
         wk_ver = int(self.wk._version)
 
         if cache_key is not None:
-            lkey: tuple[Any, ...] = ("explicit", cache_key, b, g, dev_s)
+            lkey: tuple[Any, ...] = ("explicit", cache_key, pass_cache_key, slot_id, b, g, dev_s, masked)
             ent = self._cache.get(lkey)
             reuse = ent.n_blocks if (ent is not None and ent.n_blocks <= nb and ent.wk_version == wk_ver) else 0
             return lkey, ent, reuse, None, loop_ref
@@ -583,7 +600,7 @@ class LSAIndexer(nn.Module):
         pkv_ref, pkv_id, pkv_ok = self._active_pkv
         pkv_obj = pkv_ref() if pkv_ref is not None else None
         if pkv_ok and (pkv_obj is not None or pkv_ref is None) and pkv_id is not None:
-            lkey = ("pkv", pkv_id, self.layer_id, b, g, dev_s)
+            lkey = ("pkv", pkv_id, self.layer_id, pass_cache_key, slot_id, b, g, dev_s, masked)
             ent = self._cache.get(lkey)
             reuse = 0
             if ent is not None and ent.n_blocks <= nb and ent.wk_version == wk_ver:
@@ -596,12 +613,13 @@ class LSAIndexer(nn.Module):
                 # Reuse prior blocks when tokens were appended (`tk > ent.last_tk`) or within the
                 # same loop forward / identical unmutated tensor (`tk == ent.last_tk`). If a caller
                 # reset/mutated a preallocated cache in-place at `tk <= ent.last_tk`, rebuild cleanly!
-                if owner_alive and (tk > ent.last_tk or (tk == ent.last_tk and (same_loop or k_ident == ent.k_ident))):
+                same_tk_ok = same_loop or (not masked and k_ident == ent.k_ident)
+                if owner_alive and (tk > ent.last_tk or (tk == ent.last_tk and same_tk_ok)):
                     reuse = ent.n_blocks
             return lkey, ent, reuse, pkv_ref, loop_ref
 
         if loop_ctx is not None:
-            lkey = ("loop", id(loop_ctx), self.layer_id, b, g, tk, dev_s)
+            lkey = ("loop", id(loop_ctx), self.layer_id, pass_cache_key, slot_id, b, g, tk, dev_s, masked)
             ent = self._cache.get(lkey)
             reuse = (
                 ent.n_blocks
@@ -616,7 +634,7 @@ class LSAIndexer(nn.Module):
             )
             return lkey, ent, reuse, loop_ref, loop_ref
 
-        if not grad_mode:
+        if not grad_mode and not masked:
             lkey = ("tensor", k_ident[0], tuple(kin.shape), tuple(kin.stride()), k_ident[1], dev_s)
             ent = self._cache.get(lkey)
             k_ref = _weakref_or_none(k)
@@ -636,7 +654,13 @@ class LSAIndexer(nn.Module):
 
         return None, None, 0, None, None
 
-    def build(self, k: torch.Tensor, cache_key: Hashable | None = None) -> BucketIndex | None:
+    def build(
+        self,
+        k: torch.Tensor,
+        cache_key: Hashable | None = None,
+        *,
+        key_valid_mask: torch.Tensor | None = None,
+    ) -> BucketIndex | None:
         """Build or incrementally extend the `BucketIndex` for `k [B,G,Tk,D]` with zero host syncs."""
         cfg = self.cfg
         b, g, tk, _ = k.shape
@@ -647,9 +671,18 @@ class LSAIndexer(nn.Module):
             return None
         kin = k.detach() if cfg.detach_inputs else k
         grad_mode = torch.is_grad_enabled() and (self.wk.requires_grad or kin.requires_grad)
+        km: torch.Tensor | None = None
+        if key_valid_mask is not None:
+            km = key_valid_mask.to(device=k.device, dtype=torch.bool)
+            if km.ndim == 1:
+                km = km.view(1, 1, -1, 1)
+            elif km.ndim == 2:
+                km = km.view(km.shape[0], 1, km.shape[1], 1)
+            else:
+                km = km.reshape(b, 1, tk, 1)
 
         lkey, ent, reuse, owner_ref, loop_ref = self._resolve_cache_lookup(
-            k, kin, nb, grad_mode, cache_key
+            k, kin, nb, grad_mode, cache_key, masked=(km is not None)
         )
 
         # Fast path: identical block set in no-grad mode -> return cached BucketIndex directly
@@ -657,13 +690,22 @@ class LSAIndexer(nn.Module):
         if not grad_mode and reuse == nb and ent is not None and ent.assembled is not None:
             ent.last_tk = tk
             ent.k_ident = (int(kin.data_ptr()), int(kin._version))
+            ent.loop_ctx_ref = loop_ref
             if lkey is not None and lkey in self._cache:
                 self._cache.move_to_end(lkey)
             return ent.assembled
 
+        def _masked_key_lat(k_slice: torch.Tensor, lo_t: int, hi_t: int) -> torch.Tensor:
+            z_out = self.key_latent(k_slice)
+            if km is not None:
+                z_out = z_out * km[:, :, lo_t:hi_t, :].to(z_out.dtype)
+            return z_out
+
         with torch.no_grad():
             if reuse < nb:
-                znew = self.key_latent(kin[:, :, reuse * bs : nb * bs]).view(b, g, nb - reuse, bs, -1)
+                znew = _masked_key_lat(kin[:, :, reuse * bs : nb * bs], reuse * bs, nb * bs).view(
+                    b, g, nb - reuse, bs, -1
+                )
                 lab_new, slab_new, scnt_new, mem_new = self._cluster_blocks(znew)
             if reuse:
                 assert ent is not None
@@ -681,14 +723,14 @@ class LSAIndexer(nn.Module):
                 labels, slot_labels, slot_counts, umem = lab_new, slab_new, scnt_new, mem_new
 
         if grad_mode:
-            z = self.key_latent(kin[:, :, : nb * bs]).view(b, g, nb, n, pool, -1).sum(4)
+            z = _masked_key_lat(kin[:, :, : nb * bs], 0, nb * bs).view(b, g, nb, n, pool, -1).sum(4)
             cent = self._centroids(z, slot_labels, slot_counts, spb)
         else:
             with torch.no_grad():
                 if reuse and ent is not None and ent.centroids is not None:
                     if reuse < nb:
                         zn = (
-                            self.key_latent(kin[:, :, reuse * bs : nb * bs])
+                            _masked_key_lat(kin[:, :, reuse * bs : nb * bs], reuse * bs, nb * bs)
                             .view(b, g, nb - reuse, n, pool, -1)
                             .sum(4)
                         )
@@ -698,7 +740,7 @@ class LSAIndexer(nn.Module):
                     else:
                         cent = ent.centroids
                 else:
-                    z = self.key_latent(kin[:, :, : nb * bs]).view(b, g, nb, n, pool, -1).sum(4)
+                    z = _masked_key_lat(kin[:, :, : nb * bs], 0, nb * bs).view(b, g, nb, n, pool, -1).sum(4)
                     cent = self._centroids(z, slot_labels, slot_counts, spb)
 
         assembled = self._assemble(labels, slot_labels, slot_counts, umem, cent)
@@ -1104,6 +1146,144 @@ def _effective_member_cap(cfg: LSAConfig, s_slots: int, kk: int, kb_n: int, tk: 
     return min(kb_n, cfg.max_selected_keys)
 
 
+_ADDITIVE_MASK_DISALLOW_THRESHOLD = -1e4
+
+
+def _normalize_caller_mask(
+    attention_mask: torch.Tensor,
+    *,
+    b: int,
+    g: int,
+    hg: int,
+    tq: int,
+    tk: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Normalize 1D/2D/3D/4D bool, int, or additive float `attention_mask` to 5D without host syncs.
+
+    Returns `(allow, bias)` each of shape `[B_m, G_m, Hg_m, Tq_m, Tk]` where:
+      * `B_m in (1, B)`, `(G_m, Hg_m) in ((1, 1), (G, 1), (G, Hg))`, `Tq_m in (1, Tq)`
+      * `allow` is `torch.bool` (`True` = allowed, `False` = masked out)
+      * `bias` is `None` for bool/int masks, or upcast additive float bias zeroed on `~allow`
+    """
+    m = attention_mask
+    if m.device != device:
+        m = m.to(device=device)
+    h = g * hg
+    if m.shape[-1] > tk:
+        m = m[..., :tk]
+    if m.shape[-1] != tk:
+        raise ValueError(f"attention_mask last dim ({m.shape[-1]}) must be >= Tk ({tk})")
+
+    if m.ndim == 1:
+        m4 = m.view(1, 1, 1, tk)
+    elif m.ndim == 2:
+        d0 = m.shape[0]
+        if d0 == 1:
+            m4 = m.view(1, 1, 1, tk)
+        elif d0 == b and d0 != tq:
+            m4 = m.view(b, 1, 1, tk)
+        elif d0 == tq and d0 != b:
+            m4 = m.view(1, 1, tq, tk)
+        elif d0 == b and d0 == tq:
+            # Ambiguous only when B == Tq > 1: float masks follow SDPA `[Tq, Tk]`; bool/int follow HF `[B, Tk]`.
+            m4 = m.view(1, 1, tq, tk) if m.is_floating_point() else m.view(b, 1, 1, tk)
+        elif d0 == tk and tq < tk:
+            m4 = m[tk - tq : tk, :tk].view(1, 1, tq, tk)
+        else:
+            raise ValueError(
+                f"incompatible 2D attention_mask shape {tuple(m.shape)} for B={b}, Tq={tq}, Tk={tk}"
+            )
+    elif m.ndim == 3:
+        d0, d1, _ = m.shape
+        if d1 > tq and d1 == tk:
+            m = m[:, tk - tq : tk, :]
+            d1 = tq
+        if d0 in (1, b) and d1 in (1, tq):
+            m4 = m.unsqueeze(1)
+        elif d0 == h and b == 1 and d1 in (1, tq):
+            m4 = m.unsqueeze(0)
+        else:
+            raise ValueError(
+                f"incompatible 3D attention_mask shape {tuple(m.shape)} for B={b}, H={h}, Tq={tq}, Tk={tk}"
+            )
+    elif m.ndim == 4:
+        d0, d1, d2, _ = m.shape
+        if d2 > tq and d2 == tk:
+            m = m[:, :, tk - tq : tk, :]
+            d2 = tq
+        if d0 not in (1, b) or d1 not in (1, g, h) or d2 not in (1, tq):
+            raise ValueError(
+                f"incompatible 4D attention_mask shape {tuple(m.shape)} for B={b}, G={g}, H={h}, Tq={tq}, Tk={tk}"
+            )
+        m4 = m
+    else:
+        raise ValueError(f"unsupported attention_mask ndim={m.ndim} (expected 1..4)")
+
+    bm, hm, tqm, _ = m4.shape
+    if hm == 1:
+        m5 = m4.view(bm, 1, 1, tqm, tk)
+    elif hm == g:
+        m5 = m4.view(bm, g, 1, tqm, tk)
+    else:
+        m5 = m4.view(bm, g, hg, tqm, tk)
+
+    if m5.dtype == torch.bool:
+        return m5, None
+    if not m5.is_floating_point():
+        return m5 != 0, None
+
+    mf = upcast(m5)
+    allow = torch.isfinite(mf) & (mf > _ADDITIVE_MASK_DISALLOW_THRESHOLD)
+    bias = torch.where(allow, mf, torch.zeros_like(mf))
+    return allow, bias
+
+
+def _slice_caller_mask(
+    mask5: torch.Tensor | None,
+    q_idx: slice | torch.Tensor,
+    k_end: int | None = None,
+) -> torch.Tensor | None:
+    if mask5 is None:
+        return None
+    sub = mask5 if mask5.shape[3] == 1 else mask5[:, :, :, q_idx, :]
+    return sub if k_end is None else sub[..., :k_end]
+
+
+def _slot_valid_mask(
+    allow_nk: torch.Tensor,
+    key2slot: torch.Tensor,
+    *,
+    b: int,
+    g: int,
+    hg: int,
+    c: int,
+    s_slots: int,
+    per_head: bool,
+) -> torch.Tensor:
+    """Compute `[B, G, C_m, S]` or `[B, H, C, S]` boolean mask of slots with >= 1 allowed key."""
+    nk = key2slot.shape[-1]
+    dev = key2slot.device
+    if per_head:
+        hg_m, c_m = allow_nk.shape[2], allow_nk.shape[3]
+        cnt = torch.zeros((b, g, hg_m, c_m, s_slots), device=dev, dtype=torch.int32)
+        cnt.scatter_add_(
+            4,
+            key2slot[:, :, None, None, :].expand(b, g, hg_m, c_m, nk),
+            allow_nk.expand(b, g, hg_m, c_m, nk).to(torch.int32),
+        )
+        return (cnt > 0).expand(b, g, hg, c, s_slots).reshape(b, g * hg, c, s_slots)
+    allow_g = allow_nk.any(dim=2)  # [B_m, G_m, C_m, nk]
+    c_m = allow_g.shape[2]
+    cnt = torch.zeros((b, g, c_m, s_slots), device=dev, dtype=torch.int32)
+    cnt.scatter_add_(
+        3,
+        key2slot.unsqueeze(2).expand(b, g, c_m, nk),
+        allow_g.expand(b, g, c_m, nk).to(torch.int32),
+    )
+    return cnt > 0
+
+
 def _sparse_chunk(
     q: torch.Tensor,
     qz: torch.Tensor,
@@ -1116,6 +1296,8 @@ def _sparse_chunk(
     cur_pass: int = 1,
     q_bounds: tuple[int, int] | None = None,
     record_stats: bool = True,
+    caller_allow: torch.Tensor | None = None,
+    caller_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """`q [B,G,Hg,C,D]`, `qz [B,G_or_Hq,C,d]`, `qpos [C]` -> `out [B,G,Hg,C,D]`."""
     cfg = idx.cfg
@@ -1138,11 +1320,25 @@ def _sparse_chunk(
     ns = min(cfg.sinks, hi)
     spos = torch.arange(ns, device=dev)
     m_sink = (spos[None] < win_lo[:, None]) & (spos[None] <= qpos[:, None])
-    s_parts = [torch.einsum("bghcd,bgld->bghcl", q, kw) * scaling]
-    masks = [m_win[None, None, None]]
+    s_win = torch.einsum("bghcd,bgld->bghcl", q, kw) * scaling
+    m_win_5d = m_win[None, None, None]
+    if caller_allow is not None:
+        m_win_5d = m_win_5d & caller_allow[..., lo:hi]
+        if caller_bias is not None:
+            s_win_u = upcast(s_win)
+            s_win = s_win_u + caller_bias[..., lo:hi].to(s_win_u.dtype)
+    s_parts = [s_win]
+    masks = [m_win_5d]
     if ns:
-        s_parts.append(torch.einsum("bghcd,bgld->bghcl", q, k[:, :, :ns]) * scaling)
-        masks.append(m_sink[None, None, None])
+        s_sink = torch.einsum("bghcd,bgld->bghcl", q, k[:, :, :ns]) * scaling
+        m_sink_5d = m_sink[None, None, None]
+        if caller_allow is not None:
+            m_sink_5d = m_sink_5d & caller_allow[..., :ns]
+            if caller_bias is not None:
+                s_sink_u = upcast(s_sink)
+                s_sink = s_sink_u + caller_bias[..., :ns].to(s_sink_u.dtype)
+        s_parts.append(s_sink)
+        masks.append(m_sink_5d)
 
     kb = vb = None
     per_head = cfg.per_head_select or (qz.shape[1] == g * hg and hg > 1)
@@ -1154,6 +1350,19 @@ def _sparse_chunk(
         with torch.no_grad():
             scores = idx.slot_scores(qz.detach(), index, qpos)
             s_slots = scores.shape[-1]
+            if caller_allow is not None:
+                nk = index.key2slot.shape[-1]
+                slot_valid = _slot_valid_mask(
+                    caller_allow[..., :nk],
+                    index.key2slot,
+                    b=b,
+                    g=g,
+                    hg=hg,
+                    c=c,
+                    s_slots=s_slots,
+                    per_head=per_head,
+                )
+                scores = scores.masked_fill(~slot_valid, float("-inf"))
             kk = min(cfg.num_select, s_slots)
             top = scores.topk(kk, dim=-1)
             finite_top = torch.isfinite(top.values)
@@ -1173,11 +1382,24 @@ def _sparse_chunk(
                     mem = index.members.gather(2, flat_sel).view(b, g, hg, c, kk, mk)
                     mem = torch.where(fin_g.unsqueeze(-1), mem, torch.full_like(mem, -1)).flatten(-2)
                     m_b = (mem >= ns) & (mem < win_lo[None, None, None, :, None])
+                    if caller_allow is not None:
+                        mem_safe = mem.clamp(min=0, max=tk - 1)
+                        mem_allow = caller_allow.expand(b, g, hg, c, tk).gather(-1, mem_safe)
+                        m_b = m_b & mem_allow
                 else:
                     flat_sel = top.indices.reshape(b, g, c * kk, 1).expand(b, g, c * kk, mk)
                     mem = index.members.gather(2, flat_sel).view(b, g, c, kk, mk)
                     mem = torch.where(finite_top.unsqueeze(-1), mem, torch.full_like(mem, -1)).flatten(-2)
                     m_b = (mem >= ns) & (mem < win_lo[None, None, :, None])
+                    if caller_allow is not None:
+                        mem_safe = mem.clamp(min=0, max=tk - 1)
+                        allow_g = (
+                            caller_allow[:, :, 0]
+                            if caller_allow.shape[2] == 1
+                            else caller_allow.any(dim=2)
+                        )
+                        mem_allow = allow_g.expand(b, g, c, tk).gather(-1, mem_safe)
+                        m_b = m_b & mem_allow
 
                 # Skip GPU->CPU host syncs (`valid_per_q.max()` / `m_final.sum()`) on intermediate chunks
                 # when `record_stats=False` — padded entries stay masked (`-inf`), keeping attention exact!
@@ -1191,21 +1413,52 @@ def _sparse_chunk(
                 gidx = mem_final.reshape(b, g, hg * c * l_pack, 1).expand(b, g, hg * c * l_pack, dh)
                 kb = k.gather(2, gidx).view(b, g, hg, c, l_pack, dh)
                 vb = v.gather(2, gidx).view(b, g, hg, c, l_pack, dh)
-                s_parts.append(torch.einsum("bghcd,bghckd->bghck", q, kb) * scaling)
+                s_b = torch.einsum("bghcd,bghckd->bghck", q, kb) * scaling
+                if caller_bias is not None:
+                    s_b_u = upcast(s_b)
+                    bias_b = caller_bias.expand(b, g, hg, c, tk).gather(-1, mem_final)
+                    s_b = s_b_u + bias_b.to(s_b_u.dtype)
+                s_parts.append(s_b)
                 masks.append(m_final)
             else:
                 gidx = mem_final.reshape(b, g, c * l_pack, 1).expand(b, g, c * l_pack, dh)
                 kb = k.gather(2, gidx).view(b, g, c, l_pack, dh)
                 vb = v.gather(2, gidx).view(b, g, c, l_pack, dh)
-                s_parts.append(torch.einsum("bghcd,bgckd->bghck", q, kb) * scaling)
-                masks.append(m_final[:, :, None])
+                s_b = torch.einsum("bghcd,bgckd->bghck", q, kb) * scaling
+                m_b_final = m_final[:, :, None]
+                if caller_allow is not None and caller_allow.shape[2] > 1:
+                    head_allow = caller_allow.expand(b, g, hg, c, tk).gather(
+                        -1, mem_final[:, :, None].expand(b, g, hg, c, l_pack)
+                    )
+                    m_b_final = m_b_final & head_allow
+                if caller_bias is not None:
+                    s_b_u = upcast(s_b)
+                    if caller_bias.shape[2] == 1:
+                        bias_b = caller_bias[:, :, 0].expand(b, g, c, tk).gather(-1, mem_final)[:, :, None]
+                    else:
+                        bias_b = caller_bias.expand(b, g, hg, c, tk).gather(
+                            -1, mem_final[:, :, None].expand(b, g, hg, c, l_pack)
+                        )
+                    s_b = s_b_u + bias_b.to(s_b_u.dtype)
+                s_parts.append(s_b)
+                masks.append(m_b_final)
 
-    scores_all = torch.cat(
-        [upcast(sp).masked_fill(~mk_i, float("-inf")) for sp, mk_i in zip(s_parts, masks)], dim=-1
-    )
-    attn = torch.softmax(scores_all, dim=-1)
-    # Guard rows that might have all -inf (never occurs in causal self-attn since qpos is in window)
-    attn = torch.nan_to_num(attn, nan=0.0).to(v.dtype)
+    if caller_allow is None:
+        scores_all = torch.cat(
+            [upcast(sp).masked_fill(~mk_i, float("-inf")) for sp, mk_i in zip(s_parts, masks)], dim=-1
+        )
+        attn = torch.softmax(scores_all, dim=-1)
+        # Guard rows that might have all -inf (never occurs in causal self-attn since qpos is in window)
+        attn = torch.nan_to_num(attn, nan=0.0).to(v.dtype)
+    else:
+        scores_raw = torch.cat([upcast(sp) for sp in s_parts], dim=-1)
+        mask_all = torch.cat([mk_i.expand(sp.shape) for sp, mk_i in zip(s_parts, masks)], dim=-1)
+        has_any = mask_all.any(dim=-1, keepdim=True)
+        neg_inf = scores_raw.new_full((), float("-inf"))
+        zero_s = scores_raw.new_zeros(())
+        scores_safe = torch.where(mask_all, scores_raw, torch.where(has_any, neg_inf, zero_s))
+        attn = torch.softmax(scores_safe, dim=-1)
+        attn = torch.where(has_any, attn, torch.zeros_like(attn)).to(v.dtype)
     sizes = [sp.shape[-1] for sp in s_parts]
     parts = torch.split(attn, sizes, dim=-1)
     out = torch.einsum("bghcl,bgld->bghcd", parts[0], vw)
@@ -1236,6 +1489,8 @@ def _distill_kl(
     index: BucketIndex,
     idx: LSAIndexer,
     scaling: float,
+    caller_allow: torch.Tensor | None = None,
+    caller_bias: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """KL(true bucket mass || indexer distribution) for queries `qpos` (`q [B,G,Hg,C,D]`)."""
     cfg = idx.cfg
@@ -1246,14 +1501,23 @@ def _distill_kl(
     hi = int(qpos[-1]) + 1
     s_slots = index.centroids.shape[2]
     per_head = cfg.per_head_select or (qz.shape[1] == idx.h and idx.h != idx.g)
+    b, g, hg, c, _ = q.shape
     with torch.no_grad():
         s = torch.einsum("bghcd,bgtd->bghct", upcast(q), upcast(k[:, :, :hi])) * scaling
         kpos = torch.arange(hi, device=q.device)
-        s = s.masked_fill(kpos[None, None, None, None] > qpos[None, None, None, :, None], float("-inf"))
-        a = torch.softmax(s, dim=-1)
+        m_allow = kpos[None, None, None, None] <= qpos[None, None, None, :, None]
+        if caller_allow is not None:
+            m_allow = m_allow & caller_allow[..., :hi]
+            if caller_bias is not None:
+                s = s + caller_bias[..., :hi].to(s.dtype)
+            has_any = m_allow.any(dim=-1, keepdim=True)
+            s = torch.where(m_allow, s, torch.where(has_any, s.new_full((), float("-inf")), s.new_zeros(())))
+            a = torch.where(has_any, torch.softmax(s, dim=-1), torch.zeros_like(s))
+        else:
+            s = s.masked_fill(~m_allow, float("-inf"))
+            a = torch.softmax(s, dim=-1)
         nk = min(hi, index.key2slot.shape[-1])
         a = a[..., :nk] * (kpos[:nk][None] < frontier[:, None])[None, None, None]
-        b, g, hg, c, _ = a.shape
         slots = index.key2slot[:, :, :nk][:, :, None, None, :].expand(b, g, hg, c, nk)
         mass_h = torch.zeros(b, g, hg, c, s_slots, device=q.device, dtype=a.dtype)
         mass_h = mass_h.scatter_add_(-1, slots, a)
@@ -1261,7 +1525,22 @@ def _distill_kl(
         tot = mass.sum(-1, keepdim=True)
         target = mass / tot.clamp_min(1e-30)
         ok = valid[None, None, :] & (tot.squeeze(-1) > 0)
-    logp = torch.log_softmax(idx.slot_scores(qz, index, qpos, flat=True), dim=-1)
+    logits = idx.slot_scores(qz, index, qpos, flat=True)
+    if caller_allow is not None:
+        nk_full = index.key2slot.shape[-1]
+        slot_valid = _slot_valid_mask(
+            caller_allow[..., :nk_full],
+            index.key2slot,
+            b=b,
+            g=g,
+            hg=hg,
+            c=c,
+            s_slots=s_slots,
+            per_head=per_head,
+        )
+        logits = logits.masked_fill(~slot_valid, float("-inf"))
+    has_slot = torch.isfinite(logits).any(dim=-1, keepdim=True)
+    logp = torch.log_softmax(torch.where(has_slot, logits, torch.zeros_like(logits)), dim=-1)
     logp = torch.where(target > 0, logp, torch.zeros_like(logp))
     kl = (target * (torch.log(target.clamp_min(1e-30)) - logp)).sum(-1)
     return kl[ok].mean() if bool(ok.any()) else None
@@ -2521,6 +2800,8 @@ def _run_detached_distill_kl(
     active_wq: nn.Parameter,
     scaling: float,
     cur_pass: int,
+    caller_allow: torch.Tensor | None = None,
+    caller_bias: torch.Tensor | None = None,
 ) -> None:
     """Fast exact detached-input KL distillation with analytic `(d_qz, d_cent)` and fused Triton teacher mass."""
     cfg = idx.cfg
@@ -2540,6 +2821,8 @@ def _run_detached_distill_kl(
     pick = (torch.randperm(n_cand, device=dev)[:nq] + cand_start).sort().values
     qpos_pick = qpos_all[pick]
     q_pick = qin[:, :, pick]
+    allow_pick = _slice_caller_mask(caller_allow, pick)
+    bias_pick = _slice_caller_mask(caller_bias, pick)
 
     need_wq = bool(active_wq.requires_grad)
     need_wk = bool(idx.wk.requires_grad)
@@ -2550,6 +2833,7 @@ def _run_detached_distill_kl(
 
     can_triton_distill = (
         _TRITON_AVAILABLE
+        and caller_allow is None
         and q_pick.is_cuda
         and q_pick.dtype in (torch.bfloat16, torch.float16)
         and key.dtype == q_pick.dtype
@@ -2708,9 +2992,23 @@ def _run_detached_distill_kl(
                         * scaling
                     )
                     kpos_c = kpos_all_hi[:hi_c]
-                    causal_m = kpos_c[None, None, None, None] > qpos_c[None, None, None, :, None]
-                    s_attn = s_attn.masked_fill(causal_m, float("-inf"))
-                    a = torch.softmax(s_attn, dim=-1)
+                    allow_sub = _slice_caller_mask(allow_pick, slice(s0, s1))
+                    bias_sub = _slice_caller_mask(bias_pick, slice(s0, s1))
+                    m_allow_c = kpos_c[None, None, None, None] <= qpos_c[None, None, None, :, None]
+                    if allow_sub is not None:
+                        m_allow_c = m_allow_c & allow_sub[..., :hi_c]
+                        if bias_sub is not None:
+                            s_attn = s_attn + bias_sub[..., :hi_c].to(s_attn.dtype)
+                        has_any_c = m_allow_c.any(dim=-1, keepdim=True)
+                        s_attn = torch.where(
+                            m_allow_c,
+                            s_attn,
+                            torch.where(has_any_c, s_attn.new_full((), float("-inf")), s_attn.new_zeros(())),
+                        )
+                        a = torch.where(has_any_c, torch.softmax(s_attn, dim=-1), torch.zeros_like(s_attn))
+                    else:
+                        s_attn = s_attn.masked_fill(~m_allow_c, float("-inf"))
+                        a = torch.softmax(s_attn, dim=-1)
                     nk = min(hi_c, index.key2slot.shape[-1])
                     a = a[..., :nk] * (kpos_c[:nk][None] < frontier_c[:, None])[None, None, None]
                     slots = index.key2slot[:, :, :nk][:, :, None, None, :].expand(b, g, hg, c_len, nk)
@@ -2725,7 +3023,6 @@ def _run_detached_distill_kl(
                     )
                     qz_c = qz_all[:, :, s0:s1]
                     logits_c = idx.slot_scores(qz_c, index, qpos_c, flat=True)
-                    logp_c = torch.log_softmax(logits_c, dim=-1)
                     elig_cmp = (
                         elig_c[:, :, None, :, :]
                         .expand(b, g, hg, c_len, s_slots)
@@ -2733,6 +3030,22 @@ def _run_detached_distill_kl(
                         if per_head
                         else elig_c
                     )
+                    if allow_sub is not None:
+                        nk_full = index.key2slot.shape[-1]
+                        slot_valid_c = _slot_valid_mask(
+                            allow_sub[..., :nk_full],
+                            index.key2slot,
+                            b=b,
+                            g=g,
+                            hg=hg,
+                            c=c_len,
+                            s_slots=s_slots,
+                            per_head=per_head,
+                        )
+                        elig_cmp = elig_cmp & slot_valid_c
+                        logits_c = logits_c.masked_fill(~slot_valid_c, float("-inf"))
+                    has_slot_c = torch.isfinite(logits_c).any(dim=-1, keepdim=True)
+                    logp_c = torch.log_softmax(torch.where(has_slot_c, logits_c, torch.zeros_like(logits_c)), dim=-1)
                     probs_c = torch.where(elig_cmp, torch.exp(logp_c), zero_acc)
                     logp_safe = torch.where(target > 0, logp_c, zero_acc)
                     kl_rows = (target * (torch.log(target.clamp_min(1e-30)) - logp_safe)).sum(-1)
@@ -2802,15 +3115,15 @@ def _run_detached_distill_kl(
             pool = cfg.pool
             n_units_k = bs // pool
             kin_det = key.detach()
+            km_det = caller_allow.any(dim=(1, 2, 3)).unsqueeze(1).unsqueeze(-1) if caller_allow is not None else None
             g_wk_acc = torch.zeros_like(idx.wk)
             for b0 in range(0, nb, 64):
                 b1 = min(nb, b0 + 64)
                 nb_c = b1 - b0
-                z_b = (
-                    idx.key_latent(kin_det[:, :, b0 * bs : b1 * bs])
-                    .view(b, g, nb_c, n_units_k, pool, -1)
-                    .sum(4)
-                )
+                z_raw = idx.key_latent(kin_det[:, :, b0 * bs : b1 * bs])
+                if km_det is not None:
+                    z_raw = z_raw * km_det[:, :, b0 * bs : b1 * bs, :].to(z_raw.dtype)
+                z_b = z_raw.view(b, g, nb_c, n_units_k, pool, -1).sum(4)
                 c_b = idx._centroids(
                     z_b,
                     index.slot_labels[:, :, b0:b1],
@@ -2837,6 +3150,61 @@ def _run_detached_distill_kl(
             idx.last_stats["distill_kl"] = loss_val
 
 
+def _maybe_sample_recall(
+    idx: LSAIndexer,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    qpos_all: torch.Tensor,
+    index: BucketIndex | None,
+    cur_pass: int,
+) -> None:
+    """Run lightweight periodic sampled recall check and update `idx.last_recall` / `mgr.last_recall` (`B2`)."""
+    cfg = idx.cfg
+    win = cfg.resolved_window()
+    tk = k.shape[2]
+    tq = q.shape[2]
+    if (
+        index is None
+        or cfg.recall_check_every <= 0
+        or tk <= cfg.sinks + win
+        or _in_backward()
+        or _is_sync_restricted()
+    ):
+        return
+    mgr_ref = getattr(idx, "_mgr_ref", None)
+    mgr = mgr_ref() if callable(mgr_ref) else None
+    step = int(mgr._step) if mgr is not None else int(idx._step)
+    check_every = max(1, int(cfg.recall_check_every))
+    due = (idx._recall_checks == 0) or (
+        step != idx._last_recall_step and (step % check_every) == 0
+    )
+    if not due:
+        return
+    q_base_pos = tk - tq
+    cand_start = max(0, (cfg.sinks + win) - q_base_pos)
+    n_cand = max(0, tq - cand_start)
+    if n_cand <= 0:
+        return
+    with torch.no_grad():
+        take = min(16, n_cand)
+        stride = max(1, n_cand // take)
+        sel_r = torch.arange(cand_start, tq, stride, device=q.device)[:take]
+        q_sub = q[:, :, sel_r].detach()
+        qpos_sub = qpos_all[sel_r]
+        chosen = idx.select_buckets(q_sub, index, qpos=qpos_sub, pass_idx=cur_pass)
+        rec = compute_lsa_recall(
+            q_sub,
+            k.detach(),
+            index,
+            chosen,
+            top_k_keys=64,
+            window=win,
+            sinks=cfg.sinks,
+            qpos=qpos_sub,
+        )
+        idx._update_recall_state(float(rec["mean_recall"]), float(rec["min_head_recall"]))
+
+
 def _resolve_hybrid_sparse(
     idx: LSAIndexer,
     q: torch.Tensor,
@@ -2844,6 +3212,8 @@ def _resolve_hybrid_sparse(
     qpos_all: torch.Tensor,
     index: BucketIndex | None,
     cur_pass: int,
+    *,
+    in_eval: bool = False,
 ) -> bool:
     """Check recall readiness (sampling if needed) and decide whether this `hybrid` step runs sparse."""
     cfg = idx.cfg
@@ -2859,39 +3229,9 @@ def _resolve_hybrid_sparse(
 
     tk = k.shape[2]
     win = cfg.resolved_window()
-    if (
-        not ready
-        and index is not None
-        and tk > cfg.sinks + win
-        and not _in_backward()
-        and not _is_sync_restricted()
-    ):
-        check_every = max(1, int(cfg.recall_check_every))
-        due = (idx._recall_checks == 0) or (
-            step != idx._last_recall_step and (step % check_every) == 0
-        )
-        if due:
-            with torch.no_grad():
-                cand_r = torch.nonzero(qpos_all >= (cfg.sinks + win)).flatten()
-                if cand_r.numel() > 0:
-                    take = min(16, int(cand_r.numel()))
-                    stride = max(1, int(cand_r.numel()) // take)
-                    sel_r = cand_r[::stride][:take]
-                    q_sub = q[:, :, sel_r].detach()
-                    qpos_sub = qpos_all[sel_r]
-                    chosen = idx.select_buckets(q_sub, index, qpos=qpos_sub, pass_idx=cur_pass)
-                    rec = compute_lsa_recall(
-                        q_sub,
-                        k.detach(),
-                        index,
-                        chosen,
-                        top_k_keys=64,
-                        window=win,
-                        sinks=cfg.sinks,
-                        qpos=qpos_sub,
-                    )
-                    idx._update_recall_state(float(rec["mean_recall"]), float(rec["min_head_recall"]))
-                    ready = bool(mgr.recall_ready) if mgr is not None else bool(idx.recall_ready)
+    if (not ready) or cfg.distill_weight > 0.0 or in_eval:
+        _maybe_sample_recall(idx, q, k, qpos_all, index, cur_pass)
+        ready = bool(mgr.recall_ready) if mgr is not None else bool(idx.recall_ready)
 
     if not ready and cfg.hybrid_warmup_steps > 0 and step >= cfg.hybrid_warmup_steps:
         ready = True
@@ -3159,11 +3499,27 @@ def lsa_attention(
 
     b, h, tq, dh = query.shape
     g, tk = key.shape[1], key.shape[2]
+    hg = h // g
     scaling = dh ** -0.5 if scaling is None else scaling
     qpos_all = torch.arange(tk - tq, tk, device=query.device)
     qin = query.detach() if cfg.detach_inputs else query
     cur_pass = idx._resolve_pass(module=module)
     active_wq = idx.active_wq(pass_idx=cur_pass)
+
+    caller_allow: torch.Tensor | None = None
+    caller_bias: torch.Tensor | None = None
+    key_valid_mask: torch.Tensor | None = None
+    if attention_mask is not None:
+        caller_allow, caller_bias = _normalize_caller_mask(
+            attention_mask,
+            b=b,
+            g=g,
+            hg=hg,
+            tq=tq,
+            tk=tk,
+            device=query.device,
+        )
+        key_valid_mask = caller_allow.any(dim=(1, 2, 3))
 
     want_kl = (
         cfg.distill_weight > 0
@@ -3179,16 +3535,19 @@ def lsa_attention(
     if need_index:
         if cfg.detach_inputs:
             with torch.no_grad():
-                index = idx.build(key, cache_key=cache_key)
+                index = idx.build(key, cache_key=cache_key, key_valid_mask=key_valid_mask)
         else:
-            index = idx.build(key, cache_key=cache_key)
+            index = idx.build(key, cache_key=cache_key, key_valid_mask=key_valid_mask)
     else:
         index = None
 
+    in_eval = (not module.training) or (not torch.is_grad_enabled())
     if cfg.mode == "sparse":
         sparse = tk > cfg.resolved_window()
+        if sparse and (cfg.distill_weight > 0.0 or in_eval):
+            _maybe_sample_recall(idx, qin, key, qpos_all, index, cur_pass)
     elif cfg.mode == "hybrid":
-        sparse = _resolve_hybrid_sparse(idx, qin, key, qpos_all, index, cur_pass)
+        sparse = _resolve_hybrid_sparse(idx, qin, key, qpos_all, index, cur_pass, in_eval=in_eval)
     else:
         sparse = False
 
@@ -3203,19 +3562,40 @@ def lsa_attention(
             # Exact zero-checkpoint-unpack, zero-inner-sync KL distillation with analytic `(d_qz, d_cent)`
             # and fused 2-pass Triton teacher bucket-mass kernels on CUDA bf16/fp16.
             if not _in_backward():
-                _run_detached_distill_kl(qin, key, qpos_all, index, idx, active_wq, scaling, cur_pass)
+                _run_detached_distill_kl(
+                    qin,
+                    key,
+                    qpos_all,
+                    index,
+                    idx,
+                    active_wq,
+                    scaling,
+                    cur_pass,
+                    caller_allow=caller_allow,
+                    caller_bias=caller_bias,
+                )
         else:
             cand_start = max(0, cfg.block_size - (tk - tq))
             n_cand = max(0, tq - cand_start)
             if n_cand > 0:
                 nq = max(1, int(n_cand * cfg.distill_query_frac))
                 pick = (torch.randperm(n_cand, device=query.device)[:nq] + cand_start).sort().values
-                qg_kl = qin.view(b, g, h // g, tq, dh)
+                qg_kl = qin.view(b, g, hg, tq, dh)
                 kls = []
                 for s0 in range(0, pick.numel(), cfg.distill_chunk):
                     sel = pick[s0 : s0 + cfg.distill_chunk]
                     qz = idx.query_latent(qin[:, :, sel], pass_idx=cur_pass)
-                    kl = _distill_kl(qg_kl[:, :, :, sel], qz, qpos_all[sel], key.detach(), index, idx, scaling)
+                    kl = _distill_kl(
+                        qg_kl[:, :, :, sel],
+                        qz,
+                        qpos_all[sel],
+                        key.detach(),
+                        index,
+                        idx,
+                        scaling,
+                        caller_allow=_slice_caller_mask(caller_allow, sel),
+                        caller_bias=_slice_caller_mask(caller_bias, sel),
+                    )
                     if kl is not None:
                         kls.append(kl)
                 if kls and not _in_backward():
@@ -3233,7 +3613,6 @@ def lsa_attention(
     if not _in_backward() and not _is_sync_restricted():
         idx.last_stats["forward_sparse"] = 1.0
 
-    hg = h // g
     qg = query.view(b, g, hg, tq, dh)
     with torch.no_grad():
         qz_all = idx.query_latent(qin.detach(), pass_idx=cur_pass)
@@ -3242,6 +3621,7 @@ def lsa_attention(
     per_head = cfg.per_head_select or (qz_all.shape[1] == g * hg and hg > 1)
     can_triton_sparse = (
         _TRITON_AVAILABLE
+        and caller_allow is None
         and query.is_cuda
         and query.dtype in (torch.bfloat16, torch.float16)
         and key.dtype == query.dtype
@@ -3292,6 +3672,8 @@ def lsa_attention(
         sl = slice(c0, c1)
         qb = (q_base_pos + c0, q_base_pos + c1 - 1)
         is_last = c1 >= tq
+        allow_c = _slice_caller_mask(caller_allow, sl)
+        bias_c = _slice_caller_mask(caller_bias, sl)
 
         def run(
             qc: torch.Tensor,
@@ -3302,6 +3684,8 @@ def lsa_attention(
             p: int = cur_pass,
             q_bounds: tuple[int, int] = qb,
             rec_stats: bool = is_last,
+            m_allow: torch.Tensor | None = allow_c,
+            m_bias: torch.Tensor | None = bias_c,
         ) -> torch.Tensor:
             return _sparse_chunk(
                 qc,
@@ -3315,6 +3699,8 @@ def lsa_attention(
                 cur_pass=p,
                 q_bounds=q_bounds,
                 record_stats=rec_stats,
+                caller_allow=m_allow,
+                caller_bias=m_bias,
             )
 
         args = (qg[:, :, :, sl], key, value, qz_all[:, :, sl])
@@ -3519,9 +3905,17 @@ class LSAManager:
             "recall_ready": self.recall_ready,
         }
 
-    def aux_loss(self) -> torch.Tensor | None:
+    def aux_loss(self, reduction: str | None = None) -> torch.Tensor | None:
         losses = [loss for ix in self.indexers.values() for loss in ix.pop_losses()]
-        return torch.stack(losses).sum() if losses else None
+        if not losses:
+            return None
+        red = self.cfg.aux_reduction if reduction is None else str(reduction)
+        stacked = torch.stack(losses)
+        if red == "mean":
+            return stacked.mean()
+        if red == "sum":
+            return stacked.sum()
+        raise ValueError(f"lsa.aux_reduction must be 'mean' or 'sum', got {red!r}")
 
     def trainable_parameters(self) -> list[nn.Parameter]:
         return [p for ix in self.indexers.values() for p in ix.parameters()]

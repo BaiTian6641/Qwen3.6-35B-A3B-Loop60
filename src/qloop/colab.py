@@ -1130,13 +1130,123 @@ def run_probe_notebook_suite(
     }
 
 
+DEFAULT_V2_STAGES: tuple[str, ...] = (
+    "s0_probe",
+    "s1_loop_a6b",
+    "s3_v2_long_1m_lsa",
+    "s2_v2_joint_bptt",
+    "s4_v2_rl",
+)
+LEGACY_HSSD_STAGES: tuple[str, ...] = (
+    "s0_probe",
+    "s1_loop_a6b",
+    "s1b_hssd_distill",
+    "s3_long_1m_lsa",
+    "s2_joint_bptt",
+    "s4_rl",
+)
+
+
+def _read_json_file(path: str) -> dict[str, Any] | None:
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _meta_proves_completion(meta: dict[str, Any] | None) -> bool:
+    """Return True only when checkpoint/stage metadata explicitly verifies completion."""
+    if not isinstance(meta, dict):
+        return False
+    if meta.get("completed") is False:
+        return False
+    status = str(meta.get("status") or "").strip().lower()
+    if status in ("in_progress", "running", "paused", "failed", "aborted"):
+        return False
+    if meta.get("completed") is True or status == "completed":
+        return True
+    raw_step = meta.get("step")
+    raw_target = meta.get("target_steps")
+    if (
+        isinstance(raw_step, int)
+        and not isinstance(raw_step, bool)
+        and isinstance(raw_target, int)
+        and not isinstance(raw_target, bool)
+        and raw_target > 0
+    ):
+        return raw_step >= raw_target
+    return False
+
+
+def _meta_contradicts_completion(meta: dict[str, Any] | None) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    if meta.get("completed") is False:
+        return True
+    status = str(meta.get("status") or "").strip().lower()
+    if status in ("in_progress", "running", "paused", "failed", "aborted"):
+        return True
+    raw_step = meta.get("step")
+    raw_target = meta.get("target_steps")
+    return (
+        isinstance(raw_step, int)
+        and not isinstance(raw_step, bool)
+        and isinstance(raw_target, int)
+        and not isinstance(raw_target, bool)
+        and raw_target > 0
+        and raw_step < raw_target
+    )
+
+
 def _local_stage_done(run_root: str, stage_name: str) -> bool:
+    """Verify strict local stage completion; mere `checkpoints/LATEST` presence is NEVER sufficient."""
+    stage_dir = os.path.join(run_root, stage_name)
     if stage_name == "s0_probe":
-        return os.path.isfile(os.path.join(run_root, "s0_probe", "esft_stats.json")) or os.path.isfile(
-            os.path.join(run_root, "probe", "probe_report.json")
+        return (
+            os.path.isfile(os.path.join(stage_dir, "COMPLETED"))
+            or os.path.isfile(os.path.join(stage_dir, "esft_stats.json"))
+            or os.path.isfile(os.path.join(run_root, "probe", "probe_report.json"))
         )
-    ck_dir = os.path.join(run_root, stage_name, "checkpoints")
-    return os.path.isfile(os.path.join(ck_dir, "PROMOTED")) or os.path.isfile(os.path.join(ck_dir, "LATEST"))
+
+    ck_dir = os.path.join(stage_dir, "checkpoints")
+    if os.path.isfile(os.path.join(ck_dir, "COMPLETED")) or os.path.isfile(os.path.join(stage_dir, "COMPLETED")):
+        return True
+
+    promoted_ptr = os.path.join(ck_dir, "PROMOTED")
+    if os.path.isfile(promoted_ptr):
+        try:
+            with open(promoted_ptr, encoding="utf-8") as f:
+                step_name = f.read().strip()
+        except OSError:
+            step_name = ""
+        step_meta = _read_json_file(os.path.join(ck_dir, step_name, "state.json")) if step_name else None
+        if not _meta_contradicts_completion(step_meta):
+            return True
+
+    latest_ptr = os.path.join(ck_dir, "LATEST")
+    if os.path.isfile(latest_ptr):
+        try:
+            with open(latest_ptr, encoding="utf-8") as f:
+                step_name = f.read().strip()
+        except OSError:
+            step_name = ""
+        if step_name:
+            step_meta = _read_json_file(os.path.join(ck_dir, step_name, "state.json"))
+            if _meta_proves_completion(step_meta):
+                return True
+
+    for cand in (
+        os.path.join(stage_dir, "state.json"),
+        os.path.join(stage_dir, "summary.json"),
+    ):
+        if _meta_proves_completion(_read_json_file(cand)):
+            return True
+
+    return False
 
 
 def run_v3_e2e_and_ship_pack(
@@ -1145,14 +1255,7 @@ def run_v3_e2e_and_ship_pack(
     pack_repo: str | None = None,
     base_precision: str | None = "nvfp4",
     smoke_toy: bool = False,
-    stages: Sequence[str] = (
-        "s0_probe",
-        "s1_loop_a6b",
-        "s1b_hssd_distill",
-        "s3_long_1m_lsa",
-        "s2_joint_bptt",
-        "s4_rl",
-    ),
+    stages: Sequence[str] = DEFAULT_V2_STAGES,
     until: str | None = None,
     debug: int = 1,
     time_budget_hours: float = 21.5,
@@ -1164,7 +1267,7 @@ def run_v3_e2e_and_ship_pack(
     force: bool = False,
     overrides: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """Run/resume the Loop-HSSD v3 pipeline and stream the final Whole Model Pack upon completion."""
+    """Run/resume the clean v2 pipeline (or explicit stages) and stream the Whole Model Pack upon completion."""
     from .hub import HubSyncManager, resolve_stage_config_path
 
     if not smoke_toy and sys.platform == "linux":

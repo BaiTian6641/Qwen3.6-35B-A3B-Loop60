@@ -4,7 +4,7 @@
 Examples:
     # 1. Live streaming audit + local Parquet dataset build (zero full-dataset downloads)
     python scripts/build_sirsi_dataset.py --build-local --max-per-source 1000 \\
-        --out-dir /Users/tianrui6641/Qwen3.6-35B-A3B-Loop60/runs/datasets/Loop64-Fable-SIRSI-v1
+        --out-dir runs/datasets/Loop64-Fable-SIRSI-v1
 
     # 2. Audit only (no Parquet export)
     python scripts/build_sirsi_dataset.py --audit-only --max-per-source 500
@@ -45,8 +45,8 @@ from qloop.data.sirsi_dataset import (  # noqa: E402
     write_parquet_records,
 )
 
-DEFAULT_OUT_DIR = "/Users/tianrui6641/Qwen3.6-35B-A3B-Loop60/runs/datasets/Loop64-Fable-SIRSI-v1"
-DEFAULT_DECONTAM_CACHE = "/Users/tianrui6641/Qwen3.6-35B-A3B-Loop60/runs/datasets/.decontam_cache"
+DEFAULT_OUT_DIR = str(Path(__file__).resolve().parents[1] / "runs" / "datasets" / "Loop64-Fable-SIRSI-v1")
+DEFAULT_DECONTAM_CACHE = str(Path(__file__).resolve().parents[1] / "runs" / "datasets" / ".decontam_cache")
 DEFAULT_GOLDEN_SEEDS = str(_REPO_ROOT / "configs" / "data" / "sirsi_golden_seeds.json")
 
 

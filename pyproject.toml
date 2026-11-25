@@ -41,7 +41,7 @@ colab = [
   "cut-cross-entropy",
   "flash-linear-attention",
 ]
-dev = ["pytest"]
+dev = ["pytest", "pyarrow>=16.0"]
 
 [project.scripts]
 qloop = "qloop.cli:entrypoint"

@@ -38,10 +38,12 @@ from .infer.hf_custom_modeling import (
     AUTO_MAP,
     CONFIG_FILENAME,
     MODELING_FILENAME,
+    QLOOP_FORMAT_VERSION,
     Qwen36LoopHSSDConfig,
     Qwen36LoopHSSDForCausalLM,
     _DepthContext,
     resolve_pack_directory,
+    resolve_qloop_commit,
     save_safetensors_file,
     write_standalone_hf_modeling_files,
 )
@@ -647,6 +649,8 @@ def extract_arch_spec(
             quant_info["fp8_modules"] = fp8_meta
     arch: dict[str, Any] = {
         "schema_version": 3,
+        "qloop_format_version": QLOOP_FORMAT_VERSION,
+        "qloop_commit": resolve_qloop_commit(),
         "backbone_kind": kind,
         "base_model": "toy" if kind == "toy" else src.base_model_name,
         "base_model_type": str(bcfg.get("model_type") or ("toy_qwen3_5_moe" if kind == "toy" else "qwen3_5_moe")),
@@ -1392,12 +1396,17 @@ def _write_non_shard_pack_files(
     ledger = _build_parameter_ledger(entries)
     total_params = int(sum(v["parameters"] for v in ledger.values()))
 
+    pack_fmt_ver = str(arch.get("qloop_format_version") or QLOOP_FORMAT_VERSION)
+    pack_commit = str(arch.get("qloop_commit") or resolve_qloop_commit())
+
     # 1) model.safetensors.index.json
     index_payload = {
         "metadata": {
             "total_size": total_tensor_bytes,
             "format": "pt",
             "qloop_pack_version": "3.0",
+            "qloop_format_version": pack_fmt_ver,
+            "qloop_commit": pack_commit,
         },
         "weight_map": weight_map,
     }
@@ -1407,7 +1416,7 @@ def _write_non_shard_pack_files(
         f.write("\n")
     written.append(SAFETENSORS_INDEX_FILE)
 
-    # 2) config.json (with auto_map + qloop_v3_arch + preserved quantization_config)
+    # 2) config.json (with auto_map + qloop_v3_arch + virtual hybrid layer_types + version metadata)
     extra_cfg_kw: dict[str, Any] = {}
     if base_cfg.get("quantization_config"):
         extra_cfg_kw["quantization_config"] = copy.deepcopy(base_cfg["quantization_config"])
@@ -1416,6 +1425,8 @@ def _write_non_shard_pack_files(
         qloop_v3_arch=arch,
         auto_map=dict(AUTO_MAP),
         architectures=["Qwen36LoopHSSDForCausalLM"],
+        qloop_format_version=pack_fmt_ver,
+        qloop_commit=pack_commit,
         **extra_cfg_kw,
     )
     hf_cfg.save_pretrained(out_dir)
@@ -1442,6 +1453,8 @@ def _write_non_shard_pack_files(
     # 6) qloop_pack_manifest.json
     manifest: dict[str, Any] = {
         "schema_version": 3,
+        "qloop_format_version": pack_fmt_ver,
+        "qloop_commit": pack_commit,
         "pack_type": "qloop_whole_model_pack",
         "repo_id": repo_id,
         "created_at": _utc_now(),

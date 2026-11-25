@@ -14,12 +14,16 @@ Provides:
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import logging
 import os
 import struct
+import subprocess
 import tempfile
-from dataclasses import fields
+import warnings
+from collections import OrderedDict
+from dataclasses import dataclass, fields
 from typing import Any
 
 import torch
@@ -40,10 +44,64 @@ log = logging.getLogger("qloop")
 
 CONFIG_FILENAME = "configuration_qwen36_loophssd.py"
 MODELING_FILENAME = "modeling_qwen36_loophssd.py"
+QLOOP_FORMAT_VERSION = "3.1"
 AUTO_MAP: dict[str, str] = {
     "AutoConfig": "configuration_qwen36_loophssd.Qwen36LoopHSSDConfig",
     "AutoModelForCausalLM": "modeling_qwen36_loophssd.Qwen36LoopHSSDForCausalLM",
 }
+
+
+@functools.lru_cache(maxsize=1)
+def resolve_qloop_commit() -> str:
+    """Return short git commit SHA of the current `qloop` checkout, or `'unknown'` if unavailable."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo_root, "rev-parse", "--short=12", "HEAD"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _warn_pack_metadata_mismatch(
+    config: Any,
+    *,
+    runtime_format_version: str = QLOOP_FORMAT_VERSION,
+    runtime_commit: str | None = None,
+) -> None:
+    """Emit non-breaking warnings if an exported pack's format version or commit differs from runtime."""
+    arch = getattr(config, "qloop_v3_arch", None)
+    arch_d = arch if isinstance(arch, dict) else {}
+    pack_fmt = getattr(config, "qloop_format_version", None) or arch_d.get("qloop_format_version")
+    if pack_fmt is not None and str(pack_fmt) != str(runtime_format_version):
+        msg = (
+            f"Whole Model Pack qloop_format_version={pack_fmt!r} differs from runtime "
+            f"QLOOP_FORMAT_VERSION={runtime_format_version!r}; loading continues in compatibility mode."
+        )
+        log.warning(msg)
+        warnings.warn(msg, UserWarning, stacklevel=3)
+    pack_commit = getattr(config, "qloop_commit", None) or arch_d.get("qloop_commit")
+    cur_commit = resolve_qloop_commit() if runtime_commit is None else str(runtime_commit)
+    if (
+        pack_commit is not None
+        and str(pack_commit) not in ("", "unknown")
+        and cur_commit not in ("", "unknown")
+        and str(pack_commit) != cur_commit
+    ):
+        msg = (
+            f"Whole Model Pack qloop_commit={pack_commit!r} differs from runtime commit "
+            f"{cur_commit!r}; loading continues cleanly."
+        )
+        log.warning(msg)
+        warnings.warn(msg, UserWarning, stacklevel=3)
 
 # ============================================================================ binary safetensors I/O
 
@@ -221,6 +279,27 @@ except ImportError:
     _HFGenerationMixin = object  # type: ignore[assignment,misc]
 
 
+try:
+    from transformers.modeling_outputs import ModelOutput as _HFModelOutput  # type: ignore[import-not-found]
+except (ImportError, AttributeError):
+    _HFModelOutput = None  # type: ignore[assignment,misc]
+
+
+class _FallbackModelOutput(OrderedDict):  # type: ignore[type-arg]
+    """Pure-Python `transformers.modeling_outputs.ModelOutput` fallback when `transformers` is absent."""
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, str):
+            return OrderedDict.__getitem__(self, key)
+        return self.to_tuple()[key]
+
+    def to_tuple(self) -> tuple[Any, ...]:
+        return tuple(OrderedDict.__getitem__(self, k) for k in self.keys())
+
+
+_ModelOutputBase: type = _HFModelOutput if isinstance(_HFModelOutput, type) else _FallbackModelOutput
+
+
 if (
     _HAS_TRANSFORMERS
     and isinstance(_HFGenerationMixin, type)
@@ -279,8 +358,77 @@ def resolve_pack_directory(
 
 # ============================================================================ Config & CausalLM
 
+_CONFIG_MIRROR_KEYS: tuple[str, ...] = (
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "rms_norm_eps",
+    "eos_token_id",
+    "pad_token_id",
+    "bos_token_id",
+    "max_position_embeddings",
+    "full_attention_interval",
+    "sliding_window",
+    "linear_conv_kernel_dim",
+    "linear_key_head_dim",
+    "linear_value_head_dim",
+    "linear_num_key_heads",
+    "linear_num_value_heads",
+    "linear_num_heads",
+    "linear_head_dim",
+)
+
+
+def _derive_physical_layer_types(bcfg: dict[str, Any]) -> list[str]:
+    """Resolve physical per-layer attention types from `base_config`."""
+    raw_lt = bcfg.get("layer_types")
+    if isinstance(raw_lt, (list, tuple)) and len(raw_lt) > 0:
+        return [str(x) for x in raw_lt]
+    n_phys = int(bcfg.get("num_hidden_layers") or 0)
+    if n_phys <= 0:
+        return []
+    interval = bcfg.get("full_attention_interval")
+    mtype = str(bcfg.get("model_type") or "").lower()
+    if interval is None and ("qwen3_5" in mtype or "qwen36" in mtype or mtype.startswith("toy")):
+        interval = 4
+    if interval is not None and int(interval) > 0:
+        iv = int(interval)
+        return ["full_attention" if (i + 1) % iv == 0 else "linear_attention" for i in range(n_phys)]
+    return ["full_attention"] * n_phys
+
+
+def _compute_virtual_layer_types(
+    bcfg: dict[str, Any],
+    arch: dict[str, Any],
+    *,
+    active_passes: int | None = None,
+) -> tuple[list[str], list[str], int]:
+    """Compute `(full_virtual_layer_types, active_layer_types, eff_active_passes)` for outer HF config."""
+    phys_lt = _derive_physical_layer_types(bcfg)
+    loop_cfg = arch.get("loop") if isinstance(arch, dict) else None
+    if isinstance(loop_cfg, dict) and loop_cfg.get("enabled") and phys_lt:
+        n_phys = len(phys_lt)
+        p_end = int(loop_cfg.get("prelude_end", 0))
+        c_end = int(loop_cfg.get("core_end", n_phys))
+        n_passes = max(1, int(loop_cfg.get("num_passes", 1)))
+        raw_r = active_passes if active_passes is not None else loop_cfg.get("active_passes", n_passes)
+        eff_r = max(1, min(int(raw_r if raw_r is not None else n_passes), n_passes))
+        if 0 <= p_end < c_end <= n_phys:
+            full_virt = phys_lt[:p_end] + phys_lt[p_end:c_end] * n_passes + phys_lt[c_end:]
+            active_virt = phys_lt[:p_end] + phys_lt[p_end:c_end] * eff_r + phys_lt[c_end:]
+            return full_virt, active_virt, eff_r
+    return phys_lt, phys_lt, 1
+
+
 class Qwen36LoopHSSDConfig(_HFPretrainedConfig):
-    """Self-contained HF configuration storing the physical backbone config + `qloop_v3_arch` recipe."""
+    """Self-contained HF configuration storing the physical backbone config + `qloop_v3_arch` recipe.
+
+    Exposes the effective virtual hybrid `layer_types` and `num_hidden_layers` at top level so
+    Hugging Face `GenerationMixin.generate()` builds an exact matching hybrid `DynamicCache`.
+    """
 
     model_type = "qwen36_loophssd"
 
@@ -292,31 +440,74 @@ class Qwen36LoopHSSDConfig(_HFPretrainedConfig):
     ) -> None:
         bcfg = copy.deepcopy(dict(base_config or {}))
         arch = copy.deepcopy(dict(qloop_v3_arch or {}))
+        req_active_passes = kwargs.pop("active_passes", None)
+        qloop_fmt = kwargs.pop("qloop_format_version", arch.get("qloop_format_version"))
+        qloop_sha = kwargs.pop("qloop_commit", arch.get("qloop_commit"))
         kwargs.setdefault("tie_word_embeddings", bool(bcfg.get("tie_word_embeddings", False)))
         kwargs.setdefault("architectures", ["Qwen36LoopHSSDForCausalLM"])
         kwargs.setdefault("auto_map", dict(AUTO_MAP))
-        for mirror_key in (
-            "vocab_size",
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "num_key_value_heads",
-            "head_dim",
-            "rms_norm_eps",
-            "eos_token_id",
-            "pad_token_id",
-            "bos_token_id",
-        ):
+        for mirror_key in _CONFIG_MIRROR_KEYS:
             if mirror_key in bcfg and mirror_key not in kwargs:
-                kwargs[mirror_key] = bcfg[mirror_key]
+                kwargs[mirror_key] = copy.deepcopy(bcfg[mirror_key])
+
+        virt_lt, active_lt, eff_r = _compute_virtual_layer_types(bcfg, arch, active_passes=req_active_passes)
+        if virt_lt:
+            kwargs["layer_types"] = list(virt_lt)
+            kwargs["num_hidden_layers"] = len(virt_lt)
+        elif "layer_types" in bcfg and "layer_types" not in kwargs:
+            kwargs["layer_types"] = list(bcfg["layer_types"])
+
         super().__init__(**kwargs)
         self.base_config = bcfg
         self.qloop_v3_arch = arch
         self.auto_map = dict(kwargs.get("auto_map") or AUTO_MAP)
         self.architectures = list(kwargs.get("architectures") or ["Qwen36LoopHSSDForCausalLM"])
-        self.virtual_num_hidden_layers = int(
-            arch.get("virtual_layers") or bcfg.get("num_hidden_layers") or getattr(self, "num_hidden_layers", 0)
+        phys_lt = _derive_physical_layer_types(bcfg)
+        self.physical_num_hidden_layers = int(
+            bcfg.get("num_hidden_layers") or len(phys_lt) or getattr(self, "num_hidden_layers", 0)
         )
+        self.virtual_num_hidden_layers = int(
+            len(virt_lt)
+            if virt_lt
+            else (arch.get("virtual_layers") or bcfg.get("num_hidden_layers") or getattr(self, "num_hidden_layers", 0))
+        )
+        if virt_lt:
+            self.layer_types = list(virt_lt)
+            self.num_hidden_layers = len(virt_lt)
+        elif not hasattr(self, "layer_types"):
+            self.layer_types = list(phys_lt)
+        self.active_passes = int(eff_r)
+        self.effective_num_hidden_layers = int(
+            len(active_lt) if active_lt else getattr(self, "num_hidden_layers", 0)
+        )
+        self.active_layer_types = list(active_lt if active_lt else getattr(self, "layer_types", []))
+        self.qloop_format_version: str | None = str(qloop_fmt) if qloop_fmt is not None else None
+        self.qloop_commit: str | None = str(qloop_sha) if qloop_sha is not None else None
+
+    def sync_active_passes(
+        self,
+        active_passes: int,
+        *,
+        full_layer_types: list[str] | None = None,
+    ) -> None:
+        """Synchronize outer hybrid config metadata whenever `set_active_passes(depth)` changes."""
+        virt_lt, active_lt, eff_r = _compute_virtual_layer_types(
+            self.base_config,
+            self.qloop_v3_arch,
+            active_passes=int(active_passes),
+        )
+        resolved_full = list(full_layer_types) if full_layer_types is not None else list(virt_lt)
+        if resolved_full:
+            self.layer_types = resolved_full
+            self.num_hidden_layers = len(resolved_full)
+            self.virtual_num_hidden_layers = len(resolved_full)
+        self.active_passes = int(eff_r)
+        self.effective_num_hidden_layers = int(len(active_lt) if active_lt else getattr(self, "num_hidden_layers", 0))
+        self.active_layer_types = list(active_lt if active_lt else getattr(self, "layer_types", []))
+        if isinstance(self.qloop_v3_arch, dict):
+            loop_d = self.qloop_v3_arch.get("loop")
+            if isinstance(loop_d, dict) and loop_d.get("enabled"):
+                loop_d["active_passes"] = int(eff_r)
 
     @classmethod
     def from_pretrained(
@@ -369,32 +560,56 @@ class _DepthContext:
         self._owner.set_active_passes(self._prev)
 
 
-class CausalLMPackOutput:
-    """HF `CausalLMOutputWithPast`-compatible container supporting attribute, tuple, and dict access."""
+_PACK_OUTPUT_ORDER: tuple[str, ...] = ("loss", "logits", "past_key_values", "hidden_states", "attentions")
 
-    def __init__(
-        self,
-        logits: torch.Tensor,
-        loss: torch.Tensor | None = None,
-        past_key_values: Any = None,
-        hidden_states: Any = None,
-        attentions: Any = None,
-    ) -> None:
-        self.logits = logits
-        self.loss = loss
-        self.past_key_values = past_key_values
-        self.hidden_states = hidden_states
-        self.attentions = attentions
+
+@dataclass
+class CausalLMPackOutput(_ModelOutputBase):  # type: ignore[misc]
+    """HF `CausalLMOutputWithPast`-compatible `ModelOutput` supporting attribute, `.get()`, dict, and tuple access."""
+
+    logits: torch.Tensor | None = None
+    loss: torch.Tensor | None = None
+    past_key_values: Any = None
+    hidden_states: Any = None
+    attentions: Any = None
+
+    def _sync_mapping(self) -> None:
+        OrderedDict.clear(self)
+        for k in _PACK_OUTPUT_ORDER:
+            v = self.__dict__.get(k)
+            if v is not None:
+                OrderedDict.__setitem__(self, k, v)
+
+    def __post_init__(self) -> None:
+        self._sync_mapping()
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__setattr__(self, name, value)
+        if name in _PACK_OUTPUT_ORDER:
+            self._sync_mapping()
 
     @property
     def cache(self) -> Any:
         return self.past_key_values
 
-    def __getitem__(self, key: int | str) -> Any:
+    def get(self, key: str, default: Any = None) -> Any:
+        if key == "cache" and "cache" not in self:
+            return self.past_key_values if self.past_key_values is not None else default
+        return OrderedDict.get(self, key, default)
+
+    def to_tuple(self) -> tuple[Any, ...]:
+        return tuple(OrderedDict.__getitem__(self, k) for k in self.keys())
+
+    def __getitem__(self, key: Any) -> Any:
         if isinstance(key, str):
-            return getattr(self, key)
-        items = [x for x in (self.loss, self.logits, self.past_key_values, self.hidden_states) if x is not None]
-        return items[key]
+            if key == "cache":
+                return self.past_key_values
+            if OrderedDict.__contains__(self, key):
+                return OrderedDict.__getitem__(self, key)
+            if key in _PACK_OUTPUT_ORDER:
+                return getattr(self, key)
+            raise KeyError(key)
+        return self.to_tuple()[key]
 
 
 def _materialize_non_moe_meta_backbone(backbone: nn.Module, fallback_cfg: Any) -> None:
@@ -526,6 +741,8 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
 
     config_class = Qwen36LoopHSSDConfig
     supports_gradient_checkpointing = True
+    _supports_cache_class = True
+    main_input_name = "input_ids"
 
     def __init__(
         self,
@@ -626,6 +843,31 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
                         target.copy_(t.to(device=target.device, dtype=target.dtype))
             if active_passes is not None:
                 self.loop_controller.set_active_passes(int(active_passes))
+        self._sync_outer_config()
+
+    def _sync_outer_config(self) -> None:
+        tm_cfg = getattr(self._text_model, "config", None)
+        tm_lt = getattr(tm_cfg, "layer_types", None) if tm_cfg is not None else None
+        full_lt = list(tm_lt) if isinstance(tm_lt, (list, tuple)) and len(tm_lt) > 0 else None
+        if hasattr(self.config, "sync_active_passes"):
+            self.config.sync_active_passes(self.active_passes, full_layer_types=full_lt)
+        elif full_lt is not None:
+            self.config.layer_types = full_lt
+            self.config.num_hidden_layers = len(full_lt)
+
+    def _sync_cache_for_active_passes(self, eff_cache: Any) -> None:
+        if eff_cache is None or self.loop_controller is None:
+            return
+        self.loop_controller._sync_cache_last_linear(eff_cache)
+        base = getattr(eff_cache, "base_cache", eff_cache)
+        layers = getattr(base, "layers", None)
+        if isinstance(layers, (list, tuple, nn.ModuleList)):
+            r_act = int(self.active_passes)
+            for s in self.loop_controller.schedule:
+                if 0 <= s.vidx < len(layers) and (s.r > r_act or s.cache_idx != s.vidx):
+                    v_lyr = layers[s.vidx]
+                    if hasattr(v_lyr, "supports_early_init") and getattr(v_lyr, "keys", None) is None:
+                        v_lyr.supports_early_init = False
 
     @property
     def _text_model(self) -> nn.Module:
@@ -662,8 +904,10 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
     def set_active_passes(self, r: int) -> None:
         if self.loop_controller is None:
             require(int(r) == 1, f"model has no LoopController; cannot set active_passes={r}")
+            self._sync_outer_config()
             return
         self.loop_controller.set_active_passes(int(r))
+        self._sync_outer_config()
 
     def depth(self, r: int) -> _DepthContext:
         prev = self.active_passes
@@ -682,18 +926,19 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
-        logits_to_keep: int | None = None,
+        logits_to_keep: int | torch.Tensor | slice | None = None,
         **kwargs: Any,
     ) -> Any:
         kw_cache = kwargs.pop("cache", None)
         eff_cache = kw_cache if past_key_values is None else past_key_values
-        if self.loop_controller is not None and eff_cache is not None:
-            self.loop_controller._sync_cache_last_linear(eff_cache)
+        if eff_cache is not None:
+            self._sync_cache_for_active_passes(eff_cache)
         if logits_to_keep is not None and labels is None:
+            eff_use_cache = (eff_cache is not None) if use_cache is None else bool(use_cache)
             tm_kw: dict[str, Any] = {
                 "input_ids": input_ids,
                 cache_kwarg_name(self._text_model): eff_cache,
-                "use_cache": bool(use_cache),
+                "use_cache": eff_use_cache,
             }
             if inputs_embeds is not None:
                 tm_kw["inputs_embeds"] = inputs_embeds
@@ -705,8 +950,12 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
                 tm_kw["output_hidden_states"] = output_hidden_states
             tm_out = self._text_model(**tm_kw, **kwargs)
             h_last = tm_out.last_hidden_state
-            keep = int(logits_to_keep)
-            h_slice = h_last[:, -keep:, :] if keep > 0 else h_last[:, :0, :]
+            if isinstance(logits_to_keep, (torch.Tensor, slice)):
+                h_slice = h_last[:, logits_to_keep, :]
+            else:
+                keep = int(logits_to_keep)
+                # HF Qwen convention: logits_to_keep == 0 keeps ALL sequence logits
+                h_slice = h_last[:, -keep:, :] if keep > 0 else h_last
             logits = self._lm_head(h_slice)
             out = CausalLMPackOutput(
                 logits=logits,
@@ -729,6 +978,8 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
             call_kw["labels"] = labels
         if use_cache is not None:
             call_kw["use_cache"] = use_cache
+        elif eff_cache is not None:
+            call_kw["use_cache"] = True
         if output_attentions is not None:
             call_kw["output_attentions"] = output_attentions
         if output_hidden_states is not None:
@@ -736,28 +987,64 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
         res = self.backbone(input_ids=input_ids, **call_kw)
         if return_dict is False:
             return (res.logits, extract_output_cache(res))
+        if not hasattr(res, "get"):
+            return CausalLMPackOutput(
+                logits=res.logits,
+                loss=getattr(res, "loss", None),
+                past_key_values=extract_output_cache(res),
+                hidden_states=getattr(res, "hidden_states", None),
+                attentions=getattr(res, "attentions", None),
+            )
         return res
 
     def prepare_inputs_for_generation(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         past_key_values: Any = None,
         attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        use_cache: bool = True,
         **kwargs: Any,
     ) -> dict[str, Any]:
         kw_cache = kwargs.pop("cache", None)
         eff_cache = kw_cache if past_key_values is None else past_key_values
+        past_length = 0
         if eff_cache is not None:
-            seq_len = getattr(eff_cache, "get_seq_length", lambda: 0)()
-            if seq_len > 0 and input_ids.shape[1] > 1:
+            get_sl = getattr(eff_cache, "get_seq_length", None)
+            if callable(get_sl):
+                past_length = int(get_sl())
+        if past_length > 0 and input_ids is not None:
+            if isinstance(cache_position, torch.Tensor) and cache_position.numel() > 0:
+                step_len = int(cache_position.shape[0])
+                if input_ids.shape[1] > step_len:
+                    if int(cache_position.max().item()) < input_ids.shape[1]:
+                        input_ids = input_ids[:, cache_position]
+                    else:
+                        input_ids = input_ids[:, -step_len:]
+            elif input_ids.shape[1] > past_length:
+                input_ids = input_ids[:, past_length:]
+            elif input_ids.shape[1] > 1:
                 input_ids = input_ids[:, -1:]
-        return {
-            "input_ids": input_ids,
-            "past_key_values": eff_cache,
-            "use_cache": True,
-            "attention_mask": attention_mask,
-            **kwargs,
-        }
+        model_inputs: dict[str, Any] = dict(kwargs)
+        if inputs_embeds is not None and past_length == 0:
+            model_inputs["inputs_embeds"] = inputs_embeds
+            model_inputs["input_ids"] = None
+        else:
+            model_inputs["input_ids"] = input_ids
+        model_inputs["past_key_values"] = eff_cache
+        model_inputs["use_cache"] = bool(use_cache)
+        if attention_mask is not None:
+            model_inputs["attention_mask"] = attention_mask
+        if cache_position is not None:
+            model_inputs["cache_position"] = cache_position
+        return model_inputs
+
+    @staticmethod
+    def _reorder_cache(past_key_values: Any, beam_idx: torch.Tensor) -> Any:
+        if past_key_values is not None and hasattr(past_key_values, "reorder_cache"):
+            past_key_values.reorder_cache(beam_idx)
+        return past_key_values
 
     @classmethod
     def from_pretrained(
@@ -797,6 +1084,8 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
             elif not isinstance(config, Qwen36LoopHSSDConfig):
                 cfg_dict = config.to_dict() if hasattr(config, "to_dict") else dict(vars(config))
                 config = Qwen36LoopHSSDConfig(**cfg_dict)
+
+            _warn_pack_metadata_mismatch(config)
 
             q_arch = dict((config.qloop_v3_arch or {}).get("quantization") or {})
             use_meta_moe = bool(
@@ -1045,6 +1334,13 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
 
             install_quantized_autograd_bridge(instance.backbone)
             instance._finalize_loop(loop_tensors)
+            if _HAS_TRANSFORMERS and os.path.isfile(os.path.join(local_dir, "generation_config.json")):
+                try:
+                    from transformers import GenerationConfig  # type: ignore[import-not-found]
+
+                    instance.generation_config = GenerationConfig.from_pretrained(local_dir)
+                except Exception:
+                    pass
             leftover_meta = [
                 f"param:{n}" for n, p in instance.named_parameters() if p.is_meta
             ] + [
@@ -1125,6 +1421,69 @@ AUTO_MAP: dict[str, str] = {
     "AutoConfig": "configuration_qwen36_loophssd.Qwen36LoopHSSDConfig",
     "AutoModelForCausalLM": "modeling_qwen36_loophssd.Qwen36LoopHSSDForCausalLM",
 }
+QLOOP_FORMAT_VERSION = "3.1"
+
+_CONFIG_MIRROR_KEYS: tuple[str, ...] = (
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "rms_norm_eps",
+    "eos_token_id",
+    "pad_token_id",
+    "bos_token_id",
+    "max_position_embeddings",
+    "full_attention_interval",
+    "sliding_window",
+    "linear_conv_kernel_dim",
+    "linear_key_head_dim",
+    "linear_value_head_dim",
+    "linear_num_key_heads",
+    "linear_num_value_heads",
+    "linear_num_heads",
+    "linear_head_dim",
+)
+
+
+def _derive_physical_layer_types(bcfg: dict[str, Any]) -> list[str]:
+    raw_lt = bcfg.get("layer_types")
+    if isinstance(raw_lt, (list, tuple)) and len(raw_lt) > 0:
+        return [str(x) for x in raw_lt]
+    n_phys = int(bcfg.get("num_hidden_layers") or 0)
+    if n_phys <= 0:
+        return []
+    interval = bcfg.get("full_attention_interval")
+    mtype = str(bcfg.get("model_type") or "").lower()
+    if interval is None and ("qwen3_5" in mtype or "qwen36" in mtype or mtype.startswith("toy")):
+        interval = 4
+    if interval is not None and int(interval) > 0:
+        iv = int(interval)
+        return ["full_attention" if (i + 1) % iv == 0 else "linear_attention" for i in range(n_phys)]
+    return ["full_attention"] * n_phys
+
+
+def _compute_virtual_layer_types(
+    bcfg: dict[str, Any],
+    arch: dict[str, Any],
+    *,
+    active_passes: int | None = None,
+) -> tuple[list[str], list[str], int]:
+    phys_lt = _derive_physical_layer_types(bcfg)
+    loop_cfg = arch.get("loop") if isinstance(arch, dict) else None
+    if isinstance(loop_cfg, dict) and loop_cfg.get("enabled") and phys_lt:
+        n_phys = len(phys_lt)
+        p_end = int(loop_cfg.get("prelude_end", 0))
+        c_end = int(loop_cfg.get("core_end", n_phys))
+        n_passes = max(1, int(loop_cfg.get("num_passes", 1)))
+        raw_r = active_passes if active_passes is not None else loop_cfg.get("active_passes", n_passes)
+        eff_r = max(1, min(int(raw_r if raw_r is not None else n_passes), n_passes))
+        if 0 <= p_end < c_end <= n_phys:
+            full_virt = phys_lt[:p_end] + phys_lt[p_end:c_end] * n_passes + phys_lt[c_end:]
+            active_virt = phys_lt[:p_end] + phys_lt[p_end:c_end] * eff_r + phys_lt[c_end:]
+            return full_virt, active_virt, eff_r
+    return phys_lt, phys_lt, 1
 
 
 class Qwen36LoopHSSDConfig(PretrainedConfig):
@@ -1140,31 +1499,71 @@ class Qwen36LoopHSSDConfig(PretrainedConfig):
     ) -> None:
         bcfg = copy.deepcopy(dict(base_config or {}))
         arch = copy.deepcopy(dict(qloop_v3_arch or {}))
+        req_active_passes = kwargs.pop("active_passes", None)
+        qloop_fmt = kwargs.pop("qloop_format_version", arch.get("qloop_format_version"))
+        qloop_sha = kwargs.pop("qloop_commit", arch.get("qloop_commit"))
         kwargs.setdefault("tie_word_embeddings", bool(bcfg.get("tie_word_embeddings", False)))
         kwargs.setdefault("architectures", ["Qwen36LoopHSSDForCausalLM"])
         kwargs.setdefault("auto_map", dict(AUTO_MAP))
-        for key in (
-            "vocab_size",
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "num_key_value_heads",
-            "head_dim",
-            "rms_norm_eps",
-            "eos_token_id",
-            "pad_token_id",
-            "bos_token_id",
-        ):
+        for key in _CONFIG_MIRROR_KEYS:
             if key in bcfg and key not in kwargs:
-                kwargs[key] = bcfg[key]
+                kwargs[key] = copy.deepcopy(bcfg[key])
+        virt_lt, active_lt, eff_r = _compute_virtual_layer_types(bcfg, arch, active_passes=req_active_passes)
+        if virt_lt:
+            kwargs["layer_types"] = list(virt_lt)
+            kwargs["num_hidden_layers"] = len(virt_lt)
+        elif "layer_types" in bcfg and "layer_types" not in kwargs:
+            kwargs["layer_types"] = list(bcfg["layer_types"])
         super().__init__(**kwargs)
         self.base_config = bcfg
         self.qloop_v3_arch = arch
         self.auto_map = dict(kwargs.get("auto_map") or AUTO_MAP)
         self.architectures = list(kwargs.get("architectures") or ["Qwen36LoopHSSDForCausalLM"])
-        self.virtual_num_hidden_layers = int(
-            arch.get("virtual_layers") or bcfg.get("num_hidden_layers") or getattr(self, "num_hidden_layers", 0)
+        phys_lt = _derive_physical_layer_types(bcfg)
+        self.physical_num_hidden_layers = int(
+            bcfg.get("num_hidden_layers") or len(phys_lt) or getattr(self, "num_hidden_layers", 0)
         )
+        self.virtual_num_hidden_layers = int(
+            len(virt_lt)
+            if virt_lt
+            else (arch.get("virtual_layers") or bcfg.get("num_hidden_layers") or getattr(self, "num_hidden_layers", 0))
+        )
+        if virt_lt:
+            self.layer_types = list(virt_lt)
+            self.num_hidden_layers = len(virt_lt)
+        elif not hasattr(self, "layer_types"):
+            self.layer_types = list(phys_lt)
+        self.active_passes = int(eff_r)
+        self.effective_num_hidden_layers = int(
+            len(active_lt) if active_lt else getattr(self, "num_hidden_layers", 0)
+        )
+        self.active_layer_types = list(active_lt if active_lt else getattr(self, "layer_types", []))
+        self.qloop_format_version: str | None = str(qloop_fmt) if qloop_fmt is not None else None
+        self.qloop_commit: str | None = str(qloop_sha) if qloop_sha is not None else None
+
+    def sync_active_passes(
+        self,
+        active_passes: int,
+        *,
+        full_layer_types: list[str] | None = None,
+    ) -> None:
+        virt_lt, active_lt, eff_r = _compute_virtual_layer_types(
+            self.base_config,
+            self.qloop_v3_arch,
+            active_passes=int(active_passes),
+        )
+        resolved_full = list(full_layer_types) if full_layer_types is not None else list(virt_lt)
+        if resolved_full:
+            self.layer_types = resolved_full
+            self.num_hidden_layers = len(resolved_full)
+            self.virtual_num_hidden_layers = len(resolved_full)
+        self.active_passes = int(eff_r)
+        self.effective_num_hidden_layers = int(len(active_lt) if active_lt else getattr(self, "num_hidden_layers", 0))
+        self.active_layer_types = list(active_lt if active_lt else getattr(self, "layer_types", []))
+        if isinstance(self.qloop_v3_arch, dict):
+            loop_d = self.qloop_v3_arch.get("loop")
+            if isinstance(loop_d, dict) and loop_d.get("enabled"):
+                loop_d["active_passes"] = int(eff_r)
 '''
 
 _STANDALONE_MODELING_SRC = '''"""Standalone Hugging Face Modeling for Qwen3.6-35B-A6B-LoopHSSD Whole Model Packs.
@@ -1190,8 +1589,10 @@ import os
 import struct
 import sys
 import types
+import warnings
 import weakref
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
@@ -1200,15 +1601,15 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 try:
-    from .configuration_qwen36_loophssd import Qwen36LoopHSSDConfig
+    from .configuration_qwen36_loophssd import QLOOP_FORMAT_VERSION, Qwen36LoopHSSDConfig
 except ImportError:
-    from configuration_qwen36_loophssd import Qwen36LoopHSSDConfig  # type: ignore[no-redef]
+    from configuration_qwen36_loophssd import QLOOP_FORMAT_VERSION, Qwen36LoopHSSDConfig  # type: ignore[no-redef]
 
 
 _HAS_QLOOP = importlib.util.find_spec("qloop") is not None
 
 if _HAS_QLOOP:
-    from qloop.infer.hf_custom_modeling import Qwen36LoopHSSDForCausalLM
+    from qloop.infer.hf_custom_modeling import CausalLMPackOutput, Qwen36LoopHSSDForCausalLM
 else:
     from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 
@@ -1217,11 +1618,36 @@ else:
     except ImportError:
         GenerationMixin = object  # type: ignore[assignment,misc]
 
+    try:
+        from transformers.modeling_outputs import ModelOutput as _STModelOutputBase
+    except (ImportError, AttributeError):
+
+        class _STModelOutputBase(OrderedDict):  # type: ignore[no-redef,type-arg]
+            def __getitem__(self, key: Any) -> Any:
+                if isinstance(key, str):
+                    return OrderedDict.__getitem__(self, key)
+                return self.to_tuple()[key]
+
+            def to_tuple(self) -> tuple[Any, ...]:
+                return tuple(OrderedDict.__getitem__(self, k) for k in self.keys())
+
     _BaseCls = (
         type("_StandaloneBase", (PreTrainedModel, GenerationMixin), {})
         if isinstance(GenerationMixin, type) and not issubclass(PreTrainedModel, GenerationMixin)
         else PreTrainedModel
     )
+
+    def _st_warn_pack_metadata_mismatch(config: Any) -> None:
+        arch = getattr(config, "qloop_v3_arch", None)
+        arch_d = arch if isinstance(arch, dict) else {}
+        pack_fmt = getattr(config, "qloop_format_version", None) or arch_d.get("qloop_format_version")
+        if pack_fmt is not None and str(pack_fmt) != str(QLOOP_FORMAT_VERSION):
+            warnings.warn(
+                f"Whole Model Pack qloop_format_version={pack_fmt!r} differs from standalone "
+                f"QLOOP_FORMAT_VERSION={QLOOP_FORMAT_VERSION!r}; loading continues in compatibility mode.",
+                UserWarning,
+                stacklevel=3,
+            )
 
     _ST_MAP: dict[str, torch.dtype] = {
         "F64": torch.float64,
@@ -6630,30 +7056,55 @@ else:
         def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
             self._owner.set_active_passes(self._prev)
 
-    class _StandaloneCausalLMOutput:
-        def __init__(
-            self,
-            logits: torch.Tensor,
-            loss: torch.Tensor | None = None,
-            past_key_values: Any = None,
-            hidden_states: Any = None,
-            attentions: Any = None,
-        ) -> None:
-            self.logits = logits
-            self.loss = loss
-            self.past_key_values = past_key_values
-            self.hidden_states = hidden_states
-            self.attentions = attentions
+    _ST_OUT_ORDER: tuple[str, ...] = ("loss", "logits", "past_key_values", "hidden_states", "attentions")
+
+    @dataclass
+    class _StandaloneCausalLMOutput(_STModelOutputBase):  # type: ignore[misc]
+        logits: torch.Tensor | None = None
+        loss: torch.Tensor | None = None
+        past_key_values: Any = None
+        hidden_states: Any = None
+        attentions: Any = None
+
+        def _sync_mapping(self) -> None:
+            OrderedDict.clear(self)
+            for k in _ST_OUT_ORDER:
+                v = self.__dict__.get(k)
+                if v is not None:
+                    OrderedDict.__setitem__(self, k, v)
+
+        def __post_init__(self) -> None:
+            self._sync_mapping()
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            object.__setattr__(self, name, value)
+            if name in _ST_OUT_ORDER:
+                self._sync_mapping()
 
         @property
         def cache(self) -> Any:
             return self.past_key_values
 
-        def __getitem__(self, key: int | str) -> Any:
+        def get(self, key: str, default: Any = None) -> Any:
+            if key == "cache" and "cache" not in self:
+                return self.past_key_values if self.past_key_values is not None else default
+            return OrderedDict.get(self, key, default)
+
+        def to_tuple(self) -> tuple[Any, ...]:
+            return tuple(OrderedDict.__getitem__(self, k) for k in self.keys())
+
+        def __getitem__(self, key: Any) -> Any:
             if isinstance(key, str):
-                return getattr(self, key)
-            items = [x for x in (self.loss, self.logits, self.past_key_values, self.hidden_states) if x is not None]
-            return items[key]
+                if key == "cache":
+                    return self.past_key_values
+                if OrderedDict.__contains__(self, key):
+                    return OrderedDict.__getitem__(self, key)
+                if key in _ST_OUT_ORDER:
+                    return getattr(self, key)
+                raise KeyError(key)
+            return self.to_tuple()[key]
+
+    CausalLMPackOutput = _StandaloneCausalLMOutput  # type: ignore[misc,assignment]
 
     _SA_CACHE_KWARGS: tuple[str, ...] = ("cache", "cache_params", "past_key_values", "past_key_value")
 
@@ -7665,6 +8116,8 @@ else:
 
     class Qwen36LoopHSSDForCausalLM(_BaseCls):  # type: ignore[no-redef,misc]
         config_class = Qwen36LoopHSSDConfig
+        _supports_cache_class = True
+        main_input_name = "input_ids"
 
         def __init__(
             self,
@@ -7804,24 +8257,47 @@ else:
             self._is_probs_cache: dict[int, bool] = {}
             self._amask_stack: list[torch.Tensor] = []
             self._slot_meta: list[tuple[int, int, str]] = []
+            self._slot_cache_meta: list[tuple[int, int, int]] = []
             self.active_passes = 1
             self._install_submodules(arch, hf_cfg)
             if not _defer_loop:
                 self._apply_standalone_loop(arch)
 
+        def _sync_outer_config(self) -> None:
+            tm = self._find_tm()
+            tm_cfg = getattr(tm, "config", None)
+            tm_lt = getattr(tm_cfg, "layer_types", None) if tm_cfg is not None else None
+            full_lt = list(tm_lt) if isinstance(tm_lt, (list, tuple)) and len(tm_lt) > 0 else None
+            if hasattr(self.config, "sync_active_passes"):
+                self.config.sync_active_passes(self.active_passes, full_layer_types=full_lt)
+            elif full_lt is not None:
+                self.config.layer_types = full_lt
+                self.config.num_hidden_layers = len(full_lt)
+
         def _sync_cache_last_linear(self, pkv: Any) -> None:
-            if pkv is None or not isinstance(getattr(pkv, "last_linear_layer", None), int):
+            if pkv is None:
+                return
+            base = getattr(pkv, "base_cache", pkv)
+            layers = getattr(base, "layers", None)
+            if isinstance(layers, (list, tuple, nn.ModuleList)) and self._slot_cache_meta:
+                r_act = int(self.active_passes)
+                for vidx, r_slot, cidx in self._slot_cache_meta:
+                    if 0 <= vidx < len(layers) and (r_slot > r_act or cidx != vidx):
+                        v_lyr = layers[vidx]
+                        if hasattr(v_lyr, "supports_early_init") and getattr(v_lyr, "keys", None) is None:
+                            v_lyr.supports_early_init = False
+            if not isinstance(getattr(base, "last_linear_layer", None), int):
                 return
             n_virt = len(self._slot_meta)
             if n_virt > 0:
                 for attr in ("conv_states", "recurrent_states", "key_cache", "value_cache"):
-                    slots = getattr(pkv, attr, None)
+                    slots = getattr(base, attr, None)
                     if isinstance(slots, list) and len(slots) < n_virt:
                         slots.extend([None] * (n_virt - len(slots)))
             for vidx, r_slot, lt in reversed(self._slot_meta):
                 if lt == "linear_attention" and r_slot <= self.active_passes:
-                    if pkv.last_linear_layer != vidx:
-                        pkv.last_linear_layer = vidx
+                    if base.last_linear_layer != vidx:
+                        base.last_linear_layer = vidx
                     return
 
         def _find_tm(self) -> nn.Module:
@@ -8406,6 +8882,7 @@ else:
         def _apply_standalone_loop(self, arch: dict[str, Any]) -> None:
             lcfg = dict(arch.get("loop") or {})
             if not lcfg.get("enabled"):
+                self._sync_outer_config()
                 return
             self._loop_spec = lcfg
             tm = self._find_tm()
@@ -8489,9 +8966,11 @@ else:
             order += [(i, 0) for i in range(c_end, n_phys)]
             v_layers = []
             ltypes = []
+            slot_cache_meta: list[tuple[int, int, int]] = []
             for v, (i, r) in enumerate(order):
                 lt = "full_attention" if hasattr(orig_layers[i], "self_attn") else "linear_attention"
                 share = bool(lcfg.get("kv_share", True) and r >= 2 and lt == "full_attention")
+                cidx = i if share else v
                 v_layers.append(
                     _StandaloneVirtualLayer(
                         self,
@@ -8500,16 +8979,19 @@ else:
                         r,
                         r >= 1 and i == p_end,
                         r >= 1 and i == c_end - 1,
-                        i if share else v,
+                        cidx,
                         lt,
                         orig_layers[i],
                     )
                 )
                 ltypes.append(lt)
+                slot_cache_meta.append((v, r, cidx))
             tm.layers = nn.ModuleList(v_layers)
             tm.config.num_hidden_layers = len(v_layers)
             tm.config.layer_types = ltypes
             self._slot_meta = [(v, r, lt) for v, ((_i, r), lt) in enumerate(zip(order, ltypes))]
+            self._slot_cache_meta = slot_cache_meta
+            self._sync_outer_config()
 
             def _tm_cache_pre(_m: nn.Module, _a: tuple[Any, ...], kw: dict[str, Any]) -> None:
                 _, pkv = _sa_extract_cache_kwarg(kw)
@@ -8705,10 +9187,12 @@ else:
             if self._loop_adapters is None:
                 if ri != 1:
                     raise ValueError(f"model has no loop adapters; cannot set active_passes={ri}")
+                self._sync_outer_config()
                 return
             if not 1 <= ri <= self.max_passes:
                 raise ValueError(f"active_passes must be in [1, {self.max_passes}], got {ri}")
             self.active_passes = ri
+            self._sync_outer_config()
 
         def depth(self, r: int) -> _StandaloneDepthContext:
             prev = self.active_passes
@@ -8737,7 +9221,7 @@ else:
             output_attentions: bool | None = None,
             output_hidden_states: bool | None = None,
             return_dict: bool | None = None,
-            logits_to_keep: int | None = None,
+            logits_to_keep: int | torch.Tensor | slice | None = None,
             **kwargs: Any,
         ) -> Any:
             try:
@@ -8746,11 +9230,12 @@ else:
                 if eff_cache is not None:
                     self._sync_cache_last_linear(eff_cache)
                 if logits_to_keep is not None and labels is None:
+                    eff_use_cache = (eff_cache is not None) if use_cache is None else bool(use_cache)
                     tm_mod = self._find_tm()
                     tm_kw: dict[str, Any] = {
                         "input_ids": input_ids,
                         _sa_cache_kwarg_name(tm_mod): eff_cache,
-                        "use_cache": bool(use_cache),
+                        "use_cache": eff_use_cache,
                     }
                     if inputs_embeds is not None:
                         tm_kw["inputs_embeds"] = inputs_embeds
@@ -8762,8 +9247,12 @@ else:
                         tm_kw["output_hidden_states"] = output_hidden_states
                     tm_out = tm_mod(**tm_kw, **kwargs)
                     h_last = tm_out.last_hidden_state
-                    keep = int(logits_to_keep)
-                    h_slice = h_last[:, -keep:, :] if keep > 0 else h_last[:, :0, :]
+                    if isinstance(logits_to_keep, (torch.Tensor, slice)):
+                        h_slice = h_last[:, logits_to_keep, :]
+                    else:
+                        keep = int(logits_to_keep)
+                        # HF Qwen convention: logits_to_keep == 0 keeps ALL sequence logits
+                        h_slice = h_last[:, -keep:, :] if keep > 0 else h_last
                     logits = self.get_output_embeddings()(h_slice)
                     out = _StandaloneCausalLMOutput(
                         logits=logits,
@@ -8786,14 +9275,75 @@ else:
                     call_kw["labels"] = labels
                 if use_cache is not None:
                     call_kw["use_cache"] = use_cache
+                elif eff_cache is not None:
+                    call_kw["use_cache"] = True
                 if output_attentions is not None:
                     call_kw["output_attentions"] = output_attentions
                 if output_hidden_states is not None:
                     call_kw["output_hidden_states"] = output_hidden_states
                 res = self.backbone(input_ids=input_ids, **call_kw)
-                return (res.logits, _sa_extract_output_cache(res)) if return_dict is False else res
+                if return_dict is False:
+                    return (res.logits, _sa_extract_output_cache(res))
+                if not hasattr(res, "get"):
+                    return _StandaloneCausalLMOutput(
+                        logits=res.logits,
+                        loss=getattr(res, "loss", None),
+                        past_key_values=_sa_extract_output_cache(res),
+                        hidden_states=getattr(res, "hidden_states", None),
+                        attentions=getattr(res, "attentions", None),
+                    )
+                return res
             finally:
                 self._amask_stack.clear()
+
+        def prepare_inputs_for_generation(
+            self,
+            input_ids: torch.Tensor | None = None,
+            past_key_values: Any = None,
+            attention_mask: torch.Tensor | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+            cache_position: torch.Tensor | None = None,
+            use_cache: bool = True,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            kw_cache = kwargs.pop("cache", None)
+            eff_cache = kw_cache if past_key_values is None else past_key_values
+            past_length = 0
+            if eff_cache is not None:
+                get_sl = getattr(eff_cache, "get_seq_length", None)
+                if callable(get_sl):
+                    past_length = int(get_sl())
+            if past_length > 0 and input_ids is not None:
+                if isinstance(cache_position, torch.Tensor) and cache_position.numel() > 0:
+                    step_len = int(cache_position.shape[0])
+                    if input_ids.shape[1] > step_len:
+                        if int(cache_position.max().item()) < input_ids.shape[1]:
+                            input_ids = input_ids[:, cache_position]
+                        else:
+                            input_ids = input_ids[:, -step_len:]
+                elif input_ids.shape[1] > past_length:
+                    input_ids = input_ids[:, past_length:]
+                elif input_ids.shape[1] > 1:
+                    input_ids = input_ids[:, -1:]
+            model_inputs: dict[str, Any] = dict(kwargs)
+            if inputs_embeds is not None and past_length == 0:
+                model_inputs["inputs_embeds"] = inputs_embeds
+                model_inputs["input_ids"] = None
+            else:
+                model_inputs["input_ids"] = input_ids
+            model_inputs["past_key_values"] = eff_cache
+            model_inputs["use_cache"] = bool(use_cache)
+            if attention_mask is not None:
+                model_inputs["attention_mask"] = attention_mask
+            if cache_position is not None:
+                model_inputs["cache_position"] = cache_position
+            return model_inputs
+
+        @staticmethod
+        def _reorder_cache(past_key_values: Any, beam_idx: torch.Tensor) -> Any:
+            if past_key_values is not None and hasattr(past_key_values, "reorder_cache"):
+                past_key_values.reorder_cache(beam_idx)
+            return past_key_values
 
         @classmethod
         def from_pretrained(
@@ -8835,6 +9385,8 @@ else:
             elif not isinstance(config, Qwen36LoopHSSDConfig):
                 cdict = config.to_dict() if hasattr(config, "to_dict") else dict(vars(config))
                 config = Qwen36LoopHSSDConfig(**cdict)
+
+            _st_warn_pack_metadata_mismatch(config)
 
             q_arch = dict((config.qloop_v3_arch or {}).get("quantization") or {})
             use_meta_moe = bool(
@@ -9058,6 +9610,13 @@ else:
 
             _st_install_quant_fallback(inst.backbone)
             inst._apply_standalone_loop(config.qloop_v3_arch or {})
+            if os.path.isfile(os.path.join(local_dir, "generation_config.json")):
+                try:
+                    from transformers import GenerationConfig
+
+                    inst.generation_config = GenerationConfig.from_pretrained(local_dir)
+                except Exception:
+                    pass
             missing_loop: list[str] = []
             unexpected_loop: list[str] = []
             if inst._loop_adapters is not None:
@@ -9131,11 +9690,13 @@ __all__ = [
     "AUTO_MAP",
     "CONFIG_FILENAME",
     "MODELING_FILENAME",
+    "QLOOP_FORMAT_VERSION",
     "CausalLMPackOutput",
     "Qwen36LoopHSSDConfig",
     "Qwen36LoopHSSDForCausalLM",
     "load_safetensors_file",
     "resolve_pack_directory",
+    "resolve_qloop_commit",
     "save_safetensors_file",
     "write_standalone_hf_modeling_files",
 ]

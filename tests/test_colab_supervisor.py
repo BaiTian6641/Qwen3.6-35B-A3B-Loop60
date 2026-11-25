@@ -1557,6 +1557,7 @@ def test_sync_pipeline_tracks_remaining_session_time_budget_across_stages(tmp_pa
         return 0
 
     monkeypatch.setattr("qloop.cli.subprocess.call", fake_call_exhausted)
+    monkeypatch.setattr(logging.getLogger("qloop"), "propagate", True)
     with caplog.at_level(logging.WARNING, logger="qloop"):
         rc2 = _run_sync_action(
             args_1,

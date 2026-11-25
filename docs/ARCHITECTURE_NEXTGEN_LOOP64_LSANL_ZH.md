@@ -23,7 +23,7 @@
 | :---: | :---: | :--- | :---: | :--- |
 | **C0** | 静态先验（`0`） | 冻结 NVFP4 基座 + `[12,36)` 三明治循环（`40L/64L/88L`）+ APOLLO | `21.85 GiB` 纯 NVFP4（`24.09 GiB` 混合） | `model/{loop,mhc,experts,quant_autograd}.py`, `train/optim.py` |
 | **C1** | **L0**（`1 / tok`） | 活跃流 `GDN-2-1M + Bounded QED + Soft Neg-Eigval`（`fla 0.6.0` DPLR） | `98.25 MiB` 固定状态（`27.53M` 适配器） | `model/gdn2.py`, `model/loop.py` |
-| **C2** | **L1–L2**（`1/512 tok`, `1/sess`） | 升级版 `D-LSA` + 分域 `KVMemBlobStore` + `DLMG` + `10B` 漏斗 | `11.25–22.50 GiB` KV + `150.2–262.5 MiB` 头部 | `model/{lsa,offload,pos_rerope}.py`, `memory/kv_blob.py` |
+| **C2** | **L1–L2**（`1/512 tok`, `1/sess`） | 升级版 `D-LSA` + `SplitHorizonKVBlobStore`（`KVMemBlobStore`）+ `DLMG` + `10B` 漏斗 | `11.25–22.50 GiB` KV + `150.2–262.5 MiB` 头部 | `model/{lsa,offload,pos_rerope}.py`, `memory/kv_blob.py` |
 | **C3** | **L3**（`1 / task`） | `EpisodicSideMemory`（`AlphaEdit` + `WISE`）+ `Cartridges++` + `Doc-to-LoRA` | `144 MiB/分片`（`ESM`）/ `11–22 MiB`（`Cart++`） | `memory/esm.py`, 规划 `model/cartridges.py` |
 | **C4** | **L4**（`1 / week`） | 三轴弹性计算（`MoR` + 自适应 `top_k` + `ZipfianTieredMoEEngram`） | `0.65–0.99 GiB` NVFP4 Engram（`top_k` 为 `0`） | `model/{loop,experts,quant_autograd}.py`, 规划 `engram.py` |
 | **C5** | 运行时引擎 | `MoR`/`MoD` 预填充 + Engram 耦合 `L35` `EAGLE-3`/`SAM`/`TreeWY` + `<= 24 GB` | `17.66–18.93 GiB`（`24 GB`）/ `10.89 GiB`（`16 GB`） | `infer/engine.py`, 规划 `infer/spec_draft.py` |
@@ -73,7 +73,7 @@ flowchart LR
     PA --> ADP["零初始化 GDN2Adapter (rank=64, 30 物理/48 虚拟层共 27.53M)"]
     ADP -- "asymmetric_tanh_bound [-3.0, +0.5] (20.1x 视界拉伸)" --> DEC["解耦通道级对数衰减 g_t"]
     ADP -- "logistic_shift + neg_eigval_max_boost=0.5" --> ERW["解耦擦除 b_t in (0, 1.5) 与写入 w_t"]
-    ADP -- "有界 QED |lambda_h| <= 0.35" --> QED["正交查询擦除: e_t = b_t*k_hat + lam_h*(b_t*q_hat - proj)"]
+    ADP -- "有界 QED abs(lambda_h) <= 0.35" --> QED["正交查询擦除: e_t = b_t*k_hat + lam_h*(b_t*q_hat - proj)"]
     BASE --> PREP["融合 tl.int64 Triton qed_dplr_prep"]
     DEC --> PREP
     ERW --> PREP
@@ -104,7 +104,7 @@ $$S_t = \big(I - \hat{k}_t e_t^{\top}\big)\operatorname{Diag}\!\big(\exp(g_t)\bi
 
 ---
 
-## C2 — 时间尺度 L1–L2（`1/512 tok` 与 `1/session`）：升级版 `D-LSA` + 分域 `KVMemBlobStore` + `DynamicLatentMemoryGraph`
+## C2 — 时间尺度 L1–L2（`1/512 tok` 与 `1/session`）：升级版 `D-LSA` + `SplitHorizonKVBlobStore`（`KVMemBlobStore`）+ `DynamicLatentMemoryGraph`
 
 ```mermaid
 flowchart TD
@@ -165,19 +165,19 @@ flowchart LR
 
 ### 工作原理（How It Works）
 反复将相同的 `100K` 词元代码库不变量、MCP 工具模式或用户偏好挂载进 B 分区，会持续挤占宝贵的横向稀疏注意力槽位。在**浅睡眠**（任务/仓库完结）阶段，**C3** 通过**三阶段渐进通路**将高频复现的 `L2` KV-Mem Blob 纵向晋升为紧凑 $O(1)$ 残差参数或高密度合成 KV 包，全程绝不修改冻结的 `32.212B` MoE 基座：
-- **阶段 A —— 零反向传播 `EpisodicSideMemory`（`ESM`，即刻可用）：** 借由 `Spark-X2.6` [22] 的 **`LRCD`** 提取 `(key, target_delta)` 残差对，采用 **`AlphaEdit`** [29] **`Float64` 双重格拉姆-施密特（`DGKS`）** 零空间岭回归将其严格投影至通用知识激活 $K_0$ 的正交补空间：
-  $$\Delta W = R K_e^{\top} \big(K_e K_e^{\top} + \lambda I\big)^{-1} P_0, \qquad P_0 = I - Q_0 Q_0^{\top}, \qquad \|\Delta W K_0\|_F / \|K_0\|_F < 10^{-12},$$
+- **阶段 A —— 零反向传播 `EpisodicSideMemory`（`ESM`，即刻可用）：** 借由 `Spark-X2.6` [22] 的 **`LRCD`** 提取 `(key, target_delta)` 残差对，先将触发键严格投影至通用知识激活 $K_0$ 的正交补空间，再采用 **`AlphaEdit`** [29] **`Float64` 双重格拉姆-施密特（`DGKS`）** 零空间岭回归求解：
+  $$K_{e,\perp} = P_0 K_e, \qquad \Delta W = R \big(K_{e,\perp}^{\top} K_{e,\perp} + \lambda I\big)^{-1} K_{e,\perp}^{\top} = R K_e^{\top} P_0 \big(P_0 K_e K_e^{\top} P_0 + \lambda I\big)^{-1} P_0, \qquad P_0 = I - Q_0 Q_0^{\top}, \qquad \|\Delta W K_0\|_F / \|K_0\|_F < 10^{-12},$$
   并在推理期套以 **`WISE`** [30] 激活作用域门控，保证作用域外的通用文本漂移精确为 **`0.000`**。每次写入均在事务级 **回滚账本（Undo Ledger）** 记录可逆增量，支持项目归档或事实撤销时的毫秒级位精确回滚。
 - **阶段 B —— 模块化压缩 KV 弹匣包（`Cartridges++`）：** 结合 **`Cartridges`** [31]、**`Cartridges++`** [32]（借路由与数据混合消除跨上下文偏航）与 **`Cartridges at Scale`** [33]，将 `100K` 词元文档/代码簇蒸馏为 `2K–4K` 合成 `H64-INT4` KV 词元（`4–8` 个 Blob = **`11.25–22.50 MiB`**，典型压缩比 **`~38×`**），零架构改动即可直接借 `D-LSA` 插回 B 分区。
 - **阶段 C —— 单次前向超网络与自编辑编译（`深睡眠 / 第 3 档`）：** **`Doc-to-LoRA`** [34] 元训练轻量化超网络，在**单次亚秒级前向（`~0.21 s`、`适配器显存 < 50 MB`、零单文档 SGD）**内将热 Blob 簇编译为即插即用知识 LoRA/Engram 适配器，并配套按周 **`SMF`** [35]（TF-IDF/惊奇度稀疏槽位更新）与 **`SEAL`** [36] 强化学习自编辑指令。
 
 ### 设计决策（How We Design It）
 - **精确锚点选址（`6` 个核心全局注意力边界，严格跳过尾声层 `L39`）：** `ESM` 仅挂载于 **`L15, L19, L23, L27, L31, L35`**（`64L` 中共 `12` 次虚拟访问），严格遵循已验证的 `S2` 校准规则**跳过尾声层 `L39`**，避免直接扰动紧邻 `lm_head` 的最终残差层而在无关提示词上引发 logit 分布冲击。
-- **精确 `144 MiB/分片` 显存预算（`闭式推导`）：** `6` 个锚点 × 两组 `bf16` 投影块（`[2048, 2048]` 或等效分解侧支 MLP，每锚点 `24 MiB`）= **`144.0 MiB`（`0.141 GiB`）/ 分片**（不足 `94.97 GiB` GDDR7 ECC 的 `0.15%`），可同时常驻数十个项目分片或 `< 3 ms` 热切换。
+- **精确 `144.0 MiB/分片` 显存预算（`闭式推导`，`Spark-X2.6 §C5.2`）：** `6` 个锚点 ×（`w_in` `[2048, 2048]` 冻结正交 `bf16` [`2 B` = `8.0 MiB/锚点`] 配归一化 `GELU` 特征 + `w_down` `[2048, 2048]` 编译 `fp32` [`4 B` = `16.0 MiB/锚点`] = `24.0 MiB/锚点`，共 `50.33M` 参数）= **`150,994,944 B = 144.0 MiB`（`0.141 GiB`）/ 分片**（不足 `94.97 GiB` GDDR7 ECC 的 `0.15%`），可同时常驻数十个项目分片或 `< 3 ms` 热切换。
 - **数值严谨性：** `DGKS` 正交化强制在 `torch.float64` 下执行两遍重正交化（保证 $\|Q_0^\top Q_0 - I\|_\infty < 10^{-14}$ 与零空间泄漏 `< 1e-12`），彻底杜绝朴素 `fp32` 正规方程常见的秩亏塌缩。
 
 ### 工程实现（How We Implement It）
-- **并行阶段 2B 底座（Memory-Core 分支）：** `src/qloop/memory/esm.py` 实现 `ESMConfig`（`anchors=(15, 19, 23, 27, 31, 35)`，严格守卫 `>= 36` 尾声层以屏蔽 `L39`）、`ESMLedgerEntry`、`NullSpaceESMAnchor`（SVD `register_general_subspace`、`Float64` AlphaEdit + DGKS `compile_nullspace_ridge`、`WISE` 激活作用域门控、相对范数硬上限与事务型 `rollback_entry`）及 `EpisodicSideMemoryBank`（`144.0 MiB` 分片账本），由 `tests/test_lsanl_memory.py` 校验（`< 1e-12` 零空间泄漏、`0.0` 第 0 步偏差、`0.000` 域外漂移与 `100%` 逐位回滚）。
+- **并行阶段 2B 底座（Memory-Core 分支）：** `src/qloop/memory/esm.py` 实现 `ESMConfig`（`anchor_layers=(15, 19, 23, 27, 31, 35)`，严格守卫 `>= 36` 尾声层以屏蔽 `L39`）、`ESMLedgerEntry`、`NullSpaceESMAnchor`（`w_in` `bf16` 正交 + `w_down` `fp32`、SVD `register_general_subspace`、`Float64` AlphaEdit + DGKS `compile_nullspace_ridge`、`WISE` 激活作用域门控、相对范数硬上限与事务型 `rollback_entry`）及 `EpisodicSideMemoryBank`（`144.0 MiB` 分片账本），由 `tests/test_lsanl_memory.py` 校验（`< 1e-12` 零空间泄漏、`0.0` 第 0 步偏差、`0.000` 域外漂移与 `100%` 逐位回滚）。
 - **阶段 B 与阶段 C 触点：** 规划 `src/qloop/model/cartridges.py`（产出标准 `H64-INT4` B 分区 Blob 的 `Cartridges++` 合成器），以及阶段 3 / 算力第 3 档复用 `FusedStepOptimizer`（`optim.py`）并受冻结 MoE SHA-256 守卫的 `Doc-to-LoRA` 超网络与 `SMF` 掩码训练器。
 
 ---
@@ -293,7 +293,7 @@ flowchart LR
 
 ### 设计决策（How We Design It）
 - **严格范围门控：** 阶段 `0–4` 保持 100% 聚焦文本与代码（训练期裁剪 `visual` 塔，但完整保留原生 `embed_tokens` 与 `3D mRoPE` 几何结构）。阶段 5 **严格仅在**文本/代码 `K0–K4` 全部通过后启用，直接服务论文 3（`ScreenSpot Pro`、`OmniDocBench` 与流式视频问答）。
-- **文献落地映射：** 将 **`ReKV`** [50]（免训练按需流式视频 KV 卸载与检索）、**`M3-Agent`** [51]（实体中心多模态情景/语义图谱）及 **`M+`** [52]（超越 `160K+` 词元的协同训练长期潜在检索器）直接映射至既有 `KVMemBlobStore` 与 `DLMG`，无需新增任何存储格式。
+- **文献落地映射：** 将 **`ReKV`** [50]（免训练按需流式视频 KV 卸载与检索）、**`M3-Agent`** [51]（实体中心多模态情景/语义图谱）及 **`M+`** [52]（超越 `160K+` 词元的协同训练长期潜在检索器）直接映射至既有 `SplitHorizonKVBlobStore`（`KVMemBlobStore`）与 `DLMG`，无需新增任何存储格式。
 
 ### 工程实现（How We Implement It）
 - 零重新对齐冻结文本/MoE 权重直接挂回内置 `visual` 视觉塔；在规划模块 `src/qloop/model/vlm_blobs.py` 中为 `apply_partial_rope_k`（`src/qloop/model/pos_rerope.py:166-195`）扩展 3D `(t, h, w)` 逆向 mRoPE 去旋，并向 `src/qloop/memory/kv_blob.py` 输出标准 `2.8125 MiB` `H64-INT4` Blob 与 `1,344 B` 头部（多模态 `K0` 熔断门：Pre-`3D-mRoPE` 视觉 Blob 达连续 VLM 神谕 `>= 90%`，且文本/代码指标 `0` 回退）。

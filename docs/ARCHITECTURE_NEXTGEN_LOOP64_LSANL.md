@@ -23,7 +23,7 @@
 | :---: | :---: | :--- | :---: | :--- |
 | **C0** | Static Prior (`0`) | Frozen NVFP4 Backbone + `[12,36)` Sandwich Loop (`40L/64L/88L`) + APOLLO | `21.85 GiB` pure NVFP4 (`24.09 GiB` mixed) | `model/{loop,mhc,experts,quant_autograd}.py`, `train/optim.py` |
 | **C1** | **L0** (`1 / tok`) | Active-Stream `GDN-2-1M + Bounded QED + Soft Neg-Eigval` (`fla 0.6.0` DPLR) | `98.25 MiB` fixed state (`27.53M` adapter) | `model/gdn2.py`, `model/loop.py` |
-| **C2** | **L1–L2** (`1/512 tok`, `1/sess`) | Upgraded `D-LSA` + Split-Horizon `KVMemBlobStore` + `DLMG` + `10B` Funnel | `11.25–22.50 GiB` KV + `150.2–262.5 MiB` hdrs | `model/{lsa,offload,pos_rerope}.py`, `memory/kv_blob.py` |
+| **C2** | **L1–L2** (`1/512 tok`, `1/sess`) | Upgraded `D-LSA` + `SplitHorizonKVBlobStore` (`KVMemBlobStore`) + `DLMG` + `10B` Funnel | `11.25–22.50 GiB` KV + `150.2–262.5 MiB` hdrs | `model/{lsa,offload,pos_rerope}.py`, `memory/kv_blob.py` |
 | **C3** | **L3** (`1 / task`) | `EpisodicSideMemory` (`AlphaEdit` + `WISE`) + `Cartridges++` + `Doc-to-LoRA` | `144 MiB/shard` (`ESM`) / `11–22 MiB` (`Cart++`) | `memory/esm.py`, planned `model/cartridges.py` |
 | **C4** | **L4** (`1 / week`) | 3-Axis Elastic Compute (`MoR` + Adaptive `top_k` + `ZipfianTieredMoEEngram`) | `0.65–0.99 GiB` NVFP4 Engram (`0` for `top_k`) | `model/{loop,experts,quant_autograd}.py`, planned `engram.py` |
 | **C5** | Runtime Engine | `MoR`/`MoD` Prefill + Engram-Coupled `L35` `EAGLE-3`/`SAM`/`TreeWY` + `<= 24 GB` | `17.66–18.93 GiB` (`24 GB`) / `10.89 GiB` (`16 GB`) | `infer/engine.py`, planned `infer/spec_draft.py` |
@@ -73,7 +73,7 @@ flowchart LR
     PA --> ADP["Zero-Init GDN2Adapter (rank=64, 27.53M across 30 phys / 48 virt L)"]
     ADP -- "asymmetric_tanh_bound [-3.0, +0.5] (20.1x Horizon)" --> DEC["Decoupled Channel Log-Decay g_t"]
     ADP -- "logistic_shift + neg_eigval_max_boost=0.5" --> ERW["Decoupled Erase b_t in (0, 1.5) & Write w_t"]
-    ADP -- "Bounded QED |lambda_h| <= 0.35" --> QED["Orthogonal Query Erase: e_t = b_t*k_hat + lam_h*(b_t*q_hat - proj)"]
+    ADP -- "Bounded QED abs(lambda_h) <= 0.35" --> QED["Orthogonal Query Erase: e_t = b_t*k_hat + lam_h*(b_t*q_hat - proj)"]
     BASE --> PREP["Fused tl.int64 Triton qed_dplr_prep"]
     DEC --> PREP
     ERW --> PREP
@@ -104,7 +104,7 @@ where:
 
 ---
 
-## C2 — Timescales L1–L2 (`1/512 tok` & `1/session`): Upgraded `D-LSA` + Split-Horizon `KVMemBlobStore` + `DynamicLatentMemoryGraph`
+## C2 — Timescales L1–L2 (`1/512 tok` & `1/session`): Upgraded `D-LSA` + `SplitHorizonKVBlobStore` (`KVMemBlobStore`) + `DynamicLatentMemoryGraph`
 
 ```mermaid
 flowchart TD
@@ -165,19 +165,19 @@ flowchart LR
 
 ### How It Works
 Repeatedly mounting the same `100K`-token repository invariants, MCP schemas, or user conventions into Partition B wastes horizontal sparse-attention slots. During **Light Sleep** (task/repo completion), **C3** graduates recurring `L2` KV-Mem Blobs vertically into compact $O(1)$ residual parameters or ultra-dense synthetic KV packs across **three progressive stages** that never touch the frozen `32.212B` MoE backbone:
-- **Stage A — Zero-Backprop `EpisodicSideMemory` (`ESM`, Ready Today):** Extracts residual `(key, target_delta)` pairs via `Spark-X2.6` [22]'s **`LRCD`**, projects them strictly into the orthogonal complement of general-knowledge activations $K_0$ using **`AlphaEdit`** [29] **`Float64` Double Gram-Schmidt (`DGKS`)** null-space ridge regression:
-  $$\Delta W = R K_e^{\top} \big(K_e K_e^{\top} + \lambda I\big)^{-1} P_0, \qquad P_0 = I - Q_0 Q_0^{\top}, \qquad \|\Delta W K_0\|_F / \|K_0\|_F < 10^{-12},$$
+- **Stage A — Zero-Backprop `EpisodicSideMemory` (`ESM`, Ready Today):** Extracts residual `(key, target_delta)` pairs via `Spark-X2.6` [22]'s **`LRCD`**, projects trigger keys first strictly into the orthogonal complement of general-knowledge activations $K_0$ using **`AlphaEdit`** [29] **`Float64` Double Gram-Schmidt (`DGKS`)** null-space ridge regression:
+  $$K_{e,\perp} = P_0 K_e, \qquad \Delta W = R \big(K_{e,\perp}^{\top} K_{e,\perp} + \lambda I\big)^{-1} K_{e,\perp}^{\top} = R K_e^{\top} P_0 \big(P_0 K_e K_e^{\top} P_0 + \lambda I\big)^{-1} P_0, \qquad P_0 = I - Q_0 Q_0^{\top}, \qquad \|\Delta W K_0\|_F / \|K_0\|_F < 10^{-12},$$
   and shields inference behind a **`WISE`** [30] activation scope gate so out-of-scope general text experiences exact **`0.000` drift**. Every write appends a reversible delta record to a transactional **Undo Ledger**, enabling exact millisecond rollback when a project is archived or a fact is retracted.
 - **Stage B — Modular Compressed KV Packs (`Cartridges++`):** Uses **`Cartridges`** [31], **`Cartridges++`** [32] (routing/data-mixing eliminating off-context derailment), and **`Cartridges at Scale`** [33] to distill `100K`-token document/code clusters into `2K–4K` synthetic `H64-INT4` KV tokens (`4–8` blobs = **`11.25–22.50 MiB`**, **`~38×`** typical compression) that plug straight back into Partition B via `D-LSA` with zero architecture changes.
 - **Stage C — Single-Forward-Pass Hypernetwork & Self-Edit Compilation (`Deep Sleep / Tier 3`):** **`Doc-to-LoRA`** [34] meta-trains a lightweight hypernetwork compiling a hot blob cluster into a plug-in knowledge LoRA/Engram adapter in **`~0.21 s`** (`< 50 MB` adapter memory, zero per-document SGD), complemented by weekly **`SMF`** [35] (TF-IDF/surprise sparse slot updates) and **`SEAL`** [36] RL-generated self-edit directives.
 
 ### How We Design It
 - **Exact Anchor Placement (`6` Core Full-Attn Boundaries, Strictly Skipping Coda `L39`):** `ESM` attaches strictly at **`L15, L19, L23, L27, L31, L35`** (`12` virtual visits in `64L`), **explicitly skipping Coda `L39`** per our verified `S2` calibration rule because editing the final pre-`lm_head` layer induces direct logit-distribution shock on unrelated prompts.
-- **Exact `144 MiB/shard` Memory Budget (`Derived Formula`):** `6` anchors × two `bf16` projection blocks (`[2048, 2048]` or factorized side-MLP equivalent = `24 MiB/anchor`) = **`144.0 MiB` (`0.141 GiB`) per shard** (`< 0.15%` of `94.97 GiB` GDDR7 ECC), allowing dozens of domain/project shards to reside simultaneously or hot-swap in `< 3 ms`.
+- **Exact `144.0 MiB/shard` Memory Budget (`Derived Formula`, `Spark-X2.6 §C5.2`):** `6` anchors × (`w_in` `[2048, 2048]` frozen orthogonal `bf16` [`2 B` = `8.0 MiB/anchor`] with normalized `GELU` features + `w_down` `[2048, 2048]` compiled `fp32` [`4 B` = `16.0 MiB/anchor`] = `24.0 MiB/anchor`, `50.33M` params) = **`150,994,944 B = 144.0 MiB` (`0.141 GiB`) per shard** (`< 0.15%` of `94.97 GiB` GDDR7 ECC), allowing dozens of domain/project shards to reside simultaneously or hot-swap in `< 3 ms`.
 - **Numerical Rigor:** `DGKS` orthogonalization runs strictly in `torch.float64` (two-pass re-orthogonalization guaranteeing $\|Q_0^\top Q_0 - I\|_\infty < 10^{-14}$ and null-space leakage `< 1e-12`), preventing the rank-deficiency collapse seen in naive `fp32` normal equations.
 
 ### How We Implement It
-- **Parallel Phase-2B Foundation (Memory-Core Branch):** `src/qloop/memory/esm.py` implements `ESMConfig` (`anchors=(15, 19, 23, 27, 31, 35)`, strict Coda `>= 36` guard blocking `L39`), `ESMLedgerEntry`, `NullSpaceESMAnchor` (SVD `register_general_subspace`, `Float64` AlphaEdit + DGKS `compile_nullspace_ridge`, `WISE` activation scope gate, relative norm cap, transactional `rollback_entry`), and `EpisodicSideMemoryBank` (`144.0 MiB` shard ledger), verified by `tests/test_lsanl_memory.py` (`< 1e-12` null-space leakage, `0.0` Step-0 diff, `0.000` out-of-scope drift, `100%` bit-exact rollback).
+- **Parallel Phase-2B Foundation (Memory-Core Branch):** `src/qloop/memory/esm.py` implements `ESMConfig` (`anchor_layers=(15, 19, 23, 27, 31, 35)`, strict Coda `>= 36` guard blocking `L39`), `ESMLedgerEntry`, `NullSpaceESMAnchor` (`w_in` `bf16` orthogonal + `w_down` `fp32`, SVD `register_general_subspace`, `Float64` AlphaEdit + DGKS `compile_nullspace_ridge`, `WISE` activation scope gate, relative norm cap, transactional `rollback_entry`), and `EpisodicSideMemoryBank` (`144.0 MiB` shard ledger), verified by `tests/test_lsanl_memory.py` (`< 1e-12` null-space leakage, `0.0` Step-0 diff, `0.000` out-of-scope drift, `100%` bit-exact rollback).
 - **Stage B & Stage C Hooks:** Planned `src/qloop/model/cartridges.py` (`Cartridges++` synthesizer emitting standard `H64-INT4` Partition-B blobs) and Phase-3/Grant-Tier-3 `Doc-to-LoRA` hypernetwork + `SMF` mask trainer reusing `FusedStepOptimizer` (`optim.py`) with frozen-MoE SHA-256 verification.
 
 ---
@@ -293,7 +293,7 @@ flowchart LR
 
 ### How We Design It
 - **Strict Scope Gate:** Phases `0–4` remain 100% text-and-code focused (`visual` pruned during text training while preserving stock `embed_tokens` and `3D mRoPE` layout). Phase 5 activates **only after** text/code `K0–K4` pass, targeting Paper 3 (`ScreenSpot Pro`, `OmniDocBench`, streaming video QA).
-- **Grounded Multimodal Memory Primitives:** Directly maps **`ReKV`** [50] (training-free on-demand streaming video KV offloading/retrieval), **`M3-Agent`** [51] (entity-centric multimodal episodic/semantic graphs), and **`M+`** [52] (co-trained long-term latent retriever past `160K+` tokens) onto our existing `KVMemBlobStore` and `DLMG` without adding a single new storage format.
+- **Grounded Multimodal Memory Primitives:** Directly maps **`ReKV`** [50] (training-free on-demand streaming video KV offloading/retrieval), **`M3-Agent`** [51] (entity-centric multimodal episodic/semantic graphs), and **`M+`** [52] (co-trained long-term latent retriever past `160K+` tokens) onto our existing `SplitHorizonKVBlobStore` (`KVMemBlobStore`) and `DLMG` without adding a single new storage format.
 
 ### How We Implement It
 - Re-attach stock `visual` tower without re-aligning frozen text/MoE weights; extend `apply_partial_rope_k` (`src/qloop/model/pos_rerope.py:166-195`) with 3D `(t, h, w)` inverse mRoPE un-rotation inside planned `src/qloop/model/vlm_blobs.py`, emitting standard `2.8125 MiB` `H64-INT4` blobs + `1,344 B` headers into `src/qloop/memory/kv_blob.py` (`K0` multimodal gate: Pre-`3D-mRoPE` visual blobs `>= 90%` of contiguous VLM oracle, `0` text/code regression).

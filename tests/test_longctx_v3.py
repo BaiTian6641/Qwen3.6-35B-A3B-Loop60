@@ -433,7 +433,7 @@ def test_segmented_kv_bptt_cross_segment_needle_gradient_proof():
     assert v_cross_norm > 1e-5, f"Expected non-zero cross-segment v_proj grad, got {v_cross_norm}"
 
     # Experiment C: When `replay_k >= seg_len` (all 16 prior tokens replayed), segmented replay
-    # matches full un-truncated BPTT gradients (`(loss / 2).backward()`) to `< 1e-10` in float64!
+    # matches exact valid-token-mean full un-truncated BPTT gradients (`ref_loss.backward()`) to `< 1e-10` in float64!
     model.zero_grad(set_to_none=True)
     runner_all = SegmentedKVBPTTRunner(model, seg_len=16, replay_k=16, replay_enabled=True)
     runner_all.run_step(ids, labels=labels, backward=True)
@@ -442,13 +442,13 @@ def test_segmented_kv_bptt_cross_segment_needle_gradient_proof():
 
     model.zero_grad(set_to_none=True)
     full_out = model(ids)
-    # Segment 1 loss in runner_all is divided by `n_segs = 2`
+    # Segment 0 has 0 valid tokens and Segment 1 has all 15 valid tokens -> valid-token weight = 15/15 = 1.0
     ref_loss = F.cross_entropy(
         full_out.logits[:, 16:-1].reshape(-1, cfg.vocab_size).float(),
         labels[:, 17:].reshape(-1),
         ignore_index=-100,
     )
-    (ref_loss / 2.0).backward()
+    ref_loss.backward()
     torch.testing.assert_close(gk_replay_all, attn.k_proj.weight.grad, rtol=1e-9, atol=1e-10)
     torch.testing.assert_close(gv_replay_all, attn.v_proj.weight.grad, rtol=1e-9, atol=1e-10)
 

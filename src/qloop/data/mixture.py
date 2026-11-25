@@ -118,7 +118,7 @@ class MixtureStream:
                 if self.consumed[i] == 0:
                     raise RuntimeError(
                         f"[mixture] source '{self.names[i]}' produced no items in epoch {self.epoch[i]} "
-                        "(empty dataset, everything filtered, or max_rows=0?)") from None
+                        "(empty dataset, everything filtered, holdout split matched 0 rows, or max_rows=0?)") from None
                 log.info("[mixture] source %s exhausted after %d items -> epoch %d", self.names[i],
                          self.consumed[i], self.epoch[i] + 1)
                 self.epoch[i] += 1
@@ -337,10 +337,77 @@ def raw_rows(spec: DatasetSpec, seed: int, epoch: int, skip: int = 0, src_cfg: d
                         cfg.get("token") or os.environ.get("HF_TOKEN"))
 
 
+SPLIT_ROLES = ("all", "train", "eval")
+
+
+def doc_holdout_key(ex: Example, row: dict[str, Any] | None = None) -> str:
+    """Canonical document-level key used for deterministic train/eval holdout partitioning.
+
+    Derived from canonical task/doc ID or normalized content (length + prefix + content SHA-1)
+    so duplicate documents across distinct sources deterministically land on the exact same side.
+    """
+    meta_doc_id = ex.meta.get("doc_id") if isinstance(ex.meta, dict) else None
+    if meta_doc_id is not None and str(meta_doc_id).strip():
+        return f"id:{str(meta_doc_id).strip()}"
+    meta_task_id = ex.meta.get("task_id") if isinstance(ex.meta, dict) else None
+    if meta_task_id is not None and str(meta_task_id).strip():
+        return f"task:{str(meta_task_id).strip()}"
+    if ex.kind == "text":
+        norm = " ".join((ex.text or "").split())
+        kind_tag = "text"
+    else:
+        prompt = " ".join(ex.prompt_text().split())
+        resp = " ".join(ex.response_text().split())
+        norm = f"{prompt}\x00{resp}" if (prompt or resp) else " ".join(ex.plain_text().split())
+        kind_tag = "chat"
+    if norm:
+        digest = hashlib.sha1(norm.encode("utf-8", "replace")).hexdigest()[:16]
+        return f"{kind_tag}:{len(norm)}:{norm[:256]}:{digest}"
+    if isinstance(row, dict):
+        for id_k in ("doc_id", "id", "task_id"):
+            val = row.get(id_k)
+            if val is not None and str(val).strip():
+                return f"id:{str(val).strip()}"
+    return f"{ex.source}:{ex.row_index}:{ex.sub_index}"
+
+
+def doc_holdout_bucket(doc_key: str, holdout_mod: int = 100) -> int:
+    """Map a canonical `doc_key` to `[0, holdout_mod)` deterministically via SHA-1."""
+    require(int(holdout_mod) > 0, "holdout_mod must be > 0", holdout_mod=holdout_mod)
+    return int(hashlib.sha1(doc_key.encode("utf-8", "replace")).hexdigest()[:8], 16) % int(holdout_mod)
+
+
+def is_eval_holdout_doc(
+    ex: Example,
+    *,
+    holdout_mod: int = 100,
+    holdout_eval_buckets: int = 2,
+    row: dict[str, Any] | None = None,
+) -> bool:
+    """Return True iff `ex` belongs to the deterministic hash-partitioned eval holdout."""
+    h_mod = int(holdout_mod)
+    h_eval = int(holdout_eval_buckets)
+    if h_mod <= 0 or h_eval <= 0:
+        return False
+    require(0 <= h_eval < h_mod, "holdout_eval_buckets must satisfy 0 <= holdout_eval_buckets < holdout_mod",
+            holdout_mod=h_mod, holdout_eval_buckets=h_eval)
+    return doc_holdout_bucket(doc_holdout_key(ex, row=row), h_mod) < h_eval
+
+
 def make_source_factory(spec: DatasetSpec, seed: int, drops: DropCounter, src_cfg: dict[str, Any] | None = None,
-                        max_rows: int | None = None, streaming: bool = True) -> SourceFactory:
+                        max_rows: int | None = None, streaming: bool = True, *, split_role: str = "all",
+                        holdout_mod: int = 100, holdout_eval_buckets: int = 2) -> SourceFactory:
     """factory(epoch, resume_from=None) -> iterator of validated `Example`s of one epoch."""
     cfg = dict(src_cfg or {})
+    eff_role = str(split_role)
+    eff_mod = int(holdout_mod)
+    eff_eval_buckets = int(holdout_eval_buckets)
+    require(eff_role in SPLIT_ROLES, f"split_role must be one of {SPLIT_ROLES}", split_role=eff_role)
+    if eff_role != "all" and eff_mod > 0:
+        require(0 <= eff_eval_buckets < eff_mod,
+                "holdout_eval_buckets must satisfy 0 <= holdout_eval_buckets < holdout_mod",
+                holdout_mod=eff_mod, holdout_eval_buckets=eff_eval_buckets)
+    partition_active = eff_role != "all" and eff_mod > 0 and eff_eval_buckets > 0
 
     def factory(epoch: int, resume_from: tuple[int, int] | None = None) -> Iterator[Example]:
         start = 0 if resume_from is None else int(resume_from[0])
@@ -363,6 +430,15 @@ def make_source_factory(spec: DatasetSpec, seed: int, drops: DropCounter, src_cf
                 if reason:
                     drops.drop(spec.name, reason, idx, "")
                     continue
+                if partition_active:
+                    in_eval = is_eval_holdout_doc(
+                        ex,
+                        holdout_mod=eff_mod,
+                        holdout_eval_buckets=eff_eval_buckets,
+                        row=row,
+                    )
+                    if (eff_role == "train" and in_eval) or (eff_role == "eval" and not in_eval):
+                        continue
                 drops.keep(spec.name)
                 ex.meta.setdefault("epoch", epoch)
                 yield ex
@@ -462,7 +538,8 @@ class TrainStream:
     def __init__(self, mixture: MixtureStream, tokenizer: Any, seq_len: int, respect_doc_boundaries: bool = True,
                  decontaminator: Decontaminator | None = None, drops: DropCounter | None = None,
                  dedupe: bool = True, dedupe_max: int = 5_000_000, keep_history_reasoning: bool = False,
-                 log_every: int = 1000, verify_first: int = 4, max_doc_tokens: int | None = None):
+                 log_every: int = 1000, verify_first: int = 4, max_doc_tokens: int | None = None, *,
+                 split_role: str = "all", holdout_mod: int = 100, holdout_eval_buckets: int = 2):
         self.mixture = mixture
         self.tokenizer = tokenizer
         self.sep_id = separator_id(tokenizer)
@@ -477,6 +554,9 @@ class TrainStream:
         self.log_every = log_every
         self.verify_first = verify_first
         self.max_doc_tokens = max_doc_tokens
+        self.split_role = str(split_role)
+        self.holdout_mod = int(holdout_mod)
+        self.holdout_eval_buckets = int(holdout_eval_buckets)
         self.doc_counter = 0
         self._queue: list[dict[str, Any]] = []
         self.counters: collections.Counter[str] = collections.Counter()
@@ -545,7 +625,9 @@ class TrainStream:
     def stats(self) -> dict[str, Any]:
         return {"counters": dict(self.counters), "fill_ratio": self.packer.fill_ratio,
                 "mixture": self.mixture.stats(), "drops": self.drops.summary(),
-                "decontam": self.decontam.summary() if self.decontam is not None else None}
+                "decontam": self.decontam.summary() if self.decontam is not None else None,
+                "split_role": self.split_role, "holdout_mod": self.holdout_mod,
+                "holdout_eval_buckets": self.holdout_eval_buckets}
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -579,7 +661,10 @@ def _as_plain(d: Any) -> Any:
     return d
 
 
-_SRC_RUNTIME_KEYS = {"name", "weight", "max_rows", "toy_rows", "bad_frac", "data_dir", "shuffle_buffer", "token"}
+_SRC_RUNTIME_KEYS = {
+    "name", "weight", "max_rows", "toy_rows", "bad_frac", "data_dir", "shuffle_buffer", "token",
+    "split_role", "holdout_mod", "holdout_eval_buckets",
+}
 
 
 def resolve_source_spec(src: dict[str, Any]) -> DatasetSpec:
@@ -596,10 +681,14 @@ def resolve_source_spec(src: dict[str, Any]) -> DatasetSpec:
 
 
 def build_train_stream(data_cfg: dict[str, Any], tokenizer: Any, seed: int = 0,
-                       eval_providers: dict[str, EvalTextProvider] | None = None) -> TrainStream:
+                       eval_providers: dict[str, EvalTextProvider] | None = None, *,
+                       split_role: str | None = None, holdout_mod: int | None = None,
+                       holdout_eval_buckets: int | None = None) -> TrainStream:
     """Build the packed training stream from the `data:` config section (or a cfg containing it).
 
     eval_providers: {group: callable -> iterable of eval texts}; overrides registry eval sets (tests).
+    split_role: "all" (default, backward compatible) | "train" | "eval" for deterministic document-level
+    SHA-1 hash holdout partitioning before packing (`bucket < holdout_eval_buckets` -> eval).
     """
     cfg = _as_plain(data_cfg)
     if "sources" not in cfg and isinstance(cfg.get("data"), dict):
@@ -610,6 +699,16 @@ def build_train_stream(data_cfg: dict[str, Any], tokenizer: Any, seed: int = 0,
         seq_len = int(cfg.get("seq_len", 4096))
         streaming = bool(cfg.get("streaming", True))
         global_max = cfg.get("max_rows_per_source")
+        eff_role = str(split_role if split_role is not None else cfg.get("split_role", "all"))
+        eff_mod = int(holdout_mod if holdout_mod is not None else cfg.get("holdout_mod", 100))
+        eff_eval_buckets = int(
+            holdout_eval_buckets if holdout_eval_buckets is not None else cfg.get("holdout_eval_buckets", 2)
+        )
+        require(eff_role in SPLIT_ROLES, f"split_role must be one of {SPLIT_ROLES}", split_role=eff_role)
+        if eff_role != "all" and eff_mod > 0:
+            require(0 <= eff_eval_buckets < eff_mod,
+                    "holdout_eval_buckets must satisfy 0 <= holdout_eval_buckets < holdout_mod",
+                    holdout_mod=eff_mod, holdout_eval_buckets=eff_eval_buckets)
         drops = DropCounter(max_format_error_frac=float(cfg.get("max_format_error_frac", 0.5)))
         sources: list[tuple[str, float, SourceFactory]] = []
         for k, src in enumerate(cfg["sources"]):
@@ -619,12 +718,17 @@ def build_train_stream(data_cfg: dict[str, Any], tokenizer: Any, seed: int = 0,
                     spec=spec)
             max_rows = src.get("max_rows", global_max)
             src_seed = int(seed) * 1009 + k
-            fac = make_source_factory(spec, src_seed, drops, src, None if max_rows is None else int(max_rows),
-                                      streaming)
+            s_role = str(src.get("split_role", eff_role))
+            s_mod = int(src.get("holdout_mod", eff_mod))
+            s_eval = int(src.get("holdout_eval_buckets", eff_eval_buckets))
+            fac = make_source_factory(
+                spec, src_seed, drops, src, None if max_rows is None else int(max_rows), streaming,
+                split_role=s_role, holdout_mod=s_mod, holdout_eval_buckets=s_eval,
+            )
             sources.append((spec.name, float(src.get("weight", 1.0)), fac))
-            log.info("[data] source %-16s w=%.3f %s role=%s format=%s%s%s", spec.name, float(src.get("weight", 1.0)),
-                     spec.hf_id, spec.role, spec.format, " gated" if spec.gated else "",
-                     "" if spec.verified else " (UNVERIFIED spec)")
+            log.info("[data] source %-16s w=%.3f %s role=%s format=%s split=%s(%d/%d)%s%s", spec.name,
+                     float(src.get("weight", 1.0)), spec.hf_id, spec.role, spec.format, s_role, s_eval, s_mod,
+                     " gated" if spec.gated else "", "" if spec.verified else " (UNVERIFIED spec)")
         mixture = MixtureStream(sources, seed=seed)
 
         dc = cfg.get("decontaminate") or {}
@@ -643,5 +747,6 @@ def build_train_stream(data_cfg: dict[str, Any], tokenizer: Any, seed: int = 0,
             mixture, tokenizer, seq_len, bool(cfg.get("respect_doc_boundaries", True)), decontaminator, drops,
             dedupe=bool(cfg.get("dedupe", True)), keep_history_reasoning=bool(cfg.get("keep_history_reasoning", False)),
             log_every=int(cfg.get("log_every", 1000)), max_doc_tokens=cfg.get("max_doc_tokens"),
+            split_role=eff_role, holdout_mod=eff_mod, holdout_eval_buckets=eff_eval_buckets,
         )
     return stream

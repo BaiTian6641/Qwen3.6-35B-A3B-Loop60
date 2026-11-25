@@ -36,16 +36,35 @@ def stable_names(model: nn.Module, extra: dict[str, nn.Module] | None = None) ->
     return names
 
 
-def _rng_state() -> dict[str, Any]:
-    st = {"python": random.getstate(), "torch": torch.get_rng_state()}
+def serialize_py_rng_state(rng: random.Random) -> list[Any]:
+    """Convert `random.Random.getstate()` into a JSON-serializable `[version, state_list, gauss_next]`."""
+    version, internal, gauss_next = rng.getstate()
+    return [int(version), [int(x) for x in internal], gauss_next]
+
+
+def deserialize_py_rng_state(raw: Any) -> tuple[Any, ...]:
+    """Restore a `random.Random.setstate()` tuple from either JSON-serialized or raw tuple state."""
+    if isinstance(raw, tuple) and len(raw) == 3 and isinstance(raw[1], tuple):
+        return raw
+    if isinstance(raw, (list, tuple)) and len(raw) == 3:
+        return (int(raw[0]), tuple(int(x) for x in raw[1]), raw[2])
+    raise ValueError(f"invalid serialized Python RNG state: {type(raw).__name__}")
+
+
+def _rng_state(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    st: dict[str, Any] = {"python": random.getstate(), "torch": torch.get_rng_state()}
     if torch.cuda.is_available():
         st["cuda"] = torch.cuda.get_rng_state_all()
+    if extra:
+        st.update(extra)
     return st
 
 
 def _set_rng_state(st: dict[str, Any]) -> None:
-    random.setstate(st["python"])
-    torch.set_rng_state(st["torch"])
+    if "python" in st:
+        random.setstate(st["python"])
+    if "torch" in st:
+        torch.set_rng_state(st["torch"])
     if "cuda" in st and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(st["cuda"])
 
@@ -108,6 +127,7 @@ class CheckpointManager:
         target_steps: int | None = None,
         metrics: dict[str, Any] | None = None,
         config_dict: dict[str, Any] | None = None,
+        extra_rng: dict[str, Any] | None = None,
     ) -> str:
         self._guard_disk_before_save()
         name = f"step_{step:07d}"
@@ -119,7 +139,7 @@ class CheckpointManager:
         torch.save({k: v.detach().to("cpu") for k, v in params.items()}, os.path.join(tmp, "trainable.pt"))
         if optim_state is not None:
             torch.save(optim_state, os.path.join(tmp, "optim.pt"))
-        torch.save(_rng_state(), os.path.join(tmp, "rng.pt"))
+        torch.save(_rng_state(extra_rng), os.path.join(tmp, "rng.pt"))
         meta = dict(state, step=step, saved_at=time.time(), n_params=sum(v.numel() for v in params.values()))
         with open(os.path.join(tmp, "state.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, default=str)
@@ -140,19 +160,30 @@ class CheckpointManager:
         )
         return final
 
-    def load(self, path: str | None = None, map_location: str = "cpu") -> dict[str, Any] | None:
+    def load(
+        self,
+        path: str | None = None,
+        map_location: str = "cpu",
+        *,
+        restore_rng: bool = True,
+    ) -> dict[str, Any] | None:
         path = path or self.latest()
         if path is None:
             return None
         with open(os.path.join(path, "state.json"), encoding="utf-8") as f:
             state = json.load(f)
-        out = {"path": path, "state": state,
-               "params": torch.load(os.path.join(path, "trainable.pt"), map_location=map_location)}
+        out: dict[str, Any] = {
+            "path": path,
+            "state": state,
+            "params": torch.load(os.path.join(path, "trainable.pt"), map_location=map_location),
+        }
         op = os.path.join(path, "optim.pt")
         out["optim"] = torch.load(op, map_location=map_location, weights_only=False) if os.path.exists(op) else None
         rp = os.path.join(path, "rng.pt")
-        if os.path.exists(rp):
-            _set_rng_state(torch.load(rp, weights_only=False))
+        rng_data = torch.load(rp, weights_only=False) if os.path.exists(rp) else None
+        out["rng"] = rng_data
+        if restore_rng and isinstance(rng_data, dict):
+            _set_rng_state(rng_data)
         log.info("loaded checkpoint %s (step %s)", path, state.get("step"))
         return out
 

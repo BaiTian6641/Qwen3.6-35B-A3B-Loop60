@@ -125,6 +125,11 @@ class BPTTStepResult:
     replayed_tokens_per_seg: list[int]
     replayed_indices: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
     stats: dict[str, float] = field(default_factory=dict)
+    ce_loss: float = 0.0
+    aux_loss: float = 0.0
+    segment_ce_losses: list[float] = field(default_factory=list)
+    segment_aux_losses: list[float] = field(default_factory=list)
+    segment_valid_tokens: list[int] = field(default_factory=list)
 
 
 def _in_backward() -> bool:
@@ -1672,6 +1677,14 @@ class SegmentedKVBPTTRunner:
         replay_meta: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, int, int]] = {}
         replayed_counts: list[int] = []
         seg_losses: list[float] = []
+        seg_ce_losses: list[float] = []
+        seg_aux_losses: list[float] = []
+        ce_loss_weighted_sum = 0.0
+        aux_loss_weighted_sum = 0.0
+        lsa_aux_total = 0.0
+        loop_aux_total = 0.0
+        hssd_aux_total = 0.0
+        replay_aux_total = 0.0
         active_seg_state = {"seg_idx": 0}
         proxy_holder: list[_ReplayKVCacheProxy | None] = [None]
         hooks: list[Any] = []
@@ -1688,31 +1701,35 @@ class SegmentedKVBPTTRunner:
         bypass_mask = _can_bypass_bptt_causal_mask(tm)
         no_mask_dict: dict[str, None] = {"full_attention": None, "linear_attention": None}
 
-        # Pre-compute which segments carry at least one valid (!= -100) target token in a single
-        # batched check. Long SFT prompts or `respect_doc_boundaries=True` trailing padding can
-        # produce an entire 32K segment with all -100 labels: running those with `grad_enabled`
-        # and skipping `.backward()` wasted compute and could pin un-traversed checkpoint graphs!
+        # Pre-compute exact valid (!= -100) supervised target token counts per segment in a single
+        # batched sync so supervised LM CE is normalized by `valid_tok_s / total_valid_toks` (exact
+        # parity with un-segmented full-sequence CE) and all-masked (`valid_tok_s == 0`) segments
+        # never waste autograd frames or divide by zero.
+        seg_valid_counts: list[int] = [0] * n_segs
         seg_valid_flags: list[bool] = [True] * n_segs
-        if can_pre_head:
-            if target_full is None:
-                seg_valid_flags = [False] * n_segs
-            else:
-                has_any_t: list[torch.Tensor] = []
-                shape_ok: list[bool] = []
-                for chk_i in range(n_segs):
-                    c0 = chk_i * seg_len
-                    c1 = min(t_total, (chk_i + 1) * seg_len)
-                    st_chk = target_full[:, c0 + 1 : c1 + 1] if c1 < t_total else target_full[:, c0 + 1 : t_total]
-                    exp_len = (c1 - c0) if c1 < t_total else max(0, (c1 - c0) - 1)
-                    ok_s = bool(st_chk.numel() > 0 and st_chk.shape[1] == exp_len)
-                    shape_ok.append(ok_s)
-                    has_any_t.append(
-                        (st_chk != -100).any()
-                        if ok_s
-                        else torch.zeros((), device=target_full.device, dtype=torch.bool)
-                    )
-                any_flags = torch.stack(has_any_t).tolist() if has_any_t else []
-                seg_valid_flags = [bool(ok_s and has_v) for ok_s, has_v in zip(shape_ok, any_flags)]
+        if target_full is not None:
+            cnt_t: list[torch.Tensor] = []
+            shape_ok: list[bool] = []
+            for chk_i in range(n_segs):
+                c0 = chk_i * seg_len
+                c1 = min(t_total, (chk_i + 1) * seg_len)
+                st_chk = target_full[:, c0 + 1 : c1 + 1] if c1 < t_total else target_full[:, c0 + 1 : t_total]
+                exp_len = (c1 - c0) if c1 < t_total else max(0, (c1 - c0) - 1)
+                ok_s = bool(st_chk.numel() > 0 and st_chk.shape[1] == exp_len)
+                shape_ok.append(ok_s)
+                cnt_t.append(
+                    (st_chk != -100).sum(dtype=torch.long)
+                    if ok_s
+                    else torch.zeros((), device=target_full.device, dtype=torch.long)
+                )
+            raw_counts = torch.stack(cnt_t).tolist() if cnt_t else []
+            seg_valid_counts = [int(c) if ok_s else 0 for ok_s, c in zip(shape_ok, raw_counts)]
+            if can_pre_head:
+                seg_valid_flags = [c > 0 for c in seg_valid_counts]
+        elif can_pre_head:
+            seg_valid_flags = [False] * n_segs
+        total_valid_toks = sum(seg_valid_counts)
+        n_active_tok_segs = sum(1 for c in seg_valid_counts if c > 0)
         last_active_seg = max((i for i, ok in enumerate(seg_valid_flags) if ok), default=-1)
 
         def make_attn_pre_hook(phys_idx: int):
@@ -1934,6 +1951,8 @@ class SegmentedKVBPTTRunner:
                 # no future segment needs their KV/HSSD state and they contribute zero loss.
                 if can_pre_head and s_idx > last_active_seg:
                     seg_losses.append(0.0)
+                    seg_ce_losses.append(0.0)
+                    seg_aux_losses.append(0.0)
                     replayed_counts.append(0)
                     continue
 
@@ -2036,29 +2055,83 @@ class SegmentedKVBPTTRunner:
                             hssd_ad.clear_aux()
                 loop_aux = loop_ctl.aux_loss() if loop_ctl is not None else None
 
-                total_seg_loss: torch.Tensor | None = seg_loss
-                extra_terms: list[torch.Tensor] = list(seg_replay_aux)
-                if lsa_terms and lsa_aux_weight > 0:
-                    extra_terms.extend(float(lsa_aux_weight) * t for t in lsa_terms)
-                if hssd_terms and hssd_aux_weight > 0:
-                    extra_terms.append(float(hssd_aux_weight) * torch.stack([t.float() for t in hssd_terms]).mean())
-                if loop_aux is not None and loop_aux_weight > 0:
-                    extra_terms.append(float(loop_aux_weight) * loop_aux)
+                seg_ce_loss: torch.Tensor | None = seg_loss
+                acc_dt = seg_ce_loss.dtype if seg_ce_loss is not None else torch.float32
+                replay_term = (
+                    torch.stack([t.to(acc_dt) for t in seg_replay_aux]).sum()
+                    if seg_replay_aux
+                    else None
+                )
+                lsa_term = (
+                    float(lsa_aux_weight) * torch.stack([t.to(acc_dt) for t in lsa_terms]).sum()
+                    if (lsa_terms and lsa_aux_weight > 0)
+                    else None
+                )
+                hssd_term = (
+                    float(hssd_aux_weight) * torch.stack([t.to(acc_dt) for t in hssd_terms]).mean()
+                    if (hssd_terms and hssd_aux_weight > 0)
+                    else None
+                )
+                loop_term = (
+                    float(loop_aux_weight) * loop_aux.to(acc_dt)
+                    if (loop_aux is not None and loop_aux_weight > 0)
+                    else None
+                )
+                aux_parts: list[torch.Tensor] = [
+                    t for t in (replay_term, lsa_term, hssd_term, loop_term) if t is not None
+                ]
+                aux_sum: torch.Tensor | None = torch.stack(aux_parts).sum() if aux_parts else None
                 lsa_terms.clear()
                 hssd_terms.clear()
                 seg_replay_aux.clear()
+                aux_parts.clear()
                 del loop_aux
 
-                if total_seg_loss is not None and extra_terms:
-                    aux_sum = torch.stack([t.to(total_seg_loss.dtype) for t in extra_terms]).sum()
-                    total_seg_loss = total_seg_loss + aux_sum
-                extra_terms.clear()
+                valid_tok_s = seg_valid_counts[s_idx]
+                if seg_ce_loss is not None:
+                    if total_valid_toks > 0 and valid_tok_s > 0:
+                        ce_weight_s = float(valid_tok_s) / float(total_valid_toks)
+                        aux_weight_s = 1.0 / float(max(1, n_active_tok_segs))
+                    elif loss_fn is None:
+                        ce_weight_s = 0.0
+                        aux_weight_s = 0.0
+                    else:
+                        ce_weight_s = 1.0 / float(n_segs)
+                        aux_weight_s = 1.0 / float(n_segs)
 
-                if total_seg_loss is not None:
-                    seg_losses.append(float(total_seg_loss.detach()))
-                    if backward and total_seg_loss.requires_grad:
-                        (total_seg_loss * (float(loss_scale) / float(n_segs))).backward()
+                    ce_val_s = float(seg_ce_loss.detach())
+                    aux_val_s = float(aux_sum.detach()) if aux_sum is not None else 0.0
+                    seg_ce_losses.append(ce_val_s)
+                    seg_aux_losses.append(aux_val_s)
+                    seg_losses.append(ce_val_s + aux_val_s)
+                    ce_loss_weighted_sum += ce_weight_s * ce_val_s
+                    aux_loss_weighted_sum += aux_weight_s * aux_val_s
+                    if replay_term is not None:
+                        replay_aux_total += aux_weight_s * float(replay_term.detach())
+                    if lsa_term is not None:
+                        lsa_aux_total += aux_weight_s * float(lsa_term.detach())
+                    if hssd_term is not None:
+                        hssd_aux_total += aux_weight_s * float(hssd_term.detach())
+                    if loop_term is not None:
+                        loop_aux_total += aux_weight_s * float(loop_term.detach())
+
+                    bwd_terms: list[torch.Tensor] = []
+                    if ce_weight_s > 0.0:
+                        bwd_terms.append(seg_ce_loss * ce_weight_s)
+                    if aux_sum is not None and aux_weight_s > 0.0:
+                        bwd_terms.append(aux_sum * aux_weight_s)
+                    bwd_loss = (
+                        bwd_terms[0]
+                        if len(bwd_terms) == 1
+                        else (torch.stack(bwd_terms).sum() if bwd_terms else None)
+                    )
+                    bwd_terms.clear()
+                    if backward and bwd_loss is not None and bwd_loss.requires_grad:
+                        (bwd_loss * float(loss_scale)).backward()
+                    bwd_loss = None
                 else:
+                    seg_ce_losses.append(0.0)
+                    seg_aux_losses.append(0.0)
                     seg_losses.append(0.0)
 
                 # Release live segment outputs & LoopContext graph stashes immediately after backward
@@ -2070,7 +2143,12 @@ class SegmentedKVBPTTRunner:
                 logits = None
                 logits_for_loss = None
                 seg_loss = None
-                total_seg_loss = None
+                seg_ce_loss = None
+                aux_sum = None
+                replay_term = None
+                lsa_term = None
+                hssd_term = None
+                loop_term = None
 
                 # Count replayed positions on this segment (from first full-attn layer if any)
                 if s_idx > 0 and full_layers and (s_idx, full_layers[0][0]) in recorded_indices:
@@ -2089,8 +2167,9 @@ class SegmentedKVBPTTRunner:
                 if loop_ctl is not None and callable(getattr(loop_ctl, "release_graph", None)):
                     loop_ctl.release_graph()
 
-            active_losses = [val for val in seg_losses if val != 0.0]
-            mean_loss = sum(active_losses) / len(active_losses) if active_losses else 0.0
+            ce_loss_out = ce_loss_weighted_sum
+            aux_loss_out = aux_loss_weighted_sum
+            total_loss_out = ce_loss_out + aux_loss_out
             recorded_indices_cpu = {
                 k: (v.cpu() if v.device.type != "cpu" else v) for k, v in recorded_indices.items()
             }
@@ -2102,14 +2181,27 @@ class SegmentedKVBPTTRunner:
                 "bptt/mean_replayed_tokens": (
                     sum(replayed_counts[1:]) / max(1, len(replayed_counts) - 1) if n_segs > 1 else 0.0
                 ),
+                "bptt/ce_loss": float(ce_loss_out),
+                "bptt/aux_loss": float(aux_loss_out),
+                "bptt/total_loss": float(total_loss_out),
+                "bptt/valid_tokens": float(total_valid_toks),
+                "bptt/lsa_kl": float(lsa_aux_total),
+                "bptt/loop_aux": float(loop_aux_total),
+                "bptt/hssd_aux": float(hssd_aux_total),
+                "bptt/replay_aux": float(replay_aux_total),
             }
             return BPTTStepResult(
-                total_loss=mean_loss,
+                total_loss=total_loss_out,
                 segment_losses=seg_losses,
                 num_segments=n_segs,
                 replayed_tokens_per_seg=replayed_counts,
                 replayed_indices=recorded_indices_cpu,
                 stats=stats,
+                ce_loss=ce_loss_out,
+                aux_loss=aux_loss_out,
+                segment_ce_losses=seg_ce_losses,
+                segment_aux_losses=seg_aux_losses,
+                segment_valid_tokens=list(seg_valid_counts),
             )
         finally:
             if copy_stream is not None:

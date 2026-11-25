@@ -96,7 +96,7 @@ Streaming one complete `10`-layer `H64-INT4` blob (`2,949,120 B`) from tiered ho
   $$t_{\text{DDR5}}^{\text{blob}} = \frac{2{,}949{,}120\ \text{B}}{50.0 \times 10^9\ \text{B/s}} = \mathbf{0.059\ \text{ms/blob}}\quad (\mathbf{0.0059\ \text{ms/layer}}).$$
 
 **Why Latency Hides Cleanly Behind `3` Interleaved `GDN-2 + MoE` Layers (`async_lookahead`):**
-In `Qwen3.6-35B-A3B`, physical full-attention layers occur every `4`th layer (`L3, L7, L11, L15, L19, L23, L27, L31, L35, L39`), separated by `3` consecutive `GDN-2 + MoE` layers. Using `Block64HadamardINT4Cache.prefetch_micro_pages(..., prefetch_layers_ahead=3)` (`offload.py:321-355`) extended to an async `io_uring`/GPUDirect/pinned-host staging queue:
+In `Qwen3.6-35B-A3B`, physical full-attention layers occur every `4`th layer (`L3, L7, L11, L15, L19, L23, L27, L31, L35, L39`), separated by `3` consecutive `GDN-2 + MoE` layers. Using `Block64HadamardINT4Cache.prefetch_micro_pages(layer_idx, page_indices, target_device=None)` (`offload.py:321-355`, with `prefetch_layers_ahead=3` configured via `Block64HadamardINT4Cache.__init__` at `offload.py:137`) extended to an async `io_uring`/GPUDirect/pinned-host staging queue:
 1. Full-attention layer $\ell$ (or early query lookahead at layer $\ell - 3$) issues the next layer's `288 KiB/blob` slice while `3` full `GDN-2 + MoE` layers execute (`~180M` active NVFP4 weights + Triton `fla` DPLR scans).
 2. Crucially, **cold-blob fetch latency is paid ONLY on cold-miss mount events**—not on every generated decode token! Once a retrieved set of $B$ blobs (e.g., $B = 16$ blobs = `8,192` tokens = `45.0 MiB` H64-INT4, taking `0.94 ms` from DDR5 or `6.74 ms` from NVMe total across all 10 layers) is mounted into Partition B's GPU-resident virtual slots (`1M–2M` capacity), all subsequent tokens in the multi-hundred-token reasoning turn attend to those mounted blobs directly at **`1,597 GB/s` GDDR7 ECC** bandwidth with zero PCIe/SSD traffic.
 
@@ -112,20 +112,20 @@ Scaling the cold archive to **`100 Mi-tokens`** ($100 \times 2^{20} = 104{,}857{
 
 ### 2.4 Realistic Single-GPU Operating Envelopes (`1× 96 GB GDDR7 ECC`, `94.97 GiB` Usable)
 
-Using pure NVFP4 base weights (`21.85 GiB` `Measured`; add `+2.24 GiB` for the `24.09 GiB` mixed NVFP4/FP8 HF checkpoint), exact `48`-state `64L` `GDN-2` recurrent state (`98.25 MiB = 0.096 GiB`), and compacted `int8` `BucketIndex` (`~0.04 GiB/1M` after fixing `lsa.py:728-768`), Table 2.1 details our three target operating envelopes alongside raw `10M` and `Inkling 2 Mini` [22] reference points.
+Using pure NVFP4 base weights (`21.85 GiB` `Measured`; add `+2.24 GiB` for the `24.09 GiB` mixed NVFP4/FP8 HF checkpoint), exact `48`-state `64L` `GDN-2` recurrent state (`98.25 MiB = 0.096 GiB`, rounded to `0.10 GiB` in table sums), and `0.3525 GiB / 1M` Partition-A routing metadata (`0.3125 GiB` `bf16` Ward centroids + `~0.04 GiB` compacted `int8` `BucketIndex` after fixing `lsa.py:728-768`) plus `0.0051–0.2563 GiB` GPU coarse headers (`4,096` mounted standalone blobs up to `204,800` `100 Mi-tok` SSD blobs), Table 2.1 details our three target operating envelopes alongside raw `10M` and `Inkling 2 Mini` [22] reference points.
 
 #### Table 2.1 — Exact Single-GPU GDDR7 ECC Memory Ledger Across Operating Envelopes (`Derived Formula` + `Measured` Weights)
 
 | Operating Envelope (`64L d=2`, `batch=1`) | Partition A (Active KV) | Partition B (Mounted KV) | Total KV (GiB) | NVFP4 Wts + `GDN-2` (GiB) | Compact Index + GPU Headers (GiB) | **Total GDDR7 (GiB)** | **Free on `94.97 GiB`** | Cold Archive (SSD) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Env. A — `3M` Precision Split** (`1M` FP8 + `2M` H64-INT4) | `10.00` (FP8) | `11.25` (H64) | **`21.25`** | `21.85 + 0.10` | `~0.50` *(0.36–0.61)* | **`~43.7`** | **`>51.2 GiB`** | Optional `100M` (`604 GB`) |
-| **Env. B — `4M` Max Logical Split** (`2M` H64 + `2M` H64) | `11.25` (H64) | `11.25` (H64) | **`22.50`** | `21.85 + 0.10` | `~0.55` *(0.55–0.96)* | **`~45.0`** | **`~50.0 GiB`** | Optional `100M` (`604 GB`) |
-| **Env. C — `2M` Hot + `100M` Cold SSD** (`1M` H64 + `1M` H64) | `5.625` (H64) | `5.625` (H64) | **`11.25`** | `21.85 + 0.10` | `~0.50–0.61` *(incl. `100M` hdrs)* | **`~33.7`** | **`>61.2 GiB`** | **`100M` (`604.0 GB`)** |
+| **Env. A — `3M` Precision Split** (`1M` FP8 + `2M` H64-INT4) | `10.00` (FP8) | `11.25` (H64) | **`21.25`** | `21.85 + 0.10` | `0.36–0.61` *(`0.3525` + hdrs)* | **`43.55–43.81`** *(`~43.6–43.8`)* | **`~51.2–51.4 GiB`** *(`51.16–51.42`)* | Optional `100M` (`604 GB`) |
+| **Env. B — `4M` Max Logical Split** (`2M` H64 + `2M` H64) | `11.25` (H64) | `11.25` (H64) | **`22.50`** | `21.85 + 0.10` | `0.71–0.96` *(`0.7050` + hdrs)* | **`45.16–45.41`** *(`~45.2–45.4`)* | **`~49.6–49.8 GiB`** *(`49.56–49.81`)* | Optional `100M` (`604 GB`) |
+| **Env. C — `2M` Hot + `100 Mi-tok` Cold SSD** (`1M` H64 + `1M` H64) | `5.625` (H64) | `5.625` (H64) | **`11.25`** | `21.85 + 0.10` | `0.61` *(`0.3525 + 0.2563`)* | **`33.81`** *(`~33.8`)* | **`~61.2 GiB`** *(`61.16`)* | **`100M` (`604.0 GB`)** |
 | *Contrast: Raw `10M` Contiguous FP8 (`10L`)* | `100.00` (FP8) | — | `100.00` | `21.85 + 0.10` | `~3.53` | **`125.5` (OOM)** | `-30.5 GiB` | None |
 | *Contrast: `Inkling 2 Mini` (`1M` F16, `Published` [22])* | `32.00` (F16) | — | `32.00` | `~18.6` (`~20 GB`) + `0.16` SWA | `0.00` | `~50.8` *(at `1M` only)* | `~44.2 GiB` | None reported |
 
 > [!TIP]
-> **Headroom for Full 5-Level Stack:** Even under the `4M` Split-Horizon envelope (`~45.0 GiB` total), **`~50 GiB` of GDDR7 ECC remains completely free**—amply accommodating `EpisodicSideMemory` (`0.141 GiB/shard`), `AnchoredMoEEngram` (`0.65–0.99 GiB` NVFP4), `DLMG` sparse adjacency tables, CUDA graphs, and multi-agent request batching on a single server card.
+> **Headroom for Full 5-Level Stack:** Even under the `4M` Split-Horizon envelope (`45.16–45.41 GiB` total), **`~49.6–49.8 GiB` of GDDR7 ECC remains completely free**—amply accommodating `EpisodicSideMemory` (`0.141 GiB/shard`), `AnchoredMoEEngram` (`0.65–0.99 GiB` NVFP4), `DLMG` sparse adjacency tables, CUDA graphs, and multi-agent request batching on a single server card.
 
 ---
 
@@ -153,7 +153,7 @@ Standard full-RoPE models (`partial_rotary_factor = 1.0`, e.g., Llama-3) apply r
    Three-quarters of every attention dot product $\langle q_{\text{nope}}, k_{\text{nope}} \rangle$ is **strictly position-invariant by architecture**. Moreover, `D-LSA` (`index_on="nope"`, [`src/qloop/model/lsa.py:154`](../src/qloop/model/lsa.py#L154)) computes `64`-D latent projections and Ward centroids *exclusively* on `[64:256)`—meaning **a blob's `D-LSA` routing centroids are bit-for-bit invariant to which session or virtual Partition-B slot it occupies!**
 2. **Exact Block-64 Orthogonal Separation Inside `H_64` Compression:** Our `walsh_hadamard_block(x, block_size=64)` ([`src/qloop/model/offload.py:32-56`](../src/qloop/model/offload.py#L32-L56)) applies block-diagonal $I_4 \otimes H_{64}$. Group 0 transforms *only* `[0:64)` (mRoPE), while Groups 1–3 transform *only* `[64:256)` (NoPE), guaranteeing zero cross-subspace leakage (`Fix C2`, `< 1e-12` commutativity error in `fp64`).
 3. **Pre-RoPE Archival Storage + Virtual Partition-B Clamped ReRoPE ([`src/qloop/model/pos_rerope.py`](../src/qloop/model/pos_rerope.py)):**
-   - During Micro-Sleep consolidation, we **un-rotate** only the `64`-d rotary slice by the inverse rotation $R(-p_s \omega) = R(p_s \omega)^{\top}$ via `apply_partial_rope_k(k, -k_positions)` (`pos_rerope.py:166-195`):
+   - During Micro-Sleep consolidation, we **un-rotate** only the `64`-d rotary slice by the inverse per-token rotation $R(-(p_s + j)\omega) = R((p_s + j)\omega)^{\top}$ via `apply_partial_rope_k(k, -k_positions)` (`pos_rerope.py:166-195`):
      $$k_j^{\text{pre}} = \big[R(-(p_s + j)\omega)\, k_{\text{rot}}^{(s)}(j),\;\; k_{\text{nope}}^{(s)}(j)\big], \qquad j \in \{0, \dots, 511\},$$
      and store $(k^{\text{pre}}, v)$ packed in `H_64` INT4.
    - At Partition-B mount time, blob $m$ receives a clean **virtual Partition-B slot position** $p_{\text{virt}}(m, j) = P_{\text{partB}}(m) + j$, preserving exact intra-blob syntax distances $(j_1 - j_2)$ while mapping cross-partition query-to-blob distance $\Delta = t - p_{\text{virt}}$ through our smooth $C^1$ **`clamped_relative_distance`** (`pos_rerope.py:89-124`, `linear_ceil = 131,072`, `log_scale = 32,768`, `max_pos = 240,000`—strictly inside `Qwen3.6`'s pretrained `262,144` arc!):

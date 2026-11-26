@@ -40,6 +40,7 @@ import gc
 import importlib
 import importlib.util
 import json
+import math
 import os
 import py_compile
 import shutil
@@ -788,11 +789,42 @@ def _probe_quantized_cache_strict_abc(num_layers: int, layer_types: list[str]) -
         if qc.is_recording_past(lin_idx) is not False or qc.is_recording_past(full_idx) is not False:
             raise AssertionError("expected is_recording_past() == False")
 
+        # Verify TF 5.24.1 `kwargs=kwargs` calling convention (`modeling_qwen3_5_moe.py:813`)
+        full_indices = [i for i, lt in enumerate(layer_types) if lt == "full_attention"]
+        full_idx2 = full_indices[1] if len(full_indices) > 1 else full_idx
+        probe_k = torch.randn(1, 2, 2, 16)
+        probe_v = torch.randn(1, 2, 2, 16)
+        probe_k_step = torch.randn(1, 2, 1, 16)
+        probe_v_step = torch.randn(1, 2, 1, 16)
+        probe_cpos = torch.arange(2, dtype=torch.long)
+        probe_cpos_step = torch.tensor([2], dtype=torch.long)
+        pk_out, pv_out = qc.update(probe_k, probe_v, full_idx, kwargs={"cache_position": probe_cpos})
+        if pk_out.shape != probe_k.shape or pv_out.shape != probe_v.shape:
+            raise AssertionError("strict ABC QuantizedHybridCache.update(..., kwargs=...) shape mismatch")
+        if full_idx2 != full_idx:
+            plk_out, plv_out = qc.layers[full_idx2].update(probe_k, probe_v, kwargs={"cache_position": probe_cpos})
+            if plk_out.shape != probe_k.shape or plv_out.shape != probe_v.shape:
+                raise AssertionError("strict ABC layers[i].update(..., kwargs=...) shape mismatch")
+        plk_s, plv_s = qc.layers[full_idx].update(
+            probe_k_step, probe_v_step, kwargs={"cache_position": probe_cpos_step}
+        )
+        if plk_s.shape != (1, 2, 3, 16) or plv_s.shape != (1, 2, 3, 16):
+            raise AssertionError("strict ABC layers[i].update(..., kwargs=...) decode append shape mismatch")
+        if qc.get_seq_length(full_idx, cache_position=probe_cpos_step) != 3:
+            raise AssertionError("strict ABC get_seq_length(..., extra_kwargs) mismatch")
+        if qc.layers[full_idx].get_seq_length(cache_position=probe_cpos_step) != 3:
+            raise AssertionError("strict ABC layers[i].get_seq_length(extra_kwargs) mismatch")
+        if qc.get_mask_sizes(probe_cpos_step, full_idx, kwargs={"cache_position": probe_cpos_step}) != (4, 0):
+            raise AssertionError("strict ABC get_mask_sizes(..., extra_kwargs) mismatch")
+        if qc.layers[full_idx].get_mask_sizes(probe_cpos_step, kwargs={"cache_position": probe_cpos_step}) != (4, 0):
+            raise AssertionError("strict ABC layers[i].get_mask_sizes(..., extra_kwargs) mismatch")
+
         return {
             "contract_mode": "strict_abc_mock",
             "cache_base": cache_cls.__name__,
             "layer_base": layer_cls.__name__,
             "layers_verified": num_layers,
+            "tf524_update_kwargs_verified": True,
         }
     finally:
         sys.modules.pop(probe_name, None)
@@ -950,14 +982,48 @@ def check_quantized_hybrid_cache(
                 raise AssertionError("unexpected is_compileable / is_sliding on real-transformers QuantizedHybridCache")
             if probe_cache.is_recording_past(lin0) is not False or probe_cache.is_recording_past(full0) is not False:
                 raise AssertionError("unexpected is_recording_past() on real-transformers QuantizedHybridCache")
+            # Explicitly exercise TF 5.24.1 `kwargs=kwargs` calling convention (`modeling_qwen3_5_moe.py:813`)
+            probe_k = torch.randn(1, 2, 2, 16)
+            probe_v = torch.randn(1, 2, 2, 16)
+            probe_k_step = torch.randn(1, 2, 1, 16)
+            probe_v_step = torch.randn(1, 2, 1, 16)
+            probe_cpos = torch.arange(2, dtype=torch.long)
+            probe_cpos_step = torch.tensor([2], dtype=torch.long)
+            pk_out, pv_out = probe_cache.update(probe_k, probe_v, full0, kwargs={"cache_position": probe_cpos})
+            if pk_out.shape != probe_k.shape or pv_out.shape != probe_v.shape:
+                raise AssertionError("real-transformers QuantizedHybridCache.update(..., kwargs=...) shape mismatch")
+            plk_out, plv_out = probe_cache.layers[full1].update(
+                probe_k, probe_v, kwargs={"cache_position": probe_cpos}
+            )
+            if plk_out.shape != probe_k.shape or plv_out.shape != probe_v.shape:
+                raise AssertionError(
+                    "real-transformers QuantizedHybridCache.layers[i].update(..., kwargs=...) shape mismatch"
+                )
+            plk_s, plv_s = probe_cache.layers[full0].update(
+                probe_k_step, probe_v_step, kwargs={"cache_position": probe_cpos_step}
+            )
+            if plk_s.shape != (1, 2, 3, 16) or plv_s.shape != (1, 2, 3, 16):
+                raise AssertionError("real-transformers layers[i].update(..., kwargs=...) decode shape mismatch")
+            if probe_cache.get_seq_length(full0, cache_position=probe_cpos_step) != 3:
+                raise AssertionError("real-transformers get_seq_length(..., extra_kwargs) mismatch")
+            if probe_cache.layers[full0].get_seq_length(cache_position=probe_cpos_step) != 3:
+                raise AssertionError("real-transformers layers[i].get_seq_length(extra_kwargs) mismatch")
+            if probe_cache.get_mask_sizes(probe_cpos_step, full0, kwargs={"cache_position": probe_cpos_step}) != (4, 0):
+                raise AssertionError("real-transformers get_mask_sizes(..., extra_kwargs) mismatch")
+            if probe_cache.layers[full0].get_mask_sizes(
+                probe_cpos_step, kwargs={"cache_position": probe_cpos_step}
+            ) != (4, 0):
+                raise AssertionError("real-transformers layers[i].get_mask_sizes(..., extra_kwargs) mismatch")
             metrics["tf524_contract"] = {
                 "contract_mode": "real_transformers",
                 "transformers_version": env["transformers_version"],
                 "layers_verified": n_layers,
+                "tf524_update_kwargs_verified": True,
             }
         else:
             metrics["tf524_contract"] = _probe_quantized_cache_strict_abc(n_layers, ltypes)
         metrics["subchecks"]["tf524_cache_and_layer_mixin"] = True
+        metrics["subchecks"]["tf524_update_kwargs_convention"] = True
 
         # Check @property descriptors on class
         if not isinstance(getattr(QuantizedHybridCache, "is_compileable", None), property):
@@ -1026,26 +1092,28 @@ def check_quantized_hybrid_cache(
             if not bool(cache.has_previous_state):
                 raise AssertionError(f"mode={mode}: bool(has_previous_state) False after populating last linear layer")
 
-            # update (prefill + decode) on full layers
-            k_pf, v_pf = cache.update(k_prefill, v_prefill, layer_idx=full0)
+            # update (prefill + decode) on full layers — including TF 5.24.1 `kwargs={"cache_position": ...}` convention
+            cpos_pf = torch.arange(int(k_prefill.shape[-2]), dtype=torch.long)
+            cpos_dec = torch.tensor([int(k_prefill.shape[-2])], dtype=torch.long)
+            k_pf, v_pf = cache.update(k_prefill, v_prefill, layer_idx=full0, kwargs={"cache_position": cpos_pf})
             if k_pf.shape != k_prefill.shape or v_pf.shape != v_prefill.shape:
                 raise AssertionError(f"mode={mode}: prefill KV shape mismatch")
-            k_f1, v_f1 = cache.layers[full1].update(k_prefill, v_prefill)
+            k_f1, v_f1 = cache.layers[full1].update(k_prefill, v_prefill, kwargs={"cache_position": cpos_pf})
             if k_f1.shape != k_prefill.shape or v_f1.shape != v_prefill.shape:
                 raise AssertionError(f"mode={mode}: layers[{full1}].update shape mismatch")
 
-            k_all, v_all = cache.update(k_dec, v_dec, layer_idx=full0)
+            k_all, v_all = cache.update(k_dec, v_dec, layer_idx=full0, kwargs={"cache_position": cpos_dec})
             if k_all.shape != (b_sz, g_kv, 7, h_dim) or v_all.shape != (b_sz, g_kv, 7, h_dim):
                 raise AssertionError(f"mode={mode}: decode append KV shape mismatch")
             if (
-                cache.get_seq_length() != 7
-                or cache.get_seq_length(lin0) != 7
-                or cache.layers[full0].get_seq_length() != 7
+                cache.get_seq_length(cache_position=cpos_dec) != 7
+                or cache.get_seq_length(lin0, cache_position=cpos_dec) != 7
+                or cache.layers[full0].get_seq_length(cache_position=cpos_dec) != 7
             ):
                 raise AssertionError(f"mode={mode}: get_seq_length after decode != 7")
-            if cache.get_mask_sizes(torch.tensor([7]), layer_idx=full0) != (8, 0):
+            if cache.get_mask_sizes(torch.tensor([7]), layer_idx=full0, kwargs={"cache_position": cpos_dec}) != (8, 0):
                 raise AssertionError(f"mode={mode}: get_mask_sizes after decode != (8, 0)")
-            if cache.layers[full0].get_mask_sizes(torch.tensor([7])) != (8, 0):
+            if cache.layers[full0].get_mask_sizes(torch.tensor([7]), kwargs={"cache_position": cpos_dec}) != (8, 0):
                 raise AssertionError(f"mode={mode}: layer.get_mask_sizes after decode != (8, 0)")
 
             # gather_kv exact parity with full dequantized slice
@@ -1106,13 +1174,13 @@ def check_quantized_hybrid_cache(
             view_read_stashed = SharedKVView(c_shared, stash, record=False)
             view_read_zero_len = SharedKVView(c_shared, None, record=False)
 
-            k_s1, v_s1 = view_rec.update(k_prefill, v_prefill, full0)
+            k_s1, v_s1 = view_rec.update(k_prefill, v_prefill, full0, kwargs={"cache_position": cpos_pf})
             bytes_p1 = int(c_shared.kv_bytes())
             if bytes_p1 <= 0:
                 raise AssertionError(f"mode={mode}: kv_bytes after pass-1 write must be > 0")
 
-            k_s2_st, v_s2_st = view_read_stashed.update(k_p2_alt, v_p2_alt, full0)
-            k_s2_zl, v_s2_zl = view_read_zero_len.update(k_p2_alt, v_p2_alt, full0)
+            k_s2_st, v_s2_st = view_read_stashed.update(k_p2_alt, v_p2_alt, full0, kwargs={"cache_position": cpos_pf})
+            k_s2_zl, v_s2_zl = view_read_zero_len.update(k_p2_alt, v_p2_alt, full0, kwargs={"cache_position": cpos_pf})
             bytes_p2_shared = int(c_shared.kv_bytes())
             if bytes_p2_shared != bytes_p1:
                 raise AssertionError(
@@ -1479,6 +1547,138 @@ def _build_clean_hf_gen_config(model: Any, max_new_tokens: int) -> Any:
     return GenerationConfig(**kw)
 
 
+def _verify_logits_to_keep_parity(
+    out_full: Any,
+    out_full_repeat: Any,
+    out_k0: Any,
+    out_k1: Any,
+    *,
+    expected_batch: int,
+    expected_seq: int,
+    expected_vocab: int,
+    label: str,
+) -> dict[str, Any]:
+    """Verify `logits_to_keep={0, 1}` shapes, empirical noise-floor-gated diffs, and final-token argmax parity."""
+    exp_full_shape = (expected_batch, expected_seq, expected_vocab)
+    exp_k1_shape = (expected_batch, 1, expected_vocab)
+
+    if tuple(out_full.logits.shape) != exp_full_shape:
+        raise AssertionError(
+            f"{label}: full forward returned shape {tuple(out_full.logits.shape)}, expected {exp_full_shape}"
+        )
+    if tuple(out_full_repeat.logits.shape) != exp_full_shape:
+        raise AssertionError(
+            f"{label}: repeat full forward returned shape {tuple(out_full_repeat.logits.shape)}, "
+            f"expected {exp_full_shape}"
+        )
+    if tuple(out_k0.logits.shape) != exp_full_shape:
+        raise AssertionError(
+            f"{label}: logits_to_keep=0 returned shape {tuple(out_k0.logits.shape)}, expected {exp_full_shape}"
+        )
+    if tuple(out_k1.logits.shape) != exp_k1_shape:
+        raise AssertionError(
+            f"{label}: logits_to_keep=1 returned shape {tuple(out_k1.logits.shape)}, expected {exp_k1_shape}"
+        )
+
+    ref_logits = out_full.logits.float()
+    rep_logits = out_full_repeat.logits.float()
+    k0_logits = out_k0.logits.float()
+    k1_logits = out_k1.logits.float()
+
+    for tag, tensor in (("full", ref_logits), ("repeat", rep_logits), ("k0", k0_logits), ("k1", k1_logits)):
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise AssertionError(f"{label}: non-finite logits detected in {tag} forward output")
+
+    repeat_diff = (rep_logits - ref_logits).abs()
+    repeat_max_diff = float(repeat_diff.max().item())
+    repeat_mean_diff = float(repeat_diff.mean().item())
+
+    k0_diff = (k0_logits - ref_logits).abs()
+    k0_max_diff = float(k0_diff.max().item())
+    k0_mean_diff = float(k0_diff.mean().item())
+
+    k1_diff = (k1_logits - ref_logits[:, -1:, :]).abs()
+    k1_max_diff = float(k1_diff.max().item())
+    k1_mean_diff = float(k1_diff.mean().item())
+
+    is_low_prec = out_full.logits.dtype in (torch.bfloat16, torch.float16)
+    base_tol = 1e-3 if is_low_prec else 1e-5
+    if not is_low_prec and repeat_max_diff <= 1e-5:
+        max_tol = base_tol
+        mean_tol = base_tol
+    else:
+        max_tol = max(base_tol, 4.0 * repeat_max_diff + 0.5)
+        mean_tol = max(base_tol, 4.0 * repeat_mean_diff + 0.05)
+
+    if (
+        not (math.isfinite(k0_max_diff) and math.isfinite(k1_max_diff))
+        or k0_max_diff > max_tol
+        or k1_max_diff > max_tol
+    ):
+        raise AssertionError(
+            f"{label}: logits_to_keep max diff exceeded max_tol={max_tol:.6g} "
+            f"(k0={k0_max_diff:.6g}, k1={k1_max_diff:.6g}, repeat_max={repeat_max_diff:.6g}, "
+            f"dtype={out_full.logits.dtype})"
+        )
+    if (
+        not (math.isfinite(k0_mean_diff) and math.isfinite(k1_mean_diff))
+        or k0_mean_diff > mean_tol
+        or k1_mean_diff > mean_tol
+    ):
+        raise AssertionError(
+            f"{label}: logits_to_keep mean diff exceeded mean_tol={mean_tol:.6g} "
+            f"(k0_mean={k0_mean_diff:.6g}, k1_mean={k1_mean_diff:.6g}, repeat_mean={repeat_mean_diff:.6g}, "
+            f"dtype={out_full.logits.dtype})"
+        )
+
+    # Final-token top-1 argmax parity (allow top-2 fallback only on noisy near-ties)
+    ref_last = ref_logits[:, -1, :]
+    k0_last = k0_logits[:, -1, :]
+    k1_last = k1_logits[:, -1, :]
+    ref_top1 = ref_last.argmax(dim=-1)
+    k0_top1 = k0_last.argmax(dim=-1)
+    k1_top1 = k1_last.argmax(dim=-1)
+    k0_exact = torch.equal(k0_top1, ref_top1)
+    k1_exact = torch.equal(k1_top1, ref_top1)
+    argmax_exact_match = bool(k0_exact and k1_exact)
+
+    if not argmax_exact_match:
+        top2_k = min(2, int(ref_last.shape[-1]))
+        top2_vals, top2_idx = torch.topk(ref_last, k=top2_k, dim=-1)
+        for cand_name, cand_top1 in (("k0", k0_top1), ("k1", k1_top1)):
+            for b in range(expected_batch):
+                ref_id = int(ref_top1[b].item())
+                cand_id = int(cand_top1[b].item())
+                if cand_id == ref_id:
+                    continue
+                if repeat_max_diff <= 0.0 or top2_k < 2:
+                    raise AssertionError(
+                        f"{label}: {cand_name} final-token argmax mismatch on batch {b} "
+                        f"(got={cand_id}, ref={ref_id}, repeat_max={repeat_max_diff:.6g})"
+                    )
+                margin = float((top2_vals[b, 0] - top2_vals[b, 1]).item())
+                top2_set = {int(top2_idx[b, 0].item()), int(top2_idx[b, 1].item())}
+                if not (margin < 2.0 * repeat_max_diff and cand_id in top2_set):
+                    raise AssertionError(
+                        f"{label}: {cand_name} final-token argmax mismatch on batch {b} "
+                        f"(got={cand_id}, ref={ref_id}, ref_top2={sorted(top2_set)}, "
+                        f"margin={margin:.6g}, repeat_max={repeat_max_diff:.6g})"
+                    )
+
+    return {
+        "repeat_max_diff": repeat_max_diff,
+        "repeat_mean_diff": repeat_mean_diff,
+        "k0_max_diff": k0_max_diff,
+        "k0_mean_diff": k0_mean_diff,
+        "k1_max_diff": k1_max_diff,
+        "k1_mean_diff": k1_mean_diff,
+        "logits_max_tol": max_tol,
+        "logits_mean_tol": mean_tol,
+        "argmax_match": argmax_exact_match,
+        "argmax_top2_fallback": bool(not argmax_exact_match),
+    }
+
+
 def _run_model_pack_checks(
     model: Any,
     *,
@@ -1530,31 +1730,28 @@ def _run_model_pack_checks(
                     raise AssertionError(f"{label} d={d}: len(active_layer_types)={len(act_lt)} != {expected_eff_n}")
 
                 # logits_to_keep=0 must return full (B, T, V), NEVER (B, 0, V)!
+                # Measure empirical repeatability noise floor with a second identical forward pass
+                # so BF16/NVFP4 Blackwell kernel jitter is distinguished from real slicing/logit bugs.
                 out_full = model(prompt, use_cache=False)
+                out_full_repeat = model(prompt, use_cache=False)
                 out_k0 = model(prompt, use_cache=False, logits_to_keep=0)
                 out_k1 = model(prompt, use_cache=False, logits_to_keep=1)
                 exp_b, exp_t = int(prompt.shape[0]), int(prompt.shape[1])
                 eff_vocab = vocab_size if vocab_size > 0 else int(out_full.logits.shape[-1])
-                if tuple(out_k0.logits.shape) != (exp_b, exp_t, eff_vocab):
-                    raise AssertionError(
-                        f"{label} d={d}: logits_to_keep=0 returned shape {tuple(out_k0.logits.shape)}, "
-                        f"expected {(exp_b, exp_t, eff_vocab)}"
-                    )
-                if tuple(out_k1.logits.shape) != (exp_b, 1, eff_vocab):
-                    raise AssertionError(
-                        f"{label} d={d}: logits_to_keep=1 returned shape {tuple(out_k1.logits.shape)}, "
-                        f"expected {(exp_b, 1, eff_vocab)}"
-                    )
-                k0_max_diff = float((out_k0.logits.float() - out_full.logits.float()).abs().max().item())
-                k1_max_diff = float((out_k1.logits.float() - out_full.logits[:, -1:, :].float()).abs().max().item())
-                tol = 1e-3 if out_full.logits.dtype in (torch.bfloat16, torch.float16) else 1e-5
-                if k0_max_diff > tol or k1_max_diff > tol:
-                    raise AssertionError(
-                        f"{label} d={d}: logits_to_keep diff exceeded tol={tol} "
-                        f"(k0={k0_max_diff:.6g}, k1={k1_max_diff:.6g})"
-                    )
+                ltk_stats = _verify_logits_to_keep_parity(
+                    out_full,
+                    out_full_repeat,
+                    out_k0,
+                    out_k1,
+                    expected_batch=exp_b,
+                    expected_seq=exp_t,
+                    expected_vocab=eff_vocab,
+                    label=f"{label} d={d}",
+                )
                 if not hasattr(out_k0, "get") or out_k0.get("logits") is not out_k0.logits:
                     raise AssertionError(f"{label} d={d}: logits_to_keep=0 output lacks ModelOutput.get('logits')")
+                k0_shape = list(out_k0.logits.shape)
+                del out_full, out_full_repeat, out_k0, out_k1
 
                 # Reference uncached greedy decode
                 eos_ids = _extract_eos_ids(model) if (use_real_tf_generate and has_generate) else set()
@@ -1636,9 +1833,19 @@ def _run_model_pack_checks(
                 depth_results[f"d{d}"] = {
                     "virtual_num_hidden_layers": int(model.config.num_hidden_layers),
                     "effective_num_hidden_layers": int(expected_eff_n),
-                    "logits_to_keep_0_shape": list(out_k0.logits.shape),
-                    "logits_to_keep_0_max_diff": k0_max_diff,
-                    "logits_to_keep_1_max_diff": k1_max_diff,
+                    "logits_to_keep_0_shape": k0_shape,
+                    "logits_to_keep_0_max_diff": ltk_stats["k0_max_diff"],
+                    "logits_to_keep_1_max_diff": ltk_stats["k1_max_diff"],
+                    "repeat_max_diff": ltk_stats["repeat_max_diff"],
+                    "repeat_mean_diff": ltk_stats["repeat_mean_diff"],
+                    "k0_max_diff": ltk_stats["k0_max_diff"],
+                    "k0_mean_diff": ltk_stats["k0_mean_diff"],
+                    "k1_max_diff": ltk_stats["k1_max_diff"],
+                    "k1_mean_diff": ltk_stats["k1_mean_diff"],
+                    "logits_max_tol": ltk_stats["logits_max_tol"],
+                    "logits_mean_tol": ltk_stats["logits_mean_tol"],
+                    "argmax_match": ltk_stats["argmax_match"],
+                    "argmax_top2_fallback": ltk_stats["argmax_top2_fallback"],
                     "generated_tokens": ref_seq[0, exp_t:].tolist(),
                     **gen_modes,
                 }
@@ -2460,8 +2667,11 @@ def render_markdown_report(report: dict[str, Any]) -> str:
                         "",
                         "## `QL60-002` Depth Parity & `logits_to_keep=0`",
                         "",
-                        "| Depth | Virtual L | Effective L | `logits_to_keep=0` Shape | Max Diff | Generated Tokens |",
-                        "| :--- | ---: | ---: | :--- | ---: | :--- |",
+                        (
+                            "| Depth | Virtual L | Effective L | `logits_to_keep=0` Shape | Repeat Diff "
+                            "| Max Diff | Argmax Match | Generated Tokens |"
+                        ),
+                        "| :--- | ---: | ---: | :--- | ---: | ---: | :---: | :--- |",
                     ]
                 )
                 for dkey, dval in depths_map.items():
@@ -2469,7 +2679,9 @@ def render_markdown_report(report: dict[str, Any]) -> str:
                         f"| `{dkey}` | `{dval.get('virtual_num_hidden_layers')}` | "
                         f"`{dval.get('effective_num_hidden_layers')}` | "
                         f"`{dval.get('logits_to_keep_0_shape')}` | "
-                        f"`{dval.get('logits_to_keep_0_max_diff'):.2e}` | "
+                        f"`{float(dval.get('repeat_max_diff', 0.0)):.2e}` | "
+                        f"`{float(dval.get('logits_to_keep_0_max_diff', 0.0)):.2e}` | "
+                        f"`{dval.get('argmax_match', True)}` | "
                         f"`{dval.get('generated_tokens')}` |"
                     )
 

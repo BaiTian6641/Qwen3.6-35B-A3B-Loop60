@@ -37,6 +37,7 @@ train:
   steps: 1000                           # 1000 x 16 x 8192 ~= 131M tokens (exact s1_loop_a6b budget on 96 GB GDDR7 ECC VRAM)
   micro_batch: 4
   grad_accum: 4
+  gradient_checkpointing: true          # Non-reentrant activation checkpointing for non-looped 40L d=1 (4 x 8192 tok/microbatch)
   log_every: 5
   ckpt_every: 25
   sha256_frozen_experts: true

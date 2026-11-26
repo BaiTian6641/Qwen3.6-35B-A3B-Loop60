@@ -1,6 +1,7 @@
 """Tests for Hugging Face Hub commit-history sync, multi-stage cumulative handoff, and 230 GB disk guard."""
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from dataclasses import dataclass
@@ -696,3 +697,243 @@ def test_mid_stage_distill_resume_pulls_and_preserves_teacher_ckpt(tmp_path, mon
     assert ws_disabled["resumed_checkpoint"] is not None
     assert ws_disabled["teacher_stage"] is None
     assert not (run_root_4 / "s1_loop_a6b" / "checkpoints").exists()
+
+
+def test_load_qloop_from_hub_d1_lora_and_non_lsa_stages_from_s2_v2_repo(tmp_path, monkeypatch):
+    """Regression test: `load_qloop_from_hub()` cleanly loads both (i) a non-LSA looped stage
+    (`s1_loop_a6b`) and (ii) a non-looped `d1_lora` control stage (`s2_2_d1_lora_control`) from a
+    Hub repo whose root `qloop_config.json` came from `s2_v2_joint_bptt` (`loop`+`gdn2`+`lsa` on).
+    """
+    api = MockHfApi()
+    repo_id = "TassP0lar/test-s2b-hub-stages"
+    run_root = tmp_path / "runs"
+    monkeypatch.setenv("QLOOP_RUN_ROOT", str(run_root))
+
+    base_sync = {
+        "hf_repo": repo_id,
+        "private": False,
+        "push_every_ckpt": True,
+        "push_optim": False,
+        "prune_local_after_push": False,
+    }
+    ids = torch.randint(4, 90, (1, 24))
+
+    # 1. Stage A: `s1_loop_a6b` (looped, NO LSA, NO GDN-2, NO HSSD, NO d1_lora)
+    cfg_s1 = Cfg({
+        **_toy_base_cfg(sync_repo=repo_id),
+        "stage": "s1_loop_a6b",
+        "gdn2": {"enabled": False},
+        "hssd": {"enabled": False},
+        "lsa": {"enabled": False},
+        "experts": {"enabled": False},
+        "checkpoint": {"sync": base_sync},
+        "train": {
+            "steps": 2,
+            "micro_batch": 1,
+            "grad_accum": 1,
+            "ckpt_every": 2,
+            "eval_every": 0,
+            "keep_last": 1,
+            "trainable": [r"self_attn\.(q_norm|k_norm)", r"input_layernorm|post_attention_layernorm"],
+            "allowed_groups": ["loop_adapters", "attention", "norms"],
+            "optim": {"lr": 5e-3, "warmup_steps": 1, "impl": "builtin"},
+        },
+    })
+    tr_s1 = LMTrainer(cfg_s1, str(run_root / "s1_loop_a6b"), hub_api=api)
+    tr_s1.train()
+    tr_s1.stack.model.eval()
+    assert tr_s1.stack.loop is not None
+    tr_s1.stack.loop.set_active_passes(2)
+    with torch.no_grad():
+        h_s1 = tr_s1.stack.hidden(ids).detach().clone()
+
+    # 2. Stage B: `s2_2_d1_lora_control` (non-looped d=1 + d1_lora, NO LSA/GDN-2/HSSD)
+    cfg_d1 = Cfg({
+        "seed": 7,
+        "stage": "s2_2_d1_lora_control",
+        "model": {"name": "toy", "dtype": "float32"},
+        "loop": {"enabled": False},
+        "gdn2": {"enabled": False},
+        "hssd": {"enabled": False},
+        "lsa": {"enabled": False},
+        "experts": {"enabled": False},
+        "d1_lora": {"enabled": True, "layer_start": 4, "layer_end": 12, "rank": 6, "seed": 5},
+        "data": {"seq_len": 32, "sources": [{"name": "toy_cot", "weight": 1.0}]},
+        "eval_quick": {"n_batches": 1, "depths": [1]},
+        "checkpoint": {"sync": base_sync},
+        "train": {
+            "steps": 2,
+            "micro_batch": 1,
+            "grad_accum": 1,
+            "ckpt_every": 2,
+            "eval_every": 0,
+            "keep_last": 1,
+            "gradient_checkpointing": True,
+            "train_d1_lora": True,
+            "trainable": [r"self_attn\.(q_norm|k_norm)", r"input_layernorm|post_attention_layernorm"],
+            "allowed_groups": ["d1_lora", "attention", "norms"],
+            "optim": {"lr": 5e-3, "warmup_steps": 1, "impl": "builtin", "lr_mult": {"d1_lora": 20.0}},
+        },
+    })
+    tr_d1 = LMTrainer(cfg_d1, str(run_root / "s2_2_d1_lora_control"), hub_api=api)
+    tr_d1.train()
+    tr_d1.stack.model.eval()
+    assert tr_d1.stack.loop is None and tr_d1.stack.d1_lora is not None
+    with torch.no_grad():
+        h_d1 = tr_d1.stack.hidden(ids).detach().clone()
+
+    # 3. Stage C (pushed LAST so root `qloop_config.json` has `loop`+`gdn2`+`lsa` enabled): `s2_v2_joint_bptt`
+    cfg_s2v2 = Cfg({
+        **_toy_base_cfg(sync_repo=repo_id),
+        "stage": "s2_v2_joint_bptt",
+        "gdn2": {"enabled": True, "rank": 6, "chunk_size": 16, "segment_chunks": 2},
+        "hssd": {"enabled": False},
+        "lsa": {
+            "enabled": True,
+            "mode": "distill",
+            "index_dim": 16,
+            "block_size": 16,
+            "pool": 2,
+            "avg_bucket_keys": 4,
+            "max_bucket_keys": 8,
+            "num_select": 4,
+            "window": 16,
+            "sinks": 4,
+        },
+        "experts": {"enabled": False},
+        "checkpoint": {"sync": base_sync},
+        "train": {
+            "steps": 2,
+            "micro_batch": 1,
+            "grad_accum": 1,
+            "ckpt_every": 2,
+            "eval_every": 0,
+            "keep_last": 1,
+            "trainable": [
+                r"self_attn\.(k_proj|v_proj|o_proj|q_norm|k_norm)",
+                r"input_layernorm|post_attention_layernorm",
+            ],
+            "allowed_groups": ["loop_adapters", "gdn2_adapters", "lsa_indexers", "attention", "norms"],
+            "optim": {"lr": 5e-3, "warmup_steps": 1, "impl": "builtin"},
+        },
+    })
+    tr_s2v2 = LMTrainer(cfg_s2v2, str(run_root / "s2_v2_joint_bptt"), hub_api=api)
+    tr_s2v2.train()
+    tr_s2v2.stack.model.eval()
+    assert tr_s2v2.stack.loop is not None
+    tr_s2v2.stack.loop.set_active_passes(2)
+    with torch.no_grad():
+        h_s2v2 = tr_s2v2.stack.hidden(ids).detach().clone()
+
+    root_qcfg = json.loads(api.files[(repo_id, "qloop_config.json")].decode("utf-8"))
+    assert root_qcfg["stage"] == "s2_v2_joint_bptt"
+    assert root_qcfg["config"]["lsa"]["enabled"] is True
+    assert root_qcfg["config"]["gdn2"]["enabled"] is True
+    assert root_qcfg["config"]["loop"]["enabled"] is True
+
+    # (i) Load `s1_loop_a6b` from the `s2_v2` Hub repo -> looped, LSA/GDN2/HSSD/d1_lora ALL disabled!
+    st_s1 = load_qloop_from_hub(repo_id, stage_name="s1_loop_a6b", api=api)
+    assert st_s1.loop is not None
+    assert st_s1.lsa is None
+    assert st_s1.gdn2 is None
+    assert st_s1.hssd is None
+    assert st_s1.d1_lora is None
+    st_s1.loop.set_active_passes(2)
+    with torch.no_grad():
+        assert torch.allclose(st_s1.hidden(ids), h_s1, atol=1e-5, rtol=1e-5)
+
+    # (ii) Load `s2_2_d1_lora_control` from the `s2_v2` Hub repo -> d1_lora enabled, loop/LSA/GDN2/HSSD ALL disabled!
+    st_d1 = load_qloop_from_hub(repo_id, stage_name="s2_2_d1_lora_control", api=api)
+    assert st_d1.d1_lora is not None
+    assert st_d1.d1_lora.rank == 6
+    assert st_d1.loop is None
+    assert st_d1.lsa is None
+    assert st_d1.gdn2 is None
+    assert st_d1.hssd is None
+    assert not st_d1.model.training
+    assert not any(p.requires_grad for p in st_d1.named_all.values())
+    with torch.no_grad():
+        assert torch.allclose(st_d1.hidden(ids), h_d1, atol=1e-5, rtol=1e-5)
+
+    # (iii) Explicit `enable_lsa_if_present=False` on `s2_v2_joint_bptt` also disables LSA cleanly
+    st_no_lsa = load_qloop_from_hub(repo_id, stage_name="s2_v2_joint_bptt", enable_lsa_if_present=False, api=api)
+    assert st_no_lsa.loop is not None
+    assert st_no_lsa.gdn2 is not None
+    assert st_no_lsa.lsa is None
+    assert st_no_lsa.d1_lora is None
+
+    # (iv) Reverse root order: when `s2_2_d1_lora_control` overwrites root `qloop_config.json`,
+    #      both default root load AND `stage_name="s1_loop_a6b"` load cleanly!
+    hub = HubSyncManager(repo_id=repo_id, api=api)
+    pulled_d1 = hub.pull_stage_checkpoint("s2_2_d1_lora_control", str(run_root), include_optim=False)
+    assert pulled_d1 is not None
+    oid_rev = hub.push_checkpoint("s2_2_d1_lora_control", pulled_d1, completed=True, config_dict=cfg_d1.to_dict())
+    assert oid_rev is not None
+
+    st_root_d1 = load_qloop_from_hub(repo_id, api=api)
+    assert st_root_d1.d1_lora is not None and st_root_d1.d1_lora.rank == 6
+    assert st_root_d1.loop is None and st_root_d1.lsa is None
+    assert st_root_d1.load_info.get("gradient_checkpointing") is not True
+    with torch.no_grad():
+        assert torch.allclose(st_root_d1.hidden(ids), h_d1, atol=1e-5, rtol=1e-5)
+
+    st_s1_rev = load_qloop_from_hub(repo_id, stage_name="s1_loop_a6b", api=api)
+    assert st_s1_rev.loop is not None
+    assert st_s1_rev.d1_lora is None and st_s1_rev.lsa is None and st_s1_rev.gdn2 is None
+    st_s1_rev.loop.set_active_passes(2)
+    with torch.no_grad():
+        assert torch.allclose(st_s1_rev.hidden(ids), h_s1, atol=1e-5, rtol=1e-5)
+
+    # Reverse-order load of `s2_v2_joint_bptt` (loop + gdn2 + lsa) after `s2_2_d1_lora_control`
+    # overwrote root `qloop_config.json` (whose `allowed_groups` omitted `lsa_indexers`)!
+    st_s2v2_rev = load_qloop_from_hub(
+        repo_id,
+        stage_name="s2_v2_joint_bptt",
+        overrides=["lsa.mode=distill"],
+        api=api,
+    )
+    assert st_s2v2_rev.loop is not None
+    assert st_s2v2_rev.gdn2 is not None and st_s2v2_rev.gdn2.cfg.rank == 6
+    assert st_s2v2_rev.lsa is not None
+    assert st_s2v2_rev.d1_lora is None and st_s2v2_rev.hssd is None
+    st_s2v2_rev.loop.set_active_passes(2)
+    with torch.no_grad():
+        assert torch.allclose(st_s2v2_rev.hidden(ids), h_s2v2, atol=1e-5, rtol=1e-5)
+
+
+def test_load_qloop_from_hub_synthetic_config_only_loop_compat(tmp_path):
+    """Backwards-compat: root `qloop_config.json` with `config.loop.enabled=True`, no `stack`,
+    and empty `qloop_adapters.pt` (`{}`) still installs `st.loop` cleanly.
+    """
+    api = MockHfApi()
+    repo_id = "TassP0lar/test-synth-config-only-loop"
+    qcfg = {
+        "repo_id": repo_id,
+        "config": {
+            "model": {"name": "toy", "dtype": "float32"},
+            "loop": {
+                "enabled": True,
+                "prelude_end": 4,
+                "core_end": 12,
+                "num_passes": 2,
+                "target_virtual_layers": 24,
+            },
+        },
+    }
+    empty_pt = tmp_path / "empty_adapters.pt"
+    torch.save({}, empty_pt)
+    api.commit_bundle(
+        repo_id,
+        [
+            ("qloop_config.json", json.dumps(qcfg).encode("utf-8")),
+            ("qloop_adapters.pt", str(empty_pt)),
+        ],
+        "synthetic config-only loop bundle",
+    )
+
+    st = load_qloop_from_hub(repo_id, api=api)
+    assert st.loop is not None
+    assert st.lsa is None
+    assert st.gdn2 is None
+    assert st.hssd is None
+    assert st.d1_lora is None

@@ -233,6 +233,63 @@ def _hot_map(ecfg: dict[str, Any]) -> dict[int, list[int]] | None:
     return stats.select_hot(**sel)
 
 
+def _enable_gradient_checkpointing(model: nn.Module, text_model: nn.Module) -> bool:
+    """Enable non-reentrant gradient checkpointing and input grads on a non-looped model."""
+    target: nn.Module | None = None
+    for cand in (model, text_model):
+        if callable(getattr(cand, "gradient_checkpointing_enable", None)):
+            target = cand
+            break
+    if target is None:
+        log.warning(
+            "train.gradient_checkpointing=true requested, but neither %s nor %s implements "
+            "gradient_checkpointing_enable(); skipping",
+            type(model).__name__,
+            type(text_model).__name__,
+        )
+        return False
+
+    try:
+        target.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    except TypeError:
+        target.gradient_checkpointing_enable()
+
+    input_grads_enabled = False
+    for cand in (model, text_model):
+        enable_fn = getattr(cand, "enable_input_require_grads", None)
+        if callable(enable_fn):
+            try:
+                enable_fn()
+                input_grads_enabled = True
+                break
+            except NotImplementedError:
+                continue
+
+    if not input_grads_enabled:
+        embed = getattr(text_model, "embed_tokens", None)
+        if isinstance(embed, nn.Module):
+            if not getattr(embed, "_qloop_input_grad_hook", False):
+                def _make_inputs_require_grad(_mod: nn.Module, _inp: Any, out: Any) -> None:
+                    if (
+                        torch.is_grad_enabled()
+                        and isinstance(out, torch.Tensor)
+                        and out.is_floating_point()
+                        and not out.requires_grad
+                    ):
+                        out.requires_grad_(True)
+
+                embed.register_forward_hook(_make_inputs_require_grad)
+                embed._qloop_input_grad_hook = True  # type: ignore[attr-defined]
+            input_grads_enabled = True
+
+    log.info(
+        "gradient checkpointing enabled on %s (use_reentrant=False, input_require_grads=%s)",
+        type(target).__name__,
+        input_grads_enabled,
+    )
+    return True
+
+
 def build_stack(cfg: dict[str, Any]) -> Stack:
     mcfg = dict(cfg.get("model") or {"name": "toy"})
     with stage("model:load"):
@@ -326,6 +383,10 @@ def build_stack(cfg: dict[str, Any]) -> Stack:
             for n, p in st.loop.adapters.named_parameters():
                 names[id(p)] = f"loop_adapters.{n}"
                 p.requires_grad_(bool(tcfg.get("train_loop_adapters", True)))
+
+    if bool(tcfg.get("gradient_checkpointing", False)) and st.loop is None:
+        with stage("model:grad-checkpoint"):
+            st.load_info["gradient_checkpointing"] = _enable_gradient_checkpointing(model, st.parts.text_model)
 
     if check_sha:
         st.verify_frozen_experts()

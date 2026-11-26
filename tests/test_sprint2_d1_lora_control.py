@@ -537,6 +537,7 @@ def test_s2_2_d1_lora_control_stage_config_invariants() -> None:
     assert cfg.train.steps == 1000
     assert cfg.train.micro_batch == 4
     assert cfg.train.grad_accum == 4
+    assert cfg.train.gradient_checkpointing is True
     assert cfg.train.sha256_frozen_experts is True
     assert cfg.train.optim.lr == pytest.approx(3.0e-5)
     assert cfg.train.optim.warmup_steps == 50
@@ -556,3 +557,266 @@ def test_s2_2_d1_lora_control_stage_config_invariants() -> None:
 
     assert cfg.eval_quick.n_batches == 16
     assert list(cfg.eval_quick.depths) == [1]
+
+
+# ==============================================================================
+# 7. Non-reentrant gradient checkpointing for non-looped stages
+# ==============================================================================
+
+
+class _MockHFCheckpointableTextModel(nn.Module):
+    """HF-style text decoder wrapping `ToyTextModel` with real non-reentrant activation checkpointing."""
+
+    def __init__(self, inner: nn.Module) -> None:
+        super().__init__()
+        self.config = inner.config
+        self.embed_tokens = inner.embed_tokens
+        self.layers = inner.layers
+        self.norm = inner.norm
+        self.rotary_emb = inner.rotary_emb
+        self.gradient_checkpointing = False
+        self.gc_kwargs: dict[str, object] = {}
+        self.ckpt_layer_calls = 0
+
+    def forward(
+        self,
+        input_ids=None,
+        inputs_embeds=None,
+        past_key_values=None,
+        use_cache: bool = False,
+        output_hidden_states: bool = False,
+        **kwargs,
+    ):
+        from torch.utils.checkpoint import checkpoint as torch_ckpt
+
+        from qloop.model.toy import ToyHybridCache, ToyOutput
+
+        h = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        if use_cache and past_key_values is None:
+            past_key_values = ToyHybridCache(self.config)
+        start = past_key_values.get_seq_length() if past_key_values is not None else 0
+        cache_position = torch.arange(start, start + h.shape[1], device=h.device)
+        position_ids = cache_position[None].expand(h.shape[0], -1)
+        pos = self.rotary_emb(h, position_ids)
+        all_h = [h] if output_hidden_states else None
+        use_ckpt = self.gradient_checkpointing and self.training and torch.is_grad_enabled() and not use_cache
+        use_reentrant = bool(self.gc_kwargs.get("use_reentrant", True))
+        for layer in self.layers[: self.config.num_hidden_layers]:
+            if use_ckpt:
+                self.ckpt_layer_calls += 1
+
+                def _run_layer(x_in: torch.Tensor, _layer=layer):
+                    return _layer(
+                        x_in,
+                        position_embeddings=pos,
+                        attention_mask=None,
+                        position_ids=position_ids,
+                        past_key_values=None,
+                        cache_position=cache_position,
+                    )
+
+                h = torch_ckpt(_run_layer, h, use_reentrant=use_reentrant)
+            else:
+                h = layer(
+                    h,
+                    position_embeddings=pos,
+                    attention_mask=None,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                )
+            if output_hidden_states:
+                all_h.append(h)
+        h = self.norm(h)
+        return ToyOutput(h, past_key_values, tuple(all_h) if all_h else None)
+
+
+class _MockHFCheckpointableCausalLM(nn.Module):
+    """Mock HF CausalLM supporting `gradient_checkpointing_enable(gradient_checkpointing_kwargs=...)`."""
+
+    def __init__(self, seed: int = 0) -> None:
+        super().__init__()
+        toy = build_toy(seed=seed)
+        self.config = toy.config
+        self.model = _MockHFCheckpointableTextModel(toy.model)
+        self.lm_head = toy.lm_head
+        self.gc_calls: list[dict[str, object] | None] = []
+        self.input_require_grads_called = False
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs: dict[str, object] | None = None) -> None:
+        self.gc_calls.append(None if gradient_checkpointing_kwargs is None else dict(gradient_checkpointing_kwargs))
+        self.model.gradient_checkpointing = True
+        self.model.gc_kwargs = dict(gradient_checkpointing_kwargs or {})
+
+    def enable_input_require_grads(self) -> None:
+        self.input_require_grads_called = True
+
+        def _make_inputs_require_grad(_mod: nn.Module, _inp, out: torch.Tensor) -> None:
+            out.requires_grad_(True)
+
+        self.model.embed_tokens.register_forward_hook(_make_inputs_require_grad)
+
+    def forward(self, input_ids, labels=None, past_key_values=None, use_cache: bool = False, **kwargs):
+        from qloop.model.toy import ToyCausalLMOutput
+
+        out = self.model(input_ids=input_ids, past_key_values=past_key_values, use_cache=use_cache)
+        logits = self.lm_head(out.last_hidden_state)
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.shape[-1]).float(),
+                labels[:, 1:].reshape(-1),
+                ignore_index=-100,
+            )
+        return ToyCausalLMOutput(logits, loss, out.past_key_values)
+
+
+class _LegacyTextModelWrapper(nn.Module):
+    """Outer wrapper lacking `gradient_checkpointing_enable`; inner `model` uses legacy zero-arg API."""
+
+    def __init__(self, seed: int = 0) -> None:
+        super().__init__()
+        toy = build_toy(seed=seed)
+        self.config = toy.config
+        self.model = _MockHFCheckpointableTextModel(toy.model)
+        self.lm_head = toy.lm_head
+        self.legacy_gc_calls = 0
+        self.legacy_input_grads_calls = 0
+
+        outer = self
+
+        def _legacy_gc_enable() -> None:
+            outer.legacy_gc_calls += 1
+            outer.model.gradient_checkpointing = True
+            outer.model.gc_kwargs = {"use_reentrant": False}
+
+        def _legacy_enable_input_grads() -> None:
+            outer.legacy_input_grads_calls += 1
+
+            def _hook(_mod: nn.Module, _inp, out: torch.Tensor) -> None:
+                out.requires_grad_(True)
+
+            outer.model.embed_tokens.register_forward_hook(_hook)
+
+        self.model.gradient_checkpointing_enable = _legacy_gc_enable  # type: ignore[attr-defined]
+        self.model.enable_input_require_grads = _legacy_enable_input_grads  # type: ignore[attr-defined]
+
+
+def test_build_stack_gradient_checkpointing_mock_hf_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    import qloop.train.stack as stack_mod
+
+    orig_load_model = stack_mod.load_model
+    _, toy_tok, _ = orig_load_model({"name": "toy", "dtype": "float32", "device_map": "cpu", "toy": {"seed": 0}})
+
+    # 1. Standard HF-style model: non-reentrant checkpointing + frozen base + d1_lora grads + eval/use_cache=True
+    mock_hf = _MockHFCheckpointableCausalLM(seed=0)
+    monkeypatch.setattr(stack_mod, "load_model", lambda _mcfg: (mock_hf, toy_tok, {"backend": "mock_hf"}))
+    cfg_d1 = {
+        "model": {"name": "mock_hf"},
+        "loop": {"enabled": False},
+        "d1_lora": {"enabled": True, "layer_start": 4, "layer_end": 12, "rank": 4, "seed": 2},
+        "train": {
+            "gradient_checkpointing": True,
+            "train_d1_lora": True,
+            "trainable": [],
+            "allowed_groups": ["d1_lora"],
+        },
+    }
+    st = build_stack(cfg_d1)
+    assert st.loop is None
+    assert st.d1_lora is not None
+    assert st.load_info["gradient_checkpointing"] is True
+    assert mock_hf.gc_calls == [{"use_reentrant": False}]
+    assert mock_hf.input_require_grads_called is True
+    assert not st.parts.text_model.embed_tokens.weight.requires_grad
+
+    ids = torch.randint(4, 90, (2, 12))
+    st.model.train()
+    h = st.hidden(ids)
+    logits = F.linear(h, st.lm_head_weight)
+    loss = F.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]).float(), ids[:, 1:].reshape(-1))
+    loss.backward()
+    assert mock_hf.model.ckpt_layer_calls == mock_hf.config.num_hidden_layers
+    assert st.parts.text_model.embed_tokens.weight.grad is None
+    up_params = [p for n, p in st.d1_lora.adapters.named_parameters() if n.endswith(".up")]
+    assert len(up_params) == 16
+    for p in up_params:
+        assert p.grad is not None and torch.isfinite(p.grad).all()
+        assert float(p.grad.abs().sum()) > 0.0
+
+    # Verify model.eval() + use_cache=True prefill and incremental decode still work cleanly
+    ckpt_calls_before_eval = mock_hf.model.ckpt_layer_calls
+    st.model.eval()
+    with torch.no_grad():
+        out_nocache = st.model(input_ids=ids, use_cache=False)
+        out_prefill = st.model(input_ids=ids[:, :-1], use_cache=True)
+        assert out_prefill.past_key_values is not None
+        out_step = st.model(input_ids=ids[:, -1:], past_key_values=out_prefill.past_key_values, use_cache=True)
+    assert mock_hf.model.ckpt_layer_calls == ckpt_calls_before_eval
+    assert torch.isfinite(out_step.logits).all()
+    assert torch.allclose(out_step.logits, out_nocache.logits[:, -1:], atol=1e-5, rtol=1e-5)
+
+    # 2. Fallback to `text_model` + `TypeError` fallback to zero-arg `gradient_checkpointing_enable()`
+    legacy_mod = _LegacyTextModelWrapper(seed=1)
+    monkeypatch.setattr(stack_mod, "load_model", lambda _mcfg: (legacy_mod, toy_tok, {"backend": "mock_legacy"}))
+    st_legacy = build_stack(cfg_d1)
+    assert st_legacy.load_info["gradient_checkpointing"] is True
+    assert legacy_mod.legacy_gc_calls == 1
+    assert legacy_mod.legacy_input_grads_calls == 1
+
+    # 3. Fallback `embed_tokens` hook (when `enable_input_require_grads` is absent) is idempotent
+    no_irg_mod = _MockHFCheckpointableCausalLM(seed=3)
+    no_irg_mod.enable_input_require_grads = None  # type: ignore[assignment]
+    assert stack_mod._enable_gradient_checkpointing(no_irg_mod, no_irg_mod.model) is True
+    assert stack_mod._enable_gradient_checkpointing(no_irg_mod, no_irg_mod.model) is True
+    assert getattr(no_irg_mod.model.embed_tokens, "_qloop_input_grad_hook", False) is True
+    assert len(no_irg_mod.model.embed_tokens._forward_hooks) == 1
+
+    # 4. Looped stage (`st.loop is not None`) must NOT double-enable HF gradient checkpointing
+    mock_looped = _MockHFCheckpointableCausalLM(seed=2)
+    monkeypatch.setattr(stack_mod, "load_model", lambda _mcfg: (mock_looped, toy_tok, {"backend": "mock_hf"}))
+    cfg_loop = {
+        "model": {"name": "mock_hf"},
+        "loop": {"enabled": True, "prelude_end": 4, "core_end": 12, "num_passes": 2, "target_virtual_layers": 24},
+        "train": {
+            "gradient_checkpointing": True,
+            "trainable": [r"input_layernorm"],
+        },
+    }
+    st_looped = build_stack(cfg_loop)
+    assert st_looped.loop is not None
+    assert mock_looped.gc_calls == []
+    assert "gradient_checkpointing" not in st_looped.load_info
+
+
+def test_build_stack_gradient_checkpointing_on_toy_model() -> None:
+    cfg = {
+        "model": {"name": "toy", "dtype": "float32", "device_map": "cpu", "toy": {"seed": 0}},
+        "loop": {"enabled": False},
+        "d1_lora": {"enabled": True, "layer_start": 4, "layer_end": 12, "rank": 4, "seed": 3},
+        "train": {
+            "gradient_checkpointing": True,
+            "train_d1_lora": True,
+            "trainable": [r"input_layernorm|post_attention_layernorm"],
+            "allowed_groups": ["d1_lora", "norms"],
+        },
+    }
+    st = build_stack(cfg)
+    assert st.loop is None
+    assert st.d1_lora is not None
+    # ToyForCausalLM lacks `gradient_checkpointing_enable()`, so build_stack skips cleanly without error
+    assert st.load_info["gradient_checkpointing"] is False
+
+    ids = torch.randint(4, 90, (2, 12))
+    st.model.train()
+    out = st.model(input_ids=ids, labels=ids)
+    out.loss.backward()
+    up_params = [p for n, p in st.d1_lora.adapters.named_parameters() if n.endswith(".up")]
+    assert len(up_params) == 16
+    assert all(
+        p.grad is not None and torch.isfinite(p.grad).all() and float(p.grad.abs().sum()) > 0.0 for p in up_params
+    )
+
+    st.model.eval()
+    gen = st.model.greedy_generate(ids[:1, :6], max_new_tokens=3)
+    assert gen.shape == (1, 9)

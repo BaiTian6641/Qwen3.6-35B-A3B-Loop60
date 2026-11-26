@@ -568,6 +568,30 @@ def contamination_conflicts(trained_groups: Iterable[str], names: Iterable[str] 
 
 
 def _load_hf_rows(spec: BenchmarkSpec, token: str | None = None) -> Iterable[dict[str, Any]]:
+    github_repo = spec.extra.get("github_repo")
+    if spec.hf_id.startswith("github:") or github_repo:
+        from qloop.data.mixture import arc_task_rows
+
+        repo = str(github_repo or spec.hf_id.split(":", 1)[1])
+        data_dir = spec.extra.get("data_dir")
+        try:
+            raw_tasks = (
+                arc_task_rows(spec.split, data_dir=data_dir, repo=repo)
+                if data_dir is not None
+                else arc_task_rows(spec.split, repo=repo)
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"arc_task_rows({spec.split!r}, repo={repo!r}) failed: {type(e).__name__}: {e}"
+            ) from e
+        rows: list[dict[str, Any]] = []
+        for task in raw_tasks:
+            row = dict(task)
+            if "id" not in row and "task_id" in row:
+                row["id"] = row["task_id"]
+            rows.append(row)
+        log.info("loaded github:%s[%s]: %d tasks", repo, spec.split, len(rows))
+        return rows
     try:
         import datasets
     except ImportError as e:
@@ -722,9 +746,11 @@ def _register_defaults() -> None:
           notes="Terminal-agent dev set in Harbor task format; use as the fast dev proxy for Terminal-Bench 4.1/2.0. "
                 "Contaminated if trained on OpenThoughts-Agent SFT/RL data."),
         S("arc_agi_2", "arcprize/ARC-AGI-2", None, "evaluation", "arc", "arc", set(), contamination_group="arc_agi_2",
-          prompt_builder=arc_prompt, adapter=adapt_arc, max_new_tokens=16384, verified=False,
-          notes="Public evaluation set (120 tasks); items are flattened per test input (id 'task#j'). Official "
-                "metric: pass@2 per test output => run with n_samples>=2 and read pass@2."),
+          prompt_builder=arc_prompt, adapter=adapt_arc, max_new_tokens=16384, verified=True,
+          notes="Public evaluation set (120 tasks, fetched via GitHub arcprize/ARC-AGI-2); items are flattened per "
+                "test input (id 'task#j'). Official metric: pass@2 per test output => run with n_samples>=2 and read "
+                "pass@2.",
+          extra={"github_repo": "arcprize/ARC-AGI-2"}),
         S("arc_agi_2_human", "arcprize/arc_agi_2_human_testing", None, "train", "arc", "arc", set(),
           contamination_group="arc_agi_2", prompt_builder=arc_prompt, adapter=adapt_arc, max_new_tokens=16384,
           verified=False, notes="Human testing set of ARC-AGI-2 (same contamination group as the public eval)."),

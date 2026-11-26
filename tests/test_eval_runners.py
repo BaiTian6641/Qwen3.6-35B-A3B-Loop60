@@ -1,8 +1,11 @@
 """Registry adapters / prompt builders, run_benchmark (multi-depth, resumable) and run_suite."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
+import sys
+import types
 
 import pytest
 
@@ -68,6 +71,47 @@ def test_load_items_without_datasets_or_offline():
         pass
     with pytest.raises(ImportError, match="offline_items"):
         R.load_items(R.get_spec("aime_2026"), 2)
+
+
+def test_arc_agi_2_routes_through_github_arc_task_rows_without_hf_datasets(monkeypatch):
+    spec = R.get_spec("arc_agi_2")
+    assert spec.hf_id == "arcprize/ARC-AGI-2"
+    assert spec.verified is True
+    assert spec.extra.get("github_repo") == "arcprize/ARC-AGI-2"
+
+    def _forbid_hf_load_dataset(*args, **kwargs):
+        raise AssertionError(f"datasets.load_dataset must not be called for arc_agi_2: {args} {kwargs}")
+
+    monkeypatch.setitem(sys.modules, "datasets", types.SimpleNamespace(load_dataset=_forbid_hf_load_dataset))
+
+    calls: list[tuple[str, str]] = []
+
+    def _fake_arc_task_rows(split: str, data_dir: str | None = None, repo: str = "arcprize/ARC-AGI-2"):
+        calls.append((split, repo))
+        return [
+            {
+                "task_id": "abc123",
+                "train": [{"input": [[0, 1]], "output": [[1, 0]]}],
+                "test": [
+                    {"input": [[1, 1]], "output": [[0, 0]]},
+                    {"input": [[0, 0]], "output": [[1, 1]]},
+                ],
+            }
+        ]
+
+    monkeypatch.setattr("qloop.data.mixture.arc_task_rows", _fake_arc_task_rows)
+
+    items = R.load_items(spec)
+    assert calls == [("evaluation", "arcprize/ARC-AGI-2")]
+    assert [it["id"] for it in items] == ["abc123#0", "abc123#1"]
+    assert items[0]["test_input"] == [[1, 1]] and items[0]["answer"] == [[0, 0]]
+    assert items[1]["test_input"] == [[0, 0]] and items[1]["answer"] == [[1, 1]]
+
+    # Also verify `github:` prefix spec without extra.github_repo routes identically
+    gh_spec = dataclasses.replace(spec, hf_id="github:arcprize/ARC-AGI-2", extra={})
+    gh_items = R.load_items(gh_spec)
+    assert calls == [("evaluation", "arcprize/ARC-AGI-2"), ("evaluation", "arcprize/ARC-AGI-2")]
+    assert [it["id"] for it in gh_items] == ["abc123#0", "abc123#1"]
 
 
 def test_adapters_and_prompts():

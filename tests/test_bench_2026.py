@@ -21,6 +21,7 @@ from qloop.eval import scoring as S
 from qloop.eval.generate import Generator
 from qloop.eval.runners import run_benchmark
 from qloop.eval.testing import ByteTokenizer, ScriptedLM
+from qloop.model.gdn2 import GDN2Config
 from qloop.model.hssd import HSSDConfig
 from qloop.model.loop import LoopSpec
 from qloop.model.lsa import LSAConfig
@@ -336,12 +337,19 @@ def test_harbor_defaults_to_terminal_bench_4_1():
 def test_eval_suite_yaml_loads_and_matches_2026_slate():
     cfg = load_config(os.path.join(ROOT, "configs", "eval", "suite.yaml"))
     loop = LoopSpec.from_dict(dict(cfg.get("loop") or {}))
+    gdn2 = GDN2Config.from_dict(dict(cfg.get("gdn2") or {}))
     hssd = HSSDConfig.from_dict(dict(cfg.get("hssd") or {}))
     lsa = LSAConfig.from_dict(dict(cfg.get("lsa") or {}))
+    gdn2.validate()
     hssd.validate()
     lsa.validate()
     assert loop.num_passes == 3 and loop.virtual_layers(40) == 88
-    assert cfg.hssd.enabled is True and cfg.lsa.enabled is True and cfg.lsa.mode == "sparse"
+    assert cfg.gdn2.enabled is True and cfg.hssd.enabled is False
+    assert gdn2.rank == 64 and gdn2.chunk_size == 64
+    assert gdn2.decay_log_min == -3.0 and gdn2.decay_log_max == 0.5
+    assert gdn2.qed_enabled is True and gdn2.qed_max_lambda == 0.35
+    assert gdn2.neg_eigval_max_boost == 0.5 and gdn2.backend == "auto"
+    assert cfg.lsa.enabled is True and cfg.lsa.mode == "sparse"
     assert cfg.eval.defaults.depths == [1, 2, 3]
     assert cfg.eval.external.harbor.dataset == "terminal-bench/terminal-bench@4.1.0"
 

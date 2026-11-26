@@ -4,11 +4,15 @@ from __future__ import annotations
 import json
 import sys
 import types
+import weakref
 
 import pytest
+import torch
 
 from qloop.eval import sprint2_reasoning as SR
+from qloop.eval.sprint2_audit import build_smoke_cpu_stack
 from qloop.eval.testing import ByteTokenizer, ScriptedLM
+from qloop.train.stack import build_stack
 
 # ----------------------------------------------------------------------------- CLI & budget parsing
 
@@ -302,11 +306,16 @@ def test_gated_benchmark_error_capture_without_silent_substitution_and_explicit_
             probe_max_new_tokens=8,
         )
 
-    # 3. With explicit --fallback gpqa_diamond=supergpqa: runs fallback AND explicitly discloses in JSON + MD
+    # 3. With explicit --fallback gpqa_diamond=supergpqa alongside direct supergpqa (different budget):
+    #    both succeed without run_config.json collision AND fallback is explicitly disclosed in JSON + MD.
     out_fb = tmp_path / "with_fb"
+    budgets_fb = SR.resolve_benchmark_budgets(
+        ["aime_2026", "gpqa_diamond", "supergpqa"],
+        max_new_tokens="aime_2026=32,gpqa_diamond=32,supergpqa=16",
+    )
     rep_fb = SR.run_sprint2_reasoning(
         arms,
-        benchmarks=budgets,
+        benchmarks=budgets_fb,
         out_dir=out_fb,
         baseline_arm="scripted_arm",
         fallback_map={"gpqa_diamond": "supergpqa"},
@@ -316,12 +325,18 @@ def test_gated_benchmark_error_capture_without_silent_substitution_and_explicit_
     assert rep_fb["benchmarks"]["gpqa_diamond"]["status"] == "fallback"
     assert rep_fb["benchmarks"]["gpqa_diamond"]["executed_benchmark"] == "supergpqa"
     assert rep_fb["benchmarks"]["gpqa_diamond"]["fallback_used"] is True
+    assert rep_fb["benchmarks"]["supergpqa"]["status"] == "ok"
+    assert rep_fb["benchmarks"]["supergpqa"]["fallback_used"] is False
     assert len(rep_fb["fallback_disclosures"]) == 1
     assert rep_fb["fallback_disclosures"][0]["executed_benchmark"] == "supergpqa"
     assert rep_fb["tables"]["gpqa_diamond"][0]["mean_score"] == pytest.approx(1.0)
+    assert rep_fb["tables"]["supergpqa"][0]["mean_score"] == pytest.approx(1.0)
+    assert (out_fb / "arms" / "scripted_arm" / "_fallback_gpqa_diamond" / "supergpqa" / "run_config.json").is_file()
+    assert (out_fb / "arms" / "scripted_arm" / "supergpqa" / "run_config.json").is_file()
     md_fb = (out_fb / "sprint2_reasoning.md").read_text(encoding="utf-8")
     assert "FALLBACK -> `supergpqa`" in md_fb
     assert "Explicit `--fallback` Benchmark Substitutions Used" in md_fb
+    assert "max_new_tokens=8" in md_fb
 
 
 def test_enable_thinking_kwarg_passed_only_when_explicit(tmp_path):
@@ -393,3 +408,187 @@ def test_enable_thinking_kwarg_passed_only_when_explicit(tmp_path):
         probe_max_new_tokens=4,
     )
     assert seen_kwargs and all(kw.get("enable_thinking") is True for kw in seen_kwargs)
+
+
+def test_multi_arm_weakref_gc_releases_arm1_before_arm2_loads(tmp_path):
+    """Prove arm 1's Stack/model/loop/gdn2/lsa are fully GC'd BEFORE arm 2 begins loading."""
+    toy_cfg = {
+        "model": {
+            "name": "toy",
+            "dtype": "float32",
+            "device_map": "cpu",
+            "toy": {
+                "seed": 0,
+                "hidden_size": 16,
+                "num_hidden_layers": 8,
+                "full_attention_interval": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "linear_num_heads": 2,
+                "linear_head_dim": 8,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 8,
+                "shared_expert_intermediate_size": 8,
+            },
+        },
+        "gdn2": {"enabled": True, "rank": 4, "chunk_size": 16, "backend": "pytorch"},
+        "lsa": {
+            "enabled": True,
+            "mode": "sparse",
+            "index_dim": 4,
+            "index_on": "nope",
+            "rotary_dim": 4,
+            "pool": 2,
+            "block_size": 8,
+            "avg_bucket_keys": 4,
+            "max_bucket_keys": 8,
+            "num_select": 2,
+            "window": 8,
+            "sinks": 2,
+            "query_chunk": 8,
+            "num_query_passes": 2,
+        },
+        "loop": {
+            "enabled": True,
+            "prelude_end": 2,
+            "core_end": 6,
+            "num_passes": 2,
+            "target_virtual_layers": 12,
+            "kv_share": True,
+            "bridge_rank": 4,
+            "bridge_mode": "subspace",
+            "per_pass_router": True,
+            "router_adapter_rank": 4,
+            "checkpoint": False,
+        },
+    }
+
+    arm1_refs: dict[str, weakref.ref[object]] = {}
+    arm1_alive_when_arm2_loads: dict[str, bool] = {}
+
+    def _load_arm1():
+        st = build_stack(toy_cfg)
+        arm1_refs["stack"] = weakref.ref(st)
+        arm1_refs["model"] = weakref.ref(st.model)
+        arm1_refs["loop"] = weakref.ref(st.loop)
+        arm1_refs["gdn2"] = weakref.ref(st.gdn2)
+        arm1_refs["lsa"] = weakref.ref(st.lsa)
+        return st, None
+
+    def _load_arm2():
+        for k, ref in arm1_refs.items():
+            arm1_alive_when_arm2_loads[k] = ref() is not None
+        return (
+            {
+                "model": ScriptedLM.from_text(r"\boxed{42}"),
+                "tokenizer": ByteTokenizer(),
+                "loop": None,
+                "gdn2": None,
+                "lsa": None,
+                "hssd": None,
+                "d1_lora": None,
+            },
+            None,
+        )
+
+    arms = [
+        SR.ArmConfig(name="arm1_full", depths=[1], model_id="toy::arm1_full"),
+        SR.ArmConfig(name="arm2_scripted", depths=[1], model_id="scripted::arm2"),
+    ]
+    budgets = SR.resolve_benchmark_budgets(["aime_2026"], max_new_tokens="4")
+    offline = {"aime_2026": [{"problem_idx": "1", "problem": "6*7?", "answer": "42"}]}
+
+    SR.run_sprint2_reasoning(
+        arms,
+        benchmarks=budgets,
+        out_dir=tmp_path,
+        baseline_arm="arm1_full",
+        offline_items=offline,
+        arm_factories={"arm1_full": _load_arm1, "arm2_scripted": _load_arm2},
+        probe_max_new_tokens=4,
+    )
+
+    assert arm1_alive_when_arm2_loads == {
+        "stack": False,
+        "model": False,
+        "loop": False,
+        "gdn2": False,
+        "lsa": False,
+    }
+
+
+def test_per_depth_eval_peak_vram_isolation_and_merged_summary(tmp_path, monkeypatch):
+    """Verify CUDA peak VRAM is reset per (arm, depth) during eval and summary.json preserves all depths."""
+    stack = build_smoke_cpu_stack(seed=0, num_passes=3, trained_perturbation=True, install_retrofit=True)
+    loop_ctl = stack["loop"]
+
+    reset_calls: list[int] = []
+    # Simulate higher peak memory at d=3 (40 GiB) vs d=1 (24 GiB) while keeping tensors on CPU
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _dev=None: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    def _fake_reset(_dev=None):
+        reset_calls.append(int(loop_ctl.active_passes))
+
+    def _fake_max_mem(_dev=None):
+        # Throughput probe sees 10 GiB; eval at d=1 sees 24 GiB; eval at d=3 sees 40 GiB.
+        # Distinguish probe (calls 1-2) vs eval d=1 (call 3) vs eval d=3 (call 4).
+        idx = len(reset_calls)
+        if idx <= 2:
+            return 10 * (1024**3)
+        return (24 if idx == 3 else 40) * (1024**3)
+
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", _fake_reset)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", _fake_max_mem)
+
+    orig_gen_cls = SR.Generator
+    fake_cuda_dev = types.SimpleNamespace(type="cuda")
+
+    def _gen_factory(*a, **kw):
+        g = orig_gen_cls(*a, **kw)
+        real_dev = g.device
+        orig_generate = g.generate
+
+        def _cpu_generate(*ga, **gk):
+            g.device = real_dev
+            try:
+                return orig_generate(*ga, **gk)
+            finally:
+                g.device = fake_cuda_dev
+
+        g.generate = _cpu_generate
+        g.device = fake_cuda_dev
+        return g
+
+    monkeypatch.setattr(SR, "Generator", _gen_factory)
+
+    arms = [SR.ArmConfig(name="looped_arm", depths=[1, 3], model_id="toy::looped_arm")]
+    budgets = SR.resolve_benchmark_budgets(["aime_2026"], max_new_tokens="4")
+    offline = {"aime_2026": [{"problem_idx": "1", "problem": "6*7?", "answer": "42"}]}
+
+    rep = SR.run_sprint2_reasoning(
+        arms,
+        benchmarks=budgets,
+        out_dir=tmp_path,
+        baseline_arm="looped_arm",
+        offline_items=offline,
+        arm_factories={"looped_arm": lambda: (stack, None)},
+        probe_max_new_tokens=6,
+    )
+
+    # 2 probe resets (d=1, d=3) + 2 separate eval resets (d=1, d=3) = 4 total resets
+    assert len(reset_calls) == 4
+    depths_rep = rep["arms"]["looped_arm"]["benchmarks"]["aime_2026"]["depths"]
+    assert depths_rep["1"]["peak_vram_gib"] == pytest.approx(24.0)
+    assert depths_rep["3"]["peak_vram_gib"] == pytest.approx(40.0)
+
+    # Combined multi-depth summary.json on disk must retain BOTH depths and depth_curve!
+    summ_disk = json.loads((tmp_path / "arms" / "looped_arm" / "aime_2026" / "summary.json").read_text())
+    assert set(summ_disk["depths"].keys()) == {"1", "3"}
+    assert set(summ_disk["depth_curve"].keys()) == {"1", "3"}
+    assert summ_disk["config"]["depths"] == ["1", "3"]
+    md = (tmp_path / "sprint2_reasoning.md").read_text(encoding="utf-8")
+    assert "max_new_tokens=6" in md

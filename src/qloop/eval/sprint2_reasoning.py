@@ -1172,6 +1172,10 @@ def run_sprint2_reasoning(
         arm_cache_dir.mkdir(parents=True, exist_ok=True)
         stack: Any = None
         gen: Generator | None = None
+        model: Any = None
+        tokenizer: Any = None
+        loop_ctl: Any = None
+        lsa: Any = None
         resolved_ckpt: str | None = None
         try:
             if arm_factories is not None and arm.name in arm_factories:
@@ -1244,48 +1248,78 @@ def run_sprint2_reasoning(
                     }
                     continue
 
+                # Isolate fallback runs under `_fallback_<requested>` so they never collide on run_config.json
+                # with a direct entry for the fallback benchmark in `--benchmarks`.
+                bench_cache_root = (
+                    arm_cache_dir / f"_fallback_{_safe_arm_dirname(bname)}"
+                    if lb.fallback_used
+                    else arm_cache_dir
+                )
+                bench_cache_root.mkdir(parents=True, exist_ok=True)
+
                 try:
-                    if is_cuda:
-                        torch.cuda.synchronize(dev)
-                        torch.cuda.reset_peak_memory_stats(dev)
-                    summ = run_benchmark(
-                        lb.spec,
-                        gen,
-                        limit=lb.budget.limit,
-                        depths=eff_depths,
-                        n_samples=int(lb.budget.n_samples),
-                        max_new_tokens=int(lb.budget.max_new_tokens),
-                        out_dir=str(arm_cache_dir),
-                        temperature=lb.budget.temperature,
-                        top_p=lb.budget.top_p,
-                        top_k=int(lb.budget.top_k),
-                        seed=int(seed),
-                        items=lb.items,
-                        capabilities=capabilities,
-                        allow_mixed_cache=bool(allow_mixed_cache),
-                        model_id=eff_model_id,
-                        checkpoint_path=resolved_ckpt,
-                    )
-                    if is_cuda:
-                        torch.cuda.synchronize(dev)
-                        eval_peak_vram_gib = float(torch.cuda.max_memory_allocated(dev)) / float(1024**3)
-                    else:
-                        eval_peak_vram_gib = 0.0
-
+                    merged_raw_depths: dict[str, Any] = {}
                     enriched_depths: dict[str, Any] = {}
-                    for dlabel, dm in (summ.get("depths") or {}).items():
-                        probe = throughput_probes.get(dlabel) or next(iter(throughput_probes.values()), {})
-                        probe_vram = float(probe.get("peak_vram_gib", 0.0) or 0.0)
-                        peak_vram = max(probe_vram, eval_peak_vram_gib) if is_cuda else 0.0
-                        enriched_depths[dlabel] = {
-                            **dict(dm),
-                            "decode_tok_s": probe.get("decode_tok_s"),
-                            "wall_s": dm.get("wall_s_this_run"),
-                            "probe_wall_s": probe.get("wall_s"),
-                            "peak_vram_gib": round(peak_vram, 4),
-                        }
+                    last_summ: dict[str, Any] | None = None
 
-                    rid = summ.get("run_identity")
+                    for d in eff_depths:
+                        if is_cuda:
+                            torch.cuda.synchronize(dev)
+                            torch.cuda.reset_peak_memory_stats(dev)
+                        summ = run_benchmark(
+                            lb.spec,
+                            gen,
+                            limit=lb.budget.limit,
+                            depths=[d],
+                            n_samples=int(lb.budget.n_samples),
+                            max_new_tokens=int(lb.budget.max_new_tokens),
+                            out_dir=str(bench_cache_root),
+                            temperature=lb.budget.temperature,
+                            top_p=lb.budget.top_p,
+                            top_k=int(lb.budget.top_k),
+                            seed=int(seed),
+                            items=lb.items,
+                            capabilities=capabilities,
+                            allow_mixed_cache=bool(allow_mixed_cache),
+                            model_id=eff_model_id,
+                            checkpoint_path=resolved_ckpt,
+                        )
+                        if is_cuda:
+                            torch.cuda.synchronize(dev)
+                            eval_peak_vram_gib = float(torch.cuda.max_memory_allocated(dev)) / float(1024**3)
+                        else:
+                            eval_peak_vram_gib = 0.0
+                        last_summ = summ
+
+                        for dlabel, dm in (summ.get("depths") or {}).items():
+                            merged_raw_depths[dlabel] = dict(dm)
+                            probe = throughput_probes.get(dlabel) or next(iter(throughput_probes.values()), {})
+                            probe_vram = float(probe.get("peak_vram_gib", 0.0) or 0.0)
+                            peak_vram = max(probe_vram, eval_peak_vram_gib) if is_cuda else 0.0
+                            enriched_depths[dlabel] = {
+                                **dict(dm),
+                                "decode_tok_s": probe.get("decode_tok_s"),
+                                "wall_s": dm.get("wall_s_this_run"),
+                                "probe_wall_s": probe.get("wall_s"),
+                                "peak_vram_gib": round(peak_vram, 4),
+                            }
+
+                    assert last_summ is not None
+                    combined_curve = {k: v.get("mean_score") for k, v in merged_raw_depths.items()}
+                    # Preserve combined multi-depth summary.json on disk when running depths individually
+                    if len(merged_raw_depths) > 1:
+                        merged_cfg = dict(last_summ.get("config") or {})
+                        merged_cfg["depths"] = list(merged_raw_depths.keys())
+                        merged_summary = {
+                            **last_summ,
+                            "config": merged_cfg,
+                            "depths": merged_raw_depths,
+                            "depth_curve": combined_curve,
+                        }
+                        summ_fp = bench_cache_root / lb.spec.name / "summary.json"
+                        summ_fp.write_text(json.dumps(merged_summary, indent=2, default=str), encoding="utf-8")
+
+                    rid = last_summ.get("run_identity")
                     arm_run_identities[bname] = rid
                     arm_bench_results[bname] = {
                         "status": lb.status,
@@ -1298,7 +1332,7 @@ def run_sprint2_reasoning(
                         "trained_group_warning": bool(lb.trained_group_warning),
                         "run_identity": rid,
                         "depths": enriched_depths,
-                        "depth_curve": summ.get("depth_curve") or {},
+                        "depth_curve": combined_curve,
                     }
                 except Exception as exc:
                     err_msg = _concise_error(exc)
@@ -1334,8 +1368,12 @@ def run_sprint2_reasoning(
             }
         finally:
             _teardown_arm_stack(stack)
-            del gen
-            del stack
+            gen = None
+            model = None
+            tokenizer = None
+            loop_ctl = None
+            lsa = None
+            stack = None
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1355,6 +1393,7 @@ def run_sprint2_reasoning(
         "chat_template_kwargs": ctk or {},
         "batch_size": int(batch_size),
         "padded_batching": bool(padded_batching),
+        "probe_max_new_tokens": int(probe_max_new_tokens),
         "seed": int(seed),
         "allow_mixed_cache": bool(allow_mixed_cache),
         "fallback_map": eff_fallback,
@@ -1367,6 +1406,7 @@ def run_sprint2_reasoning(
             "elapsed_s": elapsed_s,
             "num_arms": len(arms),
             "num_benchmarks": len(prepared),
+            "probe_max_new_tokens": int(probe_max_new_tokens),
         },
     }
     write_reasoning_artifacts(report, out_path)
@@ -1449,7 +1489,11 @@ def format_reasoning_markdown(report: Mapping[str, Any]) -> str:
         lines.append("")
 
     # Section 1: Throughput & VRAM probes
-    lines.append("## 1. Decode Throughput & Peak VRAM Probe (`max_new_tokens=32`, greedy)")
+    probe_tok = report.get(
+        "probe_max_new_tokens",
+        (report.get("metadata") or {}).get("probe_max_new_tokens", DEFAULT_PROBE_MAX_NEW_TOKENS),
+    )
+    lines.append(f"## 1. Decode Throughput & Peak VRAM Probe (`max_new_tokens={probe_tok}`, greedy)")
     lines.append("")
     lines.append(
         "| Arm | Depth | Loop | GDN-2 | D-LSA | d1-LoRA | Decode tok/s | Probe Wall (s) | Peak VRAM (GiB) |"

@@ -17,6 +17,7 @@ import torch
 from torch import nn
 
 from ..debug import register_nonfinite_hooks, require, stage
+from ..model.d1_lora import D1LoRAConfig, D1LoRAManager, install_d1_lora
 from ..model.experts import (
     ExpertStats,
     HotExpertDeltas,
@@ -56,6 +57,8 @@ class Stack:
     _folded_experts: set[tuple[int, int]] = field(default_factory=set)
     load_info: dict[str, Any] = field(default_factory=dict)
     hot_map: dict[int, list[int]] | None = None
+    d1_lora: D1LoRAManager | None = None
+    carried_d1_lora_cfg: dict[str, Any] | None = None
 
     @property
     def device(self) -> torch.device:
@@ -96,6 +99,8 @@ class Stack:
             s.update(self.hssd.stats())
         if self.lsa is not None:
             s.update(self.lsa.stats())
+        if self.d1_lora is not None:
+            s.update(self.d1_lora.stats())
         return s
 
     def verify_frozen_experts(self) -> str:
@@ -133,6 +138,8 @@ class Stack:
                 self.carried_hssd_cfg = dict(prior_stack_meta["hssd"])
             if self.lsa is None and isinstance(prior_stack_meta.get("lsa"), dict):
                 self.carried_lsa_cfg = dict(prior_stack_meta["lsa"])
+            if self.d1_lora is None and isinstance(prior_stack_meta.get("d1_lora"), dict):
+                self.carried_d1_lora_cfg = dict(prior_stack_meta["d1_lora"])
             if self.deltas is None and prior_stack_meta.get("expert_delta_scale") is not None:
                 expert_delta_scale = float(prior_stack_meta["expert_delta_scale"])
         if strict:
@@ -193,6 +200,7 @@ class Stack:
             "gdn2": (asdict(self.gdn2.cfg) if self.gdn2 is not None else self.carried_gdn2_cfg),
             "hssd": hssd_desc,
             "lsa": (self.lsa.cfg.__dict__ if self.lsa is not None else self.carried_lsa_cfg),
+            "d1_lora": (self.d1_lora.describe() if self.d1_lora is not None else self.carried_d1_lora_cfg),
             "hot_experts": None if self.hot_map is None else {str(k): v for k, v in self.hot_map.items()},
             "expert_delta_scale": None if self.deltas is None else self.deltas.scale,
             "frozen_experts_sha256": self.frozen_experts_sha256,
@@ -301,6 +309,17 @@ def build_stack(cfg: dict[str, Any]) -> Stack:
         st.frozen_experts_sha256 = sha256_frozen_experts(model)
         st.load_info["frozen_experts_sha256"] = st.frozen_experts_sha256
 
+    d1_cfg_raw = dict(cfg.get("d1_lora") or {})
+    if bool(d1_cfg_raw.get("enabled", False)):
+        with stage("model:d1_lora"):
+            st.d1_lora = install_d1_lora(model, D1LoRAConfig.from_dict(d1_cfg_raw))
+            d1_train = bool(tcfg.get("train_d1_lora", True))
+            if allowed_groups is not None and "d1_lora" not in allowed_groups:
+                d1_train = False
+            for n, p in st.d1_lora.adapters.named_parameters():
+                names[id(p)] = f"d1_lora.{n}"
+                p.requires_grad_(d1_train)
+
     if loop_on and loop_spec_pre is not None:
         with stage("model:loop"):
             st.loop = apply_loop(model, loop_spec_pre)
@@ -312,6 +331,8 @@ def build_stack(cfg: dict[str, Any]) -> Stack:
         st.verify_frozen_experts()
 
     params = {id(p): p for p in model.parameters()}
+    if st.d1_lora is not None:
+        params.update({id(p): p for p in st.d1_lora.adapters.parameters()})
     if st.loop is not None:
         params.update({id(p): p for p in st.loop.adapters.parameters()})
     require(all(i in names for i in params), "a parameter has no stable name (internal error)")

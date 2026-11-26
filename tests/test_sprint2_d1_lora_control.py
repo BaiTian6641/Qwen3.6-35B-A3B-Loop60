@@ -764,7 +764,15 @@ def test_build_stack_gradient_checkpointing_mock_hf_models(monkeypatch: pytest.M
     assert legacy_mod.legacy_gc_calls == 1
     assert legacy_mod.legacy_input_grads_calls == 1
 
-    # 3. Looped stage (`st.loop is not None`) must NOT double-enable HF gradient checkpointing
+    # 3. Fallback `embed_tokens` hook (when `enable_input_require_grads` is absent) is idempotent
+    no_irg_mod = _MockHFCheckpointableCausalLM(seed=3)
+    no_irg_mod.enable_input_require_grads = None  # type: ignore[assignment]
+    assert stack_mod._enable_gradient_checkpointing(no_irg_mod, no_irg_mod.model) is True
+    assert stack_mod._enable_gradient_checkpointing(no_irg_mod, no_irg_mod.model) is True
+    assert getattr(no_irg_mod.model.embed_tokens, "_qloop_input_grad_hook", False) is True
+    assert len(no_irg_mod.model.embed_tokens._forward_hooks) == 1
+
+    # 4. Looped stage (`st.loop is not None`) must NOT double-enable HF gradient checkpointing
     mock_looped = _MockHFCheckpointableCausalLM(seed=2)
     monkeypatch.setattr(stack_mod, "load_model", lambda _mcfg: (mock_looped, toy_tok, {"backend": "mock_hf"}))
     cfg_loop = {

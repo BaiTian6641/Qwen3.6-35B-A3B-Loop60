@@ -268,16 +268,18 @@ def _enable_gradient_checkpointing(model: nn.Module, text_model: nn.Module) -> b
     if not input_grads_enabled:
         embed = getattr(text_model, "embed_tokens", None)
         if isinstance(embed, nn.Module):
-            def _make_inputs_require_grad(_mod: nn.Module, _inp: Any, out: Any) -> None:
-                if (
-                    torch.is_grad_enabled()
-                    and isinstance(out, torch.Tensor)
-                    and out.is_floating_point()
-                    and not out.requires_grad
-                ):
-                    out.requires_grad_(True)
+            if not getattr(embed, "_qloop_input_grad_hook", False):
+                def _make_inputs_require_grad(_mod: nn.Module, _inp: Any, out: Any) -> None:
+                    if (
+                        torch.is_grad_enabled()
+                        and isinstance(out, torch.Tensor)
+                        and out.is_floating_point()
+                        and not out.requires_grad
+                    ):
+                        out.requires_grad_(True)
 
-            embed.register_forward_hook(_make_inputs_require_grad)
+                embed.register_forward_hook(_make_inputs_require_grad)
+                embed._qloop_input_grad_hook = True  # type: ignore[attr-defined]
             input_grads_enabled = True
 
     log.info(

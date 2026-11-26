@@ -817,7 +817,13 @@ def test_load_qloop_from_hub_d1_lora_and_non_lsa_stages_from_s2_v2_repo(tmp_path
             "optim": {"lr": 5e-3, "warmup_steps": 1, "impl": "builtin"},
         },
     })
-    LMTrainer(cfg_s2v2, str(run_root / "s2_v2_joint_bptt"), hub_api=api).train()
+    tr_s2v2 = LMTrainer(cfg_s2v2, str(run_root / "s2_v2_joint_bptt"), hub_api=api)
+    tr_s2v2.train()
+    tr_s2v2.stack.model.eval()
+    assert tr_s2v2.stack.loop is not None
+    tr_s2v2.stack.loop.set_active_passes(2)
+    with torch.no_grad():
+        h_s2v2 = tr_s2v2.stack.hidden(ids).detach().clone()
 
     root_qcfg = json.loads(api.files[(repo_id, "qloop_config.json")].decode("utf-8"))
     assert root_qcfg["stage"] == "s2_v2_joint_bptt"
@@ -877,3 +883,57 @@ def test_load_qloop_from_hub_d1_lora_and_non_lsa_stages_from_s2_v2_repo(tmp_path
     st_s1_rev.loop.set_active_passes(2)
     with torch.no_grad():
         assert torch.allclose(st_s1_rev.hidden(ids), h_s1, atol=1e-5, rtol=1e-5)
+
+    # Reverse-order load of `s2_v2_joint_bptt` (loop + gdn2 + lsa) after `s2_2_d1_lora_control`
+    # overwrote root `qloop_config.json` (whose `allowed_groups` omitted `lsa_indexers`)!
+    st_s2v2_rev = load_qloop_from_hub(
+        repo_id,
+        stage_name="s2_v2_joint_bptt",
+        overrides=["lsa.mode=distill"],
+        api=api,
+    )
+    assert st_s2v2_rev.loop is not None
+    assert st_s2v2_rev.gdn2 is not None and st_s2v2_rev.gdn2.cfg.rank == 6
+    assert st_s2v2_rev.lsa is not None
+    assert st_s2v2_rev.d1_lora is None and st_s2v2_rev.hssd is None
+    st_s2v2_rev.loop.set_active_passes(2)
+    with torch.no_grad():
+        assert torch.allclose(st_s2v2_rev.hidden(ids), h_s2v2, atol=1e-5, rtol=1e-5)
+
+
+def test_load_qloop_from_hub_synthetic_config_only_loop_compat(tmp_path):
+    """Backwards-compat: root `qloop_config.json` with `config.loop.enabled=True`, no `stack`,
+    and empty `qloop_adapters.pt` (`{}`) still installs `st.loop` cleanly.
+    """
+    api = MockHfApi()
+    repo_id = "TassP0lar/test-synth-config-only-loop"
+    qcfg = {
+        "repo_id": repo_id,
+        "config": {
+            "model": {"name": "toy", "dtype": "float32"},
+            "loop": {
+                "enabled": True,
+                "prelude_end": 4,
+                "core_end": 12,
+                "num_passes": 2,
+                "target_virtual_layers": 24,
+            },
+        },
+    }
+    empty_pt = tmp_path / "empty_adapters.pt"
+    torch.save({}, empty_pt)
+    api.commit_bundle(
+        repo_id,
+        [
+            ("qloop_config.json", json.dumps(qcfg).encode("utf-8")),
+            ("qloop_adapters.pt", str(empty_pt)),
+        ],
+        "synthetic config-only loop bundle",
+    )
+
+    st = load_qloop_from_hub(repo_id, api=api)
+    assert st.loop is not None
+    assert st.lsa is None
+    assert st.gdn2 is None
+    assert st.hssd is None
+    assert st.d1_lora is None

@@ -1121,9 +1121,10 @@ def load_qloop_from_hub(
     from .model.d1_lora import D1LoRAConfig
     from .model.loop import LoopSpec
 
+    same_root_stage = (not stage_name) or (not meta.get("stage")) or (meta.get("stage") == stage_name)
     if stage_name and stage_meta.get("stack"):
         smeta = dict(stage_meta["stack"])
-    elif not stage_name or not meta.get("stage") or meta.get("stage") == stage_name:
+    elif same_root_stage:
         smeta = dict(meta.get("stack") or {})
     else:
         smeta = {}
@@ -1131,12 +1132,27 @@ def load_qloop_from_hub(
     if not raw_cfg.get("model"):
         raw_cfg["model"] = {"name": meta.get("base_model", DEFAULT_BASE_MODEL), "dtype": "bfloat16",
                             "device_map": "auto", "attn_implementation": "sdpa"}
-    if isinstance(raw_cfg.get("train"), dict):
-        tcfg_load = dict(raw_cfg["train"])
-        tcfg_load["gradient_checkpointing"] = False
-        raw_cfg["train"] = tcfg_load
+    tcfg_load = dict(raw_cfg.get("train") or {})
+    tcfg_load.update({
+        "gradient_checkpointing": False,
+        "allowed_groups": None,
+        "strict_patterns": False,
+        "sha256_frozen_experts": False,
+        "trainable": [],
+        "train_gdn2": False,
+        "train_hssd": False,
+        "train_lsa": False,
+        "train_d1_lora": False,
+        "train_loop_adapters": False,
+        "train_expert_deltas": False,
+    })
+    raw_cfg["train"] = tcfg_load
 
-    has_loop = any("loop_adapters." in k for k in saved) or bool(smeta.get("loop"))
+    has_loop = (
+        any("loop_adapters." in k for k in saved)
+        or bool(smeta.get("loop"))
+        or (same_root_stage and "loop" not in smeta and bool((raw_cfg.get("loop") or {}).get("enabled", False)))
+    )
     if has_loop:
         known_loop = {f.name for f in fields(LoopSpec)}
         prior_loop = {k: v for k, v in dict(smeta.get("loop") or {}).items() if k in known_loop}

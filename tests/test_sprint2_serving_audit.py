@@ -173,6 +173,191 @@ def test_ql60_001_strict_tf5_flag_and_simulated_real_transformers(
     assert env_v5["has_cache_layer_mixin"] is True
 
 
+def test_real_tf524_dynamic_cache_without_top_level_conv_states_and_strict_tf5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for Blocker 1 + Gate 2 polish under faithful TF 5.24.0 `DynamicCache` (no top-level conv_states).
+
+    Verifies BOTH `--smoke-cpu --strict-tf5` AND the large-live-stack (`>50M`) Toy companion path
+    succeed cleanly when `transformers 5.24.0` is active and `DynamicCache` exposes conv/recurrent
+    states ONLY on `layers[i]`.
+    """
+    import importlib
+
+    import qloop.infer.engine as engine_mod
+    import qloop.infer.hf_custom_modeling as hcm_mod
+
+    mock_tf = AUDIT._make_strict_tf524_mock_modules()
+    tf_mod = mock_tf["transformers"]
+    cu_mod = mock_tf["transformers.cache_utils"]
+    tf_mod.__version__ = "5.24.0"  # type: ignore[attr-defined]
+
+    class _FaithfulTF524DynamicCache(cu_mod.DynamicCache):  # type: ignore[name-defined,misc]
+        """Mirrors real TF 5.24.0 `DynamicCache`: NO top-level `conv_states` or `recurrent_states`."""
+
+        def __init__(self, config: Any) -> None:
+            super().__init__(config)
+            del self.conv_states
+            del self.recurrent_states
+
+    class _FaithfulGenerationConfig:
+        def __init__(self, **kwargs: Any) -> None:
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class _FaithfulGenerationMixin(tf_mod.GenerationMixin):  # type: ignore[name-defined,misc]
+        @torch.no_grad()
+        def generate(
+            self,
+            input_ids: torch.Tensor,
+            *,
+            max_new_tokens: int = 6,
+            do_sample: bool = False,
+            use_cache: bool = True,
+            past_key_values: Any = None,
+            logits_to_keep: int = 0,
+            attention_mask: torch.Tensor | None = None,
+            generation_config: Any = None,
+            **kwargs: Any,
+        ) -> torch.Tensor:
+            del generation_config
+            pkv = past_key_values
+            if use_cache and pkv is None:
+                pkv = _FaithfulTF524DynamicCache(self.config)  # type: ignore[attr-defined]
+            return super().generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                use_cache=use_cache,
+                past_key_values=pkv,
+                logits_to_keep=logits_to_keep,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+
+    cu_mod.DynamicCache = _FaithfulTF524DynamicCache  # type: ignore[attr-defined]
+    tf_mod.GenerationConfig = _FaithfulGenerationConfig  # type: ignore[attr-defined]
+    tf_mod.GenerationMixin = _FaithfulGenerationMixin  # type: ignore[attr-defined]
+
+    saved_sys = {k: sys.modules.get(k) for k in mock_tf}
+    try:
+        for k, v in mock_tf.items():
+            sys.modules[k] = v
+        importlib.reload(engine_mod)
+        importlib.reload(hcm_mod)
+
+        spec = importlib.util.spec_from_file_location("_verify_tf524_real_tf_probe", SCRIPT_PATH)
+        assert spec is not None and spec.loader is not None
+        live_audit = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = live_audit
+        spec.loader.exec_module(live_audit)
+
+        # 1) --smoke-cpu --strict-tf5 passes all 4 checks (ENV:strict_tf5 + QL60-001/002/005)
+        out_json = tmp_path / "real_tf524_smoke.json"
+        rc = live_audit.main(
+            [
+                "--smoke-cpu",
+                "--strict-tf5",
+                "--depths",
+                "1,2,3",
+                "--max-new-tokens",
+                "4",
+                "--out-json",
+                str(out_json),
+                "--quiet",
+            ]
+        )
+        assert rc == 0
+        rep = json.loads(out_json.read_text(encoding="utf-8"))
+        assert rep["overall_passed"] is True
+        assert rep["passed_count"] == rep["total_checks"] == 4
+        by_name = {c["name"]: c for c in rep["checks"]}
+        assert by_name["ENV:strict_tf5"]["passed"] is True
+        assert by_name["QL60-001:quantized_hybrid_cache"]["metrics"]["tf524_contract"]["contract_mode"] == (
+            "real_transformers"
+        )
+        sa_d1 = by_name["QL60-002:pack_model_and_generate"]["metrics"]["standalone"]["depths"]["d1"]
+        assert sa_d1.get("generate_quantized_cache_native_parity") is True
+        assert "generate_implicit_cache_parity" not in sa_d1
+
+        # 2) Large live Stack (>50M threshold lowered to 100) Toy companion path passes cleanly
+        monkeypatch.setattr(live_audit, "_SMALL_MODEL_PARAM_LIMIT", 100)
+        live_stack = live_audit._build_smoke_toy_stack(seed=409, kv_share=True)
+        res_large = live_audit.check_pack_model_and_generate(live_stack, depths=(1, 2), max_new_tokens=3)
+        assert res_large["passed"] is True, res_large["detail"]
+        assert res_large["metrics"]["standalone"]["verified_on_toy_companion"] is True
+        assert res_large["metrics"]["subchecks"]["standalone_live_config_roundtrip"] is True
+        assert (
+            res_large["metrics"]["standalone"]["depths"]["d1"].get("generate_quantized_cache_native_parity") is True
+        )
+    finally:
+        sys.modules.pop("_verify_tf524_real_tf_probe", None)
+        for k, prev in saved_sys.items():
+            if prev is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = prev
+        importlib.reload(engine_mod)
+        importlib.reload(hcm_mod)
+
+
+def test_checkpoint_hf_hub_repo_with_stage_config_rewires_sync_and_stage_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for Blocker 2: `--checkpoint <owner/repo> --config <stage.yaml>` configures Hub sync + stage path."""
+    import qloop.cli as cli_mod
+
+    stage_yaml = tmp_path / "s2_v2_joint_bptt.yaml"
+    stage_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "stage": "s2_v2_joint_bptt",
+                "run": {"name": "s2_v2_joint_bptt"},
+                "checkpoint": {"sync": {"enabled": False, "hf_repo": None}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    captured: list[tuple[Any, str | None]] = []
+    dummy_stack = AUDIT._build_smoke_toy_stack(seed=419, kv_share=True)
+
+    def _fake_stack_with_ckpt(cfg: Any, ckpt: str | None) -> Any:
+        captured.append((cfg, ckpt))
+        return dummy_stack
+
+    monkeypatch.setattr(cli_mod, "_stack_with_ckpt", _fake_stack_with_ckpt)
+
+    # 1) HF Hub owner/repo ID + --config -> sets checkpoint.sync.{enabled,hf_repo} and passes runs/<stage>
+    st_obj, tok_obj, kind = AUDIT._load_target_for_audit("TassP0lar/Qwen3.6-35B-A3B-Loop64", str(stage_yaml))
+    assert st_obj is dummy_stack
+    assert tok_obj is dummy_stack.tokenizer
+    assert kind == "training_checkpoint_hf_repo"
+    assert len(captured) == 1
+    cfg_seen, ckpt_seen = captured[0]
+    assert cfg_seen["checkpoint"]["sync"]["enabled"] is True
+    assert cfg_seen["checkpoint"]["sync"]["hf_repo"] == "TassP0lar/Qwen3.6-35B-A3B-Loop64"
+    assert ckpt_seen == "runs/s2_v2_joint_bptt"
+
+    # 2) Fallback to run.name when top-level `stage` is omitted
+    run_only_yaml = tmp_path / "run_only.yaml"
+    run_only_yaml.write_text(yaml.safe_dump({"run": {"name": "s4_v2_rl"}}, sort_keys=False), encoding="utf-8")
+    captured.clear()
+    _, _, kind2 = AUDIT._load_target_for_audit("org/my-loop-ckpts", str(run_only_yaml))
+    assert kind2 == "training_checkpoint_hf_repo"
+    assert captured[0][0]["checkpoint"]["sync"]["enabled"] is True
+    assert captured[0][0]["checkpoint"]["sync"]["hf_repo"] == "org/my-loop-ckpts"
+    assert captured[0][1] == "runs/s4_v2_rl"
+
+    # 3) Local `runs/<stage>` path must NOT be misclassified as an HF Hub repo ID
+    captured.clear()
+    _, _, kind3 = AUDIT._load_target_for_audit("runs/s2_v2_joint_bptt", str(stage_yaml))
+    assert kind3 == "training_checkpoint_stack"
+    assert captured[0][0]["checkpoint"]["sync"]["enabled"] is False
+    assert captured[0][1] == "runs/s2_v2_joint_bptt"
+
+
 # ============================================================================ 2. QL60-002
 
 

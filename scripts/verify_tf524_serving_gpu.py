@@ -579,18 +579,31 @@ def _build_smoke_toy_stack(*, seed: int = 2026, kv_share: bool = True) -> Stack:
 def _is_toy_model(obj: Any) -> bool:
     if isinstance(obj, LoadedModelPack) and obj.hf_model is not None:
         obj = obj.hf_model
-    if isinstance(obj, Qwen36LoopHSSDForCausalLM):
-        arch = obj.config.qloop_v3_arch or {}
-        if arch.get("backbone_kind") == "toy":
-            return True
-        obj = obj.backbone
     elif isinstance(obj, Stack):
         obj = obj.model
+
+    cfg = getattr(obj, "config", None)
+    if cfg is not None:
+        arch = getattr(cfg, "qloop_v3_arch", None)
+        if isinstance(arch, dict):
+            if str(arch.get("backbone_kind") or "").lower() == "toy":
+                return True
+            if str(arch.get("base_model_type") or "").lower().startswith("toy"):
+                return True
+        bcfg = getattr(cfg, "base_config", None)
+        if isinstance(bcfg, dict) and str(bcfg.get("model_type") or "").lower().startswith("toy"):
+            return True
+        mtype = str(getattr(cfg, "model_type", "") or "").lower()
+        if mtype.startswith("toy"):
+            return True
+
+    backbone = getattr(obj, "backbone", None)
+    if isinstance(backbone, nn.Module) and backbone is not obj:
+        return _is_toy_model(backbone)
+
     if isinstance(obj, ToyForCausalLM):
         return True
-    cfg = getattr(obj, "config", None)
-    mtype = str(getattr(cfg, "model_type", "") or "").lower()
-    return mtype.startswith("toy") or type(obj).__name__.startswith("Toy")
+    return type(obj).__name__.startswith("Toy")
 
 
 def _model_param_count(mod: nn.Module) -> int:
@@ -923,6 +936,20 @@ def check_quantized_hybrid_cache(
                 isinstance(lyr, RealHFCacheLayerMixin) for lyr in probe_cache.layers
             ):
                 raise AssertionError("QuantizedHybridCache.layers do not inherit real CacheLayerMixin")
+            if probe_cache.layers[lin0].is_croppable is not False or probe_cache.layers[full0].is_croppable is not True:
+                raise AssertionError("unexpected is_croppable on real-transformers CacheLayerMixin views")
+            if (
+                probe_cache.layers[lin0].supports_early_init is not False
+                or probe_cache.layers[full0].supports_early_init is not True
+            ):
+                raise AssertionError("unexpected supports_early_init on real-transformers CacheLayerMixin views")
+            if probe_cache.layers[full0].get_max_length() != -1:
+                raise AssertionError("unexpected get_max_length() on real-transformers CacheLayerMixin view")
+            probe_cache.layers[full0].lazy_initialization(torch.randn(1, 2, 1, 16), torch.randn(1, 2, 1, 16))
+            if probe_cache.is_compileable is not False or probe_cache.is_sliding != [False] * n_layers:
+                raise AssertionError("unexpected is_compileable / is_sliding on real-transformers QuantizedHybridCache")
+            if probe_cache.is_recording_past(lin0) is not False or probe_cache.is_recording_past(full0) is not False:
+                raise AssertionError("unexpected is_recording_past() on real-transformers QuantizedHybridCache")
             metrics["tf524_contract"] = {
                 "contract_mode": "real_transformers",
                 "transformers_version": env["transformers_version"],
@@ -2280,6 +2307,17 @@ def _is_whole_model_pack_dir(path: str) -> bool:
     return False
 
 
+def _looks_like_hf_repo_id(raw: str) -> bool:
+    """True when `raw` looks like a non-existent Hugging Face `owner/repo` ID (not a local/runs path)."""
+    s = raw.strip()
+    if not s or os.path.exists(s) or s.startswith(("/", ".", "~")):
+        return False
+    parts = s.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return False
+    return parts[0] not in ("runs", "checkpoints", "configs", "tmp", "var", "content")
+
+
 def _load_target_for_audit(
     checkpoint: str,
     config_path: str | None,
@@ -2301,12 +2339,34 @@ def _load_target_for_audit(
         )
 
     from qloop.cli import _stack_with_ckpt
-    from qloop.config import load_config
+    from qloop.config import Cfg, load_config
 
     cfg = load_config(config_path, overrides=overrides)
-    stack = _stack_with_ckpt(cfg, checkpoint)
+    eff_ckpt = checkpoint
+    target_kind = "training_checkpoint_stack"
+    if _looks_like_hf_repo_id(checkpoint):
+        ckpt_section = cfg.get("checkpoint")
+        if not isinstance(ckpt_section, dict):
+            ckpt_section = Cfg()
+            cfg["checkpoint"] = ckpt_section
+        sync_section = ckpt_section.get("sync")
+        if not isinstance(sync_section, dict):
+            sync_section = Cfg()
+            ckpt_section["sync"] = sync_section
+        sync_section["enabled"] = True
+        sync_section["hf_repo"] = checkpoint.strip()
+
+        stage_name = str(cfg.get("stage") or (cfg.get("run") or {}).get("name") or "").strip()
+        if not stage_name:
+            raise ValueError(
+                f"cannot resolve stage name from {config_path!r} for HF Hub checkpoint repo {checkpoint!r}"
+            )
+        eff_ckpt = f"runs/{stage_name}"
+        target_kind = "training_checkpoint_hf_repo"
+
+    stack = _stack_with_ckpt(cfg, eff_ckpt)
     stack.model.eval()
-    return stack, stack.tokenizer, "training_checkpoint_stack"
+    return stack, stack.tokenizer, target_kind
 
 
 def build_audit_report(

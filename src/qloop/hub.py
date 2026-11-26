@@ -23,7 +23,7 @@ import logging
 import os
 import shutil
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 log = logging.getLogger("qloop")
@@ -1118,13 +1118,35 @@ def load_qloop_from_hub(
                 except Exception:
                     stage_meta = {}
 
-    smeta = dict(stage_meta.get("stack") or meta.get("stack") or {})
+    from .model.d1_lora import D1LoRAConfig
+    from .model.loop import LoopSpec
+
+    if stage_name and stage_meta.get("stack"):
+        smeta = dict(stage_meta["stack"])
+    elif not stage_name or not meta.get("stage") or meta.get("stage") == stage_name:
+        smeta = dict(meta.get("stack") or {})
+    else:
+        smeta = {}
     raw_cfg = dict(meta.get("config") or {})
     if not raw_cfg.get("model"):
         raw_cfg["model"] = {"name": meta.get("base_model", DEFAULT_BASE_MODEL), "dtype": "bfloat16",
                             "device_map": "auto", "attn_implementation": "sdpa"}
-    if not raw_cfg.get("loop") and smeta.get("loop"):
-        raw_cfg["loop"] = {"enabled": True, **dict(smeta["loop"])}
+    if isinstance(raw_cfg.get("train"), dict):
+        tcfg_load = dict(raw_cfg["train"])
+        tcfg_load["gradient_checkpointing"] = False
+        raw_cfg["train"] = tcfg_load
+
+    has_loop = any("loop_adapters." in k for k in saved) or bool(smeta.get("loop"))
+    if has_loop:
+        known_loop = {f.name for f in fields(LoopSpec)}
+        prior_loop = {k: v for k, v in dict(smeta.get("loop") or {}).items() if k in known_loop}
+        lpcfg = {k: v for k, v in dict(raw_cfg.get("loop") or {}).items() if k in known_loop}
+        lpcfg.update(prior_loop)
+        lpcfg["enabled"] = True
+        raw_cfg["loop"] = lpcfg
+    else:
+        raw_cfg["loop"] = {"enabled": False}
+
     # At inference we fold any `expert_deltas` directly into float base weights via `restore_checkpoint`
     # (zero hook overhead during generation).
     raw_cfg["experts"] = {"enabled": False}
@@ -1163,6 +1185,39 @@ def load_qloop_from_hub(
         lcfg["mode"] = "sparse"
         lcfg["enabled"] = True
         raw_cfg["lsa"] = lcfg
+    else:
+        raw_cfg["lsa"] = {"enabled": False}
+
+    has_d1_lora = any("d1_lora." in k for k in saved) or bool(smeta.get("d1_lora"))
+    if has_d1_lora:
+        known_d1 = {f.name for f in fields(D1LoRAConfig)}
+        prior_d1_raw = dict(smeta.get("d1_lora") or {})
+        prior_d1 = {k: v for k, v in prior_d1_raw.items() if k in known_d1}
+        d1cfg = {k: v for k, v in dict(raw_cfg.get("d1_lora") or {}).items() if k in known_d1}
+        d1cfg.update(prior_d1)
+        if prior_d1_raw.get("resolved_rank") is not None:
+            d1cfg["rank"] = int(prior_d1_raw["resolved_rank"])
+            d1cfg["target_params"] = None
+        elif not prior_d1_raw:
+            layer_idxs: list[int] = []
+            inferred_rank: int | None = None
+            for k, t in saved.items():
+                if k.startswith("d1_lora.L"):
+                    parts_k = k.split(".")
+                    if len(parts_k) >= 4 and parts_k[1].startswith("L") and parts_k[1][1:].isdigit():
+                        layer_idxs.append(int(parts_k[1][1:]))
+                    if inferred_rank is None and k.endswith(".down") and getattr(t, "ndim", 0) == 2:
+                        inferred_rank = int(t.shape[0])
+            if inferred_rank is not None:
+                d1cfg["rank"] = inferred_rank
+                d1cfg["target_params"] = None
+            if layer_idxs:
+                d1cfg["layer_start"] = min(layer_idxs)
+                d1cfg["layer_end"] = max(layer_idxs) + 1
+        d1cfg["enabled"] = True
+        raw_cfg["d1_lora"] = d1cfg
+    elif "d1_lora" in raw_cfg:
+        raw_cfg["d1_lora"] = {"enabled": False}
 
     if overrides:
         apply_overrides(raw_cfg, overrides)

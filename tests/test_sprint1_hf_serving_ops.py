@@ -66,6 +66,8 @@ from qloop.infer.engine import (
     InferenceConfig,
     OptimizedLoopInferenceEngine,
     QuantizedHybridCache,
+    _FP8Slot,
+    _HadamardINT4Slot,
 )
 from qloop.infer.hf_custom_modeling import (
     CONFIG_FILENAME,
@@ -432,6 +434,20 @@ def _make_mock_tf524_modules(*, strict_cache_init: bool = True) -> dict[str, typ
     class _MockGenerationMixin:
         """Faithful mini-replica of HF 5.24 `GenerationMixin.generate()` greedy loop."""
 
+        def _validate_model_kwargs(self, model_kwargs: dict[str, Any]) -> None:
+            fwd_params = inspect.signature(self.forward).parameters  # type: ignore[attr-defined]
+            valid_keys = {
+                pname
+                for pname, p in fwd_params.items()
+                if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            }
+            unused = [k for k, v in model_kwargs.items() if v is not None and k not in valid_keys]
+            if unused:
+                raise ValueError(
+                    f"The following model_kwargs are not used by the model: {unused} "
+                    "(note: typos in the generate arguments will also show up in this list)"
+                )
+
         @torch.no_grad()
         def generate(
             self,
@@ -439,14 +455,20 @@ def _make_mock_tf524_modules(*, strict_cache_init: bool = True) -> dict[str, typ
             *,
             max_new_tokens: int = 3,
             past_key_values: Any = None,
+            cache: Any = None,
             logits_to_keep: int = 0,
             use_cache: bool = True,
             **kwargs: Any,
         ) -> torch.Tensor:
             cur_ids = input_ids
-            pkv = past_key_values
+            used_cache_kw = cache is not None and past_key_values is None
+            pkv = cache if used_cache_kw else past_key_values
             if use_cache and pkv is None:
                 pkv = _MockHybridDynamicCache(self.config)  # type: ignore[attr-defined]
+            val_kw: dict[str, Any] = dict(kwargs)
+            if pkv is not None:
+                val_kw["cache"] = pkv
+            self._validate_model_kwargs(val_kw)
             # Validate every linear layer slot on hybrid DynamicCache just like real HF Qwen3_5Moe
             if isinstance(pkv, _MockHybridDynamicCache):
                 for idx, lt in enumerate(getattr(self.config, "layer_types", [])):  # type: ignore[attr-defined]
@@ -463,12 +485,13 @@ def _make_mock_tf524_modules(*, strict_cache_init: bool = True) -> dict[str, typ
                 else:
                     cache_pos = torch.tensor([past_len], device=cur_ids.device)
 
+                prep_cache_kw = {"cache": pkv} if used_cache_kw else {"past_key_values": pkv}
                 model_inputs = self.prepare_inputs_for_generation(  # type: ignore[attr-defined]
                     cur_ids,
-                    past_key_values=pkv,
                     cache_position=cache_pos,
                     use_cache=use_cache,
                     logits_to_keep=logits_to_keep,
+                    **prep_cache_kw,
                     **kwargs,
                 )
                 outputs = self(**model_inputs)  # type: ignore[operator]
@@ -885,6 +908,92 @@ def test_ql60_001_engine_prefill_chunked_decode_depths_across_quant_modes(mode: 
     assert abs(kv_mbs[2] - kv_mbs[0]) < 1e-6
 
 
+@pytest.mark.parametrize("slot_cls", [_FP8Slot, _HadamardINT4Slot])
+def test_ql60_001_geometric_slots_multi_chunk_parity_ops_nbytes_and_bf16_dequant(slot_cls: Any) -> None:
+    """Verify geometric KV slots: 16-chunk append parity, crop/reorder/repeat, live `nbytes()`, & BF16 dequant."""
+    gen = torch.Generator().manual_seed(2026)
+    b, g, d = 2, 3, 64
+    chunks = [torch.randn(b, g, 5 + (i % 4), d, generator=gen) for i in range(16)]
+    full = torch.cat(chunks, dim=-2)
+    total_t = int(full.shape[-2])
+
+    ref_slot = slot_cls.from_float(full)
+    inc_slot = slot_cls.from_float(chunks[0])
+    for ch in chunks[1:]:
+        inc_slot.append(ch)
+
+    assert inc_slot.seq_len == total_t
+    assert inc_slot.capacity >= total_t
+    assert inc_slot.capacity > total_t  # geometric doubling pre-allocated headroom beyond live length
+
+    # 1) Exact parity across 16 chunked appends vs single-shot quantization
+    ref_fp32 = ref_slot.dequantize(torch.float32)
+    inc_fp32 = inc_slot.dequantize(torch.float32)
+    assert torch.equal(inc_fp32, ref_fp32)
+    if slot_cls is _FP8Slot:
+        assert inc_slot.q_data.shape == (b, g, total_t, d)
+        assert inc_slot.scale.shape == (b, g, total_t, 1)
+        expected_live_bytes = (
+            inc_slot.q_data.numel() * inc_slot.q_data.element_size()
+            + inc_slot.scale.numel() * inc_slot.scale.element_size()
+        )
+    else:
+        assert inc_slot.packed.shape[:3] == (b, g, total_t)
+        assert inc_slot.scale.shape[:3] == (b, g, total_t)
+        expected_live_bytes = (
+            inc_slot.packed.numel() * inc_slot.packed.element_size()
+            + inc_slot.scale.numel() * inc_slot.scale.element_size()
+        )
+    # 2) `nbytes()` reports exact live used bytes (NOT overallocated capacity)
+    assert inc_slot.nbytes() == expected_live_bytes == ref_slot.nbytes()
+
+    # 3) Direct bfloat16 dequant accuracy (< 1e-2 relative & unit-scale abs vs fp32) + bit-exact sparse slice
+    inc_bf16 = inc_slot.dequantize(torch.bfloat16)
+    assert inc_bf16.dtype == torch.bfloat16
+    diff_f32 = (inc_bf16.float() - inc_fp32).abs()
+    assert torch.allclose(inc_bf16.float(), inc_fp32, rtol=1e-2, atol=1e-2)
+    assert (diff_f32 / inc_fp32.abs().clamp_min(1.0)).max().item() < 1e-2
+    assert diff_f32.mean().item() < 1e-2
+    unit_slot = slot_cls.from_float(full.clamp(-1.0, 1.0))
+    unit_diff = (unit_slot.dequantize(torch.bfloat16).float() - unit_slot.dequantize(torch.float32)).abs()
+    assert unit_diff.max().item() < 1e-2
+    sel_idx = torch.tensor([0, 7, total_t // 2, total_t - 1], dtype=torch.long)
+    sel_bf16 = inc_slot.dequantize_slice(sel_idx, torch.bfloat16)
+    assert sel_bf16.dtype == torch.bfloat16
+    assert torch.equal(sel_bf16, inc_bf16.index_select(-2, sel_idx))
+
+    # 4) `crop()` (including re-append after crop), `reorder_cache()`, and `batch_repeat_interleave()`
+    crop_t = total_t - 11
+    inc_slot.crop(crop_t)
+    assert inc_slot.seq_len == crop_t
+    assert torch.equal(inc_slot.dequantize(torch.float32), ref_fp32[..., :crop_t, :])
+    tail = torch.randn(b, g, 4, d, generator=gen)
+    inc_slot.append(tail)
+    assert inc_slot.seq_len == crop_t + 4
+    expected_after_reappend = torch.cat(
+        [ref_fp32[..., :crop_t, :], slot_cls.from_float(tail).dequantize(torch.float32)],
+        dim=-2,
+    )
+    assert torch.equal(inc_slot.dequantize(torch.float32), expected_after_reappend)
+
+    beam = torch.tensor([1, 0], dtype=torch.long)
+    inc_slot.reorder_cache(beam)
+    assert torch.equal(inc_slot.dequantize(torch.float32), expected_after_reappend[beam])
+
+    inc_slot.batch_repeat_interleave(2)
+    assert inc_slot.dequantize(torch.float32).shape == (b * 2, g, crop_t + 4, d)
+    assert torch.equal(inc_slot.dequantize(torch.float32), expected_after_reappend[beam].repeat_interleave(2, dim=0))
+
+    # 5) QuantizedHybridCache.kv_bytes() tracks exact live bytes across multi-chunk appends (not geometric slack)
+    mode_name = "fp8" if slot_cls is _FP8Slot else "hadamard_int4"
+    qc_inc = QuantizedHybridCache(num_layers=2, layer_types=["linear_attention", "full_attention"], mode=mode_name)
+    qc_ref = QuantizedHybridCache(num_layers=2, layer_types=["linear_attention", "full_attention"], mode=mode_name)
+    for ch in chunks:
+        qc_inc.update(ch, ch, layer_idx=1)
+    qc_ref.update(full, full, layer_idx=1)
+    assert qc_inc.kv_bytes() == qc_ref.kv_bytes() == 2 * expected_live_bytes
+
+
 # ============================================================================ 2. QL60-002
 
 
@@ -1182,6 +1291,58 @@ def test_ql60_002_outer_config_virtual_layers_logits_to_keep_zero_and_hf_generat
         warn_sa = mod_sa.Qwen36LoopHSSDForCausalLM.from_pretrained(str(pack_dir), strict=True)
     assert any("qloop_format_version" in str(w.message) for w in rec_sa)
     assert warn_sa(prompt, use_cache=False, logits_to_keep=0).logits.shape == (1, 6, stack.tokenizer.vocab_size)
+
+
+def test_ql60_002_tf524_validate_model_kwargs_cache_signature_inpkg_and_standalone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify explicit `cache` parameter in `forward` & `prepare_inputs_for_generation` passes TF 5.24.1 validation."""
+    stack = _build_loop_toy_stack(seed=131)
+    pack_dir = tmp_path / "tf524_cache_sig_pack"
+    export_whole_model_pack(stack, pack_dir, max_shard_size_bytes=65536, merge_in_place=False)
+
+    loaded = load_whole_model_pack(pack_dir)
+    hf_model = loaded.hf_model
+    assert hf_model is not None
+
+    tf_mods = _make_mock_tf524_modules(strict_cache_init=True)
+    _, mod_sa = _load_standalone_pack_modules(pack_dir, monkeypatch, tf_mods=tf_mods)
+    sa_model = mod_sa.Qwen36LoopHSSDForCausalLM.from_pretrained(str(pack_dir), strict=True)
+
+    # 1) Explicit `cache` parameter on BOTH in-package and standalone `forward` and `prepare_inputs_for_generation`
+    for mdl in (hf_model, sa_model):
+        fwd_params = inspect.signature(mdl.forward).parameters
+        prep_params = inspect.signature(mdl.prepare_inputs_for_generation).parameters
+        assert "cache" in fwd_params and "past_key_values" in fwd_params
+        assert "cache" in prep_params and "past_key_values" in prep_params
+
+    # 2) Mock TF 5.24.1 GenerationMixin._validate_model_kwargs(cache=...) passes on both, fails without `cache` param
+    gen_mixin = tf_mods["transformers"].GenerationMixin
+    dummy_c = QuantizedHybridCache(num_layers=12, layer_types=hf_model.config.layer_types, mode="native")
+    gen_mixin._validate_model_kwargs(hf_model, {"cache": dummy_c})
+    sa_model._validate_model_kwargs({"cache": dummy_c})
+
+    class _MissingCacheParamModel(gen_mixin):  # type: ignore[misc,valid-type]
+        def forward(self, input_ids: torch.Tensor | None = None, past_key_values: Any = None, **kwargs: Any) -> Any:
+            return input_ids
+
+    with pytest.raises(ValueError, match=r"not used by the model.*cache"):
+        _MissingCacheParamModel()._validate_model_kwargs({"cache": dummy_c})
+
+    # 3) prepare_inputs_for_generation never emits BOTH cache keys, and generate(..., cache=...) works
+    prompt = torch.tensor([[11, 22, 33, 44, 55, 66]], dtype=torch.long)
+    for mdl in (hf_model, sa_model):
+        mi_c = mdl.prepare_inputs_for_generation(prompt, cache=dummy_c)
+        assert mi_c.get("cache") is dummy_c and "past_key_values" not in mi_c
+        mi_p = mdl.prepare_inputs_for_generation(prompt, past_key_values=dummy_c)
+        assert mi_p.get("past_key_values") is dummy_c and "cache" not in mi_p
+
+    with torch.no_grad():
+        ref_seq = hf_model.backbone.greedy_generate(prompt, max_new_tokens=3)
+        q_cache_kw = QuantizedHybridCache(num_layers=12, layer_types=sa_model.config.layer_types, mode="native")
+        gen_via_cache = sa_model.generate(prompt, max_new_tokens=3, cache=q_cache_kw, logits_to_keep=1)
+        assert torch.equal(gen_via_cache, ref_seq)
+        assert q_cache_kw.get_seq_length() == prompt.shape[1] + 2
 
 
 # ============================================================================ 3. QL60-005

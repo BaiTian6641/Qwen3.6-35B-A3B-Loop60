@@ -350,8 +350,8 @@ class LengthLadderPoint:
 
     length: int
     chunk_size: int
-    dense_nll: float
-    dense_ppl: float
+    dense_nll: float | None
+    dense_ppl: float | None
     valid_tokens: int
     sparse_nll: float | None = None
     sparse_ppl: float | None = None
@@ -366,8 +366,8 @@ class LengthLadderPoint:
         return {
             "length": int(self.length),
             "chunk_size": int(self.chunk_size),
-            "dense_nll": float(self.dense_nll),
-            "dense_ppl": float(self.dense_ppl),
+            "dense_nll": None if self.dense_nll is None else float(self.dense_nll),
+            "dense_ppl": None if self.dense_ppl is None else float(self.dense_ppl),
             "valid_tokens": int(self.valid_tokens),
             "sparse_nll": None if self.sparse_nll is None else float(self.sparse_nll),
             "sparse_ppl": None if self.sparse_ppl is None else float(self.sparse_ppl),
@@ -2148,6 +2148,20 @@ def build_ruler_multi_needle_episode(
     }
 
 
+def _release_gpu_memory(cache: Any = None) -> None:
+    """Release cache tensor storage immediately and reclaim cached CUDA segments between long-context passes."""
+    if cache is not None and hasattr(cache, "reset") and callable(cache.reset):
+        try:
+            cache.reset()
+        except Exception:
+            pass
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+    else:
+        gc.collect(0)
+
+
 @torch.no_grad()
 def evaluate_ruler_multi_needle(
     model: nn.Module,
@@ -2174,13 +2188,18 @@ def evaluate_ruler_multi_needle(
     answer_ids_list = [int(x) for x in episode["answer_ids"]]
     prompt_len = len(prompt_ids_list)
     ans_len = len(answer_ids_list)
-    prompt_t = torch.tensor([prompt_ids_list], dtype=torch.long, device=dev)
-    ans_t = torch.tensor([answer_ids_list], dtype=torch.long, device=dev)
+    prompt_t: torch.Tensor | None = torch.tensor([prompt_ids_list], dtype=torch.long, device=dev)
+    ans_t: torch.Tensor | None = torch.tensor([answer_ids_list], dtype=torch.long, device=dev)
 
     c_step = max(2, int(chunk_size))
     cache_kw = cache_kwarg_name(text_model)
     fwd_params = _text_model_forward_kwargs(text_model)
-    cache = _init_streaming_cache(model, kv_cache_quant)
+    cache: Any = _init_streaming_cache(model, kv_cache_quant)
+    linear_snap: Any = None
+    last_prompt_h: torch.Tensor | None = None
+    cur_h: torch.Tensor | None = None
+    h_c: torch.Tensor | None = None
+    h_for_ans: torch.Tensor | None = None
     if lsa is not None:
         lsa.clear_cache()
 
@@ -2192,8 +2211,8 @@ def evaluate_ruler_multi_needle(
         return lm_head(h_in)
 
     try:
+        assert prompt_t is not None and ans_t is not None
         # 1. Stream prompt chunks once
-        last_prompt_h: torch.Tensor | None = None
         for s0 in range(0, prompt_len, c_step):
             s1 = min(prompt_len, s0 + c_step)
             h_c, cache = _step_text_model_chunk(
@@ -2205,6 +2224,7 @@ def evaluate_ruler_multi_needle(
                 fwd_params=fwd_params,
             )
             last_prompt_h = h_c[:, -1:, :].detach()
+            h_c = None
         assert last_prompt_h is not None
 
         # 2. Capture GDN-2 recurrent state norms at exact prompt horizon
@@ -2247,6 +2267,7 @@ def evaluate_ruler_multi_needle(
                     fwd_params=fwd_params,
                 )
                 h_for_ans = torch.cat([last_prompt_h, h_ans], dim=1)
+                del h_ans
             else:
                 h_for_ans = last_prompt_h
             ans_loss, _ = lm_loss(
@@ -2269,12 +2290,26 @@ def evaluate_ruler_multi_needle(
             answer_nll = float(F.cross_entropy(logits_first, ans_t[:, 0]).item())
             answer_tok_acc = float(gen_ids[0] == answer_ids_list[0]) if gen_ids else 0.0
     finally:
+        if cache is not None and hasattr(cache, "reset") and callable(cache.reset):
+            try:
+                cache.reset()
+            except Exception:
+                pass
+        cache = None
+        linear_snap = None
+        last_prompt_h = None
+        cur_h = None
+        h_c = None
+        h_for_ans = None
+        prompt_t = None
+        ans_t = None
         if lsa is not None:
             lsa.aux_loss()
             lsa.clear_cache()
         if loop is not None and callable(getattr(loop, "release_graph", None)):
             loop.release_graph(clear_routing=True)
         model.train(was_training)
+        _release_gpu_memory()
 
     needles = list(episode["needles"])
     if episode.get("mode") == "text" and tokenizer is not None:
@@ -2349,6 +2384,7 @@ def run_length_ladder_audit(
     lsa: LSAManager | None = None,
     num_needles: int = 4,
     needle_depths: Sequence[float] | None = DEFAULT_NEEDLE_DEPTHS,
+    skip_dense_above: int | None = None,
     seed: int = 0,
     arm_name: str = "model",
 ) -> LengthLadderResult:
@@ -2377,22 +2413,36 @@ def run_length_ladder_audit(
                 seed=seed,
             )
 
-            # (a) Dense chunked NLL + GDN-2 state norms
-            dense_ctx = lsa.temporary_mode("dense") if lsa is not None else contextlib.nullcontext()
-            with dense_ctx:
-                dense_nll, valid_toks, dense_cache, _, _ = stream_chunked_lm_nll(
-                    model,
-                    seq_ids,
-                    seq_ids,
-                    chunk_size=eff_chunk,
-                    ce_chunk_size=ce_chunk_size,
-                    kv_cache_quant=kv_cache_quant,
-                    loop=ctl,
-                    lsa=lsa,
-                    sample_lsa_recall=False,
-                )
-                dense_norms = inspect_gdn2_recurrent_state_norms(dense_cache)
-            del dense_cache
+            skip_dense = bool(
+                lsa is not None and skip_dense_above is not None and t_len > int(skip_dense_above)
+            )
+
+            # (a) Dense chunked NLL + GDN-2 state norms (optionally skipped above `skip_dense_above` when D-LSA active)
+            dense_nll: float | None = None
+            dense_ppl: float | None = None
+            valid_toks = 0
+            dense_norms: GDN2StateNormTelemetry | None = None
+            if not skip_dense:
+                dense_ctx = lsa.temporary_mode("dense") if lsa is not None else contextlib.nullcontext()
+                with dense_ctx:
+                    d_nll, valid_toks, dense_cache, _, _ = stream_chunked_lm_nll(
+                        model,
+                        seq_ids,
+                        seq_ids,
+                        chunk_size=eff_chunk,
+                        ce_chunk_size=ce_chunk_size,
+                        kv_cache_quant=kv_cache_quant,
+                        loop=ctl,
+                        lsa=lsa,
+                        sample_lsa_recall=False,
+                    )
+                    dense_norms = inspect_gdn2_recurrent_state_norms(dense_cache)
+                if hasattr(dense_cache, "reset") and callable(dense_cache.reset):
+                    dense_cache.reset()
+                del dense_cache
+                _release_gpu_memory()
+                dense_nll = float(d_nll)
+                dense_ppl = _safe_ppl(dense_nll)
 
             # (b) Sparse D-LSA chunked NLL + live `lsa/last_recall` (`B2`)
             sparse_nll: float | None = None
@@ -2403,7 +2453,7 @@ def run_length_ladder_audit(
             sparse_norms: GDN2StateNormTelemetry | None = None
             if lsa is not None:
                 with lsa.temporary_mode("sparse"):
-                    s_nll, _, sparse_cache, rec_val, s_act = stream_chunked_lm_nll(
+                    s_nll, s_valid_toks, sparse_cache, rec_val, s_act = stream_chunked_lm_nll(
                         model,
                         seq_ids,
                         seq_ids,
@@ -2415,10 +2465,15 @@ def run_length_ladder_audit(
                         sample_lsa_recall=True,
                     )
                     sparse_norms = inspect_gdn2_recurrent_state_norms(sparse_cache)
+                if hasattr(sparse_cache, "reset") and callable(sparse_cache.reset):
+                    sparse_cache.reset()
                 del sparse_cache
+                _release_gpu_memory()
+                if skip_dense:
+                    valid_toks = int(s_valid_toks)
                 sparse_nll = float(s_nll)
                 sparse_ppl = _safe_ppl(sparse_nll)
-                ds_gap = float(sparse_nll - dense_nll)
+                ds_gap = None if dense_nll is None else float(sparse_nll - dense_nll)
                 lsa_recall = rec_val
                 sparse_active = bool(s_act)
 
@@ -2431,20 +2486,28 @@ def run_length_ladder_audit(
                 seed=seed,
                 vocab_size=vocab_size,
             )
-            ruler_res, ruler_norms = evaluate_ruler_multi_needle(
-                model,
-                episode,
-                tokenizer=tokenizer,
-                chunk_size=eff_chunk,
-                ce_chunk_size=ce_chunk_size,
-                kv_cache_quant=kv_cache_quant,
-                loop=ctl,
-                lsa=lsa,
-            )
+            ruler_ctx = lsa.temporary_mode("sparse") if (skip_dense and lsa is not None) else contextlib.nullcontext()
+            with ruler_ctx:
+                ruler_res, ruler_norms = evaluate_ruler_multi_needle(
+                    model,
+                    episode,
+                    tokenizer=tokenizer,
+                    chunk_size=eff_chunk,
+                    ce_chunk_size=ce_chunk_size,
+                    kv_cache_quant=kv_cache_quant,
+                    loop=ctl,
+                    lsa=lsa,
+                )
 
             # Prefer the highest-norm telemetry snapshot across dense/sparse/RULER for strict boundedness check
-            chosen_norms = sparse_norms if (sparse_norms is not None and sparse_norms.num_linear_states > 0) else (
-                dense_norms if dense_norms.num_linear_states > 0 else ruler_norms
+            chosen_norms = (
+                sparse_norms
+                if (sparse_norms is not None and sparse_norms.num_linear_states > 0)
+                else (
+                    dense_norms
+                    if (dense_norms is not None and dense_norms.num_linear_states > 0)
+                    else ruler_norms
+                )
             )
             if (
                 ruler_norms.num_linear_states > 0
@@ -2458,8 +2521,8 @@ def run_length_ladder_audit(
                 LengthLadderPoint(
                     length=t_len,
                     chunk_size=eff_chunk,
-                    dense_nll=float(dense_nll),
-                    dense_ppl=_safe_ppl(dense_nll),
+                    dense_nll=dense_nll,
+                    dense_ppl=dense_ppl,
                     valid_tokens=int(valid_toks),
                     sparse_nll=sparse_nll,
                     sparse_ppl=sparse_ppl,
@@ -2471,10 +2534,13 @@ def run_length_ladder_audit(
                     elapsed_ms=elapsed_ms,
                 )
             )
+            del seq_ids, episode
+            _release_gpu_memory()
     finally:
         if ctl is not None and prev_passes is not None:
             ctl.set_active_passes(prev_passes)
         _cleanup_eval_side_state(loop=ctl, lsa=lsa)
+        _release_gpu_memory()
 
     all_bounded = all(
         (p.gdn2_state_norms is None or p.gdn2_state_norms.is_bounded) for p in points
@@ -2489,7 +2555,11 @@ def run_length_ladder_audit(
         all_states_bounded=all_bounded,
         max_dense_sparse_nll_gap=max(gaps) if gaps else None,
         min_lsa_recall=min(recalls) if recalls else None,
-        metadata={"lengths": [int(x) for x in lengths], "num_needles": int(num_needles)},
+        metadata={
+            "lengths": [int(x) for x in lengths],
+            "num_needles": int(num_needles),
+            "skip_dense_above": None if skip_dense_above is None else int(skip_dense_above),
+        },
     )
 
 
@@ -3139,8 +3209,14 @@ def format_sprint2_markdown(report: Sprint2AuditReport) -> str:
             )
             lines.append("| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
             for pt in ll.points:
+                d_nll = "skipped" if pt.dense_nll is None else f"{pt.dense_nll:.5f}"
                 s_nll = "N/A" if pt.sparse_nll is None else f"{pt.sparse_nll:.5f}"
-                s_gap = "N/A" if pt.dense_sparse_nll_gap is None else f"{pt.dense_sparse_nll_gap:+.5f}"
+                if pt.dense_sparse_nll_gap is not None:
+                    s_gap = f"{pt.dense_sparse_nll_gap:+.5f}"
+                elif pt.dense_nll is None and pt.sparse_nll is not None:
+                    s_gap = "skipped"
+                else:
+                    s_gap = "N/A"
                 l_rec = "N/A" if pt.lsa_last_recall is None else f"{pt.lsa_last_recall:.4f}"
                 r_em = (
                     f"{pt.ruler.needles_matched}/{pt.ruler.num_needles} ({pt.ruler.exact_match_acc:.1%})"
@@ -3153,7 +3229,7 @@ def format_sprint2_markdown(report: Sprint2AuditReport) -> str:
                 st_abs = f"{st.max_abs_val:.3f}" if st is not None else "N/A"
                 st_nan = str(st.nan_count) if st is not None else "0"
                 lines.append(
-                    f"| `{pt.length}` | `{pt.dense_nll:.5f}` | `{s_nll}` | `{s_gap}` | `{l_rec}` | "
+                    f"| `{pt.length}` | `{d_nll}` | `{s_nll}` | `{s_gap}` | `{l_rec}` | "
                     f"{r_em} | `{r_nll}` | `{st_l2}` | `{st_abs}` | `{st_nan}` |"
                 )
             lines.append("")
@@ -3812,6 +3888,7 @@ def run_sprint2_audit_from_config(
     chunk_size: int = 4096,
     ce_chunk_size: int = 1024,
     kv_cache_quant: str = "fp8",
+    skip_dense_above: int | None = None,
     baseline_arm: str | None = None,
     ablation_arm: str | None = None,
     skip_length_ladder: bool = False,
@@ -3944,6 +4021,7 @@ def run_sprint2_audit_from_config(
                     kv_cache_quant=kv_cache_quant,
                     loop=stack.loop,
                     lsa=stack.lsa,
+                    skip_dense_above=skip_dense_above,
                     seed=int(seed),
                     arm_name=arm_name,
                 )
@@ -3985,6 +4063,7 @@ def run_sprint2_audit_from_config(
             "baseline_arm": base_name,
             "ablation_arm": target_ablation_arm,
             "eval_seq_len": eff_eval_seq_len,
+            "skip_dense_above": None if skip_dense_above is None else int(skip_dense_above),
             "repeats": int(repeats),
             "seed": int(seed),
             "elapsed_s": round(elapsed_s, 3),
@@ -4054,6 +4133,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--cache-dir", type=str, default=None, help="Optional QL60-010 identity-bound cache directory.")
     ap.add_argument("--allow-mixed-cache", action="store_true", help="Allow overwriting mismatched QL60-010 cache.")
+    ap.add_argument(
+        "--skip-dense-above",
+        type=int,
+        default=None,
+        help=(
+            "Optional context length above which the O(T^2) dense pass is skipped in the length ladder "
+            "when D-LSA is active (sparse D-LSA NLL, recall, RULER, and GDN-2 norms still run)."
+        ),
+    )
     ap.add_argument("--skip-length-ladder", action="store_true", help="Skip length-ladder & RULER audit.")
     ap.add_argument("--skip-ablations", action="store_true", help="Skip S2.3 causal ablation matrix.")
     ap.add_argument("--seed", type=int, default=42, help="Deterministic evaluation seed.")
@@ -4110,6 +4198,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             chunk_size=int(args.chunk_size),
             ce_chunk_size=int(args.ce_chunk_size),
             kv_cache_quant=str(args.kv_cache_quant),
+            skip_dense_above=args.skip_dense_above,
             baseline_arm=args.baseline_arm,
             ablation_arm=args.ablation_arm,
             skip_length_ladder=bool(args.skip_length_ladder),

@@ -944,6 +944,7 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         past_key_values: Any = None,
+        cache: Any = None,
         inputs_embeds: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         use_cache: bool | None = None,
@@ -954,7 +955,7 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
         **kwargs: Any,
     ) -> Any:
         kw_cache = kwargs.pop("cache", None)
-        eff_cache = kw_cache if past_key_values is None else past_key_values
+        eff_cache = past_key_values if past_key_values is not None else (cache if cache is not None else kw_cache)
         if eff_cache is not None:
             self._sync_cache_for_active_passes(eff_cache)
         if logits_to_keep is not None and labels is None:
@@ -1025,6 +1026,7 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
         self,
         input_ids: torch.Tensor | None = None,
         past_key_values: Any = None,
+        cache: Any = None,
         attention_mask: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         cache_position: torch.Tensor | None = None,
@@ -1032,7 +1034,8 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
         **kwargs: Any,
     ) -> dict[str, Any]:
         kw_cache = kwargs.pop("cache", None)
-        eff_cache = kw_cache if past_key_values is None else past_key_values
+        passed_cache_kw = (cache is not None or kw_cache is not None) and past_key_values is None
+        eff_cache = past_key_values if past_key_values is not None else (cache if cache is not None else kw_cache)
         past_length = 0
         if eff_cache is not None:
             get_sl = getattr(eff_cache, "get_seq_length", None)
@@ -1073,7 +1076,12 @@ class Qwen36LoopHSSDForCausalLM(_ModelBase):
                 model_inputs["position_ids"] = pos_ids[..., cache_position]
             else:
                 model_inputs["position_ids"] = pos_ids[..., -input_ids.shape[1] :]
-        model_inputs["past_key_values"] = eff_cache
+        if passed_cache_kw:
+            model_inputs["cache"] = eff_cache
+            model_inputs.pop("past_key_values", None)
+        else:
+            model_inputs["past_key_values"] = eff_cache
+            model_inputs.pop("cache", None)
         model_inputs["use_cache"] = bool(use_cache)
         if attention_mask is not None:
             model_inputs["attention_mask"] = attention_mask
@@ -9280,6 +9288,7 @@ else:
             attention_mask: torch.Tensor | None = None,
             position_ids: torch.Tensor | None = None,
             past_key_values: Any = None,
+            cache: Any = None,
             inputs_embeds: torch.Tensor | None = None,
             labels: torch.Tensor | None = None,
             use_cache: bool | None = None,
@@ -9291,7 +9300,11 @@ else:
         ) -> Any:
             try:
                 kw_cache = kwargs.pop("cache", None)
-                eff_cache = kw_cache if past_key_values is None else past_key_values
+                eff_cache = (
+                    past_key_values
+                    if past_key_values is not None
+                    else (cache if cache is not None else kw_cache)
+                )
                 if eff_cache is not None:
                     self._sync_cache_last_linear(eff_cache)
                 if logits_to_keep is not None and labels is None:
@@ -9365,6 +9378,7 @@ else:
             self,
             input_ids: torch.Tensor | None = None,
             past_key_values: Any = None,
+            cache: Any = None,
             attention_mask: torch.Tensor | None = None,
             inputs_embeds: torch.Tensor | None = None,
             cache_position: torch.Tensor | None = None,
@@ -9372,7 +9386,12 @@ else:
             **kwargs: Any,
         ) -> dict[str, Any]:
             kw_cache = kwargs.pop("cache", None)
-            eff_cache = kw_cache if past_key_values is None else past_key_values
+            passed_cache_kw = (cache is not None or kw_cache is not None) and past_key_values is None
+            eff_cache = (
+                past_key_values
+                if past_key_values is not None
+                else (cache if cache is not None else kw_cache)
+            )
             past_length = 0
             if eff_cache is not None:
                 get_sl = getattr(eff_cache, "get_seq_length", None)
@@ -9413,7 +9432,12 @@ else:
                     model_inputs["position_ids"] = pos_ids[..., cache_position]
                 else:
                     model_inputs["position_ids"] = pos_ids[..., -input_ids.shape[1] :]
-            model_inputs["past_key_values"] = eff_cache
+            if passed_cache_kw:
+                model_inputs["cache"] = eff_cache
+                model_inputs.pop("past_key_values", None)
+            else:
+                model_inputs["past_key_values"] = eff_cache
+                model_inputs.pop("cache", None)
             model_inputs["use_cache"] = bool(use_cache)
             if attention_mask is not None:
                 model_inputs["attention_mask"] = attention_mask

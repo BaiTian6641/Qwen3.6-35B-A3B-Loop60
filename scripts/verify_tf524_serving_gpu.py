@@ -39,6 +39,7 @@ import datetime as _dt
 import gc
 import importlib
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -378,6 +379,21 @@ def _make_strict_tf524_mock_modules() -> dict[str, types.ModuleType]:
     class _StrictGenerationMixin:
         """Faithful TF 5.24 greedy `GenerationMixin.generate()` replica for offline smoke tests."""
 
+        def _validate_model_kwargs(self, model_kwargs: dict[str, Any]) -> None:
+            """Mirror TF 5.24.1 `GenerationMixin._validate_model_kwargs()` inspecting explicit forward params."""
+            fwd_params = inspect.signature(self.forward).parameters  # type: ignore[attr-defined]
+            valid_keys = {
+                pname
+                for pname, p in fwd_params.items()
+                if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            }
+            unused = [k for k, v in model_kwargs.items() if v is not None and k not in valid_keys]
+            if unused:
+                raise ValueError(
+                    f"The following model_kwargs are not used by the model: {unused} "
+                    "(note: typos in the generate arguments will also show up in this list)"
+                )
+
         @torch.no_grad()
         def generate(
             self,
@@ -387,6 +403,7 @@ def _make_strict_tf524_mock_modules() -> dict[str, types.ModuleType]:
             do_sample: bool = False,
             use_cache: bool = True,
             past_key_values: Any = None,
+            cache: Any = None,
             logits_to_keep: int = 0,
             attention_mask: torch.Tensor | None = None,
             **kwargs: Any,
@@ -394,9 +411,17 @@ def _make_strict_tf524_mock_modules() -> dict[str, types.ModuleType]:
             if do_sample:
                 raise ValueError("Offline mock generate() supports greedy decoding (do_sample=False) only")
             cur_ids = input_ids
-            pkv = past_key_values
+            used_cache_kw = cache is not None and past_key_values is None
+            pkv = cache if used_cache_kw else past_key_values
             if use_cache and pkv is None:
                 pkv = _StrictHybridDynamicCache(self.config)  # type: ignore[attr-defined]
+            # Validate TF 5.24.1 `cache` kwarg against explicit `forward` signature (never passes via **kwargs!)
+            val_kw: dict[str, Any] = dict(kwargs)
+            if pkv is not None:
+                val_kw["cache"] = pkv
+            if attention_mask is not None:
+                val_kw["attention_mask"] = attention_mask
+            self._validate_model_kwargs(val_kw)
             if isinstance(pkv, _StrictHybridDynamicCache):
                 for idx, lt in enumerate(getattr(self.config, "layer_types", [])):  # type: ignore[attr-defined]
                     if lt == "linear_attention":
@@ -413,13 +438,14 @@ def _make_strict_tf524_mock_modules() -> dict[str, types.ModuleType]:
                 else:
                     cache_pos = torch.tensor([past_len], device=cur_ids.device)
 
+                prep_cache_kw = {"cache": pkv} if used_cache_kw else {"past_key_values": pkv}
                 model_inputs = self.prepare_inputs_for_generation(  # type: ignore[attr-defined]
                     cur_ids,
-                    past_key_values=pkv,
                     attention_mask=cur_mask,
                     cache_position=cache_pos,
                     use_cache=use_cache,
                     logits_to_keep=logits_to_keep,
+                    **prep_cache_kw,
                     **kwargs,
                 )
                 outputs = self(**model_inputs)  # type: ignore[operator]
@@ -1399,6 +1425,17 @@ def _verify_position_ids_slicing(model: Any, *, label: str) -> dict[str, Any]:
     )
     if tuple(mi_2d["input_ids"].shape) != (1, 1) or not torch.equal(mi_2d["position_ids"], pos_2d[:, -1:]):
         raise AssertionError(f"{label}: 2D position_ids slicing with cache_position failed")
+    if "past_key_values" not in mi_2d or "cache" in mi_2d:
+        raise AssertionError(f"{label}: past_key_values input emitted ambiguous cache keys: {sorted(mi_2d)}")
+
+    # TF 5.24.1 `cache=` kwarg path must emit `"cache"` and NEVER both `"cache"` and `"past_key_values"`
+    mi_cache = model.prepare_inputs_for_generation(
+        full_ids, cache=past5, cache_position=cpos, position_ids=pos_2d
+    )
+    if tuple(mi_cache["input_ids"].shape) != (1, 1) or not torch.equal(mi_cache["position_ids"], pos_2d[:, -1:]):
+        raise AssertionError(f"{label}: 2D position_ids slicing via cache= failed")
+    if mi_cache.get("cache") is not past5 or "past_key_values" in mi_cache:
+        raise AssertionError(f"{label}: cache= input emitted ambiguous cache keys: {sorted(mi_cache)}")
 
     mi_3d = model.prepare_inputs_for_generation(
         full_ids, past_key_values=past5, cache_position=cpos, position_ids=pos_3d
@@ -1419,7 +1456,12 @@ def _verify_position_ids_slicing(model: Any, *, label: str) -> dict[str, Any]:
     ):
         raise AssertionError(f"{label}: 3D MRoPE position_ids slicing without cache_position failed")
 
-    return {"2d_with_cache_pos": True, "3d_mrope_with_cache_pos": True, "2d_and_3d_without_cache_pos": True}
+    return {
+        "2d_with_cache_pos": True,
+        "2d_with_tf524_cache_kwarg": True,
+        "3d_mrope_with_cache_pos": True,
+        "2d_and_3d_without_cache_pos": True,
+    }
 
 
 def _expected_virtual_geometry(config: Any, depth: int) -> tuple[list[str], int]:
@@ -1695,6 +1737,22 @@ def _run_model_pack_checks(
     is_toy = _is_toy_model(model)
     has_generate = hasattr(model, "generate") and callable(model.generate)
 
+    # QL60-002 / TF 5.24.1: GenerationMixin._validate_model_kwargs inspects explicit `forward` params for `cache`
+    fwd_params = inspect.signature(model.forward).parameters
+    if "cache" not in fwd_params:
+        raise AssertionError(
+            f"{label}: model.forward missing explicit 'cache' parameter required by TF 5.24.1 _validate_model_kwargs"
+        )
+    prep_params = inspect.signature(model.prepare_inputs_for_generation).parameters
+    if "cache" not in prep_params:
+        raise AssertionError(
+            f"{label}: model.prepare_inputs_for_generation missing explicit 'cache' parameter (TF 5.24.1)"
+        )
+    if hasattr(model, "_validate_model_kwargs") and callable(model._validate_model_kwargs):
+        cfg_lt = list(getattr(model.config, "layer_types", None) or ["full_attention"])
+        val_cache = QuantizedHybridCache(num_layers=len(cfg_lt), layer_types=cfg_lt, mode="native")
+        model._validate_model_kwargs({"cache": val_cache})
+
     pos_metrics = _verify_position_ids_slicing(model, label=label)
     orig_passes = int(getattr(model, "active_passes", 1))
     max_passes = int(getattr(model, "max_passes", 1))
@@ -1857,6 +1915,8 @@ def _run_model_pack_checks(
     return {
         "has_hf_generate": has_generate,
         "use_real_tf_generate": use_real_tf_generate,
+        "forward_accepts_cache_kwarg": True,
+        "prepare_inputs_accepts_cache_kwarg": True,
         "position_ids": pos_metrics,
         "depths": depth_results,
     }

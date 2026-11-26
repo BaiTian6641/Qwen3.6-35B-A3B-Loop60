@@ -443,6 +443,73 @@ def test_length_ladder_ruler_sparse_recall_and_fp8_cache() -> None:
     assert st_small.num_linear_states > 0 and st_small.is_bounded is True
 
 
+def test_length_ladder_skip_dense_above_and_markdown_skipped_rendering() -> None:
+    """Verify `skip_dense_above` skips dense pass above cutoff while keeping sparse NLL/RULER/GDN-2 & clean MD."""
+    from qloop.eval.sprint2_audit import Sprint2AuditReport, build_arg_parser
+
+    st = build_smoke_cpu_stack(seed=29, num_passes=2, trained_perturbation=True)
+    tok = st["tokenizer"]
+
+    ladder = run_length_ladder_audit(
+        st["model"],
+        lengths=(64, 128),
+        tokenizer=tok,
+        chunk_size=32,
+        ce_chunk_size=32,
+        kv_cache_quant="fp8",
+        depth=2,
+        loop=st["loop"],
+        lsa=st["lsa"],
+        num_needles=4,
+        skip_dense_above=64,
+        seed=29,
+        arm_name="smoke_skip_dense",
+    )
+    assert len(ladder.points) == 2
+    assert ladder.all_states_bounded is True
+    assert ladder.metadata["skip_dense_above"] == 64
+
+    pt_64, pt_128 = ladder.points
+    # Length 64 <= 64: both dense and sparse run
+    assert pt_64.dense_nll is not None and math.isfinite(pt_64.dense_nll)
+    assert pt_64.dense_ppl is not None and math.isfinite(pt_64.dense_ppl)
+    assert pt_64.sparse_nll is not None and math.isfinite(pt_64.sparse_nll)
+    assert pt_64.dense_sparse_nll_gap == pytest.approx(pt_64.sparse_nll - pt_64.dense_nll)
+    assert pt_64.valid_tokens == 63
+
+    # Length 128 > 64: dense skipped (None), sparse D-LSA + recall + RULER + GDN-2 state norms still run!
+    assert pt_128.dense_nll is None
+    assert pt_128.dense_ppl is None
+    assert pt_128.dense_sparse_nll_gap is None
+    assert pt_128.valid_tokens == 127
+    assert pt_128.sparse_nll is not None and math.isfinite(pt_128.sparse_nll)
+    assert pt_128.sparse_ppl is not None and math.isfinite(pt_128.sparse_ppl)
+    assert pt_128.lsa_sparse_active is True
+    assert pt_128.lsa_last_recall is not None and 0.0 < pt_128.lsa_last_recall <= 1.0
+    assert pt_128.ruler is not None and pt_128.ruler.num_needles == 4 and math.isfinite(pt_128.ruler.answer_nll)
+    assert pt_128.gdn2_state_norms is not None and pt_128.gdn2_state_norms.is_bounded is True
+
+    # JSON round-trip & Markdown formatting with dense_nll=None
+    d = ladder.to_dict()
+    assert json.loads(json.dumps(d))["points"][1]["dense_nll"] is None
+    rep = Sprint2AuditReport(
+        mode="unit_skip_dense",
+        datasets={},
+        depth_sweeps={},
+        comparisons={},
+        length_ladders={"smoke_skip_dense": ladder},
+    )
+    md = format_sprint2_markdown(rep)
+    assert "| `128` | `skipped` |" in md
+    row_64 = next(ln for ln in md.splitlines() if ln.startswith("| `64` |"))
+    assert "skipped" not in row_64
+
+    # CLI flag parses cleanly and defaults to None
+    ap = build_arg_parser()
+    assert ap.parse_args([]).skip_dense_above is None
+    assert ap.parse_args(["--skip-dense-above", "131072"]).skip_dense_above == 131072
+
+
 # ==============================================================================
 # 4. S2.3 Zero-Training Reversible Causal Ablations & Bit-Exact Restoration
 # ==============================================================================

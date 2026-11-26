@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import inspect
 import json
 import os
 import stat
@@ -440,6 +441,38 @@ def test_ql60_002_rejects_corrupted_pack_metadata(tmp_path: Path) -> None:
     res = AUDIT.check_pack_model_and_generate(pack_dir, depths=(1,), max_new_tokens=2, device="cpu")
     assert res["passed"] is False
     assert "qloop_format_version" in res["detail"]
+
+
+def test_ql60_002_tf524_cache_kwarg_signature_and_validate_model_kwargs(tmp_path: Path) -> None:
+    """Verify `check_pack_model_and_generate` enforces explicit `cache` signature & `_validate_model_kwargs`."""
+    stack = AUDIT._build_smoke_toy_stack(seed=317, kv_share=True)
+    pack_dir = tmp_path / "tf524_cache_audit_pack"
+    export_whole_model_pack(stack, pack_dir, max_shard_size_bytes=65536, merge_in_place=False)
+
+    res = AUDIT.check_pack_model_and_generate(pack_dir, depths=(1, 2), max_new_tokens=3, device="cpu")
+    assert res["passed"] is True, res["detail"]
+    assert res["metrics"]["in_package"]["forward_accepts_cache_kwarg"] is True
+    assert res["metrics"]["in_package"]["prepare_inputs_accepts_cache_kwarg"] is True
+    assert res["metrics"]["in_package"]["position_ids"]["2d_with_tf524_cache_kwarg"] is True
+    assert res["metrics"]["standalone"]["forward_accepts_cache_kwarg"] is True
+    assert res["metrics"]["standalone"]["prepare_inputs_accepts_cache_kwarg"] is True
+    assert res["metrics"]["standalone"]["position_ids"]["2d_with_tf524_cache_kwarg"] is True
+
+    # Direct mock `_validate_model_kwargs(cache=...)` check on in-package model + failure regression when `cache` absent
+    hf_model = Qwen36LoopHSSDForCausalLM.from_pretrained(pack_dir, device_map="cpu", strict=True)
+    assert "cache" in inspect.signature(hf_model.forward).parameters
+    assert "cache" in inspect.signature(hf_model.prepare_inputs_for_generation).parameters
+
+    mock_tf = AUDIT._make_strict_tf524_mock_modules()
+    strict_gen_mixin = mock_tf["transformers"].GenerationMixin
+    strict_gen_mixin._validate_model_kwargs(hf_model, {"cache": object()})
+
+    class _NoCacheKwargModel(strict_gen_mixin):  # type: ignore[misc,valid-type]
+        def forward(self, input_ids: torch.Tensor | None = None, past_key_values: Any = None, **kwargs: Any) -> Any:
+            return input_ids
+
+    with pytest.raises(ValueError, match=r"not used by the model.*cache"):
+        _NoCacheKwargModel()._validate_model_kwargs({"cache": object()})
 
 
 def test_ql60_001_audit_exercises_tf524_update_kwargs_convention_and_catches_rejection(

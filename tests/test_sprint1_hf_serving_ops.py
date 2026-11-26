@@ -78,7 +78,7 @@ from qloop.infer.hf_custom_modeling import (
 )
 from qloop.model.gdn2 import GDN2Config, install_gdn2
 from qloop.model.introspect import inspect_model
-from qloop.model.loop import LoopSpec, apply_loop
+from qloop.model.loop import LoopSpec, SharedKVView, apply_loop
 from qloop.model.lsa import LSAConfig, install_lsa
 from qloop.model.toy import ToyConfig, ToyForCausalLM, ToyHybridCache
 from qloop.train.stack import Stack
@@ -776,6 +776,68 @@ def test_ql60_001_hybrid_cache_contract_methods_and_sparse_gather(mode: str) -> 
     # Verify update docstring honestly documents full K/V materialization vs sparse gather_kv
     doc = (QuantizedHybridCache.update.__doc__ or "").lower()
     assert "materializes" in doc and "gather_kv" in doc
+
+
+@pytest.mark.parametrize("mode", ["native", "bf16", "fp8", "hadamard_int4"])
+def test_ql60_001_tf524_update_and_query_extra_kwargs_convention(mode: str) -> None:
+    """Regression for live `transformers 5.24.1` `cache.update(k, v, layer_idx, kwargs=kwargs)` call convention.
+
+    Mirrors `transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py:813`, which passes
+    `kwargs=kwargs` (a nested dict keyword argument) directly to `cache.update(...)` as well as
+    per-layer `cache.layers[idx].update(...)` and `SharedKVView.update(...)`, plus defensive
+    `**extra_kwargs` on `get_seq_length` / `get_mask_sizes`.
+    """
+    ltypes = ["linear_attention", "full_attention", "linear_attention", "full_attention"]
+    cache = QuantizedHybridCache(num_layers=4, layer_types=ltypes, mode=mode)
+
+    k_pf = torch.randn(2, 2, 5, 16)
+    v_pf = torch.randn(2, 2, 5, 16)
+    k_dec = torch.randn(2, 2, 1, 16)
+    v_dec = torch.randn(2, 2, 1, 16)
+    cpos_pf = torch.arange(5, dtype=torch.long)
+    cpos_dec = torch.tensor([5], dtype=torch.long)
+
+    # 1) Direct `cache.update(k, v, idx, kwargs={...})` (exact TF 5.24.1 Qwen3_5MoeAttention call site)
+    k1_pf, v1_pf = cache.update(k_pf, v_pf, 1, kwargs={"cache_position": cpos_pf, "sin": None})
+    assert k1_pf.shape == (2, 2, 5, 16) and v1_pf.shape == (2, 2, 5, 16)
+    k1_all, v1_all = cache.update(
+        k_dec,
+        v_dec,
+        1,
+        cache_kwargs={"cache_position": cpos_dec},
+        kwargs={"cache_position": cpos_dec},
+        extra_future_flag=True,
+    )
+    assert k1_all.shape == (2, 2, 6, 16) and v1_all.shape == (2, 2, 6, 16)
+
+    # 2) Per-layer `cache.layers[idx].update(k, v, kwargs={...})`
+    k3_pf, v3_pf = cache.layers[3].update(k_pf, v_pf, kwargs={"cache_position": cpos_pf})
+    assert k3_pf.shape == (2, 2, 5, 16) and v3_pf.shape == (2, 2, 5, 16)
+    k3_all, v3_all = cache.layers[3].update(
+        k_dec,
+        v_dec,
+        kwargs={"cache_position": cpos_dec},
+        extra_future_flag=True,
+    )
+    assert k3_all.shape == (2, 2, 6, 16) and v3_all.shape == (2, 2, 6, 16)
+
+    # 3) Defensive `**extra_kwargs` on `get_seq_length` and `get_mask_sizes` (cache & layer views)
+    assert cache.get_seq_length(1, cache_position=cpos_dec, kwargs={"cache_position": cpos_dec}) == 6
+    assert cache.get_seq_length(cache_position=cpos_dec) == 6
+    assert cache.layers[1].get_seq_length(cache_position=cpos_dec, kwargs={"cache_position": cpos_dec}) == 6
+    assert cache.get_mask_sizes(cpos_dec, 1, kwargs={"cache_position": cpos_dec}) == (7, 0)
+    assert cache.layers[1].get_mask_sizes(cpos_dec, kwargs={"cache_position": cpos_dec}) == (7, 0)
+
+    # 4) SharedKVView pass-1 record + pass-2 read forwarding `kwargs=kwargs` with 1.0x KV RAM
+    c_shared = QuantizedHybridCache(num_layers=4, layer_types=ltypes, mode=mode)
+    stash: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    view_rec = SharedKVView(c_shared, stash, record=True)
+    view_read = SharedKVView(c_shared, None, record=False)
+    ks1, vs1 = view_rec.update(k_pf, v_pf, 1, kwargs={"cache_position": cpos_pf})
+    b1 = c_shared.kv_bytes()
+    ks2, vs2 = view_read.update(torch.randn_like(k_pf), torch.randn_like(v_pf), 1, kwargs={"cache_position": cpos_pf})
+    assert c_shared.kv_bytes() == b1
+    assert torch.equal(ks2, ks1) and torch.equal(vs2, vs1)
 
 
 @pytest.mark.parametrize("mode", ["native", "fp8", "hadamard_int4"])

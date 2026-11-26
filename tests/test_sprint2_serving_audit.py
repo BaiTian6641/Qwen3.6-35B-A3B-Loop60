@@ -69,6 +69,7 @@ def test_ql60_001_quantized_hybrid_cache_modes_and_kv_share() -> None:
     assert res["passed"] is True, res["detail"]
     m = res["metrics"]
     assert m["subchecks"]["tf524_cache_and_layer_mixin"] is True
+    assert m["subchecks"]["tf524_update_kwargs_convention"] is True
     assert m["subchecks"]["property_descriptors"] is True
     assert m["subchecks"]["kv_share_true_and_false"] is True
     assert m["subchecks"]["contract_methods_and_proxies"] is True
@@ -394,6 +395,19 @@ def test_ql60_002_pack_dir_and_in_memory_model_standalone_parity(tmp_path: Path)
         assert sa_d["effective_num_hidden_layers"] == eff_layers
         assert in_d["logits_to_keep_0_shape"] == [1, 6, vocab]
         assert sa_d["logits_to_keep_0_shape"] == [1, 6, vocab]
+        for entry in (in_d, sa_d):
+            for key in (
+                "repeat_max_diff",
+                "repeat_mean_diff",
+                "k0_max_diff",
+                "k0_mean_diff",
+                "k1_max_diff",
+                "k1_mean_diff",
+                "argmax_match",
+            ):
+                assert key in entry, f"missing {key!r} in depth {dk}"
+            assert entry["repeat_max_diff"] == pytest.approx(0.0)
+            assert entry["argmax_match"] is True
         assert len(in_d["generated_tokens"]) == 6
         assert in_d["generated_tokens"] == sa_d["generated_tokens"]
 
@@ -426,6 +440,279 @@ def test_ql60_002_rejects_corrupted_pack_metadata(tmp_path: Path) -> None:
     res = AUDIT.check_pack_model_and_generate(pack_dir, depths=(1,), max_new_tokens=2, device="cpu")
     assert res["passed"] is False
     assert "qloop_format_version" in res["detail"]
+
+
+def test_ql60_001_audit_exercises_tf524_update_kwargs_convention_and_catches_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`check_quantized_hybrid_cache` must exercise `kwargs=kwargs` and fail if a cache rejects it."""
+    # 1) Live model whose full-attention layers call `cache.update(k, v, layer_idx, kwargs=...)`
+    stack = AUDIT._build_smoke_toy_stack(seed=521, kv_share=True)
+    saw_kwargs_call: list[int] = []
+
+    class _TF524KwargsUpdateProxy:
+        def __init__(self, inner: Any, cpos: torch.Tensor | None) -> None:
+            self._inner = inner
+            self._cpos = cpos
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int, *a: Any, **kw: Any) -> Any:
+            saw_kwargs_call.append(int(layer_idx))
+            return self._inner.update(k, v, layer_idx, *a, kwargs={"cache_position": self._cpos}, **kw)
+
+    patched_attn_ids: set[int] = set()
+    for vlyr in stack.model.model.layers:
+        phys_lyr = getattr(vlyr, "inner", vlyr)
+        if getattr(phys_lyr, "layer_type", None) == "full_attention":
+            attn = phys_lyr.self_attn
+            if id(attn) in patched_attn_ids:
+                continue
+            patched_attn_ids.add(id(attn))
+            orig_fwd = attn.forward
+
+            def _tf524_attn_fwd(
+                _self: Any,
+                hidden_states: torch.Tensor,
+                position_embeddings: tuple[torch.Tensor, torch.Tensor],
+                attention_mask: torch.Tensor | None = None,
+                past_key_value: Any = None,
+                cache_position: torch.Tensor | None = None,
+                _orig: Any = orig_fwd,
+            ) -> torch.Tensor:
+                proxied = (
+                    _TF524KwargsUpdateProxy(past_key_value, cache_position)
+                    if past_key_value is not None
+                    else None
+                )
+                return _orig(hidden_states, position_embeddings, attention_mask, proxied, cache_position)
+
+            attn.forward = types.MethodType(_tf524_attn_fwd, attn)  # type: ignore[method-assign]
+
+    res = AUDIT.check_quantized_hybrid_cache(stack, modes=("bf16", "fp8", "hadamard_int4"))
+    assert res["passed"] is True, res["detail"]
+    assert res["metrics"]["subchecks"]["tf524_update_kwargs_convention"] is True
+    assert res["metrics"]["tf524_contract"]["tf524_update_kwargs_verified"] is True
+    assert len(saw_kwargs_call) > 0
+
+    # 2) If `QuantizedHybridCache.update` regresses to rejecting `kwargs=...`, the audit check MUST fail
+    class _BrokenNoExtraKwargsCache(AUDIT.QuantizedHybridCache):
+        def update(
+            self,
+            key_states: torch.Tensor,
+            value_states: torch.Tensor,
+            layer_idx: int,
+            cache_kwargs: dict[str, Any] | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return super().update(key_states, value_states, layer_idx, cache_kwargs=cache_kwargs)
+
+    monkeypatch.setattr(AUDIT, "QuantizedHybridCache", _BrokenNoExtraKwargsCache)
+    res_fail = AUDIT.check_quantized_hybrid_cache(
+        {
+            "num_hidden_layers": 4,
+            "layer_types": ["linear_attention", "full_attention", "linear_attention", "full_attention"],
+        },
+        modes=("bf16",),
+    )
+    assert res_fail["passed"] is False
+    assert "TypeError" in res_fail["detail"] and "kwargs" in res_fail["detail"]
+
+
+def test_ql60_002_logits_to_keep_empirical_noise_floor_vs_deterministic_bug_detection() -> None:
+    """Verify empirical `repeat_max_diff` BF16/NVFP4 noise-floor gating and strict deterministic bug detection."""
+
+    class _Out:
+        def __init__(self, logits: torch.Tensor) -> None:
+            self.logits = logits
+
+    torch.manual_seed(77)
+    b, t, v = 1, 6, 128
+    base = torch.randn(b, t, v, dtype=torch.float32) * 3.0
+    # Ensure a clear top-1 margin (winner=42 at +20.0, runner-up=7 at +12.0)
+    base[0, -1, 42] = 20.0
+    base[0, -1, 7] = 12.0
+
+    # 1) Live Colab Blackwell BF16/NVFP4 jitter reproduction: k0=1.54492, k1=0.34375, repeat_max=0.6
+    #    with small mean diff (~0.01) and matching final-token top-1 argmax -> MUST PASS!
+    bf16_ref = base.to(torch.bfloat16)
+    bf16_rep = bf16_ref.clone().float()
+    bf16_rep[0, 0, 1] += 0.6
+    bf16_rep = bf16_rep.to(torch.bfloat16)
+
+    bf16_k0 = bf16_ref.clone().float()
+    bf16_k0[0, 2, 5] += 1.54492
+    bf16_k0 = bf16_k0.to(torch.bfloat16)
+
+    bf16_k1 = bf16_ref[:, -1:, :].clone().float()
+    bf16_k1[0, 0, 9] += 0.34375
+    bf16_k1 = bf16_k1.to(torch.bfloat16)
+
+    stats_gpu_jitter = AUDIT._verify_logits_to_keep_parity(
+        _Out(bf16_ref),
+        _Out(bf16_rep),
+        _Out(bf16_k0),
+        _Out(bf16_k1),
+        expected_batch=b,
+        expected_seq=t,
+        expected_vocab=v,
+        label="live-bf16-nvfp4-jitter",
+    )
+    assert stats_gpu_jitter["repeat_max_diff"] >= 0.5
+    assert stats_gpu_jitter["k0_max_diff"] >= 1.4
+    assert stats_gpu_jitter["k1_max_diff"] >= 0.25
+    assert stats_gpu_jitter["argmax_match"] is True
+    assert stats_gpu_jitter["argmax_top2_fallback"] is False
+
+    # 2) Deterministic BF16 M=T vs M=1 GEMM rounding (repeat_max=0.0, k1=0.34375 <= 0.5) -> MUST PASS!
+    stats_det_bf16 = AUDIT._verify_logits_to_keep_parity(
+        _Out(bf16_ref),
+        _Out(bf16_ref.clone()),
+        _Out(bf16_ref.clone()),
+        _Out(bf16_k1),
+        expected_batch=b,
+        expected_seq=t,
+        expected_vocab=v,
+        label="det-bf16-gemm",
+    )
+    assert stats_det_bf16["repeat_max_diff"] == pytest.approx(0.0)
+    assert stats_det_bf16["logits_max_tol"] == pytest.approx(0.5)
+    assert stats_det_bf16["argmax_match"] is True
+
+    # 3) Noisy BF16 near-tie: margin < 2 * repeat_max_diff and candidate flips to ref top-2 -> ALLOWED
+    tie_ref = base.clone()
+    tie_ref[0, -1, 42] = 20.0
+    tie_ref[0, -1, 7] = 19.875  # margin = 0.125 < 2 * 0.5
+    tie_ref[0, -1, 3] = 19.75   # rank #3 (close enough that flipping to it stays within max_tol)
+    tie_ref_bf16 = tie_ref.to(torch.bfloat16)
+    tie_rep_bf16 = tie_ref_bf16.clone().float()
+    tie_rep_bf16[0, 0, 1] += 0.5
+    tie_rep_bf16 = tie_rep_bf16.to(torch.bfloat16)
+    tie_k1_top2 = tie_ref_bf16[:, -1:, :].clone().float()
+    tie_k1_top2[0, 0, 7] = 20.125  # diff = 0.25 <= 0.5, flips to ref top-2 (token 7)
+    tie_k1_top2 = tie_k1_top2.to(torch.bfloat16)
+
+    stats_tie = AUDIT._verify_logits_to_keep_parity(
+        _Out(tie_ref_bf16),
+        _Out(tie_rep_bf16),
+        _Out(tie_ref_bf16.clone()),
+        _Out(tie_k1_top2),
+        expected_batch=b,
+        expected_seq=t,
+        expected_vocab=v,
+        label="noisy-near-tie-top2",
+    )
+    assert stats_tie["argmax_match"] is False
+    assert stats_tie["argmax_top2_fallback"] is True
+
+    # 4) Noisy BF16 near-tie, but candidate picks rank #3 (outside top-2) -> MUST FAIL argmax check!
+    tie_k1_wrong = tie_ref_bf16[:, -1:, :].clone().float()
+    tie_k1_wrong[0, 0, 3] = 20.25  # diff = 0.5 <= max_tol, but token 3 is not in top-2 {42, 7}
+    tie_k1_wrong = tie_k1_wrong.to(torch.bfloat16)
+    with pytest.raises(AssertionError, match="argmax mismatch"):
+        AUDIT._verify_logits_to_keep_parity(
+            _Out(tie_ref_bf16),
+            _Out(tie_rep_bf16),
+            _Out(tie_ref_bf16.clone()),
+            _Out(tie_k1_wrong),
+            expected_batch=b,
+            expected_seq=t,
+            expected_vocab=v,
+            label="noisy-wrong-token",
+        )
+
+    # 4b) Noisy BF16 with LARGE margin (>= 2 * repeat_max_diff) flipping to top-2 -> MUST FAIL argmax check!
+    wide_ref = base.clone()
+    wide_ref[0, -1, 42] = 20.0
+    wide_ref[0, -1, 7] = 18.5  # margin = 1.5 >= 2 * 0.5
+    wide_ref_bf16 = wide_ref.to(torch.bfloat16)
+    wide_rep_bf16 = wide_ref_bf16.clone().float()
+    wide_rep_bf16[0, 0, 1] += 0.5
+    wide_rep_bf16 = wide_rep_bf16.to(torch.bfloat16)
+    wide_k1_flip = wide_ref_bf16[:, -1:, :].clone().float()
+    wide_k1_flip[0, 0, 7] = 20.25  # diff = 1.75 <= max_tol=2.5, yet margin=1.5 >= 2*0.5 -> rejected!
+    wide_k1_flip = wide_k1_flip.to(torch.bfloat16)
+    with pytest.raises(AssertionError, match="argmax mismatch"):
+        AUDIT._verify_logits_to_keep_parity(
+            _Out(wide_ref_bf16),
+            _Out(wide_rep_bf16),
+            _Out(wide_ref_bf16.clone()),
+            _Out(wide_k1_flip),
+            expected_batch=b,
+            expected_seq=t,
+            expected_vocab=v,
+            label="noisy-wide-margin-flip",
+        )
+
+    # 5) Deterministic BF16 (repeat_max=0.0) with argmax flip even within max_tol -> MUST FAIL!
+    with pytest.raises(AssertionError, match="argmax mismatch"):
+        AUDIT._verify_logits_to_keep_parity(
+            _Out(tie_ref_bf16),
+            _Out(tie_ref_bf16.clone()),
+            _Out(tie_ref_bf16.clone()),
+            _Out(tie_k1_top2),
+            expected_batch=b,
+            expected_seq=t,
+            expected_vocab=v,
+            label="det-bf16-argmax-flip",
+        )
+
+    # 6) Deterministic FP32 tight 1e-5 gate catches tiny numerical bug (5e-4 > 1e-5) -> MUST FAIL!
+    fp32_k0_bug = base.clone()
+    fp32_k0_bug[0, 0, 0] += 5e-4
+    with pytest.raises(AssertionError, match="max diff exceeded"):
+        AUDIT._verify_logits_to_keep_parity(
+            _Out(base),
+            _Out(base.clone()),
+            _Out(fp32_k0_bug),
+            _Out(base[:, -1:, :].clone()),
+            expected_batch=b,
+            expected_seq=t,
+            expected_vocab=v,
+            label="det-fp32-bug",
+        )
+
+    # 7) Noisy BF16 wrong-token slice (huge mean diff even if max diff under noise floor) -> MUST FAIL!
+    bf16_k1_bad_mean = (bf16_ref[:, -1:, :].float() + 0.35).to(torch.bfloat16)
+    with pytest.raises(AssertionError, match="mean diff exceeded"):
+        AUDIT._verify_logits_to_keep_parity(
+            _Out(bf16_ref),
+            _Out(bf16_rep),
+            _Out(bf16_ref.clone()),
+            _Out(bf16_k1_bad_mean),
+            expected_batch=b,
+            expected_seq=t,
+            expected_vocab=v,
+            label="noisy-bf16-mean-bug",
+        )
+
+    # 8) QL60-002 empty (B, 0, V) logits_to_keep=0 shape bug -> ALWAYS FAILS immediately!
+    with pytest.raises(AssertionError, match="logits_to_keep=0 returned shape"):
+        AUDIT._verify_logits_to_keep_parity(
+            _Out(bf16_ref),
+            _Out(bf16_rep),
+            _Out(bf16_ref[:, :0, :]),
+            _Out(bf16_ref[:, -1:, :]),
+            expected_batch=b,
+            expected_seq=t,
+            expected_vocab=v,
+            label="ql60-002-empty-shape",
+        )
+
+    # 9) Non-finite (NaN) logits -> ALWAYS FAILS!
+    nan_k1 = bf16_ref[:, -1:, :].clone()
+    nan_k1[0, 0, 0] = float("nan")
+    with pytest.raises(AssertionError, match="non-finite logits"):
+        AUDIT._verify_logits_to_keep_parity(
+            _Out(bf16_ref),
+            _Out(bf16_rep),
+            _Out(bf16_ref.clone()),
+            _Out(nan_k1),
+            expected_batch=b,
+            expected_seq=t,
+            expected_vocab=v,
+            label="nan-logits",
+        )
 
 
 # ============================================================================ 3. QL60-005

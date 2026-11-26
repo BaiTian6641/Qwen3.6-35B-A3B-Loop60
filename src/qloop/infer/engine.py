@@ -531,8 +531,15 @@ class _QuantizedCacheLayer(_HFCacheLayerBase):  # type: ignore[misc]
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         cache_kwargs: dict[str, Any] | None = None,
+        **extra_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._cache.update(key_states, value_states, self._layer_idx, cache_kwargs=cache_kwargs)
+        return self._cache.update(
+            key_states,
+            value_states,
+            self._layer_idx,
+            cache_kwargs=cache_kwargs,
+            **extra_kwargs,
+        )
 
     def update_conv_state(
         self,
@@ -563,14 +570,14 @@ class _QuantizedCacheLayer(_HFCacheLayerBase):  # type: ignore[misc]
     def get_recurrent_state(self, state_idx: int = 0) -> Any:
         return self._cache.get_recurrent_state(self._layer_idx, state_idx=state_idx)
 
-    def get_seq_length(self) -> int:
-        return self._cache.get_seq_length(self._layer_idx)
+    def get_seq_length(self, **extra_kwargs: Any) -> int:
+        return self._cache.get_seq_length(self._layer_idx, **extra_kwargs)
 
     def get_max_cache_shape(self) -> int | None:
         return self._cache.get_max_cache_shape(self._layer_idx)
 
-    def get_mask_sizes(self, cache_position: torch.Tensor | int) -> tuple[int, int]:
-        return self._cache.get_mask_sizes(cache_position, self._layer_idx)
+    def get_mask_sizes(self, cache_position: torch.Tensor | int, **extra_kwargs: Any) -> tuple[int, int]:
+        return self._cache.get_mask_sizes(cache_position, self._layer_idx, **extra_kwargs)
 
     def crop(self, max_length: int) -> None:
         self._cache._crop_layer(self._layer_idx, max_length)
@@ -712,6 +719,7 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
         value_states: torch.Tensor,
         layer_idx: int,
         cache_kwargs: dict[str, Any] | None = None,
+        **extra_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Append new KV tokens (when `T_new > 0`) and return full layer `(K, V)`.
 
@@ -720,7 +728,7 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
         return to satisfy standard dense/SDPA attention callers. Use `gather_kv()` for sparse
         selected-token dequantization without full-sequence materialization.
         """
-        del cache_kwargs
+        del cache_kwargs, extra_kwargs
         out_dt = key_states.dtype
         v_dt = value_states.dtype
         self._k_dtypes[layer_idx] = out_dt
@@ -828,7 +836,8 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
         idx = int(layer_idx)
         return self.recurrent_states[idx] if 0 <= idx < self.num_layers else None
 
-    def get_seq_length(self, layer_idx: int | None = None) -> int:
+    def get_seq_length(self, layer_idx: int | None = None, **extra_kwargs: Any) -> int:
+        del extra_kwargs
         if layer_idx is None:
             if self._has_full_attention:
                 seq_l = self._kv_seq_len(self.first_full)
@@ -868,8 +877,14 @@ class QuantizedHybridCache(_HFCacheBase):  # type: ignore[misc]
         del layer_idx
         return None
 
-    def get_mask_sizes(self, cache_position: torch.Tensor | int, layer_idx: int = 0) -> tuple[int, int]:
+    def get_mask_sizes(
+        self,
+        cache_position: torch.Tensor | int,
+        layer_idx: int = 0,
+        **extra_kwargs: Any,
+    ) -> tuple[int, int]:
         """Return `(kv_length, kv_offset)` for HF `create_causal_mask` (`transformers 5.x`)."""
+        del extra_kwargs
         if isinstance(cache_position, torch.Tensor):
             q_len = int(cache_position.shape[0]) if cache_position.ndim > 0 else 1
         else:

@@ -1,31 +1,31 @@
-# 中期外部评审交叉核验台账与双冲刺修复计划（`v1.1`）
+# 中期外部评审交叉核验台账与双冲刺修复计划（`v1.2`）
 
 > **英文对照版：** [English Version (`docs/MIDWAY_REVIEW_AND_ACTION_PLAN.md`)](MIDWAY_REVIEW_AND_ACTION_PLAN.md)  
-> **受审仓库基线：** `0f5d7f7`（两份独立外部评审） · **当前 `main` `HEAD`：** `a94c163`（**冲刺 1 轨道 A–D 已 100% 合入** + 冲刺 2 评测套件）  
+> **受审仓库基线：** `0f5d7f7`（两份独立外部评审） · **当前 `main` `HEAD`：** `e1cf41b`（**冲刺 1 轨道 A–D 已 100% 合入** + **冲刺 2A GPU 收尾 `rc=0`** + 冲刺 2B 评测套件）  
 > **已完结 `s2_v2_joint_bptt@600` 检查点：** Hub 提交 `17382c2e166d`（`2026-11-26T03:14:49Z`，`600/600` 步，`157,286,400` [`157.29M`] 词元，`156,941,238` 可训练参数，`69.97 GiB` 峰值显存，`U = 18.19` [`1.764×`，每词元唯一调阅参数 `3.716B`]；接替中期受审快照 `s2_v2@450` `a5b20b20`）  
 > **目标硬件：** `1× NVIDIA RTX PRO 6000 Blackwell Server Edition`（`96 GB GDDR7 ECC` [`94.97 GiB` 可用]，`1,597 GB/s`，`sm_120`）  
-> **战略状态：** **冲刺 1（轨道 A–D）已 100% 完成并合入** · **冲刺 2A（`S2.1` `8K–128K`、`S2.3`、`K0`、真机 TF `5.24.1` 审计）已在 Blackwell GPU 完成实测** · **`s4_v2_rl`、`LSA-NL`/`CoMem` 训练扩张与公开完整模型包发布继续保持冻结**，直至**冲刺 2B（`S2.2` `d=1` LoRA 对照）**、`QL60-002` `cache` 参数 `4/4 PASS` 复验及 `512K / 1M` 长上下文收尾通过。
+> **战略状态：** **冲刺 1（轨道 A–D）已 100% 完成并合入** · **冲刺 2A + GPU 收尾（`e1cf41b`，`rc=0`：`S2.1` `4K–1M`、`S2.3`、`K0`、真机 TF `5.24.1` `4/4 PASS`）已在 Blackwell GPU 完整闭环** · **`s4_v2_rl`、`LSA-NL`/`CoMem` 训练扩张与公开完整模型包发布继续保持冻结**，仅余 **2 项剩余门控**：**冲刺 2B（`S2.2` `~18.41M` `d=1` LoRA 对照）**与**下游生成式推理基准（`AIME 2026` / `GPQA Diamond` / `ARC-AGI-2`）**。
 
 ---
 
-## 1. 中期执行总评与冲刺 1 / 2A 进展
+## 1. 中期执行总评与冲刺 1 / 2A 收尾进展
 
 两份独立的外部中期评审在仓库提交 `0f5d7f7` 上对本项目与线上 Hugging Face Hub 检查点元数据进行了系统审计：
 1. **评审 1（`GPT-6 Astra Pro` 代码与系统审计 @ `0f5d7f7`）：** 指出 `10` 项具体代码、评测、推理服务与编排缺陷（`QL60-001` 至 `QL60-010`）以及参数口径不一致问题（`§6`）。
 2. **评审 2（研究方法与代码库审计 @ `0f5d7f7` + 线上 Hub `s2_v2@450` `manifest.json` `a5b20b20`）：** 指出 `16` 项科学性、方法学、遥测与工程卫生问题，分为 `A1–A3`（科学有效性）、`B1–B5`（核心主张与遥测）、`C1–C3`（损失/索引器/路由器正确性）及 `D1–D5`（可维护性与数据溯源）。
 
-我们已在提交 `17216c0` 上逐条对照线上 `s2_v2@450` Hub 遥测（`a5b20b20`）完成独立复核：**评审 1 的 `10/10` 项与评审 2 的 `16/16` 项发现全部确证属实。** 此后，**冲刺 1 全部四条 CPU 工程修复轨道（轨道 A–D）已全部完成并合入 `main`**，`s2_v2_joint_bptt` 顺利跑满 `600/600` 步（`17382c2e166d`），隔离且经 CPU 验证的冲刺 2 评测模块（`engram.py`、`kill_gate_k0.py`、`verify_tf524_serving_gpu.py`、`sprint2_audit.py`、`d1_lora.py` + `s2_2_d1_lora_control.yaml`）均已合入 `main`，并完成了**冲刺 2A Blackwell GPU 实证验证**（`S2.1` 无泄漏留出/OOD + `8K–128K` 阶梯、`S2.3` 因果消融、`K0` Pre-RoPE KV-Blob 预言机及真实 `transformers 5.24.1` 推理服务审计，详见 `§7`）。
+我们已在提交 `17216c0` 上逐条对照线上 `s2_v2@450` Hub 遥测（`a5b20b20`）完成独立复核：**评审 1 的 `10/10` 项与评审 2 的 `16/16` 项发现全部确证属实。** 此后，**冲刺 1 全部四条 CPU 工程修复轨道（轨道 A–D）已全部完成并合入 `main`**，`s2_v2_joint_bptt` 顺利跑满 `600/600` 步（`17382c2e166d`），隔离且经 CPU 验证的冲刺 2 评测模块（`engram.py`、`kill_gate_k0.py`、`verify_tf524_serving_gpu.py`、`sprint2_audit.py`、`d1_lora.py` + `s2_2_d1_lora_control.yaml`）均已合入 `main`，并完成了**冲刺 2A + GPU 收尾（`e1cf41b`，`rc=0`）**全套 Blackwell GPU 实证验证（`S2.1` 无泄漏留出/OOD + `8K–1M` 长上下文阶梯与 4 针 RULER、`S2.3` 因果消融、`K0` Pre-RoPE KV-Blob 预言机及真实 `transformers 5.24.1` 推理导出 **`4/4 PASS`**，详见 `§7`）。
 
-### 经受住检验的基础设施与冲刺 2A 实证结论
+### 经受住检验的基础设施与冲刺 2A 收尾实证结论
 - **单卡 Blackwell `sm_120` 系统栈：** 在单张 `NVIDIA RTX PRO 6000 Blackwell Server Edition`（`96 GB GDDR7 ECC` [`94.97 GiB` 可用]，`1,597 GB/s`，`sm_120`）上改造 `Qwen/Qwen3.6-35B-A3B` [1]（`30` 层原生 Gated DeltaNet [2] + `10` 层门控全局注意力，`32.212B` 路由 MoE 权重 100% 冻结且经 SHA-256 校验）运行稳定，融合 `GDN-2-1M` [3]、有界 `QED` [4]、软负特征值 [5]、逐轮 `D-LSA` [6]、低秩 `APOLLO` [7]、`mHC` `LoopBridge` [8]、纯 `4.0×` YaRN [9] 与 `fla 0.6.0` DPLR Triton 内核 [10]。
-- **已验证工程里程碑与冲刺 2A 实证：** 提交 `574898d` 的 `4×8K` 宏分段将 `T=32K` `GDN2Adapter` 瞬时显存压缩 `3.28×`（`23.051 → 7.032 GiB`，令完结态 `s2_v2@600` 峰值显存保持在 `69.97 GiB`）；`1M` `FP8` `1.0×` `SharedKV` 解析状态仅占 `10.65 GiB`（较 Inkling 2 Mini 的 `32.16 GiB` [11] 缩小 `3.02×`）；公开检查点 [12] 与经审计的 `v1.2` 数据产物 [13] 保持完整可追溯性。在**冲刺 2A**（`§7`）中，无泄漏 `0/4` 重叠留出集（较原版 PPL `-10.71%`，`+469σ`）、纯未见 `wikitext-103-raw-v1` OOD（较原版 PPL `-1.11%`，`+33.6σ`）、`8K–128K` 多针 RULER（`12/12 = 100%` vs 原版 `2/12`）、`128K` 稀疏–稠密 `D-LSA` 极窄差距（`+0.00050`，较 `s3_v2` 收紧 `129×`）、平稳 `GDN-2` 状态范数（`186.2 → 191.4 → 191.0`，`0` NaN），以及真机 `transformers 5.24.1` `QL60-001`（精确 `1.00×` KV）与 `QL60-005`（`13/13`）均**实测通过**。
+- **已验证工程里程碑与冲刺 2A 收尾实证：** 提交 `574898d` 的 `4×8K` 宏分段将 `T=32K` `GDN2Adapter` 瞬时显存压缩 `3.28×`（`23.051 → 7.032 GiB`，令完结态 `s2_v2@600` 峰值显存保持在 `69.97 GiB`）；`1M` `FP8` `1.0×` `SharedKV` 解析状态仅占 `10.65 GiB`（较 Inkling 2 Mini 的 `32.16 GiB` [11] 缩小 `3.02×`）；公开检查点 [12] 与经审计的 `v1.2` 数据产物 [13] 保持完整可追溯性。在**冲刺 2A + 收尾（`e1cf41b`，`rc=0`，`§7`）**中，无泄漏 `0/4` 重叠留出集（较原版 PPL `-10.71%`，`+469σ`）、纯未见 `wikitext-103-raw-v1` OOD（较原版 PPL `-1.11%`，`+33.6σ`）、`8K–1M` 4 针 RULER（**`20/20 = 100.0%`** vs 原版 `9/20 = 45.0%`）、`1M`（`1,048,576` 词元）稀疏 NLL `0.00120`（较原版 `0.01429` 低 `11.9×`，较 `s3_v2` `0.02048` 低 `17.1×`，且 `88L` `d=3` 比原版稠密 `40L` 快 `1.32×`，峰值显存仅 `65.19 GiB`，`0` OOM 告警）、`128K` 稀疏–稠密 `D-LSA` 极窄差距（`+0.00050`，较 `s3_v2` 收紧 `129×`）、贯穿 `1M` 的平稳 `GDN-2` 状态范数（`186.2 → 191.4 → 191.0 → 191.38 → 191.21`，`max_abs = 27.74`，`0` NaN），以及真机 `transformers 5.24.1` 推理导出（**`4/4 PASS`**，`217.6s`：`ENV`、`QL60-001`、`QL60-002` 跨 `d = 1, 2, 3`、`QL60-005` `13/13`）均**实测通过**。
 
-### 原审计阻塞项闭环情况与冲刺 2A 后剩余开放缺口
-- **已在冲刺 1（轨道 A–D 合入 `main`）与冲刺 2A 闭环：** 打包前 SHA-1 文档留出（`QL60-003` / `A1`）、`self.rng` 与仅权重 `lr_factor` 续训同步（`QL60-004`）、按有效词元归一化 BPTT CE 与纯 `loss/lm` / `loss/aux` 分离（`QL60-009` / `C1`）、模型指纹绑定评测缓存（`QL60-010`）、稀疏 `lsa_attention()` 调用方掩码（`QL60-007`）、按轮次分键的未共享 `BucketIndex`（`QL60-008`）、均值归约 `aux_loss()`（`C2`）、稀疏 `lsa/last_recall` 实时采样（`B2`，`4K` 实测 `0.8360`）、确定性路由器识别（`C3`）、洁净 v2 默认阶段序列（`QL60-006`）、严格 `_local_stage_done()` 发布门控（`QL60-005`，真机 `13/13` PASS）、真机 `transformers 5.24.1` `QuantizedHybridCache`（`QL60-001`，真机 PASS）、原版 `Qwen3.6 + YaRN 4×` 正面对比与 `3` 次重复底噪（`A3`、`B4`）、`QED` / 负特征值因果裁撤依据（`B5`）及 `D3` / `D5` 卫生与溯源政策。
-- **明确的剩余开放缺口（为何继续维持冻结直至冲刺 2B）：** (1) `QL60-002` 真机 `transformers 5.24.1` `.generate()` 要求 `forward()` 显式声明 `cache: Any = None` 参数（正在并行闭环，待 `4/4 PASS` GPU 复验）；(2) `512K / 1M` 长度阶梯（`B3`）在阶段 4 触达 `5.5h` 安全上限与 `94.43 GiB` 峰值（`96,697 / 97,887 MiB`；OOM 告警时 `93.15 GiB` / `95,381 MiB`）CUDA 分配器碎片化而未完结；(3) **冲刺 2B（`S2.2`）** `~18.41M` 参数量匹配 `d=1` LoRA 对照基线（`A2`）尚未在 GPU 上开训——鉴于 `s2_v2@600` 在未见 OOD 上 `d=1`（`1.69971`）略优于 `d=3`（`1.70122`，`-4.2σ`），该对照更具决定性；(4) 零训练 `K0` 获判 **`YELLOW_B_BLOCK_ATTN_CALIB`**（`6.05×` 压缩 KV 下 `100.0%` EM 保持率，仅因冻结投影动态误差 NLL 差 `+0.6228` nats 未达 `GREEN`）；(5) 端到端生成式推理基准（`AIME`/`GPQA`/`ARC-AGI-2`）尚未执行。
+### 原审计阻塞项闭环情况与冲刺 2A 收尾后剩余开放缺口
+- **已在冲刺 1（轨道 A–D 合入 `main`）与冲刺 2A 收尾（`e1cf41b`，`rc=0`）闭环：** 打包前 SHA-1 文档留出（`QL60-003` / `A1`）、`self.rng` 与仅权重 `lr_factor` 续训同步（`QL60-004`）、按有效词元归一化 BPTT CE 与纯 `loss/lm` / `loss/aux` 分离（`QL60-009` / `C1`）、模型指纹绑定评测缓存（`QL60-010`）、稀疏 `lsa_attention()` 调用方掩码（`QL60-007`）、按轮次分键的未共享 `BucketIndex`（`QL60-008`）、均值归约 `aux_loss()`（`C2`）、稀疏 `lsa/last_recall` 实时采样（`B2`，`4K` 为 `0.8360`、`512K` 为 `0.0627`、`1M` 为 `0.0317`）、确定性路由器识别（`C3`）、洁净 v2 默认阶段序列（`QL60-006`）、严格 `_local_stage_done()` 发布门控（`QL60-005`，真机 `13/13` PASS）、真机 `QuantizedHybridCache`（`QL60-001`，`47.60s`）及包内/独立 `.generate(max_new_tokens=8)` 跨 `d = 1, 2, 3`（`QL60-002`，`19.01s`，真实 `transformers 5.24.1` **`4/4 PASS`**）、`8K–1M` 长度阶梯 + 4 针 RULER（`20/20`）+ `GDN-2` `1M` 有界状态范数（`B3`，峰值 `65.19 GiB`，`0` OOM 告警，`0` NaN）、原版 `Qwen3.6 + YaRN 4×` 正面对比与 `3` 次重复底噪（`A3`、`B4`）、`QED` / 负特征值因果裁撤依据（`B5`）及 `D3` / `D5` 卫生与溯源政策。
+- **明确的剩余开放缺口（现仅余 2 项核心门控维持冻结）：** (1) **冲刺 2B（`S2.2` / `A2`）** `~18.41M` 参数量匹配 `d=1` LoRA 对照基线（`configs/stages/s2_2_d1_lora_control.yaml`，`~18` GPU-h）尚未在 GPU 上开训——鉴于 `s2_v2@600` 在未见 OOD 上 `d=1`（`1.69971`）略优于 `d=3`（`1.70122`，`-4.2σ`），该对照更具决定性；(2) **下游生成式推理基准**（`AIME 2026` / `GPQA Diamond` / `ARC-AGI-2`）须待 `S2.2` 通过并解冻 `s4_v2_rl` 后执行。*（另行说明：零训练 `K0` 已定级为 **`YELLOW_B_BLOCK_ATTN_CALIB`** [`6.05×` 压缩 KV 下 `100.0%` EM 保持率，`+0.6228`-nat NLL 差]，仅作为后续 `LSA-NL`/`CoMem` 训练扩张的 `2–4h` 块注意力标定前置门控，见 `§7.5`。）*
 
 > [!IMPORTANT]
-> **强制中期冻结令（冲刺 2A 后更新）：** 冲刺 1（轨道 A–D）已 **100% 完结**，冲刺 2A（`S2.1` `8K–128K`、`S2.3`、`K0`、真机 TF `5.24.1` 审计）已在 Blackwell GPU **完整落盘**（`§7`）。尽管如此，`s4_v2_rl`、`LSA-NL` / `CoMem` 训练扩张与公开完整模型包发布仍**严格冻结**，直至**冲刺 2B（`S2.2` `d=1` LoRA 对照）**、`QL60-002` 真机 `4/4 PASS` 复验及第 `6.3` 节剩余门控全部通过。
+> **强制中期冻结令（冲刺 2A 收尾后更新）：** 冲刺 1（轨道 A–D）与**冲刺 2A + GPU 收尾（`e1cf41b`，`rc=0`：`S2.1` `4K–1M`、`S2.3`、`K0`、真机 TF `5.24.1` `4/4 PASS`）**已在 Blackwell GPU **100% 完结**（`§7`）。`s4_v2_rl`、`LSA-NL` / `CoMem` 训练扩张与公开完整模型包发布仍**严格冻结**，仅待剩余 **2 项核心门控**通过：**冲刺 2B（`S2.2` `~18.41M` `d=1` LoRA 对照）**与**下游生成式推理基准（`AIME 2026` / `GPQA Diamond` / `ARC-AGI-2`）**（以及面向 `LSA-NL`/`CoMem` 的 `K0` 块注意力标定，见 `§6.3`）。
 
 ---
 
@@ -44,13 +44,13 @@
 
 ### 2.2 评审 1 发现核验台账（`GPT-6 Astra Pro`，`QL60-001`..`QL60-010`）
 
-| 编号 | 交叉映射 | 闭环状态 | 已验证修复与实证证据（`main` `a94c163` + 冲刺 2A） | 轨道 / 提交 | 门控结果 |
+| 编号 | 交叉映射 | 闭环状态 | 已验证修复与实证证据（`main` `e1cf41b` + 冲刺 2A 收尾） | 轨道 / 提交 | 门控结果 |
 | :--- | :---: | :---: | :--- | :---: | :--- |
-| **`QL60-001`** | — | **已修复且真机 PASS** | [`src/qloop/infer/engine.py`](../src/qloop/infer/engine.py)：`QuantizedHybridCache` 完整实现 `transformers 5.24+` `Cache`/`CacheLayerMixin` 协议（`conv_states`、`recurrent_states`、`reorder_cache`、`crop`、`reset`、`get_mask_sizes`）与 `update()` kwargs。 | 轨道 C（`2b15d4c`、`581db44`） | **真机 GPU PASS**（实测 `transformers 5.24.1`）：`bf16`/`fp8`/`hadamard_int4` 在 `d=1` 与 `d=3` 下均达成精确 `1.00×` KV（`kv_share=False` 为 `2.00×`）。 |
-| **`QL60-002`** | `D1` | **已合入；待复验** | [`src/qloop/infer/hf_custom_modeling.py`](../src/qloop/infer/hf_custom_modeling.py)：已合入兼容 `ModelOutput` 的 `CausalLMPackOutput`、同步虚拟 `layer_types`、`logits_to_keep=0` 返回 `(B, T, V)` 与 `qloop_commit` 元数据。 | 轨道 C（`2b15d4c`、`581db44`） | 已通过 `ModelOutput` 与 `d=1` 包内 `logits_to_keep=0/1`，随后在 `past_key_values=qcache` 路径 `.generate()` 抛出 `ValueError: ['cache']`（要求 `forward()` 显式声明 `cache: Any = None`；并行修复中，待 `4/4 PASS` 复验）。 |
+| **`QL60-001`** | — | **已修复且真机 PASS** | [`src/qloop/infer/engine.py`](../src/qloop/infer/engine.py)：`QuantizedHybridCache` 完整实现 `transformers 5.24+` `Cache`/`CacheLayerMixin` 协议、`update()` kwargs、几何扩容 `_FP8Slot` 与零 FP32 BF16 反量化。 | 轨道 C（`2b15d4c`、`581db44`）+ `7346f77` | **真机 GPU PASS（`47.60s`，`e1cf41b`）**（实测 `transformers 5.24.1`）：`bf16`/`fp8`/`hadamard_int4` 在 `d=1` 与 `d=3` 下均达成精确 `1.00×` KV（`kv_share=False` 为 `2.00×`）。 |
+| **`QL60-002`** | `D1` | **已修复且真机 PASS** | [`src/qloop/infer/hf_custom_modeling.py`](../src/qloop/infer/hf_custom_modeling.py)：兼容 `ModelOutput` 的 `CausalLMPackOutput`、同步虚拟 `layer_types`、`logits_to_keep=0` 返回 `(B, T, V)`、`qloop_commit` 元数据与 `forward()` 显式 `cache: Any = None`。 | 轨道 C（`2b15d4c`、`581db44`）+ `7346f77` | **真机 GPU PASS（`19.01s`，`e1cf41b` 总计 `4/4`）**：包内与独立 `Qwen36LoopHSSDForCausalLM` 均通过 `d = 1, 2, 3`（`40L / 64L / 88L`）逐词元 `.generate(max_new_tokens=8)` 一致性、`logits_to_keep=0` `[1, 16, 248320]` 与 `Argmax Match = True`。 |
 | **`QL60-003`** | **`A1`** | **已修复并实证** | [`src/qloop/train/trainer.py`](../src/qloop/train/trainer.py) 与 [`src/qloop/data/mixture.py`](../src/qloop/data/mixture.py)：打包前 SHA-1 文档哈希切分（`split_role="train"` / `"eval"`）。 | 轨道 A（`70f789e`）+ 冲刺 2A | CPU 8 文档复现 `0` 重叠 + 冲刺 2A Blackwell GPU 留出集 **PASS（`0/4` 文档重叠**，`19,093` 有效词元）与未见 `wikitext-103-raw-v1` OOD（`30,030` 有效词元）。 |
 | **`QL60-004`** | — | **已修复并合入** | [`src/qloop/train/trainer.py`](../src/qloop/train/trainer.py) 与 [`src/qloop/train/checkpoint.py`](../src/qloop/train/checkpoint.py)：序列化还原 `self.rng`；仅权重恢复记录 `resume_mode="weights_only"` 并同步 `self.opt.step_count = self.step`。 | 轨道 A（`70f789e`） | CPU 单元测试 PASS（`test_sprint1_train_data_resume.py`）：`self.rng` 精确往返与仅权重 `lr_factor` 保持通过。 |
-| **`QL60-005`** | — | **已修复且真机 PASS** | [`src/qloop/colab.py`](../src/qloop/colab.py)：`_local_stage_done()` 强制校验显式 `COMPLETED`/`PROMOTED` 标记或 `step >= target_steps`，拒绝裸/中途 `LATEST`。 | 轨道 C（`2b15d4c`） | **真机 GPU PASS（`13/13` 用例）**，载于 `runs/sprint2a/serving_audit.md`，含暂停态 `step000001` 拒绝校验。 |
+| **`QL60-005`** | — | **已修复且真机 PASS** | [`src/qloop/colab.py`](../src/qloop/colab.py)：`_local_stage_done()` 强制校验显式 `COMPLETED`/`PROMOTED` 标记或 `step >= target_steps`，拒绝裸/中途 `LATEST`。 | 轨道 C（`2b15d4c`） | **真机 GPU PASS（`13/13` 用例，`0.002s`）**，载于 `runs/sprint2a/serving_audit_v2.md`（`e1cf41b`，`4/4 PASS`），含暂停态 `step000001` 拒绝校验。 |
 | **`QL60-006`** | `D2`、`D3` | **已修复并合入** | [`src/qloop/colab.py`](../src/qloop/colab.py) 与 [`src/qloop/colab_supervisor.py`](../src/qloop/colab_supervisor.py)：默认阶段序列切换为洁净 v2（`s0_probe`、`s1_loop_a6b`、`s3_v2_long_1m_lsa`、`s2_v2_joint_bptt`、`s4_v2_rl`）。 | 轨道 C（`2b15d4c`） | CPU 单元测试 PASS（`test_sprint1_hf_serving_ops.py`）；退役 HSSD 仅作 `--stages` 显式回溯项。 |
 | **`QL60-007`** | — | **已修复并合入** | [`src/qloop/model/lsa.py`](../src/qloop/model/lsa.py)：在 sink、局部窗与桶选键全路径强制布尔/浮点 2D/3D/4D `attention_mask`，保留 `None` 零开销快路径。 | 轨道 B（`36d73eb`） | CPU 单元测试 PASS（`test_sprint1_lsa_loop.py`）：左/右填充与分块对角掩码误差 `< 1e-6`。 |
 | **`QL60-008`** | — | **已修复并合入** | [`src/qloop/model/lsa.py`](../src/qloop/model/lsa.py)：`kv_share=False` 时按 `(phys_layer, cur_pass)` 分键缓存 `BucketIndex`，同时保持 `kv_share=True` 物理复用。 | 轨道 B（`36d73eb`） | CPU 单元测试 PASS（`test_sprint1_lsa_loop.py`）：两种模式 float64 精度一致误差 `< 1e-12`。 |
@@ -59,20 +59,20 @@
 
 ### 2.3 评审 2 发现核验台账（代码与研究方法审计，`A1–A3`、`B1–B5`、`C1–C3`、`D1–D5`）
 
-| 编号 | 严重度 | 闭环状态 | 已验证修复与冲刺 2A 实证证据（`main` `a94c163`） | 轨道 / 阶段 | 门控结果 |
+| 编号 | 严重度 | 闭环状态 | 已验证修复与冲刺 2A 收尾实证证据（`main` `e1cf41b`） | 轨道 / 阶段 | 门控结果 |
 | :--- | :---: | :---: | :--- | :---: | :--- |
 | **`A1`**（`QL60-003`） | 致命 | **已闭环** | 打包前 SHA-1 留出（`70f789e`）+ 冲刺 2A（`§7.2`）在 `0/4` 重叠留出集（`19,093` 有效词元）与未见 `wikitext-103-raw-v1` 测试集（`30,030` 有效词元）完成 4 臂重评。 | 轨道 A + 冲刺 2A | **PASS：** `s2_v2@600` 在留出集较原版 PPL `-10.71%`（`+469σ`），在未见 OOD 较原版 PPL `-1.11%`（`+33.6σ`）。 |
-| **`A2`** | 致命 | **代码已合入；待 GPU 训练** | `src/qloop/model/d1_lora.py` + `configs/stages/s2_2_d1_lora_control.yaml` 已合入（`63d8b00`，CPU 验证通过），在 `[12, 36)` 上匹配 `~18.41M` `d=1` 参数量。 | **冲刺 2B（`~18` GPU-h）** | **开放决定性门控：** 解冻 `s4_v2_rl` 或 `LSA-NL` 前必跑（尤因 `s2_v2@600` 未见 OOD `d=1` 略优于 `d=3`）。 |
+| **`A2`** | 致命 | **代码已合入；待 GPU 训练** | `src/qloop/model/d1_lora.py` + `configs/stages/s2_2_d1_lora_control.yaml` 已合入（`63d8b00`，CPU 验证通过），在 `[12, 36)` 上匹配 `~18.41M` `d=1` 参数量。 | **冲刺 2B（`~18` GPU-h）** | **开放决定性门控（#1）：** 解冻 `s4_v2_rl` 或 `LSA-NL` 前必跑（尤因 `s2_v2@600` 未见 OOD `d=1` 略优于 `d=3`）。 |
 | **`A3`** | 中 | **已闭环** | 冲刺 2A（`§7.2`）在 Blackwell 量化路径执行 `3` 次重复（`mean ± std`）+ `2× d=1` 非确定性底噪检测（`max_diff = 2.36e-4 .. 1.18e-3`）。 | 冲刺 2A | **PASS：** 全部核心相对原版差值（`+20.7σ .. +469.3σ`）及关键消融（`+5.5σ .. +156.6σ`）均大幅超出 `3σ`。 |
 | **`B1`**（`R1 §6`） | 高 | **已闭环** | 在 `README.md` 与 `§3` 锁定规范四轴参数账本（已补录 `s2_v2@600` `U=18.19` / `3.716B`）；`S2.3` 完成 `PassRouterAdapters` 因果消融。 | 轨道 D + 冲刺 2A | **PASS：** `no_pass_router` 致 NLL 恶化 `+0.00251`（`+6.8σ`）→ `KEEP_CRITICAL`。 |
-| **`B2`** | 高 | **已闭环** | 轨道 B（`36d73eb`）启用 `mode="sparse"` 周期抽样 `lsa/last_recall`；冲刺 2A 录得实时召回率（`4K` 为 `0.8360`，`8K–128K` 为 `0.6171 → 0.1340`）。 | 轨道 B + 冲刺 2A | **PASS：** `s2_v2@600` 在 `128K` 下稀疏–稠密差距仅 **`+0.00050`**（较 `s3_v2` 的 `+0.06457` 收紧 `129×`）。 |
-| **`B3`** | 高 | **部分闭环（`128K` 已证）** | 冲刺 2A（`§7.3`）实测证明 `s2_v2@600` 的 `8K / 64K / 128K` NLL（稠密 `0.00746` / 稀疏 `0.00796`）与 4 针 RULER **`12/12 (100%)`**。 | 轨道 D + 冲刺 2A / 2B | **`8K–128K` PASS；`512K / 1M` 仍开放：** 阶段 4 触达 `5.5h` 上限与 `94.43 GiB` 峰值（`96,697 / 97,887 MiB`；OOM 告警时 `93.15 GiB` / `95,381 MiB`）分配器碎片化；完成前 `1M` 维持“显存可行（memory-feasible）”口径。 |
-| **`B4`** | 中 | **已闭环** | 冲刺 2A（`§7.2`、`§7.3`）在统一留出、OOD 与 `8K–128K` RULER 上将**原版 `Qwen3.6 + YaRN 4×`** 与 `s1@1000`、`s3_v2@600`、`s2_v2@600` 同台对比。 | 冲刺 2A | **PASS：** `s2_v2@600` `128K` NLL 较原版低 `13.4×`（`0.00746` vs `0.10026`），RULER `12/12` vs `2/12`。 |
-| **`B5`** | 低 | **已闭环（确认裁撤）** | 冲刺 2A `S2.3`（`§7.4`）直接消融 `QED` 与 `neg_eigval` 并记录至 `128K` 的 `GDN-2` `max_l2`（`186.2 → 191.4 → 191.0`，`0` NaN）。 | 冲刺 2A | **PASS（可执行结论）：** `no_qed`（`-0.00009`，`-0.31σ`）与 `no_neg_eigval`（`-0.00026`，`-0.97σ`）确证为 **`PRUNE_CANDIDATE`**，后续阶段予以裁撤以恢复严格 `[0, 1]` GDN-2 稳定界。 |
+| **`B2`** | 高 | **已闭环** | 轨道 B（`36d73eb`）启用 `mode="sparse"` 周期抽样 `lsa/last_recall`；冲刺 2A + 收尾录得实时召回率（`4K` 为 `0.8360`，`8K–128K` 为 `0.6171 → 0.1340`，`512K` 为 `0.0627`，`1M` 为 `0.0317`）。 | 轨道 B + 冲刺 2A 收尾 | **PASS：** `s2_v2@600` 在 `128K` 下稀疏–稠密差距仅 **`+0.00050`**（较 `s3_v2` 的 `+0.06457` 收紧 `129×`）；`512K/1M` 跳过稠密（`--skip-dense-above 131072`）。 |
+| **`B3`** | 高 | **已闭环（`8K–1M` 已证）** | 冲刺 2A + 收尾（`e1cf41b`，`rc=0`，`§7.3`）实测完成 `8K / 64K / 128K / 512K / 1M`（`1,048,576`）长度阶梯（`fp8` KV、几何 `_FP8Slot`、零 FP32 BF16 反量化）与 4 针 RULER **`20/20 (100.0%)`**（`s2_v2@600` 与 `s3_v2@600`）。 | 轨道 D + 冲刺 2A 收尾 | **PASS（峰值 `65.19 GiB` [`66,759 / 97,887 MiB`]，`0` OOM 告警）：** `s2_v2@600` `1M` 稀疏 NLL `0.00120`（较原版低 `11.9×`），`GDN-2` `max_l2 = 191.21`（`0` NaN）；诚实说明：重复合成填充使 NLL 按 `~1/T` 下降。 |
+| **`B4`** | 中 | **已闭环** | 冲刺 2A + 收尾（`§7.2`、`§7.3`）在统一留出、OOD 与贯穿 `1M`（`1,048,576`）词元的 RULER 上将**原版 `Qwen3.6 + YaRN 4×`** 与 `s1@1000`、`s3_v2@600`、`s2_v2@600` 同台对比。 | 冲刺 2A 收尾 | **PASS：** `s2_v2@600` `128K` NLL 低 `13.4×`（`0.00746` vs `0.10026`），`1M` NLL 低 `11.9×`（`0.00120` vs `0.01429`），RULER `20/20` vs `9/20`，且 `1M` 耗时反快 `1.32×`（`1,688.8s` vs `2,231.3s`）。 |
+| **`B5`** | 低 | **已闭环（确认裁撤）** | 冲刺 2A `S2.3`（`§7.4`）直接消融 `QED` 与 `neg_eigval`，收尾（`§7.3`）记录至 `1M` 的 `GDN-2` `max_l2`（`186.2 → 191.4 → 191.0 → 191.38 → 191.21`，`max_abs = 27.74`，`0` NaN）。 | 冲刺 2A 收尾 | **PASS（可执行结论）：** `no_qed`（`-0.00009`，`-0.31σ`）与 `no_neg_eigval`（`-0.00026`，`-0.97σ`）确证为 **`PRUNE_CANDIDATE`**，后续阶段予以裁撤以恢复严格 `[0, 1]` GDN-2 稳定界。 |
 | **`C1`**（`QL60-009`） | 高 | **已修复并合入** | [`src/qloop/train/bptt.py`](../src/qloop/train/bptt.py) 分离 `ce_loss`（`loss/lm`）与 `aux_loss`（`loss/aux`）并按有效词元加权。 | 轨道 A（`70f789e`） | CPU 梯度一致 PASS 且冲刺 2A 纯 LM CE 验证完成。 |
 | **`C2`** | 高 | **已修复并合入** | [`src/qloop/model/lsa.py`](../src/qloop/model/lsa.py)：`LSAManager.aux_loss()` 默认 `aux_reduction="mean"`，保持 `lsa_kl` 为 `O(1)` 量级。 | 轨道 B（`36d73eb`） | CPU 单元测试 PASS（`test_sprint1_lsa_loop.py`）。 |
 | **`C3`** | 低 | **已修复并合入** | [`src/qloop/model/loop.py`](../src/qloop/model/loop.py)：安装期确定性识别路由器类型与属性（仅未知单测桩回退数值检测）。 | 轨道 B（`36d73eb`） | CPU 单元测试 PASS（`test_sprint1_lsa_loop.py`）。 |
-| **`D1`** | 高 | **轨道 C 已修；抽取待办** | 轨道 C（`2b15d4c`、`581db44`）修复 `ModelOutput`、`logits_to_keep=0` 与 `qloop_commit`；将约 `7.9K` 行独立字符串抽为受 lint 模块留作冲刺后待办。 | 轨道 C + 待办 | 轨道 C 已合入；模块抽取安排于冲刺 2B 后。 |
+| **`D1`** | 高 | **轨道 C 已修；抽取待办** | 轨道 C（`2b15d4c`、`581db44`）+ `7346f77` 修复 `ModelOutput`、`logits_to_keep=0`、`cache: Any = None` 与 `qloop_commit`（真机 `4/4 PASS`）；将约 `7.9K` 行独立字符串抽为受 lint 模块留作冲刺后待办。 | 轨道 C + 待办 | 真机 `4/4 PASS` 已验；模块抽取安排于冲刺 2B 后。 |
 | **`D2`** | 中 | **待办** | 将已退役 `hssd.py`（`13,255` 行）与 v1 配置归档至 `qloop/legacy/`，同时保留负向消融复现单测。 | 冲刺 1 后待办 | 安排于冲刺 2B 后（默认流水线已在 `QL60-006` 切至洁净 v2）。 |
 | **`D3`** | 中 | **已闭环** | 按洁净 v2 与规范四轴参数账本重写 `README.md`；修正 `configs/base.yaml` 过期注释且未改动任何 YAML 键。 | 轨道 D（`2d23615`） | 已合入并通过 `test_configs_cli.py`、`test_experiment_report.py`。 |
 | **`D4`** | 低 | **待办** | 将 `tests/test_experiment_report.py` 固定文案子串断言拆入独立 `make docs-check` 目标。 | 冲刺 1 后待办 | 安排于冲刺 2B 后。 |
@@ -156,36 +156,36 @@ P_{\text{uniq}}(U) &= P_{\text{dense,uniq}}^{\text{ex-emb}} + (16 \times 8 + 24 
 
 ### 6.1 冲刺 1 —— CPU 工程、正确性与卫生修复（`0` GPU-h）—— **已 100% 完成并合入**
 
-| 轨道 / 分支 | 状态 | 关闭发现项 | 合入 `main`（`a94c163`）的验证范围 |
+| 轨道 / 分支 | 状态 | 关闭发现项 | 合入 `main`（`e1cf41b`）的验证范围 |
 | :--- | :---: | :---: | :--- |
 | **轨道 A**（`fix/sprint1-eval-bptt-resume`） | **已合入（`70f789e`）** | `QL60-003`（`A1`）、`QL60-009`（`C1`）、`QL60-004`、`QL60-010` | `mixture.py`、`trainer.py`、`bptt.py`、`checkpoint.py`、`optim.py`、`runners.py`、`tests/test_sprint1_train_data_resume.py` —— `0` 重叠留出、有效词元 BPTT CE 与纯 `loss/lm`、`self.rng` + 仅权重 `lr_factor` 同步、模型指纹绑定评测缓存。 |
 | **轨道 B**（`fix/sprint1-lsa-correctness`） | **已合入（`36d73eb`）** | `QL60-007`、`QL60-008`、`C2`、`B2`、`C3` | `lsa.py`、`loop.py`、`tests/test_sprint1_lsa_loop.py` —— 调用方掩码 `< 1e-6`、按轮分键未共享 `BucketIndex` `< 1e-12`、均值归约 `aux_loss()`、稀疏 `last_recall` 采样、安装期确定性路由器识别。 |
-| **轨道 C**（`fix/sprint1-hf-serving-ops`） | **已合入（`2b15d4c`、`581db44`）** | `QL60-001`、`QL60-002`、`QL60-005`、`QL60-006`、`D5`（代码） | `engine.py`、`hf_custom_modeling.py`、`export_pack.py`、`colab.py`、`colab_supervisor.py`、`report.py`、`build_sirsi_dataset.py`、`pyproject.toml`、`tests/test_sprint1_hf_serving_ops.py` —— TF `5.24.1` `QuantizedHybridCache`（真机 PASS）、`ModelOutput` + `logits_to_keep=0`（`cache` 参数并行闭环）、`13/13` `_local_stage_done()` 门控、洁净 v2 默认阶段、可移植路径 + `pyarrow>=16.0`。 |
+| **轨道 C**（`fix/sprint1-hf-serving-ops` + `fix/s2a-closeout-tf524-1m`） | **已合入（`2b15d4c`、`581db44`、`7346f77`）** | `QL60-001`、`QL60-002`、`QL60-005`、`QL60-006`、`B3` 显存、`D5`（代码） | `engine.py`、`hf_custom_modeling.py`、`export_pack.py`、`sprint2_audit.py`、`colab.py`、`colab_supervisor.py`、`report.py`、`build_sirsi_dataset.py`、`pyproject.toml`、`tests/test_sprint1_hf_serving_ops.py` —— TF `5.24.1` `QuantizedHybridCache` + `cache: Any = None` + 几何 `_FP8Slot` BF16 反量化 + `--skip-dense-above 131072`（`4/4 PASS` 与 `65.19 GiB` `1M` 峰值）、`13/13` `_local_stage_done()`、洁净 v2 默认阶段、可移植路径 + `pyarrow>=16.0`。 |
 | **轨道 D**（`docs/midway-review-and-cleanup`） | **已合入（`2d23615`）** | `B1`、`D3`、`D5`（文档与政策） | `MIDWAY_REVIEW_AND_ACTION_PLAN{,_ZH}.md`、`README.md`、`DATASET_AUDIT_REPORT.md`、`IMPLEMENTATION_PLAN.md`、`configs/base.yaml` —— 严格 IEEE `[1]..[20]` 双语对齐、`GDDR7 ECC` 口径、`0` 用户路径、约束性 `§5` 溯源政策。 |
 | **隔离冲刺 2 评测套件** | **已合入（`591b0df..71c4a99`）** | 预 GPU `S2.1–S2.3`、`K0`、TF `5.24` | 经 CPU 验证的 [`src/qloop/memory/engram.py`](../src/qloop/memory/engram.py)、[`src/qloop/eval/kill_gate_k0.py`](../src/qloop/eval/kill_gate_k0.py)、[`scripts/verify_tf524_serving_gpu.py`](../scripts/verify_tf524_serving_gpu.py)、[`src/qloop/eval/sprint2_audit.py`](../src/qloop/eval/sprint2_audit.py) 以及 [`src/qloop/model/d1_lora.py`](../src/qloop/model/d1_lora.py) + [`configs/stages/s2_2_d1_lora_control.yaml`](../configs/stages/s2_2_d1_lora_control.yaml)。 |
 | **冲刺 1 后清理项** | **延后执行** | `D1`、`D2`、`D4` | 将约 `7.9K` 行独立代码字符串抽为受 lint 模块；将 `hssd.py`（`13,255` 行）与 v1 配置归档至 `qloop/legacy/`；将文案断言拆入 `make docs-check`。 |
 
-### 6.2 冲刺 2 —— 决定性单卡科学验证（**冲刺 2A 已执行 · 冲刺 2B 待执行**）
+### 6.2 冲刺 2 —— 决定性单卡科学验证（**冲刺 2A + 收尾已完成 · 冲刺 2B 待执行**）
 
 于单张 `NVIDIA RTX PRO 6000 Blackwell Server Edition`（`96 GB GDDR7 ECC` [`94.97 GiB` 可用]，`1,597 GB/s`，`sm_120`）执行：
 
 | 工作流 | 状态 | 算力预算 | 闭环发现项 | 实测结果 / 剩余门控 |
 | :--- | :---: | :---: | :---: | :--- |
-| **S2.1 无泄漏留出 + OOD 与 `8K–128K` 能力审计** | **2A 已完成（`512K/1M` 开放）** | 已耗 `~6` GPU-h（`512K/1M` 待补） | `A1`、`A3`、`B2`、`B3`、`B4` | **已完成（`§7.2`、`§7.3`）：** `s2_v2@600` 在 `0/4` 重叠留出集较原版 PPL `-10.71%`（`+469σ`）、未见 `wikitext-103` OOD `-1.11%`（`+33.6σ`）、`128K` NLL 低 `13.4×`（`0.00746`）、稀疏–稠密差 `+0.00050` 且 RULER [20] `12/12`（`0` NaN）。**开放项：** `512K / 1M` 阶梯（阶段 4 触达 `5.5h` 上限与 `94.43 GiB` 峰值 [`96,697 / 97,887 MiB`；OOM 告警时 `93.15 GiB` / `95,381 MiB`] 分配器碎片化）。 |
-| **S2.3 因果消融 + 窄域 `K0` 预言机 + 真机 TF `5.24.1`** | **2A 已完成（`QL60-002` 待复验）** | 已耗 `~2` GPU-h | `B1`、`B5`、`QL60-001/002/005`、`LSA-NL` 门控 | **已完成（`§7.4`–`§7.6`）：** `GDN-2`（`+156.6σ`）、`PassRouter`（`+6.8σ`）与 `lsa_sparse`（`0.8360` 召回）为 `KEEP_CRITICAL`；`QED`（`-0.31σ`）与 `neg_eigval`（`-0.97σ`）为 `PRUNE_CANDIDATE`；`K0` = **`YELLOW_B_BLOCK_ATTN_CALIB`**（`6.05×` 小 KV 下 `100.0%` EM 保持率，`+0.6228`-nat 差距）；TF `5.24.1` `QL60-001` 与 `QL60-005` PASS（`QL60-002` `cache` 参数复验待补）。 |
-| **S2.2 参数量匹配 `d=1` LoRA 对照（冲刺 2B）** | **待执行（套件已合入）** | `~18` GPU-h | `A2` | 在 `[12, 36)` 上以相同哈希切分 `s1` 数据与调度训练 `~18.41M` `d=1`（`40L`）LoRA 基线（`src/qloop/model/d1_lora.py`、`configs/stages/s2_2_d1_lora_control.yaml`）。**决定性门控：** 循环 `d >= 2` 须在无泄漏留出与未见 OOD 上打平或超越 `d=1` LoRA 方可解冻 `s4_v2_rl`。 |
+| **S2.1 无泄漏留出 + OOD 与 `8K–1M` 能力审计** | **2A + 收尾已完成** | 已耗 `~8.1` GPU-h（2A `~6h` + 收尾 `2.09h`） | `A1`、`A3`、`B2`、`B3`、`B4` | **已完成（`§7.2`、`§7.3`，`e1cf41b`，`rc=0`）：** `s2_v2@600` 在 `0/4` 重叠留出集较原版 PPL `-10.71%`（`+469σ`）、未见 `wikitext-103` OOD `-1.11%`（`+33.6σ`）、`128K` 稀疏–稠密差 `+0.00050`、**`1M` 稀疏 NLL `0.00120`**（较原版 `0.01429` 低 `11.9×`，较 `s3_v2` `0.02048` 低 `17.1×`）、**`8K–1M` RULER [20] `20/20 (100.0%)`**（vs 原版 `9/20`）、`GDN-2` `max_l2 = 191.21`（`0` NaN）且**峰值显存 `65.19 GiB`**（`0` OOM 告警）。 |
+| **S2.3 因果消融 + 窄域 `K0` 预言机 + 真机 TF `5.24.1`** | **2A + 收尾已完成（`4/4 PASS`）** | 已耗 `~2.1` GPU-h | `B1`、`B5`、`QL60-001/002/005`、`LSA-NL` 门控 | **已完成（`§7.4`–`§7.6`，`e1cf41b`，`rc=0`）：** `GDN-2`（`+156.6σ`）、`PassRouter`（`+6.8σ`）与 `lsa_sparse`（`0.8360` 召回）为 `KEEP_CRITICAL`；`QED`（`-0.31σ`）与 `neg_eigval`（`-0.97σ`）为 `PRUNE_CANDIDATE`；`K0` = **`YELLOW_B_BLOCK_ATTN_CALIB`**（`6.05×` 小 KV 下 `100.0%` EM 保持率，`+0.6228`-nat 差距）；TF `5.24.1` **`4/4 PASS`**（`217.6s`：`ENV`、`QL60-001`、`QL60-002` `d = 1, 2, 3`、`QL60-005` `13/13`）。 |
+| **S2.2 参数量匹配 `d=1` LoRA 对照（冲刺 2B）** | **待执行 —— 门控 #1** | `~18` GPU-h | `A2` | 在 `[12, 36)` 上以相同哈希切分 `s1` 数据与调度训练 `~18.41M` `d=1`（`40L`）LoRA 基线（`src/qloop/model/d1_lora.py`、`configs/stages/s2_2_d1_lora_control.yaml`）。**决定性门控（#1）：** 循环 `d >= 2` 须在无泄漏留出与未见 OOD 上打平或超越 `d=1` LoRA 方可解冻 `s4_v2_rl`。 |
 
 ### 6.3 明确的放行 / 终止解冻判据（当前门控状态）
 
-- **解冻 `s4_v2_rl`（SI-RSI GRPO）：** 须满足冲刺 1（`100%` **PASS**）、S2.1 `8K–128K`（**PASS**；`512K/1M` 待补），**以及冲刺 2B `S2.2` `d=1` LoRA 对照（待执行）**。由于 `s2_v2@600` 在未见 OOD 上 `d=1`（`1.69971`）略优于 `d=3`（`1.70122`），`S2.2` 具备严格一票否决效力：若循环 `d >= 2` 未跑赢等参 `d=1` LoRA，则继续暂停 RL，转而迭代低锚点循环训练课程（`McLeish et al.` [14]）或交付裁撤了 `QED` 与 `neg_eigval` 的洁净 `d=1` 长上下文 `GDN-2 + D-LSA` 主干。
+- **解冻 `s4_v2_rl`（SI-RSI GRPO）：** 冲刺 1（`100%` **PASS**）、S2.1 `4K–1M`（**PASS**）、S2.3（**PASS**）与真机 TF `5.24.1` `4/4`（**PASS**）均已闭环；仅待**冲刺 2B `S2.2` `d=1` LoRA 对照（待执行 —— 门控 #1）**。由于 `s2_v2@600` 在未见 OOD 上 `d=1`（`1.69971`）略优于 `d=3`（`1.70122`），`S2.2` 具备严格一票否决效力：若循环 `d >= 2` 未跑赢等参 `d=1` LoRA，则继续暂停 RL，转而迭代低锚点循环训练课程（`McLeish et al.` [14]）或交付裁撤了 `QED` 与 `neg_eigval` 的洁净 `d=1` 长上下文 `GDN-2 + D-LSA` 主干。
 - **解冻 `LSA-NL` / `CoMem`（`C2–C6`）训练：** 须满足全部 `s4_v2_rl` 前置条件**外加**通过轻量 `2–4h` 单卡块注意力 APOLLO [7] 标定（仅调 `D-LSA` 索引器与全局 `q/k/v/o` 适配器，保持 `32.212B` MoE 100% 冻结）将 `K0` 从 `YELLOW_B_BLOCK_ATTN_CALIB`（`+0.6228`-nat NLL 差距）提升至 `GREEN`（`<= 0.050`-nat）。
-- **解冻公开完整模型包发布：** 须通过上述全部门控、完成真机 `transformers 5.24.1` `.generate()` `4/4 PASS` 复验（`QL60-001`、`QL60-002`、`QL60-005`）、补齐生成式基准（`AIME`/`GPQA`/`ARC-AGI-2`），并确保 **100% 剔除 `opus46_*` 受限溯源数据集**（`§5`）。
+- **解冻公开完整模型包发布：** 真机 `transformers 5.24.1` `4/4 PASS`（`QL60-001`、`QL60-002`、`QL60-005`）已**闭环**（`e1cf41b`）；须满足 `S2.2`（**门控 #1**）、**下游生成式推理基准（`AIME 2026` / `GPQA Diamond` / `ARC-AGI-2`，门控 #2）**，并确保 **100% 剔除 `opus46_*` 受限溯源数据集**（`§5`）。
 
 ---
 
-## 7. 冲刺 2A Blackwell GPU 实证结果（`S2.1`、`S2.3`、`K0`、真机 `transformers 5.24.1`）
+## 7. 冲刺 2A + GPU 收尾实证结果（`S2.1` `4K–1M`、`S2.3`、`K0`、真机 `transformers 5.24.1` `4/4 PASS`）
 
-本节全部数据均直接在单张 `NVIDIA RTX PRO 6000 Blackwell Server Edition`（`96 GB GDDR7 ECC` [`94.97 GiB` 可用]，`1,597 GB/s`，`sm_120`）上实测采集，环境为 Python `3.13.16`、PyTorch `2.14.1+cu130`、`transformers 5.24.1`，代码基于提交 `a94c163`（原始日志见 `runs/sprint2a/{sprint2_audit_8k_128k.md,kill_gate_k0.md,serving_audit.md}`）。
+本节全部数据均直接在单张 `NVIDIA RTX PRO 6000 Blackwell Server Edition`（`96 GB GDDR7 ECC` [`94.97 GiB` 可用]，`1,597 GB/s`，`sm_120`）上实测采集，环境为 Python `3.13.16`、PyTorch `2.14.1+cu130`、`transformers 5.24.1`（冲刺 2A 基线实测基于 `a94c163`，**冲刺 2A GPU 收尾 `rc=0`** 基于 `e1cf41b`；原始产物见 `runs/sprint2a/{sprint2_audit_8k_128k.md,sprint2_audit_512k_1m.md,kill_gate_k0.md,serving_audit_v2.md,closeout_supervisor.log}`）。
 
 ### 7.1 `s2_v2_joint_bptt@600` 完结态实测记录（`17382c2e166d`）
 
@@ -206,9 +206,9 @@ P_{\text{uniq}}(U) &= P_{\text{dense,uniq}}^{\text{ex-emb}} + (16 \times 8 + 24 
 
 - **核心科学解读：** 三个洁净 v2 阶段在无泄漏留出与未见 OOD 上均以 `> 20σ` 显著跑赢**原版 `Qwen3.6 + YaRN 4×`**（`2× d=1` 非确定性 `max_diff` 稳定落在 `2.36e-4 .. 1.18e-3`）。然而，尽管 `s1@1000`（`+13.2σ`）与 `s3_v2@600`（`+38.4σ`）在未见 OOD 上维持单调 `d=1 → d=3` 提升，`s2_v2@600` 的未见 OOD 最优值出现在 `d=1`（`1.69971`，PPL `5.472`），略优于 `d=3`（`1.70122`，PPL `5.481`，`-4.2σ`）。这直接要求在解冻 `s4_v2_rl` 前必须执行冲刺 2B（`S2.2`）等参 `d=1` LoRA 对照实验。
 
-### 7.3 `8K / 64K / 128K` 长上下文阶梯、多针 RULER 与 `GDN-2` 状态范数（`fp8` KV）
+### 7.3 `8K–1M` 超长上下文阶梯、4 针 RULER 与 `GDN-2` `1M` 状态范数（`fp8` KV）
 
-在 `kv_cache_quant=fp8` 下测试 `8K / 64K / 128K` 稠密与稀疏 NLL、4 针 **RULER** [20] 精确匹配率及 `GDN-2` 递推状态范数（`all_states_bounded=True`，全臂 `0` NaN）：
+在 `kv_cache_quant=fp8` 下分别实测 `8K / 64K / 128K`（冲刺 2A，`sprint2_audit_8k_128k.md`）与 `512K / 1M`（`524,288 / 1,048,576`，冲刺 2A GPU 收尾 `e1cf41b`，`rc=0`，`sprint2_audit_512k_1m.md`，启用几何 `_FP8Slot`、零 FP32 BF16 反量化与 `--skip-dense-above 131072`，峰值显存 **`65.19 GiB` = `66,759 / 97,887 MiB`**，**`0` OOM 告警**，`all_states_bounded=True`，全臂 `0` NaN）：
 
 | 检查点臂（深度） | `8K` 稠密 / 稀疏 NLL | `64K` 稠密 / 稀疏 NLL | `128K` 稠密 / 稀疏 NLL | `128K` 稀疏−稠密差距 | 4 针 RULER（`8K, 64K, 128K`） | `GDN-2` `max_l2`（`8K → 64K → 128K`） |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -217,7 +217,14 @@ P_{\text{uniq}}(U) &= P_{\text{dense,uniq}}^{\text{ex-emb}} + (16 \times 8 + 24 
 | **`s3_v2_long_1m_lsa@600`**（`d=3`） | `0.26157` / `0.28208` | `0.08195` / `0.17592` | `0.04913` / `0.11370` | `+0.06457` | **`4/4, 4/4, 4/4`（`12/12`，`100%`）** | `182.6 → 184.6 → 185.2`（`0` NaN） |
 | **`s2_v2_joint_bptt@600`**（`d=3`） | `0.10123` / `0.10728` | `0.01362` / `0.01557` | **`0.00746` / `0.00796`** | **`+0.00050`**（**收紧 `129×`**） | **`4/4, 4/4, 4/4`（`12/12`，`100%`）** | **`186.2 → 191.4 → 191.0`**（`0` NaN） |
 
-- **长上下文突破：** `s2_v2_joint_bptt@600` 将 `128K` 稠密 NLL 降至原版 `Qwen3.6 + YaRN 4×` 的 **`1/13.4`**（`0.00746` vs `0.10026`），将 `128K` 稀疏−稠密 `D-LSA` [6] 差距较 `s3_v2@600` 收紧 **`129×`**（`+0.00050` vs `+0.06457`），实现 **`12/12 (100%)`** 多针 RULER [20] 命中（原版仅 `2/12`，`s1` 于 `128K` 坍塌至 `0/4`），同时 `GDN-2` 递推状态范数保持平坦有界（`186.2 → 191.4 → 191.0`，`0` NaN）。
+| 检查点臂（深度，`512K / 1M` 收尾） | `512K` NLL 与 `lsa/last_recall` | `512K` RULER EM（`ans_nll`）与耗时 | `1M`（`1,048,576`）NLL 与 `lsa/last_recall` | `1M` RULER EM（`ans_nll`）与耗时 | `GDN-2` `max_l2` / `max_abs`（`512K → 1M`） | `8K–1M` RULER 累计 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **原版 `Qwen3.6 + YaRN 4×`**（`d=1`，稠密） | `0.02454`（稠密）· `N/A` | `3/4 (75.0%)`（`0.1827`）· `619.7s` | `0.01429`（稠密）· `N/A` | `4/4 (100.0%)`（`0.2022`）· `2,231.3s` | `184.65 / 26.70 → 185.42 / 27.39`（`0` NaN） | **`9/20 (45.0%)`** |
+| **`s3_v2_long_1m_lsa@600`**（`d=3`，稀疏 `D-LSA`） | `0.03970`（稀疏）· `0.0534` | **`4/4 (100.0%)`**（`0.2473`）· `558.3s` | `0.02048`（稀疏）· `0.0333` | **`4/4 (100.0%)`**（`0.1925`）· `1,557.9s` | `184.59 / 26.60 → 185.35 / 27.36`（`0` NaN） | **`20/20 (100.0%)`** |
+| **`s2_v2_joint_bptt@600`**（`d=3`，`GDN-2` + 稀疏 `D-LSA`） | **`0.00232`**（稀疏）· `0.0627` | **`4/4 (100.0%)`**（`0.3088`）· `628.3s` | **`0.00120`**（稀疏）· `0.0317` | **`4/4 (100.0%)`**（`0.3233`）· **`1,688.8s`** | **`191.38 / 27.23 → 191.21 / 27.74`**（`0` NaN） | **`20/20 (100.0%)`** |
+
+- **超长上下文 `512K / 1M` 收尾突破（`e1cf41b`，`rc=0`，`7,513.0s`）：** 以几何预分配 `_FP8Slot`、零 FP32 BF16 反量化与 `--skip-dense-above 131072`（`7346f77`）取代动态拼接后，`1M` 峰值显存直降 `29.24 GiB`（`94.43 → 65.19 GiB` [`66,759 / 97,887 MiB`]，**`0` OOM 告警**）。贯穿 `8K–1M`，`s2_v2_joint_bptt@600` 取得 **`20/20 (100.0%)`** 4 针 RULER [20] 满贯（与 `s3_v2@600` 并列 `20/20`，远超原版 `9/20 = 45.0%` 及在 `128K` 坍塌至 `0/4` 的 `s1`），将 `128K` 稠密 NLL 压至较原版低 **`13.4×`**（`0.00746` vs `0.10026`），将 `1M`（`1,048,576`）稀疏 NLL 压至 **`0.00120`**（较原版 `0.01429` 低 **`11.9×`**、较 `s3_v2` `0.02048` 低 **`17.1×`**），`GDN-2` 递推状态范数直至 `1M` 始终平坦有界（`max_l2 = 191.21`，`max_abs = 27.74`，`0` NaN），且 `1M` 端到端仅耗 **`1,688.8s`** —— 即便运行 `88L`（`d=3`）也比原版稠密 `40L`（`2,231.3s`）反快 **`1.32×`**。
+- **诚实科学边界说明：** 长度阶梯 NLL 随 `~1/T` 下降是因为合成大海捞针探针在 `T` 上重复低熵填充词元；各臂在完全相同的 `seed=42` 序列上做横向对比严格有效，但绝对 `512K / 1M` NLL **不可**等同于自然 `1M` 词元书籍困惑度（PPL）。此外，`D-LSA` [6] 各臂在 `512K / 1M` 主动跳过稠密前向（`--skip-dense-above 131072`），故精确 `sparse−dense` NLL 差距的实测边界为 `128K`（`s2_v2@600` 仅 `+0.00050` nats，较 `s3_v2@600` 的 `+0.06457` 收紧 `129×`）。
 
 ### 7.4 `S2.3` 零训练因果消融矩阵（`s2_v2@600`，`d=3`，SHA-256 逐臂复原校验）
 
@@ -246,18 +253,16 @@ P_{\text{uniq}}(U) &= P_{\text{dense,uniq}}^{\text{ex-emb}} + (16 \times 8 + 24 
 
 - **裁决 —— `YELLOW_B_BLOCK_ATTN_CALIB`：** 在 `d=3` 下，Arm (c) 以 **`6.05×` 更小 KV 体积**（`7.16 MB` vs `43.32 MB`）达成 **`100.0%` EM 保持率**（`0.350` vs `0.350`）与近乎无损词元准确率（`0.821` vs `0.827`），将 `temporal_update` 从 `73.8% → 95.7%` 并优于朴素拼接 `-0.1001` nats（`d=1` 下 Arm (c) 获 `87.5%` EM 保持率、`0.827` vs `0.839` 词元准确率、`+0.6010` NLL 差、`temporal_update 73.8% → 100.0%`）。未达 `GREEN` 的唯一原因在于冻结投影下的跨会话动态误差 NLL 差距（`+0.6228` nats；`5%` CacheBlend `+0.6120`），支持在任意 `LSA-NL` 训练前先执行 `2–4h` 轻量单卡块注意力 APOLLO [7] 标定。
 
-### 7.6 真机 `transformers 5.24.1` 推理服务审计（`a94c163`）与明确剩余开放缺口
+### 7.6 真机 `transformers 5.24.1` 推理与导出审计（`e1cf41b`，`4/4 PASS`）与剩余 2 项开放缺口
 
-- **真机 `transformers 5.24.1` 审计（`runs/sprint2a/serving_audit.md`，`2026-11-26T07:53:38Z`，`3/4 PASS`）：**
-  - `ENV:strict_tf5`：**PASS**（实测 `transformers 5.24.1`）。
-  - `QL60-001:quantized_hybrid_cache`：**真机 PASS** —— 在真实 `transformers 5.24.1` `CacheLayerMixin` 下验证 `88` 虚拟层，在 `d=1` 与 `d=3` 上对 `bf16`（`143,360 B`）、`fp8`（`72,240 B`，`0.5039×`；单元缓存契约 `3,168 / 6,144 B = 0.5156×`）及 `hadamard_int4`（`38,080 B`，`0.2656×`）实现精确 **`1.00×` KV**，且 `kv_share=False` 为精确 `2.00×`。
-  - `QL60-005:stage_completion_gate`：**真机 PASS（`13/13`）** —— `_local_stage_done()` 全部接受/拒绝用例通过。
-  - `QL60-002:pack_model_and_generate`：已通过 `ModelOutput` 与 `d=1` 包内 `logits_to_keep=0/1` 校验，随后在 `past_key_values=qcache` 路径 `.generate()` 抛出 `ValueError: The following model_kwargs are not used by the model: ['cache']`（精准定位 `transformers 5.24.1` 校验器要求 `forward()` 签名显式声明 `cache: Any = None`，故 `d=2, 3` 与独立打包检查待 `4/4 PASS` 复验），当前正在并行闭环。
-- **明确剩余开放缺口（零虚假宣称）：**
-  1. **`QL60-002` `cache: Any = None` 复验：** 并行签名修复合入后重跑 `scripts/verify_tf524_serving_gpu.py` 以取得 `4/4 PASS`。
-  2. **`512K / 1M` 长上下文阶梯补齐（`B3`）：** 阶段 4 触达 `5.5h` 安全上限并伴随 `94.43 GiB` 峰值（`96,697 / 97,887 MiB`；OOM 告警时 `93.15 GiB` / `95,381 MiB`）PyTorch CUDA 分配器碎片化（`expandable_segments` OOM 告警）；需单独安排分配器清理后的 `512K / 1M` 评测后再将能力宣称延伸至 `128K` 以上。
-  3. **冲刺 2B（`S2.2`）`~18.41M` 参数量匹配 `d=1` LoRA 对照（`A2`）：** `src/qloop/model/d1_lora.py` + `configs/stages/s2_2_d1_lora_control.yaml` 已合入并经 CPU 验证（`63d8b00`），待执行 `~18` GPU-h 训练——这是解冻 `s4_v2_rl` 或 `LSA-NL` 前的**决定性检验**。
-  4. **生成式推理基准：** `AIME 2026`、`GPQA` 与 `ARC-AGI-2` 端到端生成式评测须待 `S2.2` 通过并解冻 `s4_v2_rl` 后执行。
+- **真机 `transformers 5.24.1` 审计（`runs/sprint2a/serving_audit_v2.md`，`2026-11-26T18:38:45Z`，`e1cf41b40564` 耗时 `217.6s`，包格式 `3.1`，**`4/4 PASS`**）：**
+  - `ENV:strict_tf5`：**PASS**（实测 `transformers 5.24.1`、`PyTorch 2.14.1+cu130`、`Python 3.13.16`、`NVIDIA RTX PRO 6000 Blackwell Server Edition`）。
+  - `QL60-001:quantized_hybrid_cache`：**真机 PASS（`47.60s`）** —— 在真实 `transformers 5.24.1` `CacheLayerMixin` 下验证 `88` 虚拟层，在 `d=1` 与 `d=3` 上对 `bf16`（`143,360 B`）、`fp8`（`72,240 B`，`0.5039×`；单元缓存契约 `3,168 / 6,144 B = 0.5156×`）及 `hadamard_int4`（`38,080 B`，`0.2656×`）实现精确 **`1.00×` KV**，且 `kv_share=False` 为精确 `2.00×`。
+  - `QL60-002:pack_model_and_generate`：**真机 PASS（`19.01s`）** —— 包内与独立 `Qwen36LoopHSSDForCausalLM` 均通过跨 `d = 1, 2, 3`（`40L / 64L / 88L`）逐词元 `.generate(max_new_tokens=8)` 一致性校验，`logits_to_keep=0` 输出形状 `[1, 16, 248320]`，`Argmax Match = True`，`Repeat Diff = 1.16–1.79`（`1.79 / 1.16 / 1.53`）对比 `Max Diff = 1.25–2.28`（`2.28 / 1.36 / 1.25`）。
+  - `QL60-005:stage_completion_gate`：**真机 PASS（`13/13`，`0.002s`）** —— `_local_stage_done()` 全部接受/拒绝用例通过。
+- **明确剩余开放缺口（现仅余 2 项核心门控；零虚假宣称）：**
+  1. **冲刺 2B（`S2.2` / `A2`）`~18.41M` 参数量匹配 `d=1` LoRA 对照：** `src/qloop/model/d1_lora.py` + `configs/stages/s2_2_d1_lora_control.yaml` 已合入并经 CPU 验证（`63d8b00`），待执行 `~18` GPU-h 训练——这是解冻 `s4_v2_rl` 或 `LSA-NL` 前的**决定性检验**。
+  2. **下游生成式推理基准：** `AIME 2026`、`GPQA Diamond` 与 `ARC-AGI-2` 端到端生成式评测须待 `S2.2` 通过并解冻 `s4_v2_rl` 后执行。*（另行说明：后续 `LSA-NL`/`CoMem` 训练扩张亦须通过 `2–4h` 块注意力标定将 `K0` 从 `YELLOW_B_BLOCK_ATTN_CALIB` 升至 `GREEN`，见 `§7.5`。）*
 
 ---
 

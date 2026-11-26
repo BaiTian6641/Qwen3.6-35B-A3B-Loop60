@@ -166,9 +166,13 @@ def pooled_sample_std(std_a: float, n_a: int, std_b: float, n_b: int) -> float:
 
 def compute_z_and_3sigma(delta: float, pooled_std: float) -> tuple[float, bool]:
     """Compute `z_score = delta / max(pooled_std, 1e-9)` and `exceeds_3sigma` gate."""
-    denom = max(float(pooled_std), 1e-9)
-    z_score = float(delta) / denom
-    exceeds = bool(abs(float(delta)) > 3.0 * float(pooled_std) and float(delta) > 0.0)
+    d = float(delta)
+    s = float(pooled_std)
+    if not (math.isfinite(d) and math.isfinite(s)):
+        return float("nan"), False
+    denom = max(s, 1e-9)
+    z_score = d / denom
+    exceeds = bool(math.isfinite(z_score) and z_score > 3.0)
     return z_score, exceeds
 
 
@@ -650,6 +654,8 @@ def build_holdout_eval_batches(
     eff_eval = int(holdout_eval_buckets if holdout_eval_buckets is not None else raw.get("holdout_eval_buckets", 2))
     raw["holdout_mod"] = eff_mod
     raw["holdout_eval_buckets"] = eff_eval
+    # Eval-only holdout streams must never trigger training-side decontamination downloads/filtering.
+    raw["decontaminate"] = {"enabled": False}
 
     norm_sources: list[Any] = []
     for src in list(raw.get("sources") or []):
@@ -1405,21 +1411,89 @@ def compare_arms_against_baseline(
 # ==============================================================================
 
 
+_LINEAR_LAYER_META_ATTRS: tuple[str, ...] = (
+    "has_previous_state",
+    "is_conv_states_initialized",
+    "is_recurrent_states_initialized",
+    "conv_kernel_size",
+    "batch_size",
+)
+
+
+def _clone_state_value(val: Any, _memo: dict[int, Any] | None = None) -> Any:
+    """Recursively clone cached linear-attention state tensors/metadata with cycle protection."""
+    if val is None or isinstance(val, (bool, int, float, str)):
+        return val
+    if isinstance(val, torch.Tensor):
+        return val.detach().clone()
+    memo: dict[int, Any] = {} if _memo is None else _memo
+    vid = id(val)
+    if vid in memo:
+        return memo[vid]
+    if isinstance(val, list):
+        out_l: list[Any] = []
+        memo[vid] = out_l
+        out_l.extend(_clone_state_value(x, memo) for x in val)
+        return out_l
+    if isinstance(val, tuple):
+        out_t = tuple(_clone_state_value(x, memo) for x in val)
+        memo[vid] = out_t
+        return out_t
+    if isinstance(val, dict):
+        out_d: dict[Any, Any] = {}
+        memo[vid] = out_d
+        for k, v in val.items():
+            out_d[k] = _clone_state_value(v, memo)
+        return out_d
+    if hasattr(val, "__len__") and hasattr(val, "__getitem__") and not isinstance(val, (bytes, bytearray)):
+        out_seq: list[Any] = []
+        memo[vid] = out_seq
+        try:
+            for idx in range(len(val)):
+                out_seq.append(_clone_state_value(val[idx], memo))
+            return out_seq
+        except Exception:
+            pass
+    if callable(getattr(val, "clone", None)):
+        try:
+            cloned = val.clone()
+            memo[vid] = cloned
+            return cloned
+        except Exception:
+            pass
+    return val
+
+
+def _is_writable_top_level_list(cache: Any, attr: str) -> bool:
+    """Return True iff `cache.<attr>` is a direct writable `list` (NOT a read-only `@property` view)."""
+    if isinstance(getattr(type(cache), attr, None), property):
+        return False
+    return isinstance(getattr(cache, attr, None), list)
+
+
 def _iter_recurrent_state_tensors(cache: Any) -> list[tuple[int, torch.Tensor]]:
     """Extract deduplicated `(slot_idx, tensor)` pairs from `cache.recurrent_states` or `cache.layers[i]`."""
     if cache is None:
         return []
     found: list[tuple[int, torch.Tensor]] = []
-    seen_ids: set[int] = set()
+    seen_tensor_ids: set[int] = set()
+    seen_container_ids: set[int] = set()
 
     def _collect(slot: int, obj: Any) -> None:
         if obj is None:
             return
         if isinstance(obj, torch.Tensor):
-            if id(obj) not in seen_ids and obj.numel() > 0:
-                seen_ids.add(id(obj))
+            if id(obj) not in seen_tensor_ids and obj.numel() > 0:
+                seen_tensor_ids.add(id(obj))
                 found.append((slot, obj))
-        elif isinstance(obj, Mapping):
+            return
+        if isinstance(obj, (str, bytes, bytearray, int, float, bool)):
+            return
+        cid = id(obj)
+        if cid in seen_container_ids:
+            return
+        seen_container_ids.add(cid)
+        if isinstance(obj, Mapping):
             for v in obj.values():
                 _collect(slot, v)
         elif isinstance(obj, (list, tuple)):
@@ -1520,8 +1594,8 @@ def inspect_gdn2_recurrent_state_norms(cache: Any) -> GDN2StateNormTelemetry:
 
 
 def _init_streaming_cache(model: nn.Module, kv_cache_quant: str) -> Any:
-    """Create a `QuantizedHybridCache` when requested (`fp8`/`hadamard_int4`), else `None` (native)."""
-    if kv_cache_quant in ("native", "bf16", "fp16", "fp32", ""):
+    """Create a `QuantizedHybridCache` for `bf16`/`fp8`/`hadamard_int4`, else `None` (native)."""
+    if kv_cache_quant in ("native", "fp16", "fp32", ""):
         return None
     from qloop.infer.engine import QuantizedHybridCache
 
@@ -1545,39 +1619,132 @@ def _init_streaming_cache(model: nn.Module, kv_cache_quant: str) -> Any:
     return QuantizedHybridCache(num_layers=num_layers, layer_types=layer_types, mode=kv_cache_quant)
 
 
+def _snapshot_state_slot(val: Any) -> tuple[str, Any] | None:
+    if val is None:
+        return None
+    if isinstance(val, torch.Tensor):
+        return ("tensor", val.detach().clone())
+    if isinstance(val, dict):
+        return ("dict", {k: _clone_state_value(v) for k, v in val.items()})
+    if isinstance(val, list):
+        return ("list", [_clone_state_value(x) for x in val])
+    if hasattr(val, "__len__") and hasattr(val, "__getitem__") and not isinstance(val, (str, bytes, bytearray)):
+        try:
+            return ("seq", [_clone_state_value(val[j]) for j in range(len(val))])
+        except Exception:
+            return None
+    return None
+
+
+def _restore_state_slot(lyr: Any, attr: str, saved: tuple[str, Any]) -> None:
+    """Restore `lyr.<attr>` in-place for read-only `@property` proxies, falling back to guarded `setattr`."""
+    kind, data = saved
+    existing = getattr(lyr, attr, None)
+    if kind == "tensor":
+        assert isinstance(data, torch.Tensor)
+        if (
+            isinstance(existing, torch.Tensor)
+            and existing.shape == data.shape
+            and existing.dtype == data.dtype
+            and existing.device == data.device
+        ):
+            existing.copy_(data)
+            return
+        try:
+            setattr(lyr, attr, data.clone())
+        except (AttributeError, TypeError):
+            pass
+        return
+
+    if kind == "dict":
+        assert isinstance(data, dict)
+        if isinstance(existing, dict):
+            existing.clear()
+            for k, v in data.items():
+                existing[k] = _clone_state_value(v)
+            return
+        try:
+            setattr(lyr, attr, {k: _clone_state_value(v) for k, v in data.items()})
+        except (AttributeError, TypeError):
+            pass
+        return
+
+    # kind in ("list", "seq")
+    items = list(data)
+    if existing is not None and hasattr(existing, "__setitem__"):
+        if isinstance(existing, list):
+            existing[:] = [_clone_state_value(v) for v in items]
+            return
+        ok = True
+        for j, v in enumerate(items):
+            cloned_v = _clone_state_value(v)
+            try:
+                existing[j] = cloned_v
+            except (AttributeError, IndexError, TypeError):
+                try:
+                    cur_slot = existing[j] if j < len(existing) else None
+                    if (
+                        isinstance(cur_slot, torch.Tensor)
+                        and isinstance(cloned_v, torch.Tensor)
+                        and cur_slot.shape == cloned_v.shape
+                        and cur_slot.dtype == cloned_v.dtype
+                        and cur_slot.device == cloned_v.device
+                    ):
+                        cur_slot.copy_(cloned_v)
+                    else:
+                        ok = False
+                        break
+                except (AttributeError, IndexError, TypeError):
+                    ok = False
+                    break
+        if ok:
+            return
+    try:
+        setattr(lyr, attr, [_clone_state_value(v) for v in items])
+    except (AttributeError, TypeError):
+        pass
+
+
 def _snapshot_linear_states(cache: Any) -> dict[str, Any]:
-    """Save compact clones of `conv_states` & `recurrent_states` (`O(1)` w.r.t. sequence length)."""
+    """Save compact clones of `conv_states`, `recurrent_states`, and TF 5.24 `LinearAttentionLayer` metadata."""
     snap: dict[str, Any] = {"direct_conv": None, "direct_rec": None, "layer_states": []}
     if cache is None:
         return snap
-    cs = getattr(cache, "conv_states", None)
-    if isinstance(cs, list):
-        snap["direct_conv"] = [t.detach().clone() if isinstance(t, torch.Tensor) else None for t in cs]
-    rs = getattr(cache, "recurrent_states", None)
-    if isinstance(rs, list):
-        snap["direct_rec"] = [t.detach().clone() if isinstance(t, torch.Tensor) else None for t in rs]
+    # Only snapshot top-level lists when they are direct writable backing lists (NOT read-only `@property` views).
+    if _is_writable_top_level_list(cache, "conv_states"):
+        snap["direct_conv"] = [_clone_state_value(x) for x in cache.conv_states]
+    if _is_writable_top_level_list(cache, "recurrent_states"):
+        snap["direct_rec"] = [_clone_state_value(x) for x in cache.recurrent_states]
     layers = getattr(cache, "layers", None)
     if isinstance(layers, (list, tuple, nn.ModuleList)) and snap["direct_conv"] is None and snap["direct_rec"] is None:
         for idx, lyr in enumerate(layers):
-            l_cs = getattr(lyr, "conv_states", None)
-            l_rs = getattr(lyr, "recurrent_states", None)
-            c_copy = None
-            r_copy = None
-            if isinstance(l_cs, torch.Tensor):
-                c_copy = l_cs.detach().clone()
-            elif isinstance(l_cs, list):
-                c_copy = [t.detach().clone() if isinstance(t, torch.Tensor) else None for t in l_cs]
-            if isinstance(l_rs, torch.Tensor):
-                r_copy = l_rs.detach().clone()
-            elif isinstance(l_rs, list):
-                r_copy = [t.detach().clone() if isinstance(t, torch.Tensor) else None for t in l_rs]
-            if c_copy is not None or r_copy is not None:
-                snap["layer_states"].append((idx, c_copy, r_copy))
+            c_snap = _snapshot_state_slot(getattr(lyr, "conv_states", None))
+            r_snap = _snapshot_state_slot(getattr(lyr, "recurrent_states", None))
+            meta_snap: dict[str, Any] = {}
+            is_lin_layer = (
+                c_snap is not None
+                or r_snap is not None
+                or hasattr(lyr, "conv_states")
+                or hasattr(lyr, "recurrent_states")
+            )
+            if is_lin_layer:
+                for m_attr in _LINEAR_LAYER_META_ATTRS:
+                    if not hasattr(lyr, m_attr):
+                        continue
+                    # Skip non-dict read-only properties (e.g. `_QuantizedCacheLayer.has_previous_state`)
+                    if isinstance(getattr(type(lyr), m_attr, None), property):
+                        m_val = getattr(lyr, m_attr, None)
+                        if isinstance(m_val, dict):
+                            meta_snap[m_attr] = _clone_state_value(m_val)
+                        continue
+                    meta_snap[m_attr] = _clone_state_value(getattr(lyr, m_attr, None))
+            if c_snap is not None or r_snap is not None or meta_snap:
+                snap["layer_states"].append((idx, c_snap, r_snap, meta_snap))
     return snap
 
 
 def _restore_and_crop_cache(cache: Any, prompt_len: int, linear_snap: Mapping[str, Any]) -> bool:
-    """Crop KV cache back to `prompt_len` and restore linear conv/recurrent state snapshots."""
+    """Crop KV cache back to `prompt_len` and restore linear conv/recurrent state snapshots + TF 5.24 metadata."""
     if cache is None:
         return False
     cropped = False
@@ -1610,38 +1777,45 @@ def _restore_and_crop_cache(cache: Any, prompt_len: int, linear_snap: Mapping[st
                     else:
                         k_t = getattr(lyr, "keys", None)
                         v_t = getattr(lyr, "values", None)
-                        if isinstance(k_t, torch.Tensor) and k_t.shape[-2] > prompt_len:
-                            lyr.keys = k_t[..., :prompt_len, :]
+                        if isinstance(k_t, torch.Tensor) and k_t.shape[-2] >= prompt_len:
+                            if k_t.shape[-2] > prompt_len:
+                                lyr.keys = k_t[..., :prompt_len, :]
                             any_c = True
-                        if isinstance(v_t, torch.Tensor) and v_t.shape[-2] > prompt_len:
-                            lyr.values = v_t[..., :prompt_len, :]
+                        if isinstance(v_t, torch.Tensor) and v_t.shape[-2] >= prompt_len:
+                            if v_t.shape[-2] > prompt_len:
+                                lyr.values = v_t[..., :prompt_len, :]
                             any_c = True
                 cropped = any_c
 
-    if linear_snap.get("direct_conv") is not None and isinstance(getattr(cache, "conv_states", None), list):
+    if linear_snap.get("direct_conv") is not None and _is_writable_top_level_list(cache, "conv_states"):
         for i, val in enumerate(linear_snap["direct_conv"]):
             if i < len(cache.conv_states):
-                cache.conv_states[i] = val.clone() if isinstance(val, torch.Tensor) else None
-    if linear_snap.get("direct_rec") is not None and isinstance(getattr(cache, "recurrent_states", None), list):
+                cache.conv_states[i] = _clone_state_value(val)
+    if linear_snap.get("direct_rec") is not None and _is_writable_top_level_list(cache, "recurrent_states"):
         for i, val in enumerate(linear_snap["direct_rec"]):
             if i < len(cache.recurrent_states):
-                cache.recurrent_states[i] = val.clone() if isinstance(val, torch.Tensor) else None
-    for idx, c_copy, r_copy in linear_snap.get("layer_states", ()):
-        layers = getattr(cache, "layers", None)
-        if isinstance(layers, (list, tuple, nn.ModuleList)) and 0 <= idx < len(layers):
+                cache.recurrent_states[i] = _clone_state_value(val)
+    layers = getattr(cache, "layers", None)
+    if isinstance(layers, (list, tuple, nn.ModuleList)):
+        for entry in linear_snap.get("layer_states", ()):
+            idx, c_snap, r_snap, meta_snap = entry
+            if not (0 <= idx < len(layers)):
+                continue
             lyr = layers[idx]
-            if c_copy is not None:
-                lyr.conv_states = (
-                    c_copy.clone()
-                    if isinstance(c_copy, torch.Tensor)
-                    else [t.clone() if isinstance(t, torch.Tensor) else None for t in c_copy]
-                )
-            if r_copy is not None:
-                lyr.recurrent_states = (
-                    r_copy.clone()
-                    if isinstance(r_copy, torch.Tensor)
-                    else [t.clone() if isinstance(t, torch.Tensor) else None for t in r_copy]
-                )
+            if c_snap is not None:
+                _restore_state_slot(lyr, "conv_states", c_snap)
+            if r_snap is not None:
+                _restore_state_slot(lyr, "recurrent_states", r_snap)
+            for m_attr, m_val in meta_snap.items():
+                cur_m = getattr(lyr, m_attr, None)
+                if isinstance(cur_m, dict) and isinstance(m_val, dict):
+                    cur_m.clear()
+                    cur_m.update(_clone_state_value(m_val))
+                else:
+                    try:
+                        setattr(lyr, m_attr, _clone_state_value(m_val))
+                    except (AttributeError, TypeError):
+                        pass
     return cropped
 
 
@@ -2565,6 +2739,22 @@ def ablate_low_anchor_probe(
                 br.mix_logits.copy_(orig)
 
 
+def _discover_lsa_manager(
+    model: nn.Module,
+    lsa: LSAManager | None = None,
+    indexers: Mapping[int, LSAIndexer] | None = None,
+) -> LSAManager | None:
+    if lsa is not None:
+        return lsa
+    ix_map = indexers if indexers is not None else _find_lsa_indexers(model)
+    for ix in ix_map.values():
+        mgr_ref = getattr(ix, "_mgr_ref", None)
+        mgr = mgr_ref() if callable(mgr_ref) else None
+        if isinstance(mgr, LSAManager):
+            return mgr
+    return None
+
+
 @contextlib.contextmanager
 def ablate_lsa_mode(
     model: nn.Module,
@@ -2577,13 +2767,29 @@ def ablate_lsa_mode(
     if mode not in ("dense", "sparse"):
         raise ValueError(f"ablate_lsa_mode expects 'dense' or 'sparse', got {mode!r}")
     indexers = _find_lsa_indexers(model, lsa=lsa)
-    saved_mgr_mode = lsa.cfg.mode if lsa is not None else None
+    mgr = _discover_lsa_manager(model, lsa=lsa, indexers=indexers)
+    saved_mgr_mode = mgr.cfg.mode if mgr is not None else None
     saved_ix_modes = {lid: ix.cfg.mode for lid, ix in indexers.items()}
-    saved_recall = _reset_lsa_recall_counters(lsa) if (sample_recall and mode == "sparse") else {}
+    saved_recall = _reset_lsa_recall_counters(mgr) if (sample_recall and mode == "sparse") else {}
+    saved_ix_recall: dict[int, tuple[int, int, int, float, bool]] = {}
+    if sample_recall and mode == "sparse" and mgr is None:
+        for lid, ix in indexers.items():
+            saved_ix_recall[lid] = (
+                ix.cfg.recall_check_every,
+                ix._recall_checks,
+                ix._last_recall_step,
+                ix.last_recall,
+                ix.recall_ready,
+            )
+            if ix.cfg.recall_check_every <= 0:
+                ix.cfg.recall_check_every = 1
+            ix._recall_checks = 0
+            ix._last_recall_step = -1
+            ix.last_recall = 0.0
 
-    if lsa is not None:
-        lsa.clear_cache()
-        lsa.set_mode(mode)
+    if mgr is not None:
+        mgr.clear_cache()
+        mgr.set_mode(mode)
     else:
         for ix in indexers.values():
             ix._cache.clear()
@@ -2597,14 +2803,26 @@ def ablate_lsa_mode(
     try:
         yield info
     finally:
-        if sample_recall and mode == "sparse" and lsa is not None:
-            rec = lsa.evaluate_recall()
-            info["lsa_last_recall"] = float(rec["mean_recall"])
-            _restore_lsa_recall_counters(lsa, saved_recall)
-        if lsa is not None:
-            lsa.clear_cache()
+        if sample_recall and mode == "sparse":
+            if mgr is not None:
+                rec = mgr.evaluate_recall()
+                info["lsa_last_recall"] = float(rec["mean_recall"])
+                _restore_lsa_recall_counters(mgr, saved_recall)
+            elif saved_ix_recall:
+                measured = [ix.last_recall for ix in indexers.values() if ix._recall_checks > 0]
+                if measured:
+                    info["lsa_last_recall"] = float(sum(measured) / len(measured))
+                for lid, (rc, checks, last_step, last_rec, ready) in saved_ix_recall.items():
+                    ix = indexers[lid]
+                    ix.cfg.recall_check_every = int(rc)
+                    ix._recall_checks = int(checks)
+                    ix._last_recall_step = int(last_step)
+                    ix.last_recall = float(last_rec)
+                    ix.recall_ready = bool(ready)
+        if mgr is not None:
+            mgr.clear_cache()
             if saved_mgr_mode is not None:
-                lsa.cfg.mode = saved_mgr_mode
+                mgr.cfg.mode = saved_mgr_mode
         for lid, orig_m in saved_ix_modes.items():
             indexers[lid].cfg.mode = orig_m
             indexers[lid]._cache.clear()
@@ -3216,21 +3434,29 @@ def run_smoke_cpu(
     )
 
 
+_BASE_ARM_SENTINELS: frozenset[str] = frozenset({"base", "stock", "none"})
+
+
+def _is_yaml_config_suffix(suffix: str) -> bool:
+    s = suffix.strip()
+    if not s:
+        return False
+    low = s.lower()
+    return low.endswith((".yaml", ".yml")) or os.path.isfile(s)
+
+
 def parse_arm_specs(
     arms_raw: Sequence[str] | str | None,
     *,
     default_config: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Parse `--arms` specifications from JSON file, inline JSON, or `name=ckpt[:config]` CLI strings."""
+    """Parse `--arms` specifications from JSON file, inline JSON, or `name=ckpt[@config.yaml]` CLI strings."""
     if not arms_raw:
         if default_config is None:
             return []
         return [{"name": Path(default_config).stem, "config": default_config, "checkpoint": None}]
 
-    if isinstance(arms_raw, str):
-        items: list[str] = [arms_raw]
-    else:
-        items = list(arms_raw)
+    items = [arms_raw] if isinstance(arms_raw, str) else list(arms_raw)
 
     parsed: list[dict[str, Any]] = []
     for raw in items:
@@ -3277,93 +3503,285 @@ def parse_arm_specs(
                     continue
                 if "=" in tok:
                     name, rest = tok.split("=", 1)
-                    if "@" in rest and not os.path.exists(rest):
-                        ckpt_part, cfg_part = rest.split("@", 1)
-                        parsed.append(
-                            {
-                                "name": name.strip(),
-                                "checkpoint": None if ckpt_part.strip() in ("", "base", "none") else ckpt_part.strip(),
-                                "config": cfg_part.strip() or default_config,
-                            }
-                        )
-                    else:
-                        ckpt_val = None if rest.strip() in ("", "base", "none") else rest.strip()
-                        is_base = rest.strip() == "base"
-                        parsed.append(
-                            {
-                                "name": name.strip(),
-                                "checkpoint": ckpt_val,
-                                "config": default_config,
-                                "base_only": is_base,
-                            }
-                        )
+                    rest_s = rest.strip()
+                    ckpt_part = rest_s
+                    cfg_val = default_config
+                    if "@" in rest_s and not os.path.exists(rest_s):
+                        lhs, rhs = rest_s.rsplit("@", 1)
+                        if _is_yaml_config_suffix(rhs):
+                            ckpt_part = lhs.strip()
+                            cfg_val = rhs.strip() or default_config
+                    low_ckpt = ckpt_part.lower()
+                    is_base = low_ckpt in _BASE_ARM_SENTINELS
+                    ckpt_val = None if (not ckpt_part or is_base) else ckpt_part
+                    parsed.append(
+                        {
+                            "name": name.strip(),
+                            "checkpoint": ckpt_val,
+                            "config": cfg_val,
+                            "base_only": is_base,
+                        }
+                    )
                 else:
                     parsed.append({"name": tok, "checkpoint": None, "config": default_config})
     return parsed
 
 
+def _parse_hf_checkpoint_spec(ckpt_str: str) -> tuple[str, str | None] | None:
+    """Parse `hf://owner/repo[@stage]` or `hf://owner/repo/stages/<stage>` into `(repo_id, stage_name)`."""
+    s = ckpt_str.strip()
+    if not s.startswith("hf://"):
+        return None
+    body = s[len("hf://") :].strip("/")
+    stage_name: str | None = None
+    if "@" in body:
+        body, stage_part = body.split("@", 1)
+        stage_name = stage_part.strip() or None
+    parts = [p for p in body.split("/") if p]
+    if len(parts) < 2:
+        raise ValueError(f"invalid HF checkpoint spec {ckpt_str!r}; expected hf://owner/repo[@stage]")
+    repo_id = f"{parts[0]}/{parts[1]}"
+    if stage_name is None and len(parts) >= 4 and parts[2] == "stages":
+        stage_name = parts[3]
+    return repo_id, stage_name
+
+
+def _resolve_step_dir_readonly(ckpt_root: str, step_tag: str | None = None) -> str | None:
+    """Read-only lookup of a `step_*` checkpoint directory inside `ckpt_root` (NEVER creates directories)."""
+    if not os.path.isdir(ckpt_root):
+        return None
+    if step_tag is not None:
+        cands = [step_tag]
+        if step_tag.isdigit():
+            cands.insert(0, f"step_{int(step_tag):07d}")
+            cands.append(f"step_{int(step_tag)}")
+        for cname in cands:
+            cpath = os.path.join(ckpt_root, cname)
+            if os.path.isfile(os.path.join(cpath, "trainable.pt")):
+                return cpath
+        return None
+
+    for ptr_name in ("LATEST", "PROMOTED"):
+        ptr_file = os.path.join(ckpt_root, ptr_name)
+        if os.path.isfile(ptr_file):
+            target = Path(ptr_file).read_text(encoding="utf-8").strip()
+            cand = os.path.join(ckpt_root, target)
+            if os.path.isfile(os.path.join(cand, "trainable.pt")):
+                return cand
+    step_dirs = sorted(
+        d
+        for d in os.listdir(ckpt_root)
+        if d.startswith("step_") and os.path.isfile(os.path.join(ckpt_root, d, "trainable.pt"))
+    )
+    if step_dirs:
+        return os.path.join(ckpt_root, step_dirs[-1])
+    return None
+
+
+def _resolve_local_checkpoint_files(ckpt_str: str) -> tuple[str, str | None, str]:
+    """Resolve `(weights_path, state_json_path, resolved_label)` strictly read-only without mutating dirs."""
+    raw = ckpt_str.strip()
+    step_tag: str | None = None
+    base_path = raw
+    if "@" in raw and not os.path.exists(raw):
+        lhs, rhs = raw.rsplit("@", 1)
+        if os.path.isdir(lhs):
+            base_path = lhs
+            step_tag = rhs.strip() or None
+
+    if os.path.isfile(base_path):
+        sib_state = os.path.join(os.path.dirname(base_path), "state.json")
+        return base_path, (sib_state if os.path.isfile(sib_state) else None), base_path
+
+    if os.path.isdir(base_path):
+        direct_pt = os.path.join(base_path, "trainable.pt")
+        if step_tag is None and os.path.isfile(direct_pt):
+            st_fp = os.path.join(base_path, "state.json")
+            return direct_pt, (st_fp if os.path.isfile(st_fp) else None), base_path
+
+        # Check `<run_dir>/checkpoints/...` first, then `<ckpt_dir>/...` directly (NEVER create dirs!)
+        for search_root in (os.path.join(base_path, "checkpoints"), base_path):
+            step_dir = _resolve_step_dir_readonly(search_root, step_tag=step_tag)
+            if step_dir is not None:
+                st_fp = os.path.join(step_dir, "state.json")
+                return (
+                    os.path.join(step_dir, "trainable.pt"),
+                    (st_fp if os.path.isfile(st_fp) else None),
+                    step_dir,
+                )
+        raise FileNotFoundError(
+            f"no trainable.pt checkpoint found under {ckpt_str!r} "
+            "(read-only lookup; expected trainable.pt, checkpoints/LATEST, or step_* directory)"
+        )
+
+    raise FileNotFoundError(f"checkpoint path not found: {ckpt_str!r}")
+
+
+def _sync_cfg_to_checkpoint_payload(
+    cfg_dict: dict[str, Any],
+    saved_params: Mapping[str, torch.Tensor],
+    smeta: Mapping[str, Any],
+    arm_spec: Mapping[str, Any],
+) -> None:
+    """Align `cfg_dict` stack components (`loop`/`gdn2`/`hssd`/`lsa`/`d1_lora`/`experts`) to checkpoint contents."""
+    keys = list(saved_params.keys())
+    has_hssd = any("hssd_adapter." in k for k in keys)
+    has_gdn2 = any("gdn2_adapter." in k for k in keys)
+    has_lsa = any("lsa_indexer." in k for k in keys)
+    has_loop = any(k.startswith("loop_adapters.") for k in keys) or bool(smeta.get("loop"))
+    has_d1_lora = any("d1_lora." in k for k in keys) or bool(smeta.get("d1_lora"))
+
+    # Fold expert deltas at restore time rather than installing training-only hot-expert hooks
+    if isinstance(cfg_dict.get("experts"), dict):
+        cfg_dict["experts"]["enabled"] = False
+
+    if has_hssd:
+        prior_hssd = dict(smeta.get("hssd") or {})
+        cfg_dict["hssd"] = {**dict(cfg_dict.get("hssd") or {}), **prior_hssd, "enabled": True}
+        cfg_dict["gdn2"] = {"enabled": False}
+    elif has_gdn2:
+        prior_gdn2 = dict(smeta.get("gdn2") or {})
+        gcfg = {**dict(cfg_dict.get("gdn2") or {}), **prior_gdn2}
+        for k, t in saved_params.items():
+            if k.endswith("gdn2_adapter.down.weight") and t.ndim == 2:
+                gcfg["rank"] = int(t.shape[0])
+                break
+        if "qed_enabled" not in prior_gdn2:
+            gcfg["qed_enabled"] = any(k.endswith("gdn2_adapter.qed_lambda_raw") for k in keys)
+        if "neg_eigval_max_boost" not in prior_gdn2 and not any(
+            k.endswith("gdn2_adapter.neg_gamma_raw") for k in keys
+        ):
+            gcfg["neg_eigval_max_boost"] = 0.0
+        gcfg["enabled"] = True
+        cfg_dict["gdn2"] = gcfg
+        cfg_dict["hssd"] = {"enabled": False}
+    else:
+        cfg_dict["gdn2"] = {"enabled": False}
+        cfg_dict["hssd"] = {"enabled": False}
+
+    if has_lsa:
+        prior_lsa = dict(smeta.get("lsa") or {})
+        lcfg = {**dict(cfg_dict.get("lsa") or {}), **prior_lsa}
+        for k, t in saved_params.items():
+            if k.endswith("lsa_indexer.wk") and t.ndim == 3:
+                lcfg.setdefault("index_dim", int(t.shape[-1]))
+                break
+        lcfg["enabled"] = True
+        cfg_dict["lsa"] = lcfg
+    else:
+        cfg_dict["lsa"] = {"enabled": False}
+
+    if has_loop:
+        prior_loop = dict(smeta.get("loop") or {})
+        cfg_dict["loop"] = {**dict(cfg_dict.get("loop") or {}), **prior_loop, "enabled": True}
+    else:
+        cfg_dict["loop"] = {"enabled": False}
+
+    if has_d1_lora:
+        prior_d1 = dict(smeta.get("d1_lora") or {})
+        cfg_dict["d1_lora"] = {**dict(cfg_dict.get("d1_lora") or {}), **prior_d1, "enabled": True}
+    elif isinstance(cfg_dict.get("d1_lora"), dict):
+        cfg_dict["d1_lora"]["enabled"] = False
+
+    # Honor explicit arm_spec component overrides when supplied
+    for flag_k, sec in (
+        ("loop_enabled", "loop"),
+        ("gdn2_enabled", "gdn2"),
+        ("lsa_enabled", "lsa"),
+        ("hssd_enabled", "hssd"),
+        ("d1_lora_enabled", "d1_lora"),
+    ):
+        if flag_k in arm_spec and arm_spec[flag_k] is not None:
+            cfg_dict.setdefault(sec, {})["enabled"] = bool(arm_spec[flag_k])
+
+
 def _load_arm_stack(arm_spec: Mapping[str, Any], *, overrides: Sequence[str] = ()) -> tuple[Any, str | None]:
-    """Instantiate a `qloop.train.stack.Stack` from an arm spec and optionally restore its checkpoint."""
+    """Instantiate a `qloop.train.stack.Stack` from an arm spec, syncing config to checkpoint metadata first."""
     from qloop.config import load_config
-    from qloop.train.checkpoint import CheckpointManager
+    from qloop.hub import load_qloop_from_hub, resolve_run_path
     from qloop.train.stack import build_stack
+
+    arm_overrides = list(overrides) + list(arm_spec.get("overrides") or [])
+    ckpt_spec = arm_spec.get("checkpoint")
+
+    # 1. Direct HF Hub checkpoint (`hf://owner/repo[@stage]` or explicit `hf_repo` key)
+    if arm_spec.get("hf_repo") or (isinstance(ckpt_spec, str) and ckpt_spec.strip().startswith("hf://")):
+        if arm_spec.get("hf_repo"):
+            repo_id = str(arm_spec["hf_repo"])
+            stage_name = arm_spec.get("stage_name")
+            label = f"hf://{repo_id}" + (f"@{stage_name}" if stage_name else "")
+        else:
+            parsed_hf = _parse_hf_checkpoint_spec(str(ckpt_spec))
+            assert parsed_hf is not None
+            repo_id, stage_name = parsed_hf
+            label = str(ckpt_spec).strip()
+        stack = load_qloop_from_hub(
+            repo_id,
+            stage_name=stage_name,
+            overrides=arm_overrides or None,
+            strict=False,
+            api=arm_spec.get("hub_api"),
+        )
+        stack.model.eval()
+        return stack, label
 
     cfg_path = arm_spec.get("config")
     if not cfg_path:
         raise ValueError(f"arm {arm_spec.get('name')!r} requires a YAML `config` path (pass --config or in --arms)")
-    arm_overrides = list(overrides) + list(arm_spec.get("overrides") or [])
     cfg = load_config(str(cfg_path), overrides=arm_overrides)
     cfg_dict = cfg.to_dict()
 
+    # 2. Pure stock base arm (no checkpoint, all retrofits disabled while preserving `model.yarn_target_len`)
     if arm_spec.get("base_only"):
-        for section in ("loop", "gdn2", "lsa", "hssd", "experts"):
+        for section in ("loop", "gdn2", "lsa", "hssd", "d1_lora", "experts"):
             if isinstance(cfg_dict.get(section), dict):
                 cfg_dict[section]["enabled"] = False
-    else:
-        for flag_k, sec in (
-            ("loop_enabled", "loop"),
-            ("gdn2_enabled", "gdn2"),
-            ("lsa_enabled", "lsa"),
-            ("hssd_enabled", "hssd"),
-        ):
-            if flag_k in arm_spec and arm_spec[flag_k] is not None:
-                cfg_dict.setdefault(sec, {})["enabled"] = bool(arm_spec[flag_k])
+        stack = build_stack(cfg_dict)
+        for p in stack.named_trainable.values():
+            p.requires_grad_(False)
+        stack.model.eval()
+        return stack, None
 
-    stack = build_stack(cfg_dict)
-    ckpt_spec = arm_spec.get("checkpoint")
-    resolved_ckpt: str | None = None
+    # 3. Local checkpoint: read `trainable.pt` + `state.json` BEFORE `build_stack` to prevent stage mismatch!
     if ckpt_spec:
-        from qloop.hub import resolve_run_path
+        raw_ckpt = str(ckpt_spec).strip()
+        resolved_candidate = resolve_run_path(raw_ckpt) or raw_ckpt
+        weights_fp, state_fp, resolved_label = _resolve_local_checkpoint_files(resolved_candidate)
+        loaded_obj = torch.load(weights_fp, map_location="cpu")
+        saved_params = (
+            loaded_obj["params"]
+            if isinstance(loaded_obj, dict) and isinstance(loaded_obj.get("params"), dict)
+            else loaded_obj
+        )
+        if not isinstance(saved_params, dict):
+            raise RuntimeError(f"checkpoint {weights_fp!r} did not contain a parameter state dict")
+        smeta: dict[str, Any] = {}
+        if state_fp is not None and os.path.isfile(state_fp):
+            smeta = dict(json.loads(Path(state_fp).read_text(encoding="utf-8")).get("stack") or {})
+        _sync_cfg_to_checkpoint_payload(cfg_dict, saved_params, smeta, arm_spec)
+        stack = build_stack(cfg_dict)
+        sc = float(smeta.get("expert_delta_scale") or 1.0)
+        stack.restore_checkpoint(saved_params, strict=False, expert_delta_scale=sc, prior_stack_meta=smeta)
+        for p in stack.named_trainable.values():
+            p.requires_grad_(False)
+        stack.model.eval()
+        return stack, resolved_label
 
-        ckpt_str = resolve_run_path(str(ckpt_spec)) or str(ckpt_spec)
-        if os.path.isfile(ckpt_str):
-            saved = torch.load(ckpt_str, map_location="cpu")
-            params = saved["params"] if isinstance(saved, dict) and "params" in saved else saved
-            stack.restore_checkpoint(params, strict=False)
-            resolved_ckpt = ckpt_str
-        elif os.path.isdir(ckpt_str):
-            if os.path.isfile(os.path.join(ckpt_str, "trainable.pt")):
-                saved_params = torch.load(os.path.join(ckpt_str, "trainable.pt"), map_location="cpu")
-                smeta: dict[str, Any] = {}
-                state_fp = os.path.join(ckpt_str, "state.json")
-                if os.path.isfile(state_fp):
-                    smeta = (json.loads(Path(state_fp).read_text(encoding="utf-8")).get("stack") or {})
-                sc = float(smeta.get("expert_delta_scale") or 1.0)
-                stack.restore_checkpoint(saved_params, strict=False, expert_delta_scale=sc, prior_stack_meta=smeta)
-                resolved_ckpt = ckpt_str
-            else:
-                ck = CheckpointManager(ckpt_str, keep_last=0).load(map_location="cpu", restore_rng=False)
-                if ck is None:
-                    raise FileNotFoundError(f"no checkpoint found under {ckpt_str!r}")
-                smeta = (ck.get("state") or {}).get("stack") or {}
-                sc = float(smeta.get("expert_delta_scale") or 1.0)
-                stack.restore_checkpoint(ck["params"], strict=False, expert_delta_scale=sc, prior_stack_meta=smeta)
-                resolved_ckpt = str(ck["path"])
-        else:
-            raise FileNotFoundError(f"checkpoint path not found: {ckpt_str!r}")
-
+    # 4. Config-only arm without checkpoint
+    for flag_k, sec in (
+        ("loop_enabled", "loop"),
+        ("gdn2_enabled", "gdn2"),
+        ("lsa_enabled", "lsa"),
+        ("hssd_enabled", "hssd"),
+        ("d1_lora_enabled", "d1_lora"),
+    ):
+        if flag_k in arm_spec and arm_spec[flag_k] is not None:
+            cfg_dict.setdefault(sec, {})["enabled"] = bool(arm_spec[flag_k])
+    stack = build_stack(cfg_dict)
+    for p in stack.named_trainable.values():
+        p.requires_grad_(False)
     stack.model.eval()
-    return stack, resolved_ckpt
+    return stack, None
 
 
 def _parse_int_list(raw: Sequence[str] | str) -> list[int]:
@@ -3377,6 +3795,9 @@ def _parse_int_list(raw: Sequence[str] | str) -> list[int]:
     return out
 
 
+DEFAULT_EVAL_SEQ_LEN_CAP: int = 4096
+
+
 def run_sprint2_audit_from_config(
     *,
     config_path: str,
@@ -3385,6 +3806,8 @@ def run_sprint2_audit_from_config(
     lengths: Sequence[int] = DEFAULT_GPU_LENGTHS,
     repeats: int = 3,
     eval_batches: int = 4,
+    eval_seq_len: int | None = None,
+    verify_train_overlap: bool = True,
     ood_files: Sequence[str | Path] = (),
     chunk_size: int = 4096,
     ce_chunk_size: int = 1024,
@@ -3408,6 +3831,10 @@ def run_sprint2_audit_from_config(
     base_name = baseline_arm or str(arms[0]["name"])
     target_ablation_arm = ablation_arm or str(arms[-1]["name"])
 
+    cfg_data = dict(base_cfg.get("data") or {})
+    cfg_seq_len = int(cfg_data.get("seq_len", DEFAULT_EVAL_SEQ_LEN_CAP))
+    eff_eval_seq_len = int(eval_seq_len) if eval_seq_len is not None else min(cfg_seq_len, DEFAULT_EVAL_SEQ_LEN_CAP)
+
     datasets_meta: dict[str, dict[str, Any]] = {}
     depth_sweeps: dict[str, dict[str, DepthSweepResult]] = {}
     length_ladders: dict[str, LengthLadderResult] = {}
@@ -3422,20 +3849,22 @@ def run_sprint2_audit_from_config(
         try:
             if eval_sets is None:
                 holdout_set = build_holdout_eval_batches(
-                    base_cfg.get("data") or {},
+                    cfg_data,
                     stack.tokenizer,
                     n_batches=int(eval_batches),
                     seed=int(seed),
                     split_role="eval",
+                    seq_len=eff_eval_seq_len,
                     label="holdout",
+                    verify_against_train_split=bool(verify_train_overlap),
+                    train_verify_batches=max(int(eval_batches) * 2, 4),
                 )
                 eval_sets = [holdout_set]
                 if ood_files:
-                    ood_seq_len = int((base_cfg.get("data") or {}).get("seq_len", 4096))
                     ood_set = build_local_file_eval_batches(
                         ood_files,
                         stack.tokenizer,
-                        seq_len=min(ood_seq_len, 8192),
+                        seq_len=eff_eval_seq_len,
                         n_batches=int(eval_batches),
                         label="ood",
                         train_doc_ids=None,
@@ -3453,6 +3882,7 @@ def run_sprint2_audit_from_config(
                     config_payload={
                         "depths": [int(d) for d in depths],
                         "repeats": int(repeats),
+                        "eval_seq_len": eff_eval_seq_len,
                         "dataset": ds.name,
                         "arm": dict(arm_spec),
                     },
@@ -3554,6 +3984,7 @@ def run_sprint2_audit_from_config(
             "config": str(config_path),
             "baseline_arm": base_name,
             "ablation_arm": target_ablation_arm,
+            "eval_seq_len": eff_eval_seq_len,
             "repeats": int(repeats),
             "seed": int(seed),
             "elapsed_s": round(elapsed_s, 3),
@@ -3581,7 +4012,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--arms",
         nargs="+",
         default=None,
-        help="Arm specs as JSON file path, inline JSON, or name=ckpt specs (use name=base for stock baseline).",
+        help="Arm specs as JSON file, inline JSON, or name=ckpt[@config.yaml] (use name=base for stock baseline).",
     )
     ap.add_argument("--baseline-arm", type=str, default=None, help="Arm name to serve as head-to-head baseline.")
     ap.add_argument("--ablation-arm", type=str, default=None, help="Arm name to run S2.3 causal ablations on.")
@@ -3599,6 +4030,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--repeats", type=int, default=3, help="Number of repeats per depth/ablation (A3 default: 3).")
     ap.add_argument("--eval-batches", type=int, default=None, help="Number of leak-free holdout batches.")
+    ap.add_argument(
+        "--eval-seq-len",
+        type=int,
+        default=None,
+        help="Sequence length for holdout/OOD depth-sweep batches (defaults to min(data.seq_len, 4096)).",
+    )
+    ap.add_argument(
+        "--verify-train-overlap",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Sample train split docs and assert zero document overlap against holdout eval batches.",
+    )
     ap.add_argument("--ood-file", action="append", default=[], help="Optional local JSONL/JSON/text OOD file path.")
     ap.add_argument("--chunk-size", type=int, default=4096, help="Streaming prefill chunk size on GPU.")
     ap.add_argument("--ce-chunk-size", type=int, default=1024, help="Token chunk size for chunked CE loss.")
@@ -3606,7 +4049,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--kv-cache-quant",
         type=str,
         default="fp8",
-        choices=("native", "fp8", "hadamard_int4"),
+        choices=("native", "bf16", "fp8", "hadamard_int4"),
         help="KV cache quantization mode for GPU length-ladder streaming.",
     )
     ap.add_argument("--cache-dir", type=str, default=None, help="Optional QL60-010 identity-bound cache directory.")
@@ -3661,6 +4104,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             lengths=lengths,
             repeats=int(args.repeats),
             eval_batches=eval_b,
+            eval_seq_len=args.eval_seq_len,
+            verify_train_overlap=bool(args.verify_train_overlap),
             ood_files=args.ood_file,
             chunk_size=int(args.chunk_size),
             ce_chunk_size=int(args.ce_chunk_size),

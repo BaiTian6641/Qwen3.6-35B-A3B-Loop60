@@ -501,14 +501,13 @@ def test_every_s23_ablation_context_modifies_only_target_and_restores_bit_exact(
 
     # 5) low_anchor_probe shifts w_anchor <= 0.3 while renormalizing on the simplex (preserving w0:w2 ratio)
     br = loop.adapters.bridge
-    orig_w0 = float(br.weights(0)[0])
-    orig_w1 = float(br.weights(0)[1])
-    orig_w2 = float(br.weights(0)[2])
+    orig_w = br.weights(0).detach()
+    orig_w0, orig_w1, orig_w2 = float(orig_w[0]), float(orig_w[1]), float(orig_w[2])
     assert orig_w1 == pytest.approx(0.85, abs=1e-5)
     with ablate_low_anchor_probe(model, loop=loop, max_anchor_weight=0.25) as info:
         assert info["applicable"] is True
         for p_idx in range(br.n_extra_passes):
-            w = br.weights(p_idx)
+            w = br.weights(p_idx).detach()
             assert float(w.sum()) == pytest.approx(1.0, abs=1e-6)
             assert float(w[1]) <= 0.3 and float(w[1]) == pytest.approx(0.25, abs=1e-5)
             assert float(w[0] / w[2]) == pytest.approx(orig_w0 / orig_w2, rel=1e-5)
@@ -796,3 +795,369 @@ def test_run_smoke_cpu_direct_api() -> None:
     # Confirm deterministic JSON serialization succeeds
     parsed = json.loads(rep.to_json())
     assert parsed["schema_version"] == d["schema_version"]
+
+
+# ==============================================================================
+# 6. Audit Blocker Regressions (B1-B5 + Gate 3/4 Hardening)
+# ==============================================================================
+
+
+def test_b1_compute_z_and_3sigma_zero_std_and_nonfinite_guards() -> None:
+    # B1: Tiny fp noise (1e-12, 1e-16) with pooled_std=0.0 MUST NOT falsely pass 3-sigma!
+    z_tiny, ex_tiny = compute_z_and_3sigma(1e-12, 0.0)
+    assert z_tiny == pytest.approx(1e-3)
+    assert ex_tiny is False
+
+    z_eps, ex_eps = compute_z_and_3sigma(1e-16, 0.0)
+    assert z_eps == pytest.approx(1e-7)
+    assert ex_eps is False
+
+    # Boundary at exactly 3.0x denom is False; strictly above 3.0x denom is True
+    z_eq, ex_eq = compute_z_and_3sigma(3e-9, 0.0)
+    assert z_eq == pytest.approx(3.0)
+    assert ex_eq is False
+    z_above, ex_above = compute_z_and_3sigma(1e-5, 0.0)
+    assert z_above > 3.0 and ex_above is True
+
+    # Non-finite inputs never pass
+    z_nan, ex_nan = compute_z_and_3sigma(float("nan"), 0.0)
+    assert math.isnan(z_nan) and ex_nan is False
+    z_inf, ex_inf = compute_z_and_3sigma(float("inf"), 0.0)
+    assert math.isnan(z_inf) and ex_inf is False
+
+
+def test_b2_readonly_property_proxies_tf524_metadata_anslen1_bf16_and_cycles() -> None:
+    from qloop.eval.sprint2_audit import (
+        _init_streaming_cache,
+        _iter_recurrent_state_tensors,
+        _restore_and_crop_cache,
+        _snapshot_linear_states,
+    )
+    from qloop.infer.engine import QuantizedHybridCache
+
+    # 1) Read-only @property top-level list view + read-only @property layer slot proxy + TF 5.24 metadata
+    class _ReadOnlySlotProxy:
+        def __init__(self, backing: list[Any], idx: int) -> None:
+            self._backing = backing
+            self._idx = idx
+
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, i: int) -> Any:
+            if i != 0:
+                raise IndexError(i)
+            return self._backing[self._idx]
+
+        def __setitem__(self, i: int, val: Any) -> None:
+            if i != 0:
+                raise IndexError(i)
+            self._backing[self._idx] = val
+
+    class _StrictTF524LinearLayer:
+        def __init__(self, backing_conv: list[Any], backing_rec: list[Any], idx: int) -> None:
+            self._backing_conv = backing_conv
+            self._backing_rec = backing_rec
+            self._idx = idx
+            self.has_previous_state: dict[int, bool] = {0: True}
+            self.is_conv_states_initialized: bool = True
+            self.is_recurrent_states_initialized: bool = True
+            self.conv_kernel_size: int = 4
+            self.batch_size: int = 1
+
+        @property
+        def conv_states(self) -> _ReadOnlySlotProxy:
+            return _ReadOnlySlotProxy(self._backing_conv, self._idx)
+
+        @property
+        def recurrent_states(self) -> _ReadOnlySlotProxy:
+            return _ReadOnlySlotProxy(self._backing_rec, self._idx)
+
+    class _StrictTF524FullLayer:
+        def __init__(self, seq_len: int) -> None:
+            self.keys = torch.ones((1, 2, seq_len, 8))
+            self.values = torch.ones((1, 2, seq_len, 8))
+
+    class _StrictTF524PropertyCache:
+        def __init__(self, seq_len: int) -> None:
+            self._conv_backing: list[Any] = [torch.full((1, 4, 2), 1.0), None]
+            self._rec_backing: list[Any] = [torch.full((1, 2, 4, 4), 2.0), None]
+            self.layers: list[Any] = [
+                _StrictTF524LinearLayer(self._conv_backing, self._rec_backing, 0),
+                _StrictTF524FullLayer(seq_len),
+            ]
+
+        @property
+        def conv_states(self) -> list[Any]:
+            # Fresh throwaway list view — mutating this directly would silently drop writes!
+            return list(self._conv_backing)
+
+        @property
+        def recurrent_states(self) -> list[Any]:
+            return list(self._rec_backing)
+
+        def crop(self, max_length: int) -> None:
+            # Simulate destructive crop that wipes linear states & metadata flags
+            self.layers[1].keys = self.layers[1].keys[..., :max_length, :]
+            self.layers[1].values = self.layers[1].values[..., :max_length, :]
+            self._conv_backing[0] = torch.full((1, 4, 2), 77.0)
+            self._rec_backing[0] = torch.full((1, 2, 4, 4), 99.0)
+            lin = self.layers[0]
+            lin.has_previous_state[0] = False
+            lin.is_conv_states_initialized = False
+            lin.is_recurrent_states_initialized = False
+            lin.conv_kernel_size = 0
+            lin.batch_size = 0
+
+    strict_cache = _StrictTF524PropertyCache(seq_len=16)
+    snap = _snapshot_linear_states(strict_cache)
+    assert snap["direct_conv"] is None and snap["direct_rec"] is None
+    assert len(snap["layer_states"]) == 1
+
+    # Mutate & crop, then restore -> MUST restore underlying tensors & ALL TF 5.24 metadata without AttributeError!
+    cropped = _restore_and_crop_cache(strict_cache, prompt_len=12, linear_snap=snap)
+    assert cropped is True
+    assert strict_cache.layers[1].keys.shape[-2] == 12
+    assert torch.equal(strict_cache._conv_backing[0], torch.full((1, 4, 2), 1.0))
+    assert torch.equal(strict_cache._rec_backing[0], torch.full((1, 2, 4, 4), 2.0))
+    lin0 = strict_cache.layers[0]
+    assert lin0.has_previous_state == {0: True}
+    assert lin0.is_conv_states_initialized is True
+    assert lin0.is_recurrent_states_initialized is True
+    assert lin0.conv_kernel_size == 4
+    assert lin0.batch_size == 1
+
+    # 2) ans_len == 1 on a no-.crop() layer-only TF 5.24 cache stays cropped=True (no false fallback!)
+    class _NoCropLayerCache:
+        def __init__(self, seq_len: int) -> None:
+            self.layers = [_StrictTF524FullLayer(seq_len)]
+
+    nc_cache = _NoCropLayerCache(seq_len=16)
+    assert _restore_and_crop_cache(nc_cache, prompt_len=16, linear_snap={"layer_states": []}) is True
+
+    # 3) Cyclic self-referential container protection in `_iter_recurrent_state_tensors`
+    class _CyclicProxy:
+        def __init__(self, tensor: torch.Tensor) -> None:
+            self.items: list[Any] = [tensor, self]
+
+        def __len__(self) -> int:
+            return len(self.items)
+
+        def __getitem__(self, idx: int) -> Any:
+            return self.items[idx]
+
+    class _CyclicCache:
+        def __init__(self) -> None:
+            self.recurrent_states = [_CyclicProxy(torch.ones(2, 2))]
+
+    extracted = _iter_recurrent_state_tensors(_CyclicCache())
+    assert len(extracted) == 1
+
+    # 4) `kv_cache_quant="bf16"` instantiates `QuantizedHybridCache(mode="bf16")` cleanly
+    tiny = build_toy(seed=11)
+    bf16_cache = _init_streaming_cache(tiny, "bf16")
+    assert isinstance(bf16_cache, QuantizedHybridCache) and bf16_cache.mode == "bf16"
+    ids = torch.randint(0, 97, (1, 32), generator=torch.Generator().manual_seed(11))
+    nll_bf16, n_tok, out_cache, _, _ = stream_chunked_lm_nll(
+        tiny, ids, ids, chunk_size=16, ce_chunk_size=16, kv_cache_quant="bf16"
+    )
+    assert n_tok == 31 and math.isfinite(nll_bf16)
+    assert isinstance(out_cache, QuantizedHybridCache) and out_cache.mode == "bf16"
+
+
+def test_b3_parse_arm_specs_base_at_yaml_and_step_tags() -> None:
+    # 1) base@<cfg.yaml> MUST preserve base_only=True
+    arms1 = parse_arm_specs(
+        ["stock_qwen36_yarn4x=base@configs/stages/s2_v2_joint_bptt.yaml"],
+        default_config="configs/base.yaml",
+    )
+    assert len(arms1) == 1
+    assert arms1[0]["name"] == "stock_qwen36_yarn4x"
+    assert arms1[0]["base_only"] is True
+    assert arms1[0]["checkpoint"] is None
+    assert arms1[0]["config"] == "configs/stages/s2_v2_joint_bptt.yaml"
+
+    # 2) @600 step tag MUST NOT be misinterpreted as config path!
+    arms2 = parse_arm_specs(
+        ["s2_v2=runs/s2_v2_joint_bptt@600"],
+        default_config="configs/stages/s2_v2_joint_bptt.yaml",
+    )
+    assert arms2[0]["checkpoint"] == "runs/s2_v2_joint_bptt@600"
+    assert arms2[0]["config"] == "configs/stages/s2_v2_joint_bptt.yaml"
+    assert arms2[0]["base_only"] is False
+
+    # 3) hf://owner/repo@stage preserves full HF URI and optional trailing @config.yaml
+    arms3 = parse_arm_specs(
+        [
+            "hub_s2=hf://TassP0lar/Qwen3.6-35B-A3B-Loop64@s2_v2_joint_bptt",
+            "hub_s1=hf://TassP0lar/Qwen3.6-35B-A3B-Loop64@s1_loop_a6b@configs/stages/s1_loop_a6b.yaml",
+        ],
+        default_config="configs/stages/s2_v2_joint_bptt.yaml",
+    )
+    assert arms3[0]["checkpoint"] == "hf://TassP0lar/Qwen3.6-35B-A3B-Loop64@s2_v2_joint_bptt"
+    assert arms3[0]["config"] == "configs/stages/s2_v2_joint_bptt.yaml"
+    assert arms3[1]["checkpoint"] == "hf://TassP0lar/Qwen3.6-35B-A3B-Loop64@s1_loop_a6b"
+    assert arms3[1]["config"] == "configs/stages/s1_loop_a6b.yaml"
+
+
+def test_b4_load_arm_stack_stage_sync_readonly_and_hf_hub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qloop.eval.sprint2_audit import _load_arm_stack
+
+    # Build an S1-only checkpoint (loop ONLY, NO gdn2, NO lsa)
+    s1_cfg: dict[str, Any] = {
+        "model": {
+            "name": "toy",
+            "dtype": "float32",
+            "device_map": "cpu",
+            "toy": {"seed": 9, "num_hidden_layers": 8, "hidden_size": 16, "full_attention_interval": 2,
+                    "num_experts": 4},
+        },
+        "loop": {
+            "enabled": True,
+            "prelude_end": 2,
+            "core_end": 6,
+            "num_passes": 2,
+            "target_virtual_layers": 12,
+            "bridge_init": [0.05, 0.85, 0.10],
+            "bridge_mode": "subspace",
+            "bridge_rank": 4,
+            "per_pass_router": True,
+            "router_adapter_rank": 4,
+        },
+        "gdn2": {"enabled": False},
+        "lsa": {"enabled": False},
+        "train": {"train_loop_adapters": True},
+    }
+    st_s1 = build_stack(s1_cfg)
+    with torch.no_grad():
+        assert st_s1.loop is not None
+        st_s1.loop.adapters.gates.fill_(0.25)
+    ids = torch.randint(0, 64, (1, 24), generator=torch.Generator().manual_seed(9))
+    st_s1.model.eval()
+    with torch.no_grad():
+        s1_ref_logits = st_s1.model(ids, use_cache=False).logits.clone()
+
+    s1_run = tmp_path / "run_s1"
+    s1_step_dir = CheckpointManager(str(s1_run)).save(
+        10, st_s1.checkpoint_params(), None, {"stage": "s1_loop_a6b", "stack": st_s1.describe()}
+    )
+
+    # S2-v2 default config has GDN-2 + sparse D-LSA enabled!
+    s2_cfg = dict(s1_cfg)
+    s2_cfg["gdn2"] = {"enabled": True, "rank": 4, "chunk_size": 16, "qed_enabled": True, "backend": "pytorch"}
+    s2_cfg["lsa"] = {
+        "enabled": True,
+        "mode": "sparse",
+        "index_dim": 4,
+        "block_size": 8,
+        "pool": 2,
+        "avg_bucket_keys": 4,
+        "max_bucket_keys": 8,
+        "window": 8,
+        "sinks": 2,
+        "num_select": 2,
+    }
+    s2_cfg_path = tmp_path / "s2_v2.yaml"
+    s2_cfg_path.write_text(yaml.safe_dump(s2_cfg), encoding="utf-8")
+
+    # 1) Loading S1 checkpoint under S2 config MUST auto-disable GDN-2 and LSA -> bit-exact S1 logits!
+    loaded_s1, resolved_s1 = _load_arm_stack({"name": "s1", "config": str(s2_cfg_path), "checkpoint": str(s1_run)})
+    assert loaded_s1.gdn2 is None and loaded_s1.lsa is None and loaded_s1.loop is not None
+    assert resolved_s1 == s1_step_dir
+    with torch.no_grad():
+        loaded_logits = loaded_s1.model(ids, use_cache=False).logits
+    assert torch.equal(loaded_logits, s1_ref_logits)
+
+    # 2) Direct `.pt` file loads sibling `state.json` AND `<run>/checkpoints` dir resolves read-only
+    direct_pt = Path(s1_step_dir) / "trainable.pt"
+    loaded_pt, _ = _load_arm_stack({"name": "s1_pt", "config": str(s2_cfg_path), "checkpoint": str(direct_pt)})
+    assert loaded_pt.gdn2 is None and loaded_pt.lsa is None
+    loaded_ckdir, _ = _load_arm_stack(
+        {"name": "s1_ck", "config": str(s2_cfg_path), "checkpoint": str(s1_run / "checkpoints")}
+    )
+    assert loaded_ckdir.gdn2 is None and loaded_ckdir.lsa is None
+
+    # 3) Non-run directory raises FileNotFoundError WITHOUT creating a side-effect `checkpoints/` folder!
+    empty_dir = tmp_path / "not_a_run_dir"
+    empty_dir.mkdir()
+    with pytest.raises(FileNotFoundError):
+        _load_arm_stack({"name": "bad", "config": str(s2_cfg_path), "checkpoint": str(empty_dir)})
+    assert list(empty_dir.iterdir()) == []
+
+    # 4) `hf://owner/repo@stage` delegates cleanly to `qloop.hub.load_qloop_from_hub`
+    import qloop.hub as hub_mod
+
+    called: dict[str, Any] = {}
+
+    def _fake_hub_load(repo_id: str, *, stage_name: str | None = None, **kwargs: Any) -> Any:
+        called["repo_id"] = repo_id
+        called["stage_name"] = stage_name
+        return st_s1
+
+    monkeypatch.setattr(hub_mod, "load_qloop_from_hub", _fake_hub_load)
+    hub_st, hub_lbl = _load_arm_stack(
+        {"name": "hub_s2", "checkpoint": "hf://TassP0lar/Qwen3.6-35B-A3B-Loop64@s2_v2_joint_bptt"}
+    )
+    assert hub_st is st_s1
+    assert called == {"repo_id": "TassP0lar/Qwen3.6-35B-A3B-Loop64", "stage_name": "s2_v2_joint_bptt"}
+    assert hub_lbl == "hf://TassP0lar/Qwen3.6-35B-A3B-Loop64@s2_v2_joint_bptt"
+
+
+def test_b5_eval_seq_len_cap_disables_decontam_and_verifies_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import qloop.data.mixture as mix_mod
+
+    def _forbid_decontam(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("eval-only holdout stream MUST NOT invoke decontaminator benchmark downloads!")
+
+    monkeypatch.setattr(mix_mod, "default_eval_providers", _forbid_decontam)
+
+    cfg_dict: dict[str, Any] = {
+        "model": {
+            "name": "toy",
+            "dtype": "float32",
+            "device_map": "cpu",
+            "toy": {"seed": 2, "num_hidden_layers": 8, "hidden_size": 16, "full_attention_interval": 2,
+                    "num_experts": 4},
+        },
+        "loop": {"enabled": False},
+        "data": {
+            "seq_len": 131072,
+            "holdout_mod": 10,
+            "holdout_eval_buckets": 2,
+            "sources": [{"name": "toy_text", "weight": 1.0, "toy_rows": 80}],
+            "decontaminate": {"enabled": True, "ngram": 13, "groups": ["aime_2026"]},
+        },
+    }
+    cfg_path = tmp_path / "long_cfg.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg_dict), encoding="utf-8")
+
+    rep = run_sprint2_audit_from_config(
+        config_path=str(cfg_path),
+        arms=[{"name": "stock", "config": str(cfg_path), "base_only": True}],
+        depths=(1,),
+        repeats=1,
+        eval_batches=1,
+        eval_seq_len=48,
+        verify_train_overlap=True,
+        skip_length_ladder=True,
+        skip_ablations=True,
+        seed=2,
+    )
+    assert rep.metadata["eval_seq_len"] == 48
+    assert rep.datasets["holdout"]["metadata"]["seq_len"] == 48
+    assert rep.datasets["holdout"]["overlap_check"]["verified"] is True
+    assert rep.datasets["holdout"]["overlap_check"]["overlap_count"] == 0
+
+
+def test_minor_gate4_ablate_lsa_mode_autodiscovers_manager_when_lsa_none() -> None:
+    st = build_smoke_cpu_stack(seed=41, num_passes=2, trained_perturbation=True)
+    model = st["model"]
+    ids = torch.randint(0, len(st["tokenizer"]), (1, 32), generator=torch.Generator().manual_seed(41))
+    with ablate_lsa_mode(model, "sparse", lsa=None, sample_recall=True) as info, torch.no_grad():
+        model(ids, use_cache=False)
+    assert info["applicable"] is True
+    assert "lsa_last_recall" in info and 0.0 < float(info["lsa_last_recall"]) <= 1.0

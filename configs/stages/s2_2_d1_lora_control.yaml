@@ -1,0 +1,74 @@
+# Sprint 2.2 (A2 Gate) - Parameter-Matched d=1 (40L) LoRA Control on Physical Core Layers [12, 36).
+# Scientific purpose: isolate recurrence depth lift (d >= 2 in s1_loop_a6b) from pure adapter capacity (~18.41M
+# trainable params) by training an exact non-looped 40L LoRA control under the identical s1_loop_a6b schedule,
+# hash-partitioned A1 holdout, 13-gram decontaminator, and 100% frozen SHA-256-verified MoE experts.
+# Parameter match on Qwen3.6-35B-A3B [12, 36) (6 full-attn + 18 GDN linear layers):
+#   * in_proj_qkv  [2048->8192]: 393,216 * r -> rank=46 => 18,087,936 LoRA + 168,960 norms = 18.257M (0.85% of 18.41M)
+#   * in_proj_qkvz [2048->12288]: 466,944 * r -> auto-solved rank=39 => 18,210,816 LoRA + 168,960 norms = 18.380M
+# Runs comfortably on 1x NVIDIA RTX PRO 6000 Blackwell (96 GB GDDR7 ECC VRAM, sm_120).
+_base_: [../base.yaml, ../model/qwen36_nvfp4.yaml]
+stage: s2_2_d1_lora_control
+stage_type: lm
+run: {name: s2_2_d1_lora_control}
+
+loop:
+  enabled: false                        # Strict d=1 (40L) non-looped control
+
+gdn2:
+  enabled: false
+
+hssd:
+  enabled: false
+
+lsa:
+  enabled: false
+
+experts:
+  enabled: false                        # 100% frozen MoE experts (SHA-256 checksum verified before/after stage)
+
+d1_lora:
+  enabled: true
+  layer_start: 12
+  layer_end: 36
+  rank: 46
+  target_params: 18243606               # Auto-matches s1_loop_a6b's ~18.41M total trainable params (incl. 168,960 norms)
+
+train:
+  steps: 1000                           # 1000 x 16 x 8192 ~= 131M tokens (exact s1_loop_a6b budget on 96 GB GDDR7 ECC VRAM)
+  micro_batch: 4
+  grad_accum: 4
+  log_every: 5
+  ckpt_every: 25
+  sha256_frozen_experts: true
+  train_d1_lora: true
+  train_loop_adapters: false
+  train_gdn2: false
+  trainable:
+    - "self_attn\\.(q_norm|k_norm)"
+    - "input_layernorm|post_attention_layernorm"
+  allowed_groups: [d1_lora, attention, norms]
+  aux_weights:
+    _replace_: true
+  optim:
+    lr: 3.0e-5
+    warmup_steps: 50
+    lr_mult:
+      _replace_: true
+      d1_lora: 20.0
+
+data:
+  seq_len: 8192
+  respect_doc_boundaries: true
+  holdout_mod: 100                      # Deterministic SHA-1 A1 document holdout (2% eval / 98% train, zero overlap)
+  holdout_eval_buckets: 2
+  sources:                              # 100% permissive open-license sources (section 5 policy; zero opus46_* subsets)
+    - {name: openthoughts3, weight: 0.30}
+    - {name: nemotron_post, weight: 0.20}
+    - {name: finepdfs_mix, weight: 0.25}
+    - {name: fineweb_edu, weight: 0.15}
+    - {name: fable51, weight: 0.10}
+  decontaminate: {enabled: true, ngram: 13, groups: [aime_2026, gpqa, hle, arc_agi_2, kernelbench], on_missing: warn}
+
+eval_quick:
+  n_batches: 16
+  depths: [1]

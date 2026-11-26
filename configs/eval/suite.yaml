@@ -1,6 +1,7 @@
-# Late-2026 held-out evaluation suite with 3-pass Loop-HSSD v3.2 depth sweep (d=1 -> 40L stock graph,
-# d=2 -> 64L, d=3 -> 88L trained A6B architecture). NEVER train on these held-out contamination groups.
-#   python -m qloop eval -c configs/eval/suite.yaml --ckpt runs/s4_rl
+# Late-2026 held-out evaluation suite for Clean v2 3-pass Loop + GDN-2-1M + QED + D-LSA depth sweep
+# (d=1 -> 40L stock graph, d=2 -> 64L, d=3 -> 88L trained A6B architecture; retired HSSD disabled).
+# NEVER train on these held-out contamination groups.
+#   python -m qloop eval -c configs/eval/suite.yaml --ckpt runs/s4_v2_rl
 _base_: [../base.yaml, ../model/qwen36_nvfp4.yaml]
 run: {name: eval}
 
@@ -31,25 +32,18 @@ loop:
   train_pass_probs: [0.10, 0.35, 0.55]
 
 gdn2:
-  enabled: false
+  enabled: true
+  rank: 64
+  chunk_size: 64
+  decay_log_min: -3.0
+  decay_log_max: 0.5
+  qed_enabled: true
+  qed_max_lambda: 0.35
+  neg_eigval_max_boost: 0.5
+  backend: auto
 
 hssd:
-  enabled: true
-  write_mode: full
-  swa_recency_init: 0.05
-  horizon_tokens: 1048576
-  compact_active_pages: true
-  compact_decode_cache: true
-  chunk_size: 64
-  window_chunks: 8
-  num_pages: 8
-  k_pages: 2
-  theta_low_rank: true
-  surprise_mode: routed
-  state_dtype: bfloat16
-  budget_weight: 1.0
-  segment_chunks: 4
-  checkpoint_segments: false
+  enabled: false
 
 lsa:
   enabled: true

@@ -7,8 +7,8 @@ Supports both `ToyForCausalLM` and `Qwen3.6-35B-A6B-LoopHSSD` Whole Model Packs 
     (`128K - 1M` tokens) chunk-by-chunk through hybrid KV + recurrent states, materializing
     `lm_head` logits **ONLY on the final token** of the prompt,
   * **Quantized `1.0x` SharedKV Cache**: `"native"`, `"fp8"` (`float8_e4m3fn` + `fp16` per-token-head
-    scale, ~50% resident full-attn KV HBM savings), and `"hadamard_int4"` (Block-64 orthogonal
-    Walsh-Hadamard packed `uint8` nibbles + `fp16` block scale, ~73% resident full-attn KV HBM
+    scale, ~50% resident full-attn KV VRAM savings), and `"hadamard_int4"` (Block-64 orthogonal
+    Walsh-Hadamard packed `uint8` nibbles + `fp16` block scale, ~73% resident full-attn KV VRAM
     savings), while preserving `1.0x` SharedKV across passes `r >= 2`. Note: standard dense
     `update()` currently materializes full dequantized K/V tensors for SDPA compatibility; sparse
     consumers can use `gather_kv(layer_idx, token_indices)` to dequantize only selected tokens,
@@ -188,69 +188,148 @@ def _fwht_pow2(x: torch.Tensor) -> torch.Tensor:
     return h.reshape(x.shape) * (1.0 / math.sqrt(float(n)))
 
 
-@dataclass
 class _FP8Slot:
-    q_data: torch.Tensor   # [B, G, T, D] in float8_e4m3fn
-    scale: torch.Tensor    # [B, G, T, 1] in float16
+    """FP8 (`float8_e4m3fn`) KV slot with geometric buffer pre-allocation and low-VRAM BF16 dequant."""
+
+    __slots__ = ("_len", "_q_buf", "_s_buf")
+
+    def __init__(self, q_data: torch.Tensor, scale: torch.Tensor, *, length: int | None = None) -> None:
+        self._q_buf: torch.Tensor = q_data   # [B, G, cap, D] in float8_e4m3fn
+        self._s_buf: torch.Tensor = scale    # [B, G, cap, 1] in float16
+        self._len: int = int(q_data.shape[-2]) if length is None else int(length)
+
+    @property
+    def q_data(self) -> torch.Tensor:
+        return self._q_buf[..., : self._len, :]
+
+    @property
+    def scale(self) -> torch.Tensor:
+        return self._s_buf[..., : self._len, :]
+
+    @property
+    def capacity(self) -> int:
+        return int(self._q_buf.shape[-2])
 
     @staticmethod
-    def from_float(x: torch.Tensor) -> _FP8Slot:
+    def _quantize_chunk(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         xf = x.float()
         amax = xf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
         sc = (amax / _FP8_MAX).to(torch.float16)
         sc_safe = sc.float().clamp_min(1e-12)
         q = (xf / sc_safe).clamp(-_FP8_MAX, _FP8_MAX)
         q_t = q.to(_FP8_DTYPE) if hasattr(torch, "float8_e4m3fn") else q.round().to(torch.int8)
+        return q_t, sc
+
+    @staticmethod
+    def from_float(x: torch.Tensor) -> _FP8Slot:
+        q_t, sc = _FP8Slot._quantize_chunk(x)
         return _FP8Slot(q_data=q_t, scale=sc)
 
+    def _ensure_capacity(self, needed: int) -> None:
+        cap = int(self._q_buf.shape[-2])
+        if needed <= cap:
+            return
+        new_cap = max(int(needed), max(cap, 1) * 2)
+        q_shape = (*self._q_buf.shape[:-2], new_cap, self._q_buf.shape[-1])
+        s_shape = (*self._s_buf.shape[:-2], new_cap, self._s_buf.shape[-1])
+        new_q = torch.empty(q_shape, dtype=self._q_buf.dtype, device=self._q_buf.device)
+        new_s = torch.empty(s_shape, dtype=self._s_buf.dtype, device=self._s_buf.device)
+        if self._len > 0:
+            new_q[..., : self._len, :].copy_(self._q_buf[..., : self._len, :])
+            new_s[..., : self._len, :].copy_(self._s_buf[..., : self._len, :])
+        self._q_buf = new_q
+        self._s_buf = new_s
+
     def append(self, x: torch.Tensor) -> None:
-        nxt = _FP8Slot.from_float(x)
-        self.q_data = torch.cat([self.q_data, nxt.q_data], dim=-2)
-        self.scale = torch.cat([self.scale, nxt.scale], dim=-2)
+        t_add = int(x.shape[-2])
+        if t_add <= 0:
+            return
+        q_t, sc = _FP8Slot._quantize_chunk(x)
+        needed = self._len + t_add
+        self._ensure_capacity(needed)
+        self._q_buf[..., self._len : needed, :].copy_(q_t)
+        self._s_buf[..., self._len : needed, :].copy_(sc)
+        self._len = needed
+
+    @staticmethod
+    def _dequant_pair(q: torch.Tensor, s: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        if dtype == torch.bfloat16:
+            # BF16 shares FP32's exact 8-bit exponent range (zero overflow) while avoiding 2x FP32 temporaries.
+            out = q.to(torch.bfloat16)
+            s_bf16 = s.to(torch.bfloat16)
+            return out * s_bf16 if s_bf16.requires_grad else out.mul_(s_bf16)
+        return (q.float() * s.float()).to(dtype)
 
     def dequantize(self, dtype: torch.dtype) -> torch.Tensor:
-        return (self.q_data.float() * self.scale.float()).to(dtype)
+        return self._dequant_pair(self.q_data, self.scale, dtype)
 
     def dequantize_slice(self, token_indices: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         """Dequantize ONLY the requested `token_indices` along the sequence dimension (sparse read)."""
-        idx = token_indices.to(device=self.q_data.device, dtype=torch.long)
-        q_sel = self.q_data.index_select(-2, idx)
-        s_sel = self.scale.index_select(-2, idx)
-        return (q_sel.float() * s_sel.float()).to(dtype)
+        q_live = self.q_data
+        s_live = self.scale
+        idx = token_indices.to(device=q_live.device, dtype=torch.long)
+        q_sel = q_live.index_select(-2, idx)
+        s_sel = s_live.index_select(-2, idx)
+        return self._dequant_pair(q_sel, s_sel, dtype)
 
     @property
     def seq_len(self) -> int:
-        return int(self.q_data.shape[-2])
+        return int(self._len)
 
     def nbytes(self) -> int:
-        return _tensor_tree_bytes((self.q_data, self.scale), set())
+        q = self.q_data
+        s = self.scale
+        return int(q.numel() * q.element_size() + s.numel() * s.element_size())
 
     def crop(self, max_length: int) -> None:
         m = max(0, int(max_length))
-        if m < self.seq_len:
-            self.q_data = self.q_data[..., :m, :].contiguous()
-            self.scale = self.scale[..., :m, :].contiguous()
+        self._len = min(self._len, m)
 
     def reorder_cache(self, beam_idx: torch.Tensor) -> None:
-        idx = beam_idx.to(device=self.q_data.device, dtype=torch.long)
-        self.q_data = self.q_data.index_select(0, idx).contiguous()
-        self.scale = self.scale.index_select(0, idx).contiguous()
+        idx = beam_idx.to(device=self._q_buf.device, dtype=torch.long)
+        self._q_buf = self._q_buf[..., : self._len, :].index_select(0, idx).contiguous()
+        self._s_buf = self._s_buf[..., : self._len, :].index_select(0, idx).contiguous()
 
     def batch_repeat_interleave(self, repeats: int) -> None:
         r = int(repeats)
-        self.q_data = self.q_data.repeat_interleave(r, dim=0).contiguous()
-        self.scale = self.scale.repeat_interleave(r, dim=0).contiguous()
+        self._q_buf = self._q_buf[..., : self._len, :].repeat_interleave(r, dim=0).contiguous()
+        self._s_buf = self._s_buf[..., : self._len, :].repeat_interleave(r, dim=0).contiguous()
 
 
-@dataclass
 class _HadamardINT4Slot:
-    packed: torch.Tensor   # [B, G, T, n_blocks, block_sz // 2] in uint8 (2x INT4 nibbles/byte)
-    scale: torch.Tensor    # [B, G, T, n_blocks, 1] in float16
-    orig_dim: int
-    block_sz: int
+    """Block-64 Walsh-Hadamard INT4 KV slot with geometric buffer pre-allocation."""
+
+    __slots__ = ("_len", "_p_buf", "_s_buf", "block_sz", "orig_dim")
+
+    def __init__(
+        self,
+        packed: torch.Tensor,
+        scale: torch.Tensor,
+        orig_dim: int,
+        block_sz: int,
+        *,
+        length: int | None = None,
+    ) -> None:
+        self._p_buf: torch.Tensor = packed  # [B, G, cap, n_blocks, block_sz // 2] in uint8
+        self._s_buf: torch.Tensor = scale   # [B, G, cap, n_blocks, 1] in float16
+        self._len: int = int(packed.shape[2]) if length is None else int(length)
+        self.orig_dim: int = int(orig_dim)
+        self.block_sz: int = int(block_sz)
+
+    @property
+    def packed(self) -> torch.Tensor:
+        return self._p_buf[:, :, : self._len, :, :]
+
+    @property
+    def scale(self) -> torch.Tensor:
+        return self._s_buf[:, :, : self._len, :, :]
+
+    @property
+    def capacity(self) -> int:
+        return int(self._p_buf.shape[2])
 
     @staticmethod
-    def from_float(x: torch.Tensor) -> _HadamardINT4Slot:
+    def _quantize_chunk(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int, int]:
         b, g, t, d = x.shape
         bsz = max(2, _largest_pow2_divisor_le_64(d if d % 2 == 0 else d + 1))
         pad = (bsz - (d % bsz)) % bsz
@@ -265,12 +344,50 @@ class _HadamardINT4Slot:
         hi = q_u8[..., 0::2]
         lo = q_u8[..., 1::2]
         pk = (hi << 4) | (lo & 0x0F)
+        return pk, sc, d, bsz
+
+    @staticmethod
+    def from_float(x: torch.Tensor) -> _HadamardINT4Slot:
+        pk, sc, d, bsz = _HadamardINT4Slot._quantize_chunk(x)
         return _HadamardINT4Slot(packed=pk, scale=sc, orig_dim=d, block_sz=bsz)
 
+    def _ensure_capacity(self, needed: int) -> None:
+        cap = int(self._p_buf.shape[2])
+        if needed <= cap:
+            return
+        new_cap = max(int(needed), max(cap, 1) * 2)
+        p_shape = (
+            self._p_buf.shape[0],
+            self._p_buf.shape[1],
+            new_cap,
+            self._p_buf.shape[3],
+            self._p_buf.shape[4],
+        )
+        s_shape = (
+            self._s_buf.shape[0],
+            self._s_buf.shape[1],
+            new_cap,
+            self._s_buf.shape[3],
+            self._s_buf.shape[4],
+        )
+        new_p = torch.empty(p_shape, dtype=self._p_buf.dtype, device=self._p_buf.device)
+        new_s = torch.empty(s_shape, dtype=self._s_buf.dtype, device=self._s_buf.device)
+        if self._len > 0:
+            new_p[:, :, : self._len, :, :].copy_(self._p_buf[:, :, : self._len, :, :])
+            new_s[:, :, : self._len, :, :].copy_(self._s_buf[:, :, : self._len, :, :])
+        self._p_buf = new_p
+        self._s_buf = new_s
+
     def append(self, x: torch.Tensor) -> None:
-        nxt = _HadamardINT4Slot.from_float(x)
-        self.packed = torch.cat([self.packed, nxt.packed], dim=2)
-        self.scale = torch.cat([self.scale, nxt.scale], dim=2)
+        t_add = int(x.shape[2])
+        if t_add <= 0:
+            return
+        pk, sc, _, _ = _HadamardINT4Slot._quantize_chunk(x)
+        needed = self._len + t_add
+        self._ensure_capacity(needed)
+        self._p_buf[:, :, self._len : needed, :, :].copy_(pk)
+        self._s_buf[:, :, self._len : needed, :, :].copy_(sc)
+        self._len = needed
 
     def _dequantize_parts(self, packed: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         b, g, t, nb, half_bsz = packed.shape
@@ -288,33 +405,35 @@ class _HadamardINT4Slot:
 
     def dequantize_slice(self, token_indices: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         """Dequantize ONLY the requested `token_indices` along the sequence dimension (sparse read)."""
-        idx = token_indices.to(device=self.packed.device, dtype=torch.long)
-        pk_sel = self.packed.index_select(2, idx)
-        sc_sel = self.scale.index_select(2, idx)
+        pk_live = self.packed
+        sc_live = self.scale
+        idx = token_indices.to(device=pk_live.device, dtype=torch.long)
+        pk_sel = pk_live.index_select(2, idx)
+        sc_sel = sc_live.index_select(2, idx)
         return self._dequantize_parts(pk_sel, sc_sel, dtype)
 
     @property
     def seq_len(self) -> int:
-        return int(self.packed.shape[2])
+        return int(self._len)
 
     def nbytes(self) -> int:
-        return _tensor_tree_bytes((self.packed, self.scale), set())
+        p = self.packed
+        s = self.scale
+        return int(p.numel() * p.element_size() + s.numel() * s.element_size())
 
     def crop(self, max_length: int) -> None:
         m = max(0, int(max_length))
-        if m < self.seq_len:
-            self.packed = self.packed[:, :, :m, :, :].contiguous()
-            self.scale = self.scale[:, :, :m, :, :].contiguous()
+        self._len = min(self._len, m)
 
     def reorder_cache(self, beam_idx: torch.Tensor) -> None:
-        idx = beam_idx.to(device=self.packed.device, dtype=torch.long)
-        self.packed = self.packed.index_select(0, idx).contiguous()
-        self.scale = self.scale.index_select(0, idx).contiguous()
+        idx = beam_idx.to(device=self._p_buf.device, dtype=torch.long)
+        self._p_buf = self._p_buf[:, :, : self._len, :, :].index_select(0, idx).contiguous()
+        self._s_buf = self._s_buf[:, :, : self._len, :, :].index_select(0, idx).contiguous()
 
     def batch_repeat_interleave(self, repeats: int) -> None:
         r = int(repeats)
-        self.packed = self.packed.repeat_interleave(r, dim=0).contiguous()
-        self.scale = self.scale.repeat_interleave(r, dim=0).contiguous()
+        self._p_buf = self._p_buf[:, :, : self._len, :, :].repeat_interleave(r, dim=0).contiguous()
+        self._s_buf = self._s_buf[:, :, : self._len, :, :].repeat_interleave(r, dim=0).contiguous()
 
 
 class _QuantizedHasPreviousState:
@@ -1017,6 +1136,26 @@ def _tensor_tree_bytes(obj: Any, seen_ptrs: set[int]) -> int:
     """Accumulate unique backing-storage bytes across nested tensors, sequences, dicts, and `HSSDCacheState`."""
     if obj is None:
         return 0
+    if isinstance(obj, _FP8Slot):
+        tot = 0
+        for t in (obj.q_data, obj.scale):
+            if t.numel() == 0:
+                continue
+            ptr = int(t.untyped_storage().data_ptr())
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                tot += int(t.numel() * t.element_size())
+        return tot
+    if isinstance(obj, _HadamardINT4Slot):
+        tot = 0
+        for t in (obj.packed, obj.scale):
+            if t.numel() == 0:
+                continue
+            ptr = int(t.untyped_storage().data_ptr())
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                tot += int(t.numel() * t.element_size())
+        return tot
     if isinstance(obj, torch.Tensor):
         if obj.numel() == 0:
             return 0
@@ -1673,7 +1812,7 @@ class OptimizedLoopInferenceEngine:
         gen_len: int = 64,
         depths: Sequence[int] = (1, 2, 3),
     ) -> dict[str, Any]:
-        """Benchmark prefill & decode throughput, latency, KV HBM, and expert diversity across `depths`."""
+        """Benchmark prefill & decode throughput, latency, KV VRAM, and expert diversity across `depths`."""
         require(int(prompt_len) >= 1 and int(gen_len) >= 1, "prompt_len and gen_len must be >= 1")
         vocab = int(getattr(self.text_config, "vocab_size", 256))
         rng = torch.Generator(device="cpu").manual_seed(2026)

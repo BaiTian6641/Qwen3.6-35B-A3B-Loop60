@@ -43,7 +43,7 @@ import random
 import sys
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -3693,6 +3693,27 @@ def _resolve_local_checkpoint_files(ckpt_str: str) -> tuple[str, str | None, str
     raise FileNotFoundError(f"checkpoint path not found: {ckpt_str!r}")
 
 
+def _sanitize_eval_train_cfg(cfg_dict: dict[str, Any]) -> None:
+    """Disable training-only freeze/checkpointing policies on an inference/eval stack config."""
+    tcfg = dict(cfg_dict.get("train") or {})
+    tcfg.update(
+        {
+            "gradient_checkpointing": False,
+            "allowed_groups": None,
+            "strict_patterns": False,
+            "sha256_frozen_experts": False,
+            "trainable": [],
+            "train_gdn2": False,
+            "train_hssd": False,
+            "train_lsa": False,
+            "train_d1_lora": False,
+            "train_loop_adapters": False,
+            "train_expert_deltas": False,
+        }
+    )
+    cfg_dict["train"] = tcfg
+
+
 def _sync_cfg_to_checkpoint_payload(
     cfg_dict: dict[str, Any],
     saved_params: Mapping[str, torch.Tensor],
@@ -3712,22 +3733,32 @@ def _sync_cfg_to_checkpoint_payload(
         cfg_dict["experts"]["enabled"] = False
 
     if has_hssd:
-        prior_hssd = dict(smeta.get("hssd") or {})
-        cfg_dict["hssd"] = {**dict(cfg_dict.get("hssd") or {}), **prior_hssd, "enabled": True}
+        from qloop.model.hssd import HSSDConfig
+
+        known_hssd = {f.name for f in fields(HSSDConfig)}
+        prior_hssd = {k: v for k, v in dict(smeta.get("hssd") or {}).items() if k in known_hssd}
+        hcfg = {k: v for k, v in dict(cfg_dict.get("hssd") or {}).items() if k in known_hssd}
+        hcfg.update(prior_hssd)
+        hcfg["enabled"] = True
+        cfg_dict["hssd"] = hcfg
         cfg_dict["gdn2"] = {"enabled": False}
     elif has_gdn2:
-        prior_gdn2 = dict(smeta.get("gdn2") or {})
-        gcfg = {**dict(cfg_dict.get("gdn2") or {}), **prior_gdn2}
+        known_gdn2 = {f.name for f in fields(GDN2Config)}
+        prior_gdn2 = {k: v for k, v in dict(smeta.get("gdn2") or {}).items() if k in known_gdn2}
+        gcfg = {k: v for k, v in dict(cfg_dict.get("gdn2") or {}).items() if k in known_gdn2}
+        gcfg.update(prior_gdn2)
         for k, t in saved_params.items():
             if k.endswith("gdn2_adapter.down.weight") and t.ndim == 2:
                 gcfg["rank"] = int(t.shape[0])
                 break
         if "qed_enabled" not in prior_gdn2:
             gcfg["qed_enabled"] = any(k.endswith("gdn2_adapter.qed_lambda_raw") for k in keys)
-        if "neg_eigval_max_boost" not in prior_gdn2 and not any(
-            k.endswith("gdn2_adapter.neg_gamma_raw") for k in keys
-        ):
-            gcfg["neg_eigval_max_boost"] = 0.0
+        if "neg_eigval_max_boost" not in prior_gdn2:
+            if any(k.endswith("gdn2_adapter.neg_gamma_raw") for k in keys):
+                if float(gcfg.get("neg_eigval_max_boost") or 0.0) <= 0.0:
+                    gcfg["neg_eigval_max_boost"] = 0.5
+            else:
+                gcfg["neg_eigval_max_boost"] = 0.0
         gcfg["enabled"] = True
         cfg_dict["gdn2"] = gcfg
         cfg_dict["hssd"] = {"enabled": False}
@@ -3736,8 +3767,10 @@ def _sync_cfg_to_checkpoint_payload(
         cfg_dict["hssd"] = {"enabled": False}
 
     if has_lsa:
-        prior_lsa = dict(smeta.get("lsa") or {})
-        lcfg = {**dict(cfg_dict.get("lsa") or {}), **prior_lsa}
+        known_lsa = {f.name for f in fields(LSAConfig)}
+        prior_lsa = {k: v for k, v in dict(smeta.get("lsa") or {}).items() if k in known_lsa}
+        lcfg = {k: v for k, v in dict(cfg_dict.get("lsa") or {}).items() if k in known_lsa}
+        lcfg.update(prior_lsa)
         for k, t in saved_params.items():
             if k.endswith("lsa_indexer.wk") and t.ndim == 3:
                 lcfg.setdefault("index_dim", int(t.shape[-1]))
@@ -3748,14 +3781,44 @@ def _sync_cfg_to_checkpoint_payload(
         cfg_dict["lsa"] = {"enabled": False}
 
     if has_loop:
-        prior_loop = dict(smeta.get("loop") or {})
-        cfg_dict["loop"] = {**dict(cfg_dict.get("loop") or {}), **prior_loop, "enabled": True}
+        known_loop = {f.name for f in fields(LoopSpec)}
+        prior_loop = {k: v for k, v in dict(smeta.get("loop") or {}).items() if k in known_loop}
+        lpcfg = {k: v for k, v in dict(cfg_dict.get("loop") or {}).items() if k in known_loop}
+        lpcfg.update(prior_loop)
+        lpcfg["enabled"] = True
+        cfg_dict["loop"] = lpcfg
     else:
         cfg_dict["loop"] = {"enabled": False}
 
     if has_d1_lora:
-        prior_d1 = dict(smeta.get("d1_lora") or {})
-        cfg_dict["d1_lora"] = {**dict(cfg_dict.get("d1_lora") or {}), **prior_d1, "enabled": True}
+        from qloop.model.d1_lora import D1LoRAConfig
+
+        known_d1 = {f.name for f in fields(D1LoRAConfig)}
+        prior_d1_raw = dict(smeta.get("d1_lora") or {})
+        prior_d1 = {k: v for k, v in prior_d1_raw.items() if k in known_d1}
+        d1cfg = {k: v for k, v in dict(cfg_dict.get("d1_lora") or {}).items() if k in known_d1}
+        d1cfg.update(prior_d1)
+        if prior_d1_raw.get("resolved_rank") is not None:
+            d1cfg["rank"] = int(prior_d1_raw["resolved_rank"])
+            d1cfg["target_params"] = None
+        elif not prior_d1_raw:
+            layer_idxs: list[int] = []
+            inferred_rank: int | None = None
+            for k, t in saved_params.items():
+                if k.startswith("d1_lora.L"):
+                    parts_k = k.split(".")
+                    if len(parts_k) >= 4 and parts_k[1].startswith("L") and parts_k[1][1:].isdigit():
+                        layer_idxs.append(int(parts_k[1][1:]))
+                    if inferred_rank is None and k.endswith(".down") and getattr(t, "ndim", 0) == 2:
+                        inferred_rank = int(t.shape[0])
+            if inferred_rank is not None:
+                d1cfg["rank"] = inferred_rank
+                d1cfg["target_params"] = None
+            if layer_idxs:
+                d1cfg["layer_start"] = min(layer_idxs)
+                d1cfg["layer_end"] = max(layer_idxs) + 1
+        d1cfg["enabled"] = True
+        cfg_dict["d1_lora"] = d1cfg
     elif isinstance(cfg_dict.get("d1_lora"), dict):
         cfg_dict["d1_lora"]["enabled"] = False
 
@@ -3806,6 +3869,7 @@ def _load_arm_stack(arm_spec: Mapping[str, Any], *, overrides: Sequence[str] = (
         raise ValueError(f"arm {arm_spec.get('name')!r} requires a YAML `config` path (pass --config or in --arms)")
     cfg = load_config(str(cfg_path), overrides=arm_overrides)
     cfg_dict = cfg.to_dict()
+    _sanitize_eval_train_cfg(cfg_dict)
 
     # 2. Pure stock base arm (no checkpoint, all retrofits disabled while preserving `model.yarn_target_len`)
     if arm_spec.get("base_only"):

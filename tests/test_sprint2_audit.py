@@ -1228,3 +1228,205 @@ def test_minor_gate4_ablate_lsa_mode_autodiscovers_manager_when_lsa_none() -> No
         model(ids, use_cache=False)
     assert info["applicable"] is True
     assert "lsa_last_recall" in info and 0.0 < float(info["lsa_last_recall"]) <= 1.0
+
+
+def test_load_arm_stack_d1_lora_checkpoint_under_s2_v2_config_and_train_sanitization(tmp_path: Path) -> None:
+    """Loading a real `LMTrainer` `d1_lora` checkpoint under an `s2_v2`-style config must strip
+    `D1LoRAManager.describe()` metadata extras, pin `resolved_rank`, sanitize `train` policies
+    (no `freeze_all_but` failure, no gradient checkpointing), and match trained logits bit-for-bit.
+    """
+    import shutil
+
+    from qloop.eval.sprint2_audit import _load_arm_stack
+    from qloop.train.trainer import LMTrainer
+
+    # 1) Train a real toy d1_lora checkpoint via LMTrainer so state.json carries real describe() extras
+    #    (resolved_rank, resolved_alpha, scale, n_hooks, n_params, active, layers).
+    d1_run_dir = tmp_path / "run_s2_2_d1_lora"
+    d1_train_cfg: dict[str, Any] = {
+        "seed": 3,
+        "stage": "s2_2_d1_lora_control",
+        "model": {"name": "toy", "dtype": "float32", "device_map": "cpu", "toy": {"seed": 3}},
+        "loop": {"enabled": False},
+        "gdn2": {"enabled": False},
+        "hssd": {"enabled": False},
+        "lsa": {"enabled": False},
+        "experts": {"enabled": False},
+        "d1_lora": {
+            "enabled": True,
+            "layer_start": 4,
+            "layer_end": 12,
+            "rank": 2,
+            "target_params": 10000,
+            "seed": 5,
+        },
+        "train": {
+            "steps": 2,
+            "grad_accum": 1,
+            "micro_batch": 1,
+            "log_every": 1,
+            "ckpt_every": 2,
+            "eval_every": 2,
+            "sha256_frozen_experts": True,
+            "train_d1_lora": True,
+            "trainable": [
+                r"self_attn\.(q_norm|k_norm)",
+                r"input_layernorm|post_attention_layernorm",
+            ],
+            "allowed_groups": ["d1_lora", "attention", "norms"],
+            "optim": {
+                "lr": 2.0e-3,
+                "warmup_steps": 1,
+                "lr_mult": {"d1_lora": 20.0},
+            },
+        },
+        "data": {
+            "seq_len": 48,
+            "sources": [{"name": "toy_cot", "weight": 0.6}, {"name": "toy_text", "weight": 0.4}],
+        },
+        "eval_quick": {"n_batches": 1, "depths": [1]},
+        "_meta_": {"config_path": "inline"},
+    }
+    trainer = LMTrainer(d1_train_cfg, str(d1_run_dir))
+    trainer.train()
+
+    st_trained = trainer.stack
+    assert st_trained.d1_lora is not None
+    expected_rank = st_trained.d1_lora.rank
+    assert expected_rank != 2, "target_params should resolve a rank distinct from fallback cfg.rank=2"
+    assert st_trained.d1_lora.stats()["d1_lora/up_abs_mean"] > 0.0
+
+    ckpt_dir = Path(CheckpointManager(str(d1_run_dir), keep_last=0).latest() or "")
+    assert ckpt_dir.is_dir()
+    state_payload = json.loads((ckpt_dir / "state.json").read_text(encoding="utf-8"))
+    d1_meta = state_payload["stack"]["d1_lora"]
+    for extra_key in ("resolved_rank", "n_hooks", "n_params", "scale", "active", "layers"):
+        assert extra_key in d1_meta
+    assert d1_meta["resolved_rank"] == expected_rank
+
+    probe_ids = torch.randint(4, 90, (2, 24), generator=torch.Generator().manual_seed(17))
+    st_trained.model.eval()
+    with torch.no_grad():
+        expected_logits = st_trained.model(input_ids=probe_ids, use_cache=False).logits.clone()
+
+    # 2) Build an s2_v2-style eval YAML with loop/gdn2/lsa enabled, allowed_groups WITHOUT d1_lora,
+    #    strict_patterns=True with a non-matching trainable regex, and gradient_checkpointing=True.
+    s2_v2_cfg: dict[str, Any] = {
+        "model": {"name": "toy", "dtype": "float32", "device_map": "cpu", "toy": {"seed": 3}},
+        "loop": {
+            "enabled": True,
+            "prelude_end": 4,
+            "core_end": 12,
+            "num_passes": 2,
+            "target_virtual_layers": 24,
+            "bridge_init": [0.05, 0.85, 0.10],
+            "bridge_mode": "subspace",
+            "bridge_rank": 4,
+            "per_pass_router": True,
+            "router_adapter_rank": 4,
+        },
+        "gdn2": {
+            "enabled": True,
+            "rank": 4,
+            "chunk_size": 16,
+            "qed_enabled": True,
+            "neg_eigval_max_boost": 0.5,
+            "backend": "pytorch",
+        },
+        "lsa": {
+            "enabled": True,
+            "mode": "sparse",
+            "index_dim": 4,
+            "block_size": 8,
+            "pool": 2,
+            "avg_bucket_keys": 4,
+            "max_bucket_keys": 8,
+            "window": 8,
+            "sinks": 2,
+            "num_select": 2,
+        },
+        "d1_lora": {"enabled": False},
+        "train": {
+            "gradient_checkpointing": True,
+            "sha256_frozen_experts": True,
+            "strict_patterns": True,
+            "train_loop_adapters": True,
+            "train_gdn2": True,
+            "train_lsa": True,
+            "train_d1_lora": False,
+            "trainable": [
+                r"self_attn\.(k_proj|v_proj|o_proj|q_norm|k_norm)",
+                r"input_layernorm|post_attention_layernorm",
+                r"nonexistent_training_only_module_pattern",
+            ],
+            "allowed_groups": ["loop_adapters", "gdn2_adapters", "lsa_indexers", "attention", "norms"],
+        },
+    }
+    s2_v2_cfg_path = tmp_path / "s2_v2_joint_bptt_toy.yaml"
+    s2_v2_cfg_path.write_text(yaml.safe_dump(s2_v2_cfg), encoding="utf-8")
+
+    # 3) Load the real d1_lora checkpoint via _load_arm_stack under s2_v2 config
+    st_loaded, resolved_lbl = _load_arm_stack(
+        {
+            "name": "s2_2_d1_lora_control",
+            "checkpoint": str(ckpt_dir),
+            "config": str(s2_v2_cfg_path),
+        }
+    )
+    assert resolved_lbl == str(ckpt_dir)
+    assert st_loaded.d1_lora is not None
+    assert st_loaded.d1_lora.rank == expected_rank
+    assert st_loaded.d1_lora.cfg.layer_start == 4
+    assert st_loaded.d1_lora.cfg.layer_end == 12
+    assert st_loaded.d1_lora.cfg.target_params is None
+    assert st_loaded.loop is None
+    assert st_loaded.gdn2 is None
+    assert st_loaded.lsa is None
+    assert not st_loaded.load_info.get("gradient_checkpointing")
+    assert not any(p.requires_grad for p in st_loaded.model.parameters())
+    assert not any(p.requires_grad for p in st_loaded.d1_lora.adapters.parameters())
+
+    with torch.no_grad():
+        loaded_logits = st_loaded.model(input_ids=probe_ids, use_cache=False).logits
+    assert torch.allclose(loaded_logits, expected_logits, rtol=0.0, atol=0.0)
+    assert torch.equal(loaded_logits, expected_logits)
+
+    # 4) Standalone trainable.pt WITHOUT state.json infers rank/layers from d1_lora.L* tensors
+    no_meta_dir = tmp_path / "weights_only_d1"
+    no_meta_dir.mkdir()
+    weights_only_pt = no_meta_dir / "trainable.pt"
+    shutil.copy2(ckpt_dir / "trainable.pt", weights_only_pt)
+
+    st_inferred, _ = _load_arm_stack(
+        {
+            "name": "s2_2_d1_lora_weights_only",
+            "checkpoint": str(weights_only_pt),
+            "config": str(s2_v2_cfg_path),
+        }
+    )
+    assert st_inferred.d1_lora is not None
+    assert st_inferred.d1_lora.rank == expected_rank
+    assert st_inferred.d1_lora.cfg.layer_start == 4
+    assert st_inferred.d1_lora.cfg.layer_end == 12
+    assert st_inferred.loop is None and st_inferred.gdn2 is None and st_inferred.lsa is None
+    assert not st_inferred.load_info.get("gradient_checkpointing")
+    with torch.no_grad():
+        inferred_logits = st_inferred.model(input_ids=probe_ids, use_cache=False).logits
+    assert torch.equal(inferred_logits, expected_logits)
+
+    # 5) base_only (path 2) and config-only (path 4) also sanitize train policies cleanly
+    st_base, _ = _load_arm_stack({"name": "stock", "config": str(s2_v2_cfg_path), "base_only": True})
+    assert st_base.loop is None and st_base.gdn2 is None and st_base.lsa is None and st_base.d1_lora is None
+    assert not st_base.load_info.get("gradient_checkpointing")
+
+    st_cfg_only, _ = _load_arm_stack(
+        {
+            "name": "cfg_only",
+            "config": str(s2_v2_cfg_path),
+            "loop_enabled": False,
+            "gdn2_enabled": False,
+            "lsa_enabled": False,
+        }
+    )
+    assert st_cfg_only.loop is None and st_cfg_only.gdn2 is None and st_cfg_only.lsa is None
+    assert not st_cfg_only.load_info.get("gradient_checkpointing")

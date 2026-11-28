@@ -1035,12 +1035,13 @@ def test_option_a_stage_configs_hygiene_and_schema() -> None:
     # S4 Option A specifics
     assert s4.stage_type == "rl"
     assert s4.train.init_from == "runs/s3_opt_a_block_attn_calib"
-    assert int(s4.train.steps) == 300
-    assert int(s4.rl.max_new_tokens) == 4096
+    assert int(s4.train.steps) == 40
+    assert int(s4.rl.max_new_tokens) == 2048
+    assert s4.rl.enable_thinking is False
     assert s4.rl.overlong.enabled is True
     assert s4.rl.overlong.accuracy_gated is True
     assert float(s4.rl.overlong.concise_bonus) == pytest.approx(0.15)
-    assert int(s4.rl.overlong.target_tokens) == 1536
+    assert int(s4.rl.overlong.target_tokens) == 1024
     assert float(s4.rl.overlong.min_pass_rate) == pytest.approx(0.25)
     assert list(s4.rl.sirsi.slap_target_groups) == ["router", "shared_expert"]
     assert float(s4.rl.sirsi.anti_slop_weight) == pytest.approx(0.05)

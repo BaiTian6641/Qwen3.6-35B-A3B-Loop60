@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -89,6 +89,53 @@ def _toy_arith_tasks(n: int, seed: int) -> list[dict[str, Any]]:
     return out
 
 
+def _extract_nested_field(row: Mapping[str, Any], field_path: str) -> Any:
+    """Resolve a flat or dotted key path (e.g. `'reward_model.ground_truth'`) on a row mapping."""
+    if field_path in row:
+        return row[field_path]
+    if "." in field_path:
+        cur: Any = row
+        for part in field_path.split("."):
+            if isinstance(cur, Mapping) and part in cur:
+                cur = cur[part]
+            else:
+                return None
+        return cur
+    return None
+
+
+def _normalize_hf_prompt(raw: Any) -> Any:
+    """Normalize HF prompt values while preserving chat message lists for `apply_chat_template`."""
+    if hasattr(raw, "tolist") and not isinstance(raw, (str, bytes, list, tuple, Mapping)):
+        raw = raw.tolist()
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, Mapping):
+        msg = dict(raw)
+        msg.setdefault("role", "user")
+        if "content" not in msg and "text" in msg:
+            msg["content"] = msg["text"]
+        if msg.get("content") is None:
+            msg["content"] = ""
+        return [msg]
+    if isinstance(raw, (list, tuple)):
+        if not raw:
+            return ""
+        if all(isinstance(m, Mapping) for m in raw):
+            msgs: list[dict[str, Any]] = []
+            for m in raw:
+                msg = dict(m)
+                msg.setdefault("role", "user")
+                if "content" not in msg and "text" in msg:
+                    msg["content"] = msg["text"]
+                if msg.get("content") is None:
+                    msg["content"] = ""
+                msgs.append(msg)
+            return msgs
+        return "\n".join(str(x) for x in raw)
+    return str(raw)
+
+
 def _hf_tasks(src: dict[str, Any], seed: int) -> list[dict[str, Any]]:
     from datasets import load_dataset
 
@@ -101,9 +148,21 @@ def _hf_tasks(src: dict[str, Any], seed: int) -> list[dict[str, Any]]:
     pf, af = src.get("prompt_field", "problem"), src.get("answer_field", "answer")
     rows = []
     for i, row in enumerate(ds):
-        require(pf in row, f"rl source {src['hf_id']}: prompt_field '{pf}' missing", keys=sorted(row))
-        rows.append({"id": str(row.get("id", f"{src['hf_id']}-{i}")), "prompt": row[pf],
-                     "answer": row.get(af), **{k: row[k] for k in src.get("keep_fields", []) if k in row}})
+        raw_prompt = _extract_nested_field(row, pf)
+        require(raw_prompt is not None, f"rl source {src['hf_id']}: prompt_field '{pf}' missing", keys=sorted(row))
+        prompt = _normalize_hf_prompt(raw_prompt)
+        ans = _extract_nested_field(row, af)
+        if ans is None:
+            for fallback_key in ("reward_model.ground_truth", "solution", "answer", "ground_truth"):
+                if fallback_key == af:
+                    continue
+                ans = _extract_nested_field(row, fallback_key)
+                if ans is not None:
+                    break
+        if isinstance(ans, Mapping) and "ground_truth" in ans:
+            ans = ans["ground_truth"]
+        rows.append({"id": str(row.get("id", f"{src['hf_id']}-{i}")), "prompt": prompt,
+                     "answer": ans, **{k: row[k] for k in src.get("keep_fields", []) if k in row}})
     return rows
 
 
@@ -464,8 +523,13 @@ class GRPOTrainer:
         self.ckpt = CheckpointManager(run_dir, keep_last=int(self.tcfg.get("keep_last", 3)),
                                       sync=sync_cfg, hub_api=hub_api)
         self.metrics = MetricsLogger(run_dir, cfg)
+        eth = self.rl.get("enable_thinking", None)
+        chat_template_kwargs: dict[str, Any] | None = (
+            {"enable_thinking": bool(eth)} if eth is not None else None
+        )
         self.gen = Generator(self.stack.model, self.stack.tokenizer, loop_controller=self.stack.loop,
-                             max_context=self.rl.get("max_context"))
+                             max_context=self.rl.get("max_context"),
+                             chat_template_kwargs=chat_template_kwargs)
         self.sampler = TaskSampler(load_rl_tasks(self.rl, self.seed), self.seed)
         self.teacher = TeacherClient(self.rl["teacher"]) if (self.rl.get("teacher") or {}).get("base_url") else None
         self.sirsi = SIRSIConfig.from_dict(self.rl.get("sirsi"))

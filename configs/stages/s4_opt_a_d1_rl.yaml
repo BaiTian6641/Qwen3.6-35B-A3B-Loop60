@@ -54,8 +54,8 @@ experts:
 train:
   init_from: runs/s3_opt_a_block_attn_calib
   drop_inactive_loop_adapters: true
-  steps: 300
-  ckpt_every: 25
+  steps: 40
+  ckpt_every: 10
   sha256_frozen_experts: true
   train_loop_adapters: false
   train_hssd: false
@@ -82,14 +82,13 @@ train:
       "mlp\\.gate\\.weight$": 0.5
 
 rl:
+  enable_thinking: false
   tasks:
     - {source: hf, name: dapo_math, hf_id: BytedTsinghua-SIA/DAPO-Math-17k, split: train,
-       prompt_field: prompt, answer_field: solution, verifier: "scorer:math", weight: 0.6}
-    - {source: registry, name: kernelbench_train, verifier: "scorer:kernelbench", speedup_bonus: 0.5,
-       device: cuda, weight: 0.4}
-  group_size: 8
-  prompts_per_step: 8
-  max_new_tokens: 4096
+       prompt_field: prompt, answer_field: reward_model.ground_truth, verifier: "scorer:math", weight: 1.0}
+  group_size: 4
+  prompts_per_step: 4
+  max_new_tokens: 2048
   temperature: 1.0
   top_p: 1.0
   micro_batch_seqs: 2
@@ -102,11 +101,11 @@ rl:
   temperature_max: 1.3
   overlong:
     enabled: true
-    buffer: 512
+    buffer: 384
     penalty: 1.0
     accuracy_gated: true
     concise_bonus: 0.15
-    target_tokens: 1536
+    target_tokens: 1024
     min_pass_rate: 0.25
   verifier_workers: 8
   teacher: {}
@@ -130,14 +129,14 @@ rl:
     lambda_hurt: 2.0
     max_hurt_frac: 0.05
     max_bench_drop: 0.025
-    every: 50
+    every: 20
     depth: 1
     min_delta: 0.0
     max_len_growth: 1.5
     rollback: true
     benchmarks:
-      - {name: aime_2026, limit: 30, max_new_tokens: 2048}
-      - {name: gpqa_diamond, limit: 50, max_new_tokens: 1024}
+      - {name: aime_2026, limit: 30, max_new_tokens: 2048, weight: 0.5}
+      - {name: gpqa_diamond, limit: 50, max_new_tokens: 1024, weight: 0.5}
 
 eval_quick:
   n_batches: 8

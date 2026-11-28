@@ -572,7 +572,11 @@ class LMTrainer:
             smeta = (ck.get("state") or {}).get("stack") or {}
             sc = float((smeta.get("expert_delta_scale")) or 1.0)
             counts = self.stack.restore_checkpoint(
-                ck["params"], strict=False, expert_delta_scale=sc, prior_stack_meta=smeta
+                ck["params"],
+                strict=False,
+                expert_delta_scale=sc,
+                prior_stack_meta=smeta,
+                drop_inactive_loop_adapters=bool(self.tcfg.get("drop_inactive_loop_adapters", False)),
             )
             self.resume_mode = "init_from"
             log.info("initialised from %s (%s; optimizer fresh)", ck["path"], counts)

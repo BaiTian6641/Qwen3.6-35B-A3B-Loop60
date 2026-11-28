@@ -285,8 +285,12 @@ def cmd_train(args: argparse.Namespace) -> int:
             from .train.trainer import LMTrainer
 
             res = LMTrainer(cfg, run_dir).train()
+        elif kind == "block_attn_calib":
+            from .train.block_attn_calib import BlockAttentionCalibrator
+
+            res = BlockAttentionCalibrator(cfg, run_dir).train()
         else:
-            raise ValueError(f"stage_type must be lm|rl, got {kind!r}")
+            raise ValueError(f"stage_type must be lm|rl|block_attn_calib, got {kind!r}")
         log.info("done: %s", json.dumps(res, default=str)[:2000])
     return 0
 

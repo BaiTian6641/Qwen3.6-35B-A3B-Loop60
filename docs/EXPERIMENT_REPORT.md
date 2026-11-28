@@ -20,7 +20,7 @@ We investigate whether a quantized 35B hybrid Mixture-of-Experts (MoE) language 
 
 Scaling test-time reasoning via long chains of thought alone encounters severe KV-cache capacity limits and serial-token latency bottlenecks, whereas pretraining looped or million-token hybrid architectures from scratch demands multi-node industrial clusters. This paper investigates a parameter-efficient alternative: retrofitting a frozen `35B` (`A3B`) NVFP4 hybrid Mixture-of-Experts backbone (`unsloth/Qwen3.6-35B-A3B-NVFP4` [1], comprising `30` Gated DeltaNet [2] linear layers and `10` gated full-attention layers, with `32.212B` routed expert weights 100% frozen and SHA-256 verified) into a runtime-scalable `88`-virtual-layer looped reasoner supporting `1,048,576`-token (`1M`) context on a **single rented Google Colab NVIDIA RTX PRO 6000 Blackwell Server Edition** (`GB202`, `sm_120`, `96 GB GDDR7 ECC` [`94.97 GiB` CUDA-usable], `512-bit` bus, `1,597 GB/s` peak bandwidth, `24,064` CUDA cores, `600 W` TDP).
 
-Grounded in low-rank APOLLO optimization [3] inside `FusedStepOptimizer`, our clean v2 design unifies three orthogonal mechanisms: (1) a calibrated `[12, 36)` sandwich recurrence with manifold-constrained hyper-connection (`mHC`) `LoopBridge` transitions [4] inspired by adaptive recursive depth [5], expanding compute from `40L` (`R=1`) to `88L` (`R=3`) via cross-pass expert re-routing; (2) Step-0 bit-identical Gated DeltaNet-2 (`GDN-2`) [6] augmented with Bounded Query-Dependent Erasure (`QED`) [7], asymmetric `1M` slow decay, and soft negative eigenvalues [8] dispatched onto production `fla 0.6.0` `DPLR` Triton kernels [9] with checkpointed `4×8K` macro-segmenting (`574898d`); and (3) pure `4.0×` YaRN [10] `FP8 1.0× SharedKV` with untied per-pass Latent Sparse Attention (`D-LSA`) [11]. Across `167.60` active single-GPU supervisor hours (`627.56M` tokens), we release all open checkpoints [12], an audited `v1.2` reasoning corpus [13], negative ablation forensics, and custom Blackwell Triton kernels. Table I-A summarizes our verified results.
+Grounded in low-rank APOLLO optimization [3] inside `FusedStepOptimizer`, our clean v2 design unifies three orthogonal mechanisms: (1) a calibrated `[12, 36)` sandwich recurrence with manifold-constrained hyper-connection (`mHC`) `LoopBridge` transitions [4] inspired by adaptive recursive depth [5], expanding compute from `40L` (`R=1`) to `88L` (`R=3`) via cross-pass expert re-routing; (2) Step-0 bit-identical Gated DeltaNet-2 (`GDN-2`) [6] augmented with Bounded Query-Dependent Erasure (`QED`) [7], asymmetric `1M` slow decay, and soft negative eigenvalues [8] dispatched onto production `fla 0.6.0` `DPLR` Triton kernels [9] with checkpointed `4×8K` macro-segmenting (`574898d`); and (3) pure `4.0×` YaRN [10] `FP8 1.0× SharedKV` with untied per-pass Latent Sparse Attention (`D-LSA`) [11]. Across `167.60` baseline single-GPU supervisor hours plus `~25.0` Sprint 2 GPU-hours (completing `s2_v2@600` [`157.29M` tokens] and `s2_2@1000` [`131.07M` clean-room tokens]), we release all open checkpoints [12], an audited `v1.2` reasoning corpus [13], negative ablation forensics, and custom Blackwell Triton kernels. Table I-A summarizes our verified results.
 
 #### Table I-A — Headline Verified Findings (`Measured` Telemetry vs. `Derived Formula`)
 
@@ -102,7 +102,7 @@ All experiments ran on a single **NVIDIA RTX PRO 6000 Blackwell Server Edition**
 | `88` activation-checkpoint boundaries + `3` prior-seg KV + `128K` `BucketIndex` | `Formula` | **`13.05`** | `11.00 GiB` (`88×[1,32K,2048] bf16`) + `1.88 GiB` prior KV + `0.17 GiB` `BucketIndex` |
 | `u_seg` cached pre-attn hidden (`3×10L`) + `66L` GDN-2 state snapshots | `Formula` | **`~4.25`** | `3.75 GiB` `u_seg` (`bptt_offload_to_cpu=0.0`, 100% GDDR7-resident) + `~0.50 GiB` GDN-2 |
 | Single-layer `T=32K` `GDN2Adapter` transient (`4×8K` macro-seg `574898d`) | `Measured` | **`7.03`** | Gate 1 **`7.032 GiB`** delta (**`3.28×` cut** vs unsegmented `23.051 GiB`) |
-| **Measured Live `s2_v2` Peak (`4×32K`, `d=3`, `88L`)** | **`Measured`** | **`67.19–67.77`** | Gate 3 **`67.194 GiB`** (`71.4 GiB` res.); live `s1–s110` **`67.77 GiB`** Hub exact (`67.8 GiB` sup. rounded; `27.20 GiB` headroom) |
+| **Measured Completed `s2_v2@600` Peak (`4×32K`, `d=3`, `88L`)** | **`Measured`** | **`67.19–69.97`** | Gate 3 **`67.194 GiB`** (`71.4 GiB` res.); completed `s2_v2@600` **`69.97 GiB`** peak (Hub `17382c2e`; **`25.00 GiB`** headroom) |
 
 ---
 
@@ -119,7 +119,7 @@ All experiments ran on a single **NVIDIA RTX PRO 6000 Blackwell Server Edition**
 | `s3_long_1m_lsa` (64K/1M) | v1 HSSD | `completed` (`600/600`) | `83.06M` (`0.240%`) | `120.78M` | `1049.8` | `81.23` |
 | `s2_joint_bptt` (131K) | v1 HSSD | `halted@500` (`500/1200`) | `187.92M` (`0.542%`) | `131.07M` | `454→936` (`2.06×`) | `78.42` |
 | **`s3_v2_long_1m_lsa` (64K/1M)** | **Clean v2** | `completed` (`600/600`) | `24.56M` (`0.071%`) | `120.11M` | `2365.1` | `69.96` |
-| **`s2_v2_joint_bptt` (131K)** | **Clean v2** | `completed` (`600/600`) | `156.94M` (`0.453%`) | `157.29M` | `1060.2` (`s110`) | `69.97` |
+| **`s2_v2_joint_bptt` (131K)** | **Clean v2** | `completed` (`600/600`) | `156.94M` (`0.453%`) | `157.29M` | `1060.2` (early mean) | `69.97` |
 | **`s2_2_d1_lora_control` (8K)** | **Sprint 2B (`A2`)** | `completed` (`1000/1000`) | `18.26M` (`0.053%`) | `131.07M` | `4528.0` | `38.84` |
 
 #### Table III-B — Cross-Stage Held-Out Quality and Virtual Depth Scaling (`0` Post-Fix Skips)
@@ -144,8 +144,8 @@ All experiments ran on a single **NVIDIA RTX PRO 6000 Blackwell Server Edition**
 | `s3_long_1m_lsa` (v1 HSSD, `600` steps) | `513879f`, `4f09463` | `33.37` | `0` skips; 2 Colab sessions with auto-rollover |
 | `s2_joint_bptt` (v1 HSSD, `0–500`) | `2e37bf6..2f5a6ba` | `53.01` | Pre-opt `6.39`, leak `1.59`, `5a82677` `21.23`, TF5.24 `9.54`+`14.26` |
 | **`s3_v2_long_1m_lsa` (v2, `600/600`)** | `28b88e4` | **`15.02`** | Completed `600/600` (`0` skips, `~2,263 tok/s` sup. mean); + `0.30 h` Gate 1/2/3 |
-| **`s2_v2_joint_bptt` (v2 live `s110`)** | `574898d` | **`7.56`** | Live `GDN-2-1M+QED` (`0` skips, `~1,027–1,173 tok/s`, `67.80 GiB` peak) |
-| **Total Supervisor Active Single-GPU Time** | `colab_supervisor*.log` | **`167.60 h`** | `v1` `145.02 h` + `s3_v2` `15.02 h` + `s2_v2` `7.56 h` (excl. ~`1.6 h` standalone gates) |
+| **`s2_v2_joint_bptt` (v2, `600/600`)** | `574898d`, `17382c2e` | **`7.56+`** | Completed `600/600` (`157.29M` tok, `0` skips, `69.97 GiB` peak; `7.56 h` logged in baseline sup.) |
+| **Total Active Single-GPU Time** | `colab_supervisor*.log` | **`167.60 h + ~25.0 h`** | Baseline sup. `167.60 h` (`v1` `145.02` + `s3_v2` `15.02` + `s2_v2` early `7.56`) + `s2_v2` completion & `~25.0 h` Sprint 2 gates |
 
 ### B. Zero-Training Diagnostic Calibration (`s0_probe`)
 
@@ -400,7 +400,7 @@ Auditing `src/qloop/model/mhc.py`, `src/qloop/model/loop.py`, and live `s2_v2@60
 
 | Fix | Targeted Defect | Mathematical / Config Mechanism | Verified Bound / Invariant |
 | :---: | :--- | :--- | :--- |
-| **`M1`** | Anchor Shortcut (`w_anchor = 0.83–0.86`) | Cosine ceiling `0.85 → 0.20` over first `60%` of steps (flat `0.20` after) + `anchor_cap_excess_loss` (`weight=0.10`) | Forces `>= 80%` norm-matched `h_1` into Pass 2 without Step-0 shock |
+| **`M1`** | Anchor Shortcut (`w_anchor = 0.83–0.86`) | Cosine ceiling `bridge_anchor_max_start: 0.85` → `bridge_anchor_max_end: 0.20` (`60%` anneal, flat `0.20` after) + `anchor_cap_excess_loss` (`weight=0.10`) | Forces `>= 80%` norm-matched `h_1` into Pass 2 without Step-0 shock |
 | **`M2`** | Collinear Raw `h_prev` (`cos = 1.0`) | `bridge_drop_raw_h_prev: true` (`w_0 = 0.0` strictly on 2-simplex `[anchor, h_prev_rms_matched]`) | Zero residual norm-shock injection; eliminates `4.4×` `w_0` inflation |
 | **`M3`** | Off-Manifold `step_emb` / `subspace_delta` | `bridge_rms_preserve: true` (`rms_anc / sqrt(D)`-scaled `step_emb` + ball projection `RMS(x_out) <= RMS(anchor)`) [4] | Strict non-expansive `mHC` norm bound on every token |
 | **`M4`** | $\lvert\alpha_2\rvert = 0.022$ & Unconstrained Exit | `gate_clamp: [0.0, 1.0]` (`_qloop_project = (0.0, 1.0)` convex `(1-alpha)h_1 + alpha*h_tilde_2`) + `lr_mult.loop_adapters = 20.0` (`4.0e-4`) | Zero sign-flip extrapolation & breaks `~45×` gradient starvation |

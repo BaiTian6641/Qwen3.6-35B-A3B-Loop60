@@ -3773,8 +3773,25 @@ def _sync_cfg_to_checkpoint_payload(
         lcfg.update(prior_lsa)
         for k, t in saved_params.items():
             if k.endswith("lsa_indexer.wk") and t.ndim == 3:
-                lcfg.setdefault("index_dim", int(t.shape[-1]))
+                lcfg["index_dim"] = int(t.shape[-1])
                 break
+        if "num_query_passes" not in prior_lsa:
+            wq_4d_passes: int | None = None
+            max_extra_idx = -1
+            for k, t in saved_params.items():
+                if k.endswith("lsa_indexer.wq") and t.ndim == 4:
+                    wq_4d_passes = int(t.shape[0])
+                elif ".lsa_indexer.q_proj_extra." in k or k.startswith("lsa_indexer.q_proj_extra."):
+                    tail = k.split("q_proj_extra.", 1)[1]
+                    idx_tok = tail.split(".", 1)[0]
+                    if idx_tok.isdigit():
+                        max_extra_idx = max(max_extra_idx, int(idx_tok))
+            if wq_4d_passes is not None:
+                lcfg["num_query_passes"] = wq_4d_passes
+                lcfg["per_head_select"] = True
+            elif any(k.endswith("lsa_indexer.wq") for k in keys):
+                lcfg["num_query_passes"] = max_extra_idx + 2
+                lcfg["per_head_select"] = False
         lcfg["enabled"] = True
         cfg_dict["lsa"] = lcfg
     else:

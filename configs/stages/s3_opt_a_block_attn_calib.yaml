@@ -1,0 +1,117 @@
+# Option A (`s3_opt_a_block_attn_calib`) - 40L (`d=1`) Block-Attention Logit-Distillation Calibrator (`YELLOW_B -> GREEN`).
+# Architecture: 40L native depth (`loop.enabled: false`) + pruned `GDN-2-1M` (`qed_enabled: false`, `neg_eigval_max_boost: 0.0`)
+# + `D-LSA 1.0x` (`num_query_passes: 1`, `mode: sparse`) + 1M YaRN on 96 GB GDDR7 ECC VRAM.
+# Warm-starts cleanly from `runs/s2_v2_joint_bptt` with `drop_inactive_loop_adapters: true` (cleanly drops stale 88L loop keys).
+# Calibrates full-attention projections (`q/k/v/o`, `q_norm/k_norm`), `gdn2_adapter`, `lsa_indexer`, `shared_expert`, and norms
+# against Full Contiguous Prefill Oracle logits using Pre-RoPE + EPIC sink-strip + H64-INT4 Partition-B KV mounts and periodic
+# contiguous LM anchor steps (`contiguous_lm_every: 5`). 100% frozen MoE experts (`sha256_frozen_experts: true`).
+# 100% permissive clean-room open-license sources only, `holdout_mod: 100`, 13-gram decontaminated.
+_base_: [../base.yaml, ../model/qwen36_nvfp4.yaml]
+stage: s3_opt_a_block_attn_calib
+stage_type: block_attn_calib
+run: {name: s3_opt_a_block_attn_calib}
+
+model:
+  yarn_target_len: 1048576
+
+loop:
+  enabled: false
+
+gdn2:
+  enabled: true
+  rank: 64
+  chunk_size: 64
+  decay_log_min: -3.0
+  decay_log_max: 0.5
+  qed_enabled: false
+  neg_eigval_max_boost: 0.0
+  backend: auto
+
+hssd:
+  enabled: false
+
+lsa:
+  enabled: true
+  mode: sparse
+  compact_active_slots: true
+  max_selected_keys: 768
+  num_query_passes: 1
+  index_dim: 64
+  index_on: nope
+  pool: 4
+  block_size: 512
+  avg_bucket_keys: 8
+  max_bucket_keys: 32
+  num_select: 64
+  window: 512
+  sinks: 64
+  search: flat
+  temperature: 0.1
+  query_chunk: 256
+
+experts:
+  enabled: false
+
+train:
+  init_from: runs/s2_v2_joint_bptt
+  drop_inactive_loop_adapters: true
+  steps: 300
+  micro_batch: 1
+  grad_accum: 4
+  log_every: 5
+  ckpt_every: 50
+  eval_every: 100
+  sha256_frozen_experts: true
+  train_loop_adapters: false
+  train_hssd: false
+  train_gdn2: true
+  train_lsa: true
+  trainable:
+    - "self_attn\\.(q_proj|k_proj|v_proj|o_proj|q_norm|k_norm)"
+    - "shared_expert\\."
+    - "input_layernorm|post_attention_layernorm"
+  allowed_groups: [gdn2_adapters, lsa_indexers, attention, shared_expert, norms]
+  aux_weights:
+    _replace_: true
+  optim:
+    lr: 1.5e-5
+    warmup_steps: 25
+    fused: false
+    max_grad_norm: 1.0
+    lr_mult:
+      _replace_: true
+      gdn2_adapter: 5.0
+      lsa_indexer: 2.0
+
+block_attn:
+  kl_weight: 0.7
+  ce_weight: 0.3
+  kl_temperature: 1.0
+  ce_chunk_size: 128
+  contiguous_lm_every: 5
+  n_sessions: 3
+  session_len: 512
+  suffix_len: 512
+  live_sink_len: 4
+  sink_tokens: 4
+  rotary_dim: 64
+  rope_theta: 10000000.0
+  synthetic_mix_prob: 0.25
+  synthetic_seed_offset: 10000
+  eval_k0_examples: 20
+
+data:
+  seq_len: 2560
+  respect_doc_boundaries: true
+  holdout_mod: 100
+  holdout_eval_buckets: 2
+  sources:
+    - {name: openthoughts3, weight: 0.30}
+    - {name: nemotron_post, weight: 0.25}
+    - {name: finepdfs_mix, weight: 0.25}
+    - {name: fineweb_edu, weight: 0.20}
+  decontaminate: {enabled: true, ngram: 13, groups: [aime_2026, gpqa, hle, arc_agi_2, kernelbench], on_missing: warn}
+
+eval_quick:
+  n_batches: 8
+  depths: [1]

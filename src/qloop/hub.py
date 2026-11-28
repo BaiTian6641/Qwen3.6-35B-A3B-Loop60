@@ -1119,7 +1119,9 @@ def load_qloop_from_hub(
                     stage_meta = {}
 
     from .model.d1_lora import D1LoRAConfig
+    from .model.gdn2 import GDN2Config
     from .model.loop import LoopSpec
+    from .model.lsa import LSAConfig
 
     same_root_stage = (not stage_name) or (not meta.get("stage")) or (meta.get("stage") == stage_name)
     if stage_name and stage_meta.get("stack"):
@@ -1185,8 +1187,10 @@ def load_qloop_from_hub(
         raw_cfg["hssd"] = hcfg
         raw_cfg["gdn2"] = {"enabled": False}
     elif any("gdn2_adapter." in k for k in saved):
-        prior_gdn2 = dict(smeta.get("gdn2") or {})
-        gcfg = {**dict(raw_cfg.get("gdn2") or {}), **prior_gdn2}
+        known_gdn2 = {f.name for f in fields(GDN2Config)}
+        prior_gdn2 = {k: v for k, v in dict(smeta.get("gdn2") or {}).items() if k in known_gdn2}
+        gcfg = {k: v for k, v in dict(raw_cfg.get("gdn2") or {}).items() if k in known_gdn2}
+        gcfg.update(prior_gdn2)
         for k, t in saved.items():
             if k.endswith("gdn2_adapter.down.weight") and t.ndim == 2:
                 gcfg["rank"] = int(t.shape[0])
@@ -1206,12 +1210,31 @@ def load_qloop_from_hub(
         raw_cfg["hssd"] = {"enabled": False}
         raw_cfg["gdn2"] = {"enabled": False}
     if enable_lsa_if_present and any("lsa_indexer." in k for k in saved):
-        prior_lsa = dict(smeta.get("lsa") or {})
-        lcfg = {**dict(raw_cfg.get("lsa") or {}), **prior_lsa}
+        known_lsa = {f.name for f in fields(LSAConfig)}
+        prior_lsa = {k: v for k, v in dict(smeta.get("lsa") or {}).items() if k in known_lsa}
+        lcfg = {k: v for k, v in dict(raw_cfg.get("lsa") or {}).items() if k in known_lsa}
+        lcfg.update(prior_lsa)
         for k, t in saved.items():
             if k.endswith("lsa_indexer.wk") and t.ndim == 3:
-                lcfg.setdefault("index_dim", int(t.shape[-1]))
+                lcfg["index_dim"] = int(t.shape[-1])
                 break
+        if "num_query_passes" not in prior_lsa:
+            wq_4d_passes: int | None = None
+            max_extra_idx = -1
+            for k, t in saved.items():
+                if k.endswith("lsa_indexer.wq") and t.ndim == 4:
+                    wq_4d_passes = int(t.shape[0])
+                elif ".lsa_indexer.q_proj_extra." in k or k.startswith("lsa_indexer.q_proj_extra."):
+                    tail = k.split("q_proj_extra.", 1)[1]
+                    idx_tok = tail.split(".", 1)[0]
+                    if idx_tok.isdigit():
+                        max_extra_idx = max(max_extra_idx, int(idx_tok))
+            if wq_4d_passes is not None:
+                lcfg["num_query_passes"] = wq_4d_passes
+                lcfg["per_head_select"] = True
+            elif any(k.endswith("lsa_indexer.wq") for k in saved):
+                lcfg["num_query_passes"] = max_extra_idx + 2
+                lcfg["per_head_select"] = False
         lcfg["mode"] = "sparse"
         lcfg["enabled"] = True
         raw_cfg["lsa"] = lcfg

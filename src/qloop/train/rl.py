@@ -467,14 +467,38 @@ class GRPOTrainer:
             for n, p in self.stack.named_trainable.items():
                 p.data = saved[n]
 
-    def _overlong(self, n_tokens: int) -> float:
+    def _overlong(self, n_tokens: int, *, pass_rate: float | None = None) -> float:
         oc = self.rl.get("overlong") or {}
         if not oc.get("enabled"):
             return 0.0
         max_new = int(self.rl.get("max_new_tokens", 1024))
         buf = int(oc.get("buffer", max_new // 8))
         start = max_new - buf
-        return -float(oc.get("penalty", 1.0)) * max(0.0, (n_tokens - start) / max(buf, 1))
+        raw_pen = -float(oc.get("penalty", 1.0)) * max(0.0, (n_tokens - start) / max(buf, 1))
+        if raw_pen == 0.0:
+            return 0.0
+        if oc.get("accuracy_gated", False) and pass_rate is not None:
+            gate = max(0.0, min(1.0, float(pass_rate)))
+            return 0.0 if gate == 0.0 else raw_pen * gate
+        return raw_pen
+
+    def _concise_bonus(self, n_tokens: int, *, reward: float, pass_rate: float) -> float:
+        oc = self.rl.get("overlong") or {}
+        if oc.get("enabled") is False:
+            return 0.0
+        bonus = float(oc.get("concise_bonus", 0.0))
+        if bonus <= 0.0 or reward <= 0.0:
+            return 0.0
+        min_pr = float(oc.get("min_pass_rate", 0.25))
+        if pass_rate < min_pr:
+            return 0.0
+        target = oc.get("target_tokens")
+        if target is None:
+            target = int(self.rl.get("max_new_tokens", 1024))
+        target_f = float(target)
+        if target_f <= 0.0:
+            return 0.0
+        return bonus * max(0.0, min(1.0, 1.0 - float(n_tokens) / target_f))
 
     # ------------------------------------------------------------------ one RL step
     def rollout(self) -> tuple[list[_Seq], dict[str, float]]:
@@ -493,6 +517,8 @@ class GRPOTrainer:
         slap_seqs: list[_Seq] = []
         stats = {"reward/mean": 0.0, "groups/all_fail": 0.0, "groups/all_pass": 0.0, "groups/used": 0.0}
         lens, flat, teacher_ok, teacher_calls = [], [], 0, 0
+        group_pass_rates: list[float] = []
+        overlong_vals: list[float] = []
         hint_calls = hint_ok = failures_logged = 0
         n_total = n_loop = n_unclosed = n_premature = n_slop = 0
         slop_pen_sum = 0.0
@@ -500,6 +526,8 @@ class GRPOTrainer:
         for t, samples, rw in zip(tasks, outs, rewards):
             p_ids = self.gen.encode_prompt(t.prompt)
             all_fail = all(r <= 0 for r in rw)
+            pass_rate = sum(1 for r in rw if r > 0.0) / max(len(rw), 1)
+            group_pass_rates.append(pass_rate)
             paths = (
                 [detect_pathologies(o.text, reward=r, cfg=sirsi) for o, r in zip(samples, rw)]
                 if sirsi.enabled
@@ -549,7 +577,10 @@ class GRPOTrainer:
                             )
                 # Apply anti-slop tie-breaker only when at least one sample succeeded (`not all_fail`),
                 # preventing std-normalized advantage amplification from positively reinforcing wrong answers.
-                shaped.append(r + self._overlong(o.completion_tokens) - (0.0 if all_fail else s_pen))
+                ol_pen = self._overlong(o.completion_tokens, pass_rate=pass_rate)
+                c_bon = self._concise_bonus(o.completion_tokens, reward=r, pass_rate=pass_rate)
+                overlong_vals.append(ol_pen)
+                shaped.append(r + ol_pen + c_bon - (0.0 if all_fail else s_pen))
 
             flat += rw
             lens += [o.completion_tokens for o in samples]
@@ -649,6 +680,8 @@ class GRPOTrainer:
         n = max(len(tasks), 1)
         stats["reward/mean"] = sum(flat) / max(len(flat), 1)
         stats["reward/pass_rate"] = sum(r >= 1 for r in flat) / max(len(flat), 1)
+        stats["groups/mean_pass_rate"] = sum(group_pass_rates) / max(len(group_pass_rates), 1)
+        stats["rewards/overlong_mean"] = sum(overlong_vals) / max(len(overlong_vals), 1)
         for k in ("groups/all_fail", "groups/all_pass", "groups/used"):
             stats[k] /= n
         stats["completion/mean_tokens"] = sum(lens) / max(len(lens), 1)
@@ -804,7 +837,7 @@ class GRPOTrainer:
         from ..eval.runners import run_benchmark
 
         gcfg = dict(self.rl.get("gate") or {})
-        depth = gcfg.get("depth") or (self.stack.loop.spec.num_passes if self.stack.loop else None)
+        depth = (gcfg.get("depth") or self.stack.loop.spec.num_passes) if self.stack.loop is not None else None
         scores, lens = [], []
         res = {}
         for entry in gcfg.get("benchmarks") or []:
@@ -875,7 +908,11 @@ class GRPOTrainer:
                 smeta = (ck.get("state") or {}).get("stack") or {}
                 sc = float((smeta.get("expert_delta_scale")) or 1.0)
                 self.stack.restore_checkpoint(
-                    ck["params"], strict=False, expert_delta_scale=sc, prior_stack_meta=smeta
+                    ck["params"],
+                    strict=False,
+                    expert_delta_scale=sc,
+                    prior_stack_meta=smeta,
+                    drop_inactive_loop_adapters=bool(self.tcfg.get("drop_inactive_loop_adapters", False)),
                 )
                 if self.ref is not None:
                     self.ref = {n: p.detach().clone() for n, p in self.stack.named_trainable.items()}

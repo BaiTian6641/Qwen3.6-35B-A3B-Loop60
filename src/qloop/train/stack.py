@@ -138,6 +138,7 @@ class Stack:
         strict: bool = True,
         expert_delta_scale: float = 1.0,
         prior_stack_meta: dict[str, Any] | None = None,
+        drop_inactive_loop_adapters: bool = False,
     ) -> dict[str, int]:
         """Restore `saved` across both active trainables and frozen prior-stage adaptations."""
         if prior_stack_meta:
@@ -161,6 +162,7 @@ class Stack:
         lookup = self.named_all or self.named_trainable
         n_train = 0
         n_pruned = 0
+        n_dropped_loop = 0
         with torch.no_grad():
             for n, t in saved.items():
                 if n in lookup:
@@ -196,6 +198,14 @@ class Stack:
                     if not strict and self._is_active_subsystem_param(n):
                         n_pruned += 1
                         continue
+                    if (
+                        not strict
+                        and drop_inactive_loop_adapters
+                        and self.loop is None
+                        and (n.startswith("loop_adapters.") or ".loop_adapters." in n)
+                    ):
+                        n_dropped_loop += 1
+                        continue
                     self.passthrough_tensors[n] = t.detach().to("cpu")
 
             if self.loop is not None and self.loop.spec.gate_clamp is not None and not strict:
@@ -204,6 +214,8 @@ class Stack:
 
         if n_pruned > 0:
             log.info("skipped %d pruned active-subsystem tensor(s) from checkpoint passthrough", n_pruned)
+        if n_dropped_loop > 0:
+            log.info("dropped %d inactive loop_adapters.* tensor(s) from checkpoint passthrough", n_dropped_loop)
 
         folded = fold_expert_deltas_state_into_base_(
             self.model,

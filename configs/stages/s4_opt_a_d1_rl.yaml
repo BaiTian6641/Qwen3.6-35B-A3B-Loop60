@@ -122,7 +122,14 @@ rl:
     max_hints_per_step: 2
     failure_ledger: true
     curriculum_sculpt_n_tasks: 4
+    regret_enabled: true
+    atomic_checks_enabled: true
   gate:
+    mode: soft_hurt
+    eval_at_step_0: true
+    lambda_hurt: 2.0
+    max_hurt_frac: 0.05
+    max_bench_drop: 0.025
     every: 50
     depth: 1
     min_delta: 0.0

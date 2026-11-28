@@ -20,6 +20,7 @@ failure logging, and Supervisor prompt/decontamination utilities:
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
@@ -32,6 +33,8 @@ import torch
 from torch import nn
 
 from ..debug import require
+from ..eval.code_exec import extract_code
+from ..eval.scoring import clean_answer, last_boxed, normalize_math, parse_int_answer, parse_number
 from ..model.experts import param_group_of
 
 log = logging.getLogger("qloop")
@@ -40,6 +43,11 @@ TAG_LOOP_DEGENERATION = "LOOP_DEGENERATION"
 TAG_UNCLOSED_THINK = "UNCLOSED_THINK"
 TAG_PREMATURE_EXIT = "PREMATURE_EXIT"
 TAG_AI_SLOP = "AI_SLOP"
+
+REGRET_NEWLY_HURT = "NEWLY_HURT"
+REGRET_UNSOLVED_CHRONIC = "UNSOLVED_CHRONIC"
+REGRET_UNSOLVED_NOVEL = "UNSOLVED_NOVEL"
+REGRET_PINNED_PASS = "PINNED_PASS"
 
 # Curated anti-slop patterns inspected strictly on final-answer prose (never inside <think>).
 DEFAULT_SLOP_PATTERNS: tuple[str, ...] = (
@@ -108,6 +116,16 @@ class SIRSIConfig:
     failure_ledger: bool = True
     failure_ledger_filename: str = "sirsi_failures.jsonl"
     curriculum_sculpt_n_tasks: int = 4
+    regret_enabled: bool = True
+    regret_drop_eps: float = 0.05
+    regret_hurt_gamma: float = 2.0
+    regret_max_weight: float = 3.0
+    regret_chronic_weight: float = 0.5
+    hurt_replay_prob: float = 0.15
+    pinned_replay_prob: float = 0.10
+    atomic_checks_enabled: bool = False
+    atomic_check_alpha: float = 0.25
+    atomic_check_min_spread: float = 0.08
 
     @property
     def effective_max_slop_penalty(self) -> float:
@@ -156,11 +174,37 @@ class SIRSIConfig:
             failure_ledger=bool(d.get("failure_ledger", True)),
             failure_ledger_filename=str(d.get("failure_ledger_filename", "sirsi_failures.jsonl")),
             curriculum_sculpt_n_tasks=max(1, int(d.get("curriculum_sculpt_n_tasks", 4))),
+            regret_enabled=bool(d.get("regret_enabled", True)),
+            regret_drop_eps=float(d.get("regret_drop_eps", 0.05)),
+            regret_hurt_gamma=float(d.get("regret_hurt_gamma", 2.0)),
+            regret_max_weight=float(d.get("regret_max_weight", 3.0)),
+            regret_chronic_weight=float(d.get("regret_chronic_weight", 0.5)),
+            hurt_replay_prob=float(d.get("hurt_replay_prob", 0.15)),
+            pinned_replay_prob=float(d.get("pinned_replay_prob", 0.10)),
+            atomic_checks_enabled=bool(d.get("atomic_checks_enabled", False)),
+            atomic_check_alpha=float(d.get("atomic_check_alpha", 0.25)),
+            atomic_check_min_spread=float(d.get("atomic_check_min_spread", 0.08)),
         )
         require(0.0 < cfg.slap_eps < 0.5, "rl.sirsi.slap_eps must be in (0, 0.5)", slap_eps=cfg.slap_eps)
         require(cfg.slap_weight >= 0.0, "rl.sirsi.slap_weight must be >= 0", slap_weight=cfg.slap_weight)
         require(cfg.anti_slop_weight >= 0.0, "rl.sirsi.anti_slop_weight must be >= 0",
                 anti_slop_weight=cfg.anti_slop_weight)
+        require(cfg.regret_drop_eps >= 0.0, "rl.sirsi.regret_drop_eps must be >= 0",
+                regret_drop_eps=cfg.regret_drop_eps)
+        require(cfg.regret_hurt_gamma >= 0.0, "rl.sirsi.regret_hurt_gamma must be >= 0",
+                regret_hurt_gamma=cfg.regret_hurt_gamma)
+        require(cfg.regret_max_weight >= 1.0, "rl.sirsi.regret_max_weight must be >= 1",
+                regret_max_weight=cfg.regret_max_weight)
+        require(cfg.regret_chronic_weight >= 0.0, "rl.sirsi.regret_chronic_weight must be >= 0",
+                regret_chronic_weight=cfg.regret_chronic_weight)
+        require(0.0 <= cfg.hurt_replay_prob <= 1.0, "rl.sirsi.hurt_replay_prob must be in [0, 1]",
+                hurt_replay_prob=cfg.hurt_replay_prob)
+        require(0.0 <= cfg.pinned_replay_prob <= 1.0, "rl.sirsi.pinned_replay_prob must be in [0, 1]",
+                pinned_replay_prob=cfg.pinned_replay_prob)
+        require(0.0 <= cfg.atomic_check_alpha < 1.0, "rl.sirsi.atomic_check_alpha must be in [0, 1)",
+                atomic_check_alpha=cfg.atomic_check_alpha)
+        require(cfg.atomic_check_min_spread >= 0.0, "rl.sirsi.atomic_check_min_spread must be >= 0",
+                atomic_check_min_spread=cfg.atomic_check_min_spread)
         return cfg
 
 
@@ -313,12 +357,16 @@ def unlikelihood_span_loss(
     span_mask: torch.Tensor | Sequence[Any],
     *,
     eps: float = 1e-4,
+    seq_weights: torch.Tensor | Sequence[float] | None = None,
 ) -> torch.Tensor:
     """Bounded token-level unlikelihood loss `-log(1 - p)` strictly over `span_mask`.
 
     Computes in fp32 (or fp64 for fp64 inputs) so `1.0 - eps` never rounds to `1.0` in bf16/fp16.
     Strictly finite even when `token_logprobs == 0.0`; returns exact `0.0` with clean autograd
     graph when `span_mask` has no True entries; exact zero gradient outside `span_mask`.
+    When `seq_weights` (`[B]` for 2D inputs or scalar/`[T]` for 1D inputs) is provided, scales
+    each sequence's masked unlikelihood contribution proportionally while normalizing by total
+    masked token count (`seq_weights=None` gives exact legacy parity).
     """
     require(0.0 < float(eps) < 0.5, "unlikelihood_span_loss: eps must be in (0, 0.5)", eps=eps)
     acc = torch.float64 if token_logprobs.dtype == torch.float64 else torch.float32
@@ -333,6 +381,42 @@ def unlikelihood_span_loss(
     safe_lp = torch.where(mask, lp, torch.full_like(lp, -1.0))
     p = torch.exp(safe_lp.clamp(max=-float(eps))).clamp(max=1.0 - float(eps))
     ul = -torch.log1p(-p)
+    if seq_weights is not None:
+        w = torch.as_tensor(seq_weights, dtype=acc, device=lp.device)
+        require(bool(torch.all(w >= 0.0)), "unlikelihood_span_loss: seq_weights must be >= 0")
+        if lp.ndim == 2:
+            if w.ndim == 1 and w.shape[0] == lp.shape[0]:
+                w_exp = w.unsqueeze(1)
+            elif w.ndim == 2 and tuple(w.shape) == (lp.shape[0], 1):
+                w_exp = w
+            else:
+                require(
+                    False,
+                    "unlikelihood_span_loss: seq_weights shape must be [B] or [B, 1] for 2D token_logprobs",
+                    seq_weights=tuple(w.shape),
+                    token_logprobs=tuple(lp.shape),
+                )
+        elif lp.ndim == 1:
+            if w.ndim == 0 or (w.ndim == 1 and w.numel() == 1):
+                w_exp = w.reshape(1)
+            elif w.ndim == 1 and w.shape[0] == lp.shape[0]:
+                w_exp = w
+            else:
+                require(
+                    False,
+                    "unlikelihood_span_loss: seq_weights shape must be scalar, [1], or [T] for 1D token_logprobs",
+                    seq_weights=tuple(w.shape),
+                    token_logprobs=tuple(lp.shape),
+                )
+        else:
+            require(
+                w.ndim == 1 and w.shape[0] == lp.shape[0],
+                "unlikelihood_span_loss: seq_weights shape must match batch dim",
+                seq_weights=tuple(w.shape),
+                token_logprobs=tuple(lp.shape),
+            )
+            w_exp = w.reshape((lp.shape[0],) + (1,) * (lp.ndim - 1))
+        ul = ul * w_exp
     masked_ul = torch.where(mask, ul, torch.zeros_like(ul))
     denom = mask.to(acc).sum().clamp_min(1.0)
     return masked_ul.sum() / denom
@@ -438,6 +522,452 @@ def map_char_span_to_token_mask(
         return _finish(round(ratio * body_n))
     frac = max(0.05, min(1.0, float(fallback_tail_frac)))
     return _finish(int(body_n * (1.0 - frac)))
+
+
+# ============================================================================ G2 directional regret tracking
+
+
+@dataclass
+class TaskMasteryState:
+    seen: int = 0
+    ever_passed: bool = False
+    last_pass_rate: float = 0.0
+    best_pass_rate: float = 0.0
+    consec_fails: int = 0
+    best_check_bits: tuple[int, ...] = ()
+    last_check_bits: tuple[int, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "seen": int(self.seen),
+            "ever_passed": bool(self.ever_passed),
+            "last_pass_rate": float(self.last_pass_rate),
+            "best_pass_rate": float(self.best_pass_rate),
+            "consec_fails": int(self.consec_fails),
+            "best_check_bits": [int(b) for b in self.best_check_bits],
+            "last_check_bits": [int(b) for b in self.last_check_bits],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> TaskMasteryState:
+        return cls(
+            seen=int(d.get("seen", 0)),
+            ever_passed=bool(d.get("ever_passed", False)),
+            last_pass_rate=float(d.get("last_pass_rate", 0.0)),
+            best_pass_rate=float(d.get("best_pass_rate", 0.0)),
+            consec_fails=int(d.get("consec_fails", 0)),
+            best_check_bits=tuple(int(b) for b in (d.get("best_check_bits") or ())),
+            last_check_bits=tuple(int(b) for b in (d.get("last_check_bits") or ())),
+        )
+
+
+@dataclass(frozen=True)
+class RegretDecision:
+    kind: str
+    weight: float
+    prev_pass_rate: float
+    regressed_checks: tuple[int | str, ...] = ()
+
+
+class TaskRegretTracker:
+    """Tracks per-task mastery & check-bit history to classify directional regret (GUARD G2)."""
+
+    def __init__(self, cfg: SIRSIConfig | dict[str, Any] | None = None):
+        self.cfg = SIRSIConfig.from_dict(cfg)
+        self.states: dict[str, TaskMasteryState] = {}
+
+    def classify_and_update(
+        self,
+        task_id: str,
+        pass_rate: float,
+        check_bits: Sequence[int] = (),
+        *,
+        check_names: Sequence[str] = (),
+    ) -> RegretDecision:
+        tid = str(task_id)
+        pr = max(0.0, min(1.0, float(pass_rate)))
+        bits = tuple(1 if int(b) else 0 for b in check_bits)
+        st = self.states.get(tid)
+        if st is None:
+            st = TaskMasteryState()
+        prev_pr = float(st.last_pass_rate)
+
+        regressed_idx: list[int] = []
+        check_hurt_frac = 0.0
+        if bits and st.best_check_bits:
+            n_cmp = min(len(bits), len(st.best_check_bits))
+            prev_passed = sum(1 for i in range(n_cmp) if st.best_check_bits[i] == 1)
+            for i in range(n_cmp):
+                if st.best_check_bits[i] == 1 and bits[i] == 0:
+                    regressed_idx.append(i)
+            if prev_passed > 0 and regressed_idx:
+                check_hurt_frac = float(len(regressed_idx)) / float(prev_passed)
+
+        regressed_checks: tuple[int | str, ...] = tuple(
+            str(check_names[i]) if i < len(check_names) else i for i in regressed_idx
+        )
+
+        drop_eps = float(self.cfg.regret_drop_eps)
+        hurt_gamma = float(self.cfg.regret_hurt_gamma)
+        max_w = float(self.cfg.regret_max_weight)
+        chronic_w = float(self.cfg.regret_chronic_weight)
+
+        is_hurt = (
+            (st.ever_passed and pr < st.last_pass_rate - drop_eps)
+            or (st.best_pass_rate >= 0.5 and pr == 0.0)
+            or bool(regressed_idx)
+        )
+        new_consec_fails = 0 if pr > 0.0 else (st.consec_fails + 1)
+
+        if is_hurt:
+            drop_mag = max(0.0, st.best_pass_rate - pr)
+            weight = min(max_w, 1.0 + hurt_gamma * max(drop_mag, check_hurt_frac))
+            kind = REGRET_NEWLY_HURT
+        elif pr > 0.0:
+            kind = REGRET_PINNED_PASS
+            weight = 1.0
+        elif (not st.ever_passed) and new_consec_fails >= 2:
+            kind = REGRET_UNSOLVED_CHRONIC
+            weight = chronic_w
+        elif not st.ever_passed:
+            kind = REGRET_UNSOLVED_NOVEL
+            weight = 1.0
+        else:
+            # Previously passed (<0.5) and already at 0.0 previously; avoid pinning a 0-pass step.
+            kind = REGRET_UNSOLVED_CHRONIC if new_consec_fails >= 2 else REGRET_UNSOLVED_NOVEL
+            weight = chronic_w if kind == REGRET_UNSOLVED_CHRONIC else 1.0
+
+        st.seen += 1
+        st.ever_passed = st.ever_passed or (pr > 0.0)
+        st.last_pass_rate = pr
+        st.best_pass_rate = max(st.best_pass_rate, pr)
+        st.consec_fails = new_consec_fails
+        if bits:
+            st.last_check_bits = bits
+            if len(st.best_check_bits) == len(bits):
+                st.best_check_bits = tuple(max(a, b) for a, b in zip(st.best_check_bits, bits))
+            else:
+                st.best_check_bits = bits
+        self.states[tid] = st
+
+        return RegretDecision(
+            kind=kind,
+            weight=float(weight),
+            prev_pass_rate=prev_pr,
+            regressed_checks=regressed_checks,
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"states": {tid: st.to_dict() for tid, st in self.states.items()}}
+
+    def load_state_dict(self, sd: dict[str, Any]) -> None:
+        self.states = {
+            str(tid): TaskMasteryState.from_dict(val)
+            for tid, val in (sd.get("states") or {}).items()
+            if isinstance(val, dict)
+        }
+
+
+# ============================================================================ G3 Tier-A atomic self-checks
+
+
+@dataclass(frozen=True)
+class AtomicCheckResult:
+    bits: tuple[int, ...]
+    names: tuple[str, ...]
+    credit: float
+    has_exec_pass: bool
+
+
+_KB_RUNTIME_ERR_MARKERS: tuple[str, ...] = (
+    "cuda",
+    "oom",
+    "out of memory",
+    "shape",
+    "runtimeerror",
+    "runtime",
+    "traceback",
+    "segfault",
+    "crashed",
+    "timeout",
+    "nan",
+    "inf",
+    "typeerror",
+    "attributeerror",
+    "indexerror",
+    "keyerror",
+    "nameerror",
+    "valueerror",
+    "zerodivision",
+    "illegal memory",
+    "assert",
+    "type mismatch",
+    "output length mismatch",
+)
+
+_AIME_PROMPT_RE = re.compile(
+    r"\baime\b|\b0\s*(?:to|through|-|\.\.)\s*999\b|between\s+0\s+and\s+999|"
+    r"three[- ]digit\s+(?:positive\s+)?integer|remainder\s+when.*divided\s+by\s+1000|modulo\s+1000",
+    re.IGNORECASE,
+)
+_PROB_PROMPT_RE = re.compile(r"\bprobabilit(?:y|ies)\b|\bchance\s+that\b", re.IGNORECASE)
+_NONNEG_INT_PROMPT_RE = re.compile(
+    r"\b(?:positive\s+integer|non[- ]?negative\s+integer|how\s+many|"
+    r"number\s+of\s+(?:ways|pairs|tuples|triples|subsets|solutions|integers))\b",
+    re.IGNORECASE,
+)
+_INT_PROMPT_RE = re.compile(r"\b(?:find\s+the\s+integer|is\s+an\s+integer|integer\s+value)\b", re.IGNORECASE)
+_MATH_BAD_WORDS_RE = re.compile(
+    r"\b(?:unknown|none|null|error|sorry|cannot|undefined|answer|todo|placeholder|wrong|invalid)\b",
+    re.IGNORECASE,
+)
+_LATEX_CMD_RE = re.compile(
+    r"\\(?:frac|dfrac|tfrac|sqrt|pi|infty|sin|cos|tan|cot|sec|csc|log|ln|exp|left|right|"
+    r"cdot|times|pm|mp|cup|cap|text|mathrm|mathbf|textbf|circ|le|ge|leq|geq)\b"
+)
+_MATH_CHARS_RE = re.compile(r"^[0-9a-zA-Z+\-*/^_()\[\]{}.,=<>!|\\: ]+$")
+
+
+def _flatten_prompt_text(prompt: Any) -> str:
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, Sequence):
+        parts: list[str] = []
+        for m in prompt:
+            if isinstance(m, dict):
+                parts.append(str(m.get("content", "")))
+            else:
+                parts.append(str(m))
+        return "\n".join(parts)
+    return str(prompt or "")
+
+
+def _check_kernelbench_ast(src: str | None) -> bool:
+    """AST verify `ModelNew` is defined and no direct reference `Model` import/bypass is present."""
+    if not src or not src.strip():
+        return False
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return False
+    has_model_new = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "ModelNew":
+            has_model_new = True
+            for base in node.bases:
+                if isinstance(base, ast.Name) and base.id == "Model":
+                    return False
+                if isinstance(base, ast.Attribute) and base.attr == "Model":
+                    return False
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                root = (alias.name or "").split(".", 1)[0]
+                if root in ("reference", "kb_reference"):
+                    return False
+        elif isinstance(node, ast.ImportFrom):
+            mod_root = (node.module or "").split(".", 1)[0]
+            if mod_root in ("reference", "kb_reference"):
+                return False
+            for alias in node.names:
+                if alias.name == "Model":
+                    return False
+        elif isinstance(node, ast.Attribute):
+            if node.attr in ("spec_from_file_location", "exec_module"):
+                return False
+            if (
+                node.attr == "modules"
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "sys"
+            ):
+                return False
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in ("__import__", "eval", "exec")
+        ):
+            return False
+    return has_model_new
+
+
+def _balanced_delimiters(s: str) -> bool:
+    stack: list[str] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    for ch in s:
+        if ch in "([{":
+            stack.append(ch)
+        elif ch in ")]}":
+            if not stack or stack[-1] != pairs[ch]:
+                return False
+            stack.pop()
+    return not stack
+
+
+def _is_valid_math_expr(raw_cand: str) -> bool:
+    cleaned = clean_answer(raw_cand)
+    norm = normalize_math(raw_cand)
+    if not cleaned or not norm or len(norm) > 128:
+        return False
+    if parse_number(norm) is not None:
+        return True
+    if _MATH_BAD_WORDS_RE.search(cleaned):
+        return False
+    if not _balanced_delimiters(norm):
+        return False
+    stripped = _LATEX_CMD_RE.sub("", cleaned)
+    if not _MATH_CHARS_RE.match(stripped):
+        return False
+    # Reject multi-word natural language sentences masquerading as answers.
+    long_words = re.findall(r"[A-Za-z]{4,}", stripped)
+    if len(long_words) >= 2:
+        return False
+    if len(long_words) == 1 and not re.search(r"[\d+\-*/^=]", stripped):
+        return False
+    return bool(re.search(r"[\d]|pi|oo|sqrt|frac|[a-zA-Z]", norm))
+
+
+def _check_math_domain(verifier: str, prompt_str: str, cand: str | None) -> bool:
+    if not cand or not normalize_math(cand):
+        return False
+    v_low = verifier.lower()
+    if "aime" in v_low or _AIME_PROMPT_RE.search(prompt_str):
+        return parse_int_answer(cand, lo=0, hi=999) is not None
+    if _PROB_PROMPT_RE.search(prompt_str):
+        val = parse_number(cand)
+        return val is not None and 0 <= val <= 1
+    if _NONNEG_INT_PROMPT_RE.search(prompt_str):
+        val = parse_number(cand)
+        return val is not None and val.denominator == 1 and val >= 0
+    if _INT_PROMPT_RE.search(prompt_str):
+        val = parse_number(cand)
+        return val is not None and val.denominator == 1
+    return _is_valid_math_expr(cand)
+
+
+def _check_http_no_test_tamper(raw_comp: str, meta_d: dict[str, Any], exec_present: bool) -> bool:
+    if "no_test_tamper" in meta_d:
+        return bool(meta_d["no_test_tamper"])
+    if "test_tampered" in meta_d:
+        return not bool(meta_d["test_tampered"])
+    if not exec_present:
+        return False
+    low = raw_comp.lower()
+    if re.search(r"^\+\+\+\s+[ab]/.*(?:test_|/tests?/)", raw_comp, flags=re.MULTILINE):
+        return False
+    return not ("pytest.skip(" in low or "unittest.skip(" in low)
+
+
+def evaluate_tier_a_checks(
+    verifier: str,
+    prompt_text: Any,
+    completion_text: str,
+    reward: float,
+    meta: dict[str, Any] | None,
+    pathology: SIRSIPathology | None,
+    *,
+    alpha_check: float = 0.25,
+) -> AtomicCheckResult:
+    """Deterministic Tier-A atomic self-checks with strict anti-hacking bounds (GUARD G3).
+
+    Invariants:
+      - Syntactic check weights sum to <= 25% of total weight (<= 0.0625 at alpha_check=0.25).
+      - `TAG_LOOP_DEGENERATION` or `TAG_UNCLOSED_THINK` vetoes credit strictly to 0.0.
+      - Passing rollouts (`reward >= 1.0`) receive 0.0 additional credit so oracle pass strictly dominates.
+    """
+    v = str(verifier or "").strip().lower()
+    meta_d = meta if isinstance(meta, dict) else {}
+    tags = set(pathology.tags) if pathology is not None else set()
+    raw_comp = str(completion_text or "")
+    final_ans, unclosed_think = extract_final_answer(raw_comp)
+    alpha = max(0.0, float(alpha_check))
+    vetoed = (TAG_LOOP_DEGENERATION in tags) or (TAG_UNCLOSED_THINK in tags)
+
+    if "kernelbench" in v:
+        src = extract_code(raw_comp, "python", must_contain="ModelNew") or extract_code(raw_comp, "python")
+        c_extract = int(bool(src and src.strip()))
+        c_no_cheat = int(c_extract and _check_kernelbench_ast(src))
+        compiled = bool(meta_d.get("compiled"))
+        correct = bool(meta_d.get("correct"))
+        err_low = str(meta_d.get("error") or "").lower()
+        no_rt_err = int(
+            compiled
+            and (
+                correct
+                or (not any(tok in err_low for tok in _KB_RUNTIME_ERR_MARKERS))
+            )
+        )
+        speedup = float(meta_d.get("speedup") or 0.0)
+        fast_1 = int(correct and speedup > 1.05)
+        checks: list[tuple[str, float, bool, int]] = [
+            ("c_extractable_code", 0.08, False, c_extract),
+            ("c_no_cheat_ast", 0.12, True, c_no_cheat),
+            ("c_compiles", 0.25, True, int(compiled)),
+            ("c_no_runtime_err", 0.20, True, no_rt_err),
+            ("c_correct", 0.25, True, int(correct)),
+            ("c_fast_1", 0.10, True, fast_1),
+        ]
+    elif "math" in v or "aime" in v:
+        prompt_str = _flatten_prompt_text(prompt_text)
+        c_think_closed = int(bool(raw_comp.strip()) and (not unclosed_think) and (TAG_UNCLOSED_THINK not in tags))
+        c_no_loop = int(bool(raw_comp.strip()) and (TAG_LOOP_DEGENERATION not in tags))
+        boxed = last_boxed(final_ans) if not unclosed_think else None
+        c_boxed = int(boxed is not None and bool(clean_answer(boxed)))
+        cand = boxed if c_boxed else (str(meta_d["pred"]) if meta_d.get("pred") is not None else None)
+        c_domain = int((not unclosed_think) and _check_math_domain(v, prompt_str, cand))
+        checks = [
+            ("c_think_closed", 0.10, False, c_think_closed),
+            ("c_no_loop", 0.10, False, c_no_loop),
+            ("c_valid_boxed_format", 0.05, False, c_boxed),
+            ("c_answer_type_domain", 0.75, True, c_domain),
+        ]
+    else:
+        has_diff = ("--- " in raw_comp and "+++ " in raw_comp) or ("@@ " in raw_comp) or ("diff --git" in raw_comp)
+        has_tool = "<tool_call>" in raw_comp or bool(meta_d.get("valid_tool_or_diff"))
+        c_valid_fmt = int(has_tool or has_diff or (extract_code(raw_comp) is not None))
+        total_tests = int(meta_d.get("total") or 0)
+        passed_tests = int(meta_d.get("passed") or 0)
+        err_s = str(meta_d.get("error") or "")
+        applies = bool(
+            meta_d.get("applies_cleanly")
+            or meta_d.get("patch_applied")
+            or meta_d.get("compiled")
+            or (total_tests > 0 and "SyntaxError" not in err_s)
+        )
+        exec_present = applies or any(
+            k in meta_d
+            for k in (
+                "existing_tests_pass",
+                "target_tests_pass",
+                "passed",
+                "applies_cleanly",
+                "patch_applied",
+            )
+        )
+        no_tamper = _check_http_no_test_tamper(raw_comp, meta_d, exec_present)
+        existing_pass = bool(meta_d.get("existing_tests_pass") or passed_tests > 0)
+        target_pass = bool(
+            meta_d.get("target_tests_pass")
+            or (total_tests > 0 and passed_tests >= total_tests)
+            or float(reward) >= 1.0
+        )
+        checks = [
+            ("c_valid_tool_or_diff", 0.10, False, c_valid_fmt),
+            ("c_applies_cleanly", 0.25, True, int(applies)),
+            ("c_no_test_tamper", 0.15, True, int(no_tamper)),
+            ("c_existing_tests_pass", 0.25, True, int(existing_pass)),
+            ("c_target_tests_pass", 0.25, True, int(target_pass)),
+        ]
+
+    names = tuple(name for name, _, _, _ in checks)
+    bits = tuple(int(bit) for _, _, _, bit in checks)
+    has_exec_pass = (not vetoed) and any(is_exec and bool(bit) for _, _, is_exec, bit in checks)
+
+    if vetoed or float(reward) >= 1.0 or alpha <= 0.0:
+        credit = 0.0
+    else:
+        weighted = sum(w * float(bit) for _, w, _, bit in checks)
+        credit = min(alpha, alpha * weighted)
+
+    return AtomicCheckResult(bits=bits, names=names, credit=float(credit), has_exec_pass=bool(has_exec_pass))
 
 
 # ============================================================================ surgical param routing
@@ -547,6 +1077,9 @@ def build_hint_messages(
     prompt: Any,
     bad_completion: str,
     tags: Sequence[str] = (),
+    *,
+    regret_kind: str | None = None,
+    prev_pass_rate: float | None = None,
 ) -> list[dict[str, str]]:
     """Build Supervisor chat messages requesting a 1-sentence supervisory nudge before divergence."""
     tag_str = ", ".join(str(t) for t in tags) if tags else "INCORRECT_SOLUTION"
@@ -556,8 +1089,16 @@ def build_hint_messages(
         "student's point of divergence or pathology and the key conceptual pivot needed to recover. "
         "Do NOT give away the final answer, do NOT write full code, and avoid filler or clichés."
     )
+    regret_block = ""
+    if regret_kind == REGRET_NEWLY_HURT:
+        prev_s = f" (previous pass_rate={float(prev_pass_rate):.2f})" if prev_pass_rate is not None else ""
+        regret_block = (
+            f"Regression status: {REGRET_NEWLY_HURT}{prev_s} — the student previously succeeded or passed "
+            "verified sub-checks on this task and has now regressed. Focus the hint on restoring the broken step.\n\n"
+        )
     user_msg = (
         f"Task:\n{_render_prompt_preview(prompt)}\n\n"
+        f"{regret_block}"
         f"Detected failure tags: {tag_str}\n\n"
         f"Student attempt:\n{_truncate_around_tail(bad_completion)}\n\n"
         "Respond with exactly 1 sentence giving a surgical hint so the student can solve this cleanly."
@@ -571,15 +1112,38 @@ def build_curriculum_sculpt_messages(
 ) -> list[dict[str, str]]:
     """Build Supervisor chat messages to synthesize targeted, verifiable micro-tasks."""
     n_tasks = max(1, int(n_tasks))
+    recs = list(failure_records)
+    has_regret = any(isinstance(r, dict) and r.get("regret_kind") for r in recs)
+    if has_regret:
+        hurt_recs = [r for r in recs if isinstance(r, dict) and r.get("regret_kind") == REGRET_NEWLY_HURT][-5:]
+        hurt_ids = {id(r) for r in hurt_recs}
+        novel_recs = [
+            r for r in recs
+            if isinstance(r, dict) and id(r) not in hurt_ids and r.get("regret_kind") == REGRET_UNSOLVED_NOVEL
+        ]
+        other_recs = [
+            r for r in recs
+            if isinstance(r, dict) and id(r) not in hurt_ids and r.get("regret_kind") != REGRET_UNSOLVED_NOVEL
+        ]
+        slots_left = max(0, 8 - len(hurt_recs))
+        tail_novel = novel_recs[-slots_left:] if slots_left > 0 else []
+        rem_slots = max(0, slots_left - len(tail_novel))
+        tail_other = other_recs[-rem_slots:] if rem_slots > 0 else []
+        selected = hurt_recs + tail_novel + tail_other
+    else:
+        selected = recs[-8:]
+
     tag_counts: dict[str, int] = {}
     examples: list[str] = []
-    for idx, rec in enumerate(list(failure_records)[-8:]):
+    for idx, rec in enumerate(selected):
         rec_tags = [str(t) for t in (rec.get("tags") or ())]
         for tg in rec_tags:
             tag_counts[tg] = tag_counts.get(tg, 0) + 1
+        rk = rec.get("regret_kind")
+        rk_str = f", regret={rk}" if rk else ""
         examples.append(
             f"- Failure {idx + 1} (task_id={rec.get('task_id', '?')}, tags={rec_tags}, "
-            f"reward={rec.get('reward', 0.0)}): {_render_prompt_preview(rec.get('prompt', ''), 300)}"
+            f"reward={rec.get('reward', 0.0)}{rk_str}): {_render_prompt_preview(rec.get('prompt', ''), 300)}"
         )
     summary = ", ".join(f"{k}={v}" for k, v in sorted(tag_counts.items())) or "general reasoning failures"
     sys_msg = (

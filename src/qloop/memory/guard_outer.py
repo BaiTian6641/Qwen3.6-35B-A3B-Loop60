@@ -684,12 +684,32 @@ class LSANLGuardOuterLoop:
     def _rollback_esm_entries(
         self,
         compiled_pairs: Sequence[tuple[int, ESMLedgerEntry]],
+        *,
+        pre_ledger_lens: Mapping[int, int] | None = None,
     ) -> tuple[tuple[int, str], ...]:
         assert self.esm_bank is not None
         rolled: list[tuple[int, str]] = []
+        rolled_set: set[tuple[int, str]] = set()
         for layer_idx, entry in reversed(compiled_pairs):
-            self.esm_bank.rollback_entry(int(layer_idx), entry.entry_id)
-            rolled.append((int(layer_idx), str(entry.entry_id)))
+            key = (int(layer_idx), str(entry.entry_id))
+            if key in rolled_set:
+                continue
+            self.esm_bank.rollback_entry(key[0], key[1])
+            rolled.append(key)
+            rolled_set.add(key)
+
+        if pre_ledger_lens is not None:
+            for layer_idx in reversed(self.esm_bank.anchor_layers):
+                lyr = int(layer_idx)
+                pre_len = int(pre_ledger_lens.get(lyr, 0))
+                anchor = self.esm_bank.anchor(lyr)
+                for entry in reversed(anchor.ledger[pre_len:]):
+                    key = (lyr, str(entry.entry_id))
+                    if key in rolled_set or not entry.active:
+                        continue
+                    self.esm_bank.rollback_entry(lyr, key[1])
+                    rolled.append(key)
+                    rolled_set.add(key)
         return tuple(rolled)
 
     def _supersede_graduated_blob(self, blob: KVMemBlob, esm_target_id: str, *, now: float) -> bool:
@@ -714,7 +734,7 @@ class LSANLGuardOuterLoop:
     ) -> list[GuardGraduationResult]:
         """Graduate hardened `KVMemBlob`s into `ESM` with `Soft-HURT` gating and transactional rollback."""
         if self.esm_bank is None:
-            raise RuntimeError("graduate_kv_to_esm requires esm_bank to be provided on LSANLGuardOuterLoop")
+            raise ValueError("graduate_kv_to_esm requires esm_bank to be provided on LSANLGuardOuterLoop")
 
         eff_bench_map = self._resolve_bench_map(bench_map)
         if bench_map is not None:
@@ -730,16 +750,30 @@ class LSANLGuardOuterLoop:
                 now,
                 floor_time=max(blob.header.t_last_access, blob.header.t_valid, blob.header.t_created),
             )
-            compiled_pairs = _normalize_compiled_entries(compile_fn(blob, self.esm_bank))
-            compiled_refs = tuple((int(lyr), str(entry.entry_id)) for lyr, entry in compiled_pairs)
-            max_post_leak = max((float(entry.post_leakage) for _, entry in compiled_pairs), default=0.0)
+            pre_ledger_lens = {
+                int(lyr): len(self.esm_bank.anchor(int(lyr)).ledger) for lyr in self.esm_bank.anchor_layers
+            }
+            compiled_pairs: list[tuple[int, ESMLedgerEntry]] = []
+            compiled_refs: tuple[tuple[int, str], ...] = ()
+            max_post_leak = 0.0
 
             try:
+                compiled_pairs = _normalize_compiled_entries(compile_fn(blob, self.esm_bank))
+                compiled_refs = tuple((int(lyr), str(entry.entry_id)) for lyr, entry in compiled_pairs)
+                max_post_leak = max((float(entry.post_leakage) for _, entry in compiled_pairs), default=0.0)
                 raw_cand = eval_fn(blob, self.esm_bank)
+                cand_clamped = {str(k): _clamp01(v) for k, v in raw_cand.items()}
+                outcome = evaluate_soft_hurt(
+                    self.baseline_items,
+                    cand_clamped,
+                    cfg=self.config.soft_hurt,
+                    bench_map=eff_bench_map,
+                )
             except BaseException as exc:
-                rolled_refs = self._rollback_esm_entries(compiled_pairs)
+                rolled_refs = self._rollback_esm_entries(compiled_pairs, pre_ledger_lens=pre_ledger_lens)
                 self._rejected_esm_count += 1
-                self._rollback_esm_count += 1
+                if rolled_refs:
+                    self._rollback_esm_count += 1
                 self.history.append(
                     {
                         "kind": "esm_graduation_exception_rollback",
@@ -751,14 +785,6 @@ class LSANLGuardOuterLoop:
                     }
                 )
                 raise
-
-            cand_clamped = {str(k): _clamp01(v) for k, v in raw_cand.items()}
-            outcome = evaluate_soft_hurt(
-                self.baseline_items,
-                cand_clamped,
-                cfg=self.config.soft_hurt,
-                bench_map=eff_bench_map,
-            )
 
             if outcome.promoted:
                 target_tag = (
@@ -793,10 +819,11 @@ class LSANLGuardOuterLoop:
                 self.history.append(grad_res.to_dict())
                 results.append(grad_res)
             else:
-                rolled_refs: tuple[tuple[int, str], ...] = ()
-                if self.config.rollback_esm_on_reject and compiled_pairs:
-                    rolled_refs = self._rollback_esm_entries(compiled_pairs)
-                    self._rollback_esm_count += 1
+                rolled_refs = ()
+                if self.config.rollback_esm_on_reject:
+                    rolled_refs = self._rollback_esm_entries(compiled_pairs, pre_ledger_lens=pre_ledger_lens)
+                    if rolled_refs:
+                        self._rollback_esm_count += 1
                 self._rejected_esm_count += 1
                 self._record_rejected_hurt_ids(cand_clamped, outcome.newly_hurt_ids)
 

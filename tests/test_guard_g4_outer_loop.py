@@ -325,7 +325,7 @@ def test_tier2_graduate_kv_to_esm_promote_rollback_and_exception_safety() -> Non
 
     # Require esm_bank error check on a bankless controller
     no_esm_loop = LSANLGuardOuterLoop(store)
-    with pytest.raises(RuntimeError, match="esm_bank"):
+    with pytest.raises(ValueError, match="esm_bank"):
         no_esm_loop.graduate_kv_to_esm(compile_fn=lambda _b, _e: [], eval_fn=lambda _b, _e: base_scores)
 
     basis = torch.eye(32, dtype=torch.float32)
@@ -435,6 +435,111 @@ def test_tier2_graduate_kv_to_esm_promote_rollback_and_exception_safety() -> Non
     # General-corpus tokens STILL suffer exact 0.0 WISE drift after promote + rollback + crash-rollback
     assert torch.equal(esm_bank(15, h_general), torch.zeros_like(h_general))
     assert torch.equal(esm_bank(19, h_general), torch.zeros_like(h_general))
+
+
+def test_tier2_graduate_partial_compile_and_malformed_eval_rollback() -> None:
+    torch.manual_seed(303)
+    d_model = 32
+    r_hidden = 96
+    kv_cfg = _make_kv_cfg(graduation_hits=1, graduation_min_stability=2.0)
+    store = SplitHorizonKVBlobStore(config=kv_cfg)
+    esm_bank = _make_esm_bank(d_model=d_model, r_hidden=r_hidden, layers=(15, 19))
+
+    # Pre-seed an existing promoted entry on layer 15 so rollback must preserve prior state cleanly
+    h_pre = F.normalize(torch.randn(2, d_model), dim=-1) * 8.0
+    y_pre = F.normalize(torch.randn(2, d_model), dim=-1) * 0.10
+    esm_bank.compile_nullspace_ridge(15, h_pre, y_pre, entry_id="pre_existing_L15")
+
+    loop = LSANLGuardOuterLoop(
+        store,
+        esm_bank=esm_bank,
+        config=GuardOuterConfig(graduation_max_per_cycle=1),
+    )
+    loop.initialize_baseline({"m0": 1.0, "m1": 0.0}, bench_map={"m0": "aime", "m1": "aime"})
+
+    basis = torch.eye(32, dtype=torch.float32)
+    b_target = _make_blob("b_partial", basis[0], cfg=kv_cfg, t_created=0.0, salience=0.90)
+    assert store.admit(b_target) is True
+    store.record_hit("b_partial", now=1.0)
+
+    snap_w15 = esm_bank.anchor(15).w_down.detach().clone()
+    snap_w19 = esm_bank.anchor(19).w_down.detach().clone()
+    snap_b15 = esm_bank.anchor(15).active_basis.detach().clone()
+    snap_b19 = esm_bank.anchor(19).active_basis.detach().clone()
+    snap_p15 = esm_bank.anchor(15).scope_prototypes.detach().clone()
+    snap_p19 = esm_bank.anchor(19).scope_prototypes.detach().clone()
+    active_l15_before = [e.entry_id for e in esm_bank.anchor(15).ledger if e.active]
+    active_l19_before = [e.entry_id for e in esm_bank.anchor(19).ledger if e.active]
+
+    # (a) Partial multi-layer `compile_fn` crash: layer 15 compiles, layer 19 raises before returning
+    def _partial_crashing_compile(blob: KVMemBlob, bank: EpisodicSideMemoryBank) -> list[tuple[int, ESMLedgerEntry]]:
+        h_trig = F.normalize(torch.randn(2, d_model), dim=-1) * 8.0
+        y_tgt = F.normalize(torch.randn(2, d_model), dim=-1) * 0.10
+        bank.compile_nullspace_ridge(15, h_trig, y_tgt, entry_id=f"{blob.blob_id}_L15_partial")
+        raise RuntimeError("layer 19 compile failed mid-transaction")
+
+    with pytest.raises(RuntimeError, match="layer 19 compile failed"):
+        loop.graduate_kv_to_esm(
+            compile_fn=_partial_crashing_compile,
+            eval_fn=lambda _b, _e: {"m0": 1.0, "m1": 1.0},
+            now=2.0,
+        )
+
+    assert float((esm_bank.anchor(15).w_down - snap_w15).abs().max()) < 1e-6
+    assert float((esm_bank.anchor(19).w_down - snap_w19).abs().max()) < 1e-6
+    assert torch.equal(esm_bank.anchor(15).active_basis, snap_b15)
+    assert torch.equal(esm_bank.anchor(19).active_basis, snap_b19)
+    assert torch.equal(esm_bank.anchor(15).scope_prototypes, snap_p15)
+    assert torch.equal(esm_bank.anchor(19).scope_prototypes, snap_p19)
+    assert [e.entry_id for e in esm_bank.anchor(15).ledger if e.active] == active_l15_before
+    assert [e.entry_id for e in esm_bank.anchor(19).ledger if e.active] == active_l19_before
+    assert store.blobs["b_partial"].header.is_active(2.0) is True
+    assert loop.history[-1]["kind"] == "esm_graduation_exception_rollback"
+    assert loop.history[-1]["rolled_back_entries"] == [[15, "b_partial_L15_partial"]]
+
+    # (b) Malformed `eval_fn` payloads (`None` and non-numeric score) roll back multi-layer writes cleanly
+    compile_counter = {"n": 0}
+
+    def _ok_multi_compile(blob: KVMemBlob, bank: EpisodicSideMemoryBank) -> list[tuple[int, ESMLedgerEntry]]:
+        compile_counter["n"] += 1
+        tag = compile_counter["n"]
+        out: list[tuple[int, ESMLedgerEntry]] = []
+        for lyr in (15, 19):
+            h_trig = F.normalize(torch.randn(2, d_model), dim=-1) * 8.0
+            y_tgt = F.normalize(torch.randn(2, d_model), dim=-1) * 0.10
+            entry, _ = bank.compile_nullspace_ridge(lyr, h_trig, y_tgt, entry_id=f"{blob.blob_id}_L{lyr}_m{tag}")
+            out.append((lyr, entry))
+        return out
+
+    with pytest.raises(AttributeError):
+        loop.graduate_kv_to_esm(
+            compile_fn=_ok_multi_compile,
+            eval_fn=lambda _b, _e: None,  # type: ignore[arg-type,return-value]
+            now=3.0,
+        )
+
+    assert float((esm_bank.anchor(15).w_down - snap_w15).abs().max()) < 1e-6
+    assert float((esm_bank.anchor(19).w_down - snap_w19).abs().max()) < 1e-6
+    assert [e.entry_id for e in esm_bank.anchor(15).ledger if e.active] == active_l15_before
+    assert [e.entry_id for e in esm_bank.anchor(19).ledger if e.active] == active_l19_before
+    assert store.blobs["b_partial"].header.is_active(3.0) is True
+
+    with pytest.raises(ValueError):
+        loop.graduate_kv_to_esm(
+            compile_fn=_ok_multi_compile,
+            eval_fn=lambda _b, _e: {"m0": "not_a_number", "m1": 1.0},  # type: ignore[arg-type,return-value]
+            now=4.0,
+        )
+
+    assert float((esm_bank.anchor(15).w_down - snap_w15).abs().max()) < 1e-6
+    assert float((esm_bank.anchor(19).w_down - snap_w19).abs().max()) < 1e-6
+    assert torch.equal(esm_bank.anchor(15).active_basis, snap_b15)
+    assert torch.equal(esm_bank.anchor(19).active_basis, snap_b19)
+    assert torch.equal(esm_bank.anchor(15).scope_prototypes, snap_p15)
+    assert torch.equal(esm_bank.anchor(19).scope_prototypes, snap_p19)
+    assert [e.entry_id for e in esm_bank.anchor(15).ledger if e.active] == active_l15_before
+    assert [e.entry_id for e in esm_bank.anchor(19).ledger if e.active] == active_l19_before
+    assert store.blobs["b_partial"].header.is_active(4.0) is True
 
 
 # ==============================================================================

@@ -1318,6 +1318,8 @@ class GRPOTrainer:
                     )
                 if ck["optim"] is not None:
                     self.opt.load_state_dict(ck["optim"])
+                else:
+                    self._reset_optim_state(int(st_ck.get("step", 0)))
                 self.opt.zero_grad(set_to_none=True)
                 decision = f"rolled back to {os.path.basename(prom)}"
             else:
@@ -1362,6 +1364,15 @@ class GRPOTrainer:
             config_dict=raw_cfg,
         )
 
+    def _reset_optim_state(self, step: int) -> None:
+        """Clear per-parameter optimizer state (incl. bf16 fp32 master copies) and sync LR schedule."""
+        for ent in self.opt.entries.values():
+            ent.opt.state.pop(ent.param, None)
+        self.opt.norm_ema = None
+        self.opt.prev_global_norm = None
+        self.opt.last_global_norm = None
+        self.opt.sync_step(int(step))
+
     def _resume(self) -> None:
         from ..hub import resolve_run_path
 
@@ -1390,9 +1401,11 @@ class GRPOTrainer:
         smeta = st.get("stack") or {}
         sc = float((smeta.get("expert_delta_scale")) or 1.0)
         self.stack.restore_checkpoint(ck["params"], strict=True, expert_delta_scale=sc, prior_stack_meta=smeta)
+        self.step = int(st["step"])
         if ck["optim"] is not None:
             self.opt.load_state_dict(ck["optim"])
-        self.step = int(st["step"])
+        else:
+            self._reset_optim_state(self.step)
         self.sampler.load_state_dict(st["sampler"])
         self.temperature = float(st.get("temperature", self.temperature))
         self.init_entropy = st.get("init_entropy")

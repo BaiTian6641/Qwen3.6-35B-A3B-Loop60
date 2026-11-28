@@ -622,6 +622,113 @@ def test_g1_resume_refreshes_kl_ref_from_restored_and_promoted_checkpoint(
         tr3.pool.shutdown(wait=False)
 
 
+def test_g1_bf16_rollback_without_optim_pt_clears_master_weights_and_moments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """bf16 rollback when `optim.pt` is absent (`push_optim: false`) must clear fp32 `master` weights & moments."""
+    run_dir = str(tmp_path / "g1_bf16_rollback_no_optim")
+    gate_cfg = {
+        "mode": "soft_hurt",
+        "eval_at_step_0": True,
+        "every": 10,
+        "depth": 2,
+        "rollback": True,
+        "benchmarks": [{"name": "bench_a", "weight": 1.0}],
+    }
+    cfg = _guard_toy_cfg(steps=20, gate=gate_cfg, fused=False)
+    cfg["model"]["dtype"] = "bfloat16"
+    cfg["train"]["trainable"] = [r"mlp\.gate\.weight$", r"shared_expert\.", r"input_layernorm\.weight$"]
+    cfg["train"]["optim"]["lr"] = 1e-6
+    cfg["train"]["optim"]["warmup_steps"] = 0
+    cfg["train"]["optim"]["apollo"] = {"min_dim": 16}
+
+    tr1 = GRPOTrainer(cfg, run_dir)
+    try:
+        bf16_names = [n for n, p in tr1.stack.named_trainable.items() if p.dtype == torch.bfloat16]
+        assert bf16_names, "expected bfloat16 trainable parameters"
+        monkeypatch.setattr(
+            "qloop.eval.runners.run_benchmark",
+            lambda name, gen, **kw: _fake_bench_summary(name, {"i0": 1.0, "i1": 1.0}),
+        )
+        assert tr1.gate()["gate/decision"] == "promoted"
+        step0_params = {n: p.detach().float().clone() for n, p in tr1.stack.named_trainable.items()}
+    finally:
+        tr1.pool.shutdown(wait=False)
+
+    # Simulate HF Hub VM restore (`push_optim: false`): unlink BOTH `PROMOTED` and `step_0000000/optim.pt`
+    ckpt0 = Path(run_dir) / "checkpoints" / "step_0000000"
+    (Path(run_dir) / "checkpoints" / "PROMOTED").unlink()
+    (ckpt0 / "optim.pt").unlink()
+    assert not (ckpt0 / "optim.pt").exists()
+
+    tr2 = GRPOTrainer(cfg, run_dir)
+    try:
+        tr2._resume()
+        assert os.path.basename(tr2.ckpt.promoted() or "") == "step_0000000"
+        assert tr2.opt.step_count == 0
+
+        # Drift bf16 params and run an update so AdamWLite & ApolloAdamWFallback populate fp32 `master` weights
+        with torch.no_grad():
+            for p in tr2.stack.named_trainable.values():
+                p.add_(0.15)
+        seqs = [
+            _Seq([1, 2, 3, 4, 5, 6], 2, 1.0, "pg"),
+            _Seq([1, 2, 7, 8, 9, 10], 2, -1.0, "pg"),
+        ]
+        tr2.update(seqs)
+        max_drift_before = max(
+            float((tr2.stack.named_trainable[n].detach().float() - step0_params[n]).abs().max())
+            for n in bf16_names
+        )
+        assert max_drift_before >= 0.10
+        assert any("master" in ent.opt.state.get(ent.param, {}) for ent in tr2.opt.entries.values())
+
+        # Failing gate triggers rollback to `step_0000000` (which has no `optim.pt`)
+        tr2.step = 10
+        monkeypatch.setattr(
+            "qloop.eval.runners.run_benchmark",
+            lambda name, gen, **kw: _fake_bench_summary(name, {"i0": 0.0, "i1": 0.0}),
+        )
+        g10 = tr2.gate()
+        assert g10["gate/decision"] == "rolled back to step_0000000"
+        max_drift_after_rb = max(
+            float((tr2.stack.named_trainable[n].detach().float() - step0_params[n]).abs().max())
+            for n in bf16_names
+        )
+        assert max_drift_after_rb == 0.0
+        assert all(ent.param not in ent.opt.state for ent in tr2.opt.entries.values())
+        assert tr2.opt.norm_ema is None
+        assert tr2.opt.prev_global_norm is None
+        assert tr2.opt.step_count == 0
+
+        # Run 1 post-rollback update at lr=1e-6: weights MUST stay near step_0000000 (NEVER snap back to +0.15!)
+        tr2.update(seqs)
+        max_drift_post_upd = max(
+            float((tr2.stack.named_trainable[n].detach().float() - step0_params[n]).abs().max())
+            for n in bf16_names
+        )
+        assert max_drift_post_upd < 1e-2, (
+            f"post-rollback bf16 weights snapped back toward rejected weights: max_drift={max_drift_post_upd}"
+        )
+
+        # Also verify weights-only `_resume()` at step > 0 syncs `opt.step_count` cleanly
+        tr2.step = 5
+        saved5 = tr2._save_ckpt()
+        (Path(saved5) / "optim.pt").unlink()
+    finally:
+        tr2.pool.shutdown(wait=False)
+
+    tr3 = GRPOTrainer(cfg, run_dir)
+    try:
+        tr3._resume()
+        assert tr3.step == 5
+        assert tr3.opt.step_count == 5
+        assert all(ent.param not in ent.opt.state for ent in tr3.opt.entries.values())
+    finally:
+        tr3.pool.shutdown(wait=False)
+
+
 # ============================================================================ G2: Directional Regret Weighting
 
 

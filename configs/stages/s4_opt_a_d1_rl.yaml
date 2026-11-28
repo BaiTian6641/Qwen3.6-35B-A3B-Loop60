@@ -54,8 +54,9 @@ experts:
 train:
   init_from: runs/s3_opt_a_block_attn_calib
   drop_inactive_loop_adapters: true
-  steps: 40
-  ckpt_every: 10
+  gradient_checkpointing: true
+  steps: 30
+  ckpt_every: 5
   sha256_frozen_experts: true
   train_loop_adapters: false
   train_hssd: false
@@ -91,7 +92,8 @@ rl:
   max_new_tokens: 2048
   temperature: 1.0
   top_p: 1.0
-  micro_batch_seqs: 2
+  micro_batch_seqs: 1
+  logprob_chunk_size: 512
   clip_low: 0.2
   clip_high: 0.28
   adv_norm: std
@@ -129,7 +131,7 @@ rl:
     lambda_hurt: 2.0
     max_hurt_frac: 0.05
     max_bench_drop: 0.025
-    every: 20
+    every: 15
     depth: 1
     min_delta: 0.0
     max_len_growth: 1.5

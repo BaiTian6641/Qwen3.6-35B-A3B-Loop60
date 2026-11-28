@@ -730,12 +730,15 @@ def test_s4_opt_a_d1_rl_config_tuning_and_hygiene() -> None:
     assert cfg.stage_type == "rl"
     assert cfg.loop.enabled is False
     assert cfg.train.sha256_frozen_experts is True
-    assert int(cfg.train.steps) == 40
-    assert int(cfg.train.ckpt_every) == 10
+    assert cfg.train.gradient_checkpointing is True
+    assert int(cfg.train.steps) == 30
+    assert int(cfg.train.ckpt_every) == 5
 
     assert cfg.rl.enable_thinking is False
     assert int(cfg.rl.group_size) == 4
     assert int(cfg.rl.prompts_per_step) == 4
+    assert int(cfg.rl.micro_batch_seqs) == 1
+    assert int(cfg.rl.logprob_chunk_size) == 512
     assert int(cfg.rl.max_new_tokens) == 2048
     assert len(cfg.rl.tasks) == 1
     task0 = cfg.rl.tasks[0]
@@ -759,7 +762,7 @@ def test_s4_opt_a_d1_rl_config_tuning_and_hygiene() -> None:
     # GUARD G1-G3 + SI-RSI intact
     assert cfg.rl.gate.mode == "soft_hurt"
     assert cfg.rl.gate.eval_at_step_0 is True
-    assert int(cfg.rl.gate.every) == 20
+    assert int(cfg.rl.gate.every) == 15
     assert int(cfg.rl.gate.depth) == 1
     benches = list(cfg.rl.gate.benchmarks)
     assert len(benches) == 2

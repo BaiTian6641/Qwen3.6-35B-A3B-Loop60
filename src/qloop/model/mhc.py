@@ -93,6 +93,9 @@ class LoopBridge(nn.Module):
         step_embedding: bool = True,
         adapter_mode: str = "concat",
         up_init_std: float = 0.01,
+        drop_raw_h_prev: bool = False,
+        max_anchor_weight: float | None = None,
+        rms_preserve: bool = False,
     ):
         super().__init__()
         if len(init_weights) != 3 or min(init_weights) <= 0:
@@ -110,6 +113,10 @@ class LoopBridge(nn.Module):
         self.rank = int(rank)
         self.adapter_mode = adapter_mode
         self.up_init_std = float(up_init_std)
+        self.drop_raw_h_prev = bool(drop_raw_h_prev)
+        self.rms_preserve = bool(rms_preserve)
+        self._anchor_cap: float | None = None
+        self.set_anchor_cap(max_anchor_weight)
         s = sum(init_weights)
         logits = torch.tensor([math.log(w / s) for w in init_weights])
         self.mix_logits = nn.Parameter(logits.repeat(self.n_extra_passes, 1))
@@ -134,8 +141,35 @@ class LoopBridge(nn.Module):
                     else:
                         nn.init.normal_(self.ups[i].weight, mean=0.0, std=self.up_init_std)
 
+    def set_anchor_cap(self, cap: float | None) -> None:
+        if cap is None:
+            self._anchor_cap = None
+            return
+        c = float(cap)
+        if not (math.isfinite(c) and 0.0 < c <= 1.0):
+            raise ValueError(f"anchor cap must be None or in (0, 1], got {cap}")
+        self._anchor_cap = c
+
+    def raw_weights(self, extra_pass: int) -> torch.Tensor:
+        logits = upcast(self.mix_logits[extra_pass])
+        if self.drop_raw_h_prev:
+            neg_inf = logits.new_full((1,), float("-inf"))
+            logits = torch.cat([neg_inf, logits[1:]], dim=-1)
+        return F.softmax(logits, dim=-1)
+
     def weights(self, extra_pass: int) -> torch.Tensor:
-        return F.softmax(upcast(self.mix_logits[extra_pass]), dim=-1)
+        w = self.raw_weights(extra_pass)
+        if self._anchor_cap is None:
+            return w
+        w_1 = torch.clamp(w[1], max=float(self._anchor_cap))
+        excess = w[1] - w_1
+        return torch.stack([w[0], w_1, w[2] + excess])
+
+    def anchor_cap_excess_loss(self, extra_pass: int) -> torch.Tensor | None:
+        if self._anchor_cap is None:
+            return None
+        w_raw = self.raw_weights(extra_pass)
+        return F.relu(w_raw[1] - float(self._anchor_cap)).pow(2)
 
     def forward(self, h: torch.Tensor, anchor: torch.Tensor, extra_pass: int) -> torch.Tensor:
         w = self.weights(extra_pass)
@@ -143,7 +177,10 @@ class LoopBridge(nn.Module):
         matched = upcast(h) * (rms_anc / _rms(h))
         x = w[0] * upcast(h) + w[1] * upcast(anchor) + w[2] * matched
         if self.step_emb is not None:
-            x = x + upcast(self.step_emb[extra_pass])
+            if self.rms_preserve:
+                x = x + (rms_anc / math.sqrt(self.hidden)) * upcast(self.step_emb[extra_pass])
+            else:
+                x = x + upcast(self.step_emb[extra_pass])
         if self.rank > 0:
             if self.adapter_mode == "concat":
                 cat_in = torch.cat([upcast(h), upcast(anchor)], dim=-1).to(self.down.weight.dtype)
@@ -156,6 +193,9 @@ class LoopBridge(nn.Module):
                 u_hat = norm_mod(upcast(h).to(norm_mod.weight.dtype))
                 delta = up_mod(F.silu(down_mod(u_hat.to(down_mod.weight.dtype))).to(up_mod.weight.dtype))
                 x = x + (rms_anc / math.sqrt(self.hidden)) * upcast(delta)
+        if self.rms_preserve:
+            rms_x = _rms(x)
+            x = x * (rms_anc / rms_x.clamp_min(rms_anc))
         return x.to(h.dtype)
 
 
@@ -170,6 +210,9 @@ class ReEntryBridge(LoopBridge):
         rank: int = 256,
         step_embedding: bool = True,
         up_init_std: float = 0.01,
+        drop_raw_h_prev: bool = False,
+        max_anchor_weight: float | None = None,
+        rms_preserve: bool = False,
     ):
         super().__init__(
             hidden=hidden,
@@ -179,4 +222,7 @@ class ReEntryBridge(LoopBridge):
             step_embedding=step_embedding,
             adapter_mode="subspace",
             up_init_std=up_init_std,
+            drop_raw_h_prev=drop_raw_h_prev,
+            max_anchor_weight=max_anchor_weight,
+            rms_preserve=rms_preserve,
         )

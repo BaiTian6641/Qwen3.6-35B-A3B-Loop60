@@ -148,6 +148,13 @@ class LoopSpec:
     bridge_rank: int = 0
     bridge_mode: str = "concat"
     bridge_up_std: float = 0.01
+    bridge_drop_raw_h_prev: bool = False
+    bridge_rms_preserve: bool = False
+    bridge_anchor_max_start: float | None = None
+    bridge_anchor_max_end: float | None = None
+    bridge_anchor_anneal_frac: float = 0.6
+    bridge_anchor_aux_weight: float = 0.0
+    gate_clamp: tuple[float, float] | None = None
     step_embedding: bool = True
     gate_init: float = 0.0
     per_pass_router: bool = True
@@ -179,6 +186,11 @@ class LoopSpec:
         for k in ("bridge_init", "kv_proj_names", "attn_proj_names", "write_zero_names", "write_neg_names"):
             if k in d and isinstance(d[k], list):
                 d[k] = tuple(d[k])
+        if "gate_clamp" in d and d["gate_clamp"] is not None:
+            gc = d["gate_clamp"]
+            if not isinstance(gc, (list, tuple)) or len(gc) != 2:
+                raise ValueError(f"gate_clamp must be a 2-element [lo, hi] sequence or null, got {gc!r}")
+            d["gate_clamp"] = (float(gc[0]), float(gc[1]))
         d.pop("enabled", None)
         return cls(**d)
 
@@ -199,6 +211,24 @@ class LoopSpec:
             raise ValueError(f"bridge_mode must be 'concat' or 'subspace', got {self.bridge_mode!r}")
         if self.bridge_up_std < 0:
             raise ValueError(f"bridge_up_std must be >= 0, got {self.bridge_up_std}")
+        if self.gate_clamp is not None:
+            if len(self.gate_clamp) != 2:
+                raise ValueError(f"gate_clamp must have 2 elements (lo, hi), got {self.gate_clamp!r}")
+            lo, hi = float(self.gate_clamp[0]), float(self.gate_clamp[1])
+            if not (math.isfinite(lo) and math.isfinite(hi) and lo <= hi):
+                raise ValueError(f"gate_clamp must satisfy finite lo <= hi, got {self.gate_clamp!r}")
+        anneal_f = float(self.bridge_anchor_anneal_frac)
+        if not (math.isfinite(anneal_f) and 0.0 < anneal_f <= 1.0):
+            raise ValueError(f"bridge_anchor_anneal_frac must be in (0, 1], got {self.bridge_anchor_anneal_frac}")
+        for attr in ("bridge_anchor_max_start", "bridge_anchor_max_end"):
+            val = getattr(self, attr)
+            if val is not None:
+                fv = float(val)
+                if not (math.isfinite(fv) and 0.0 < fv <= 1.0):
+                    raise ValueError(f"{attr} must be in (0, 1], got {val}")
+        aux_w = float(self.bridge_anchor_aux_weight)
+        if not (math.isfinite(aux_w) and aux_w >= 0.0):
+            raise ValueError(f"bridge_anchor_aux_weight must be >= 0, got {self.bridge_anchor_aux_weight}")
         if self.attn_adapter_rank < 0:
             raise ValueError(f"attn_adapter_rank must be >= 0, got {self.attn_adapter_rank}")
         if self.kv_share and self.attn_adapter_rank > 0 and (set(self.attn_proj_names) & set(self.kv_proj_names)):
@@ -584,6 +614,18 @@ class LoopAdapters(nn.Module):
         super().__init__()
         extra = max(spec.num_passes - 1, 1)
         self.gates = nn.Parameter(torch.full((extra, hidden), float(spec.gate_init)))
+        if spec.gate_clamp is not None:
+            lo, hi = float(spec.gate_clamp[0]), float(spec.gate_clamp[1])
+            with torch.no_grad():
+                self.gates.clamp_(lo, hi)
+            self.gates._qloop_project = (lo, hi)  # type: ignore[attr-defined]
+        # Default inference/eval cap to the final trained cap (`bridge_anchor_max_end`) when specified;
+        # `trainer.train()` overrides via `LoopController.set_step(step, total_steps)` before step-0 eval.
+        init_anchor_cap = (
+            spec.bridge_anchor_max_end
+            if spec.bridge_anchor_max_end is not None
+            else spec.bridge_anchor_max_start
+        )
         self.bridge = LoopBridge(
             hidden,
             extra,
@@ -592,6 +634,9 @@ class LoopAdapters(nn.Module):
             spec.step_embedding,
             adapter_mode=spec.bridge_mode,
             up_init_std=spec.bridge_up_std,
+            drop_raw_h_prev=spec.bridge_drop_raw_h_prev,
+            max_anchor_weight=init_anchor_cap,
+            rms_preserve=spec.bridge_rms_preserve,
         )
         self.pass_router: PassRouterAdapters | None = None
         if spec.per_pass_router and spec.num_passes > 1 and num_experts is not None and spec.core_len > 0:
@@ -1146,7 +1191,11 @@ class LoopController:
 
     def _combine(self, ctx: LoopContext, h: torch.Tensor, r: int) -> torch.Tensor:
         start = ctx.start[r]
-        coef = self.adapters.gates[r - 2].to(h.dtype)
+        gate = self.adapters.gates[r - 2]
+        if self.spec.gate_clamp is not None:
+            lo, hi = float(self.spec.gate_clamp[0]), float(self.spec.gate_clamp[1])
+            gate = gate.clamp(lo, hi)
+        coef = gate.to(h.dtype)
         if r in ctx.coef:
             coef = coef * ctx.coef[r].to(h.dtype)
         return start + coef * (h - start)
@@ -1164,6 +1213,27 @@ class LoopController:
         if not 1 <= r <= self.spec.num_passes:
             raise ValueError(f"active passes must be in [1, {self.spec.num_passes}], got {r}")
         self.active_passes = r
+
+    def set_step(self, step: int, total_steps: int) -> float | None:
+        """Update scheduled `LoopBridge` anchor cap for training step `step` of `total_steps`."""
+        start = self.spec.bridge_anchor_max_start
+        end = self.spec.bridge_anchor_max_end
+        if start is not None and end is not None:
+            anneal_frac = float(self.spec.bridge_anchor_anneal_frac)
+            denom = max(1.0, float(total_steps) * anneal_frac)
+            p = min(1.0, max(0.0, float(step) / denom))
+            cap = float(end) + 0.5 * (float(start) - float(end)) * (1.0 + math.cos(math.pi * p))
+            self.adapters.bridge.set_anchor_cap(cap)
+            return cap
+        if end is not None:
+            cap = float(end)
+            self.adapters.bridge.set_anchor_cap(cap)
+            return cap
+        if start is not None:
+            cap = float(start)
+            self.adapters.bridge.set_anchor_cap(cap)
+            return cap
+        return None
 
     def set_router_repel(self, value: float) -> None:
         """Set cross-pass expert repulsion logit penalty across all core layers (runtime knob)."""
@@ -1184,6 +1254,15 @@ class LoopController:
         if self.ctx.div_terms and self.spec.router_diversity_weight > 0:
             div_mean = torch.stack([t.float() for t in self.ctx.div_terms]).mean()
             vals.append(float(self.spec.router_diversity_weight) * div_mean)
+        if self.spec.bridge_anchor_aux_weight > 0 and self.active_passes >= 2:
+            bridge = self.adapters.bridge
+            cap_losses = []
+            for i in range(self.active_passes - 1):
+                cl = bridge.anchor_cap_excess_loss(i)
+                if cl is not None:
+                    cap_losses.append(cl.float())
+            if cap_losses:
+                vals.append(float(self.spec.bridge_anchor_aux_weight) * torch.stack(cap_losses).mean())
         return torch.stack(vals).sum() if vals else None
 
     def trainable_parameters(self) -> list[nn.Parameter]:
@@ -1242,8 +1321,14 @@ class LoopController:
         s = dict(self.ctx.stats)
         with torch.no_grad():
             bridge = self.adapters.bridge
+            if bridge._anchor_cap is not None:
+                s["loop/bridge_anchor_cap"] = float(bridge._anchor_cap)
             for i in range(self.spec.num_passes - 1):
-                s[f"loop/gate_abs_mean_p{i + 2}"] = float(self.adapters.gates[i].abs().mean())
+                g_i = self.adapters.gates[i].detach().float()
+                s[f"loop/gate_abs_mean_p{i + 2}"] = float(g_i.abs().mean())
+                s[f"loop/gate_mean_p{i + 2}"] = float(g_i.mean())
+                s[f"loop/gate_min_p{i + 2}"] = float(g_i.min())
+                s[f"loop/gate_max_p{i + 2}"] = float(g_i.max())
                 w = bridge.weights(i)
                 for j, nm in enumerate(LoopBridge.STREAMS):
                     s[f"loop/bridge_w_{nm}_p{i + 2}"] = float(w[j])

@@ -122,6 +122,15 @@ class Stack:
         out.update(collect_trainable(self.named_trainable))
         return out
 
+    def _is_active_subsystem_param(self, name: str) -> bool:
+        if self.loop is not None and (name.startswith("loop_adapters.") or ".loop_adapters." in name):
+            return True
+        if self.gdn2 is not None and (name.startswith("gdn2_adapter.") or ".gdn2_adapter." in name):
+            return True
+        if self.lsa is not None and (name.startswith("lsa_indexer.") or ".lsa_indexer." in name):
+            return True
+        return bool(self.d1_lora is not None and (name.startswith("d1_lora.") or ".d1_lora." in name))
+
     def restore_checkpoint(
         self,
         saved: dict[str, torch.Tensor],
@@ -151,15 +160,32 @@ class Stack:
                 )
         lookup = self.named_all or self.named_trainable
         n_train = 0
+        n_pruned = 0
         with torch.no_grad():
             for n, t in saved.items():
                 if n in lookup:
                     p = lookup[n]
+                    t_use = t
                     if p.shape != t.shape:
-                        raise RuntimeError(
-                            f"shape mismatch for {n}: model {tuple(p.shape)} vs ckpt {tuple(t.shape)}"
-                        )
-                    p.copy_(t.to(p.device, p.dtype))
+                        if (
+                            not strict
+                            and n.startswith("loop_adapters.")
+                            and t.ndim == p.ndim
+                            and t.shape[1:] == p.shape[1:]
+                            and t.shape[0] > p.shape[0]
+                        ):
+                            t_use = t[: p.shape[0]]
+                            log.info(
+                                "sliced loop_adapters param %s from %s -> %s",
+                                n,
+                                tuple(t.shape),
+                                tuple(p.shape),
+                            )
+                        else:
+                            raise RuntimeError(
+                                f"shape mismatch for {n}: model {tuple(p.shape)} vs ckpt {tuple(t.shape)}"
+                            )
+                    p.copy_(t_use.to(p.device, p.dtype))
                     if n in self.named_trainable:
                         n_train += 1
                     else:
@@ -167,7 +193,17 @@ class Stack:
                 else:
                     if strict and not self.named_all:
                         raise RuntimeError(f"checkpoint mismatch: unexpected key {n!r}")
+                    if not strict and self._is_active_subsystem_param(n):
+                        n_pruned += 1
+                        continue
                     self.passthrough_tensors[n] = t.detach().to("cpu")
+
+            if self.loop is not None and self.loop.spec.gate_clamp is not None and not strict:
+                lo, hi = float(self.loop.spec.gate_clamp[0]), float(self.loop.spec.gate_clamp[1])
+                self.loop.adapters.gates.clamp_(lo, hi)
+
+        if n_pruned > 0:
+            log.info("skipped %d pruned active-subsystem tensor(s) from checkpoint passthrough", n_pruned)
 
         folded = fold_expert_deltas_state_into_base_(
             self.model,

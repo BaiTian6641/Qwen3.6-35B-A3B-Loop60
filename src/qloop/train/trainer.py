@@ -893,6 +893,8 @@ class LMTrainer:
             self.eval_batches = self._eval_set()
             self.ood_eval_batches = self._ood_eval_set()
         self.maybe_resume()
+        if st.loop is not None and callable(getattr(st.loop, "set_step", None)):
+            st.loop.set_step(self.step, steps)
         if distill_on and distill_cfg is not None:
             self.shared_teacher = SharedBackboneTeacher(
                 st,
@@ -940,6 +942,8 @@ class LMTrainer:
             while self.step < steps and not self._stop:
                 if st.lsa is not None and callable(getattr(st.lsa, "set_step", None)):
                     st.lsa.set_step(self.step)
+                if st.loop is not None and callable(getattr(st.loop, "set_step", None)):
+                    st.loop.set_step(self.step, steps)
                 depth = st.loop.sample_active_passes(self.rng) if st.loop is not None else 1
                 losses: dict[str, float] = {}
 
@@ -1043,6 +1047,8 @@ class LMTrainer:
             self.stream.log_stats()
         if st.frozen_experts_sha256 is not None:
             st.verify_frozen_experts()
+        if st.loop is not None and callable(getattr(st.loop, "set_step", None)):
+            st.loop.set_step(self.step, steps)
         final = self.quick_eval() if (self.eval_batches or self.ood_eval_batches) else {}
         if final:
             self.metrics.log(self.step, final)

@@ -1,0 +1,134 @@
+# Option B (`s2_v3_loop64_mhc`) - 64-Layer (`d=2`) Manifold-Constrained Loop Refinement on 96 GB GDDR7 ECC VRAM.
+# Architecture: [0,12) x1 + [12,36) x2 + [36,40) x1 = 64 virtual layers (removes Pass-3 snap-back + 2.36x decode cost).
+# Fixes all 6 Sprint 2 `mHC` connection defects while warm-starting cleanly from `runs/s2_v2_joint_bptt` (`num_passes: 3 -> 2`):
+#   * `bridge_drop_raw_h_prev: true`: drops collinear raw `h_prev` stream (eliminates residual norm shock).
+#   * `bridge_anchor_max_start: 0.85 -> bridge_anchor_max_end: 0.20` (cosine over 60% steps) + `bridge_anchor_aux_weight: 0.10`:
+#     breaks the `w_anchor = 0.83` shortcut trap with smooth step-0 continuity and direct excess gradient into `mix_logits`.
+#   * `bridge_rms_preserve: true`: scales `step_emb` by `rms(anchor)/sqrt(d)` and enforces exact non-expansive ball projection.
+#   * `gate_clamp: [0.0, 1.0]`: enforces strict convex 2-stream mHC pass-exit interpolation (`h + alpha * (h_tilde - h)`).
+#   * Prunes zero-effect `QED` (`qed_enabled: false`) and `neg_eigval` (`neg_eigval_max_boost: 0.0`) from GDN-2.
+#   * 100% permissive clean-room sources (zero `opus46_*` subsets), 13-gram decontaminated, 16K sequence length.
+_base_: [../base.yaml, ../model/qwen36_nvfp4.yaml]
+stage: s2_v3_loop64_mhc
+stage_type: lm
+run: {name: s2_v3_loop64_mhc}
+
+model:
+  yarn_target_len: 1048576
+
+loop:
+  enabled: true
+  prelude_end: 12
+  core_end: 36
+  num_passes: 2
+  target_virtual_layers: 64
+  kv_share: true
+  bridge_init: [0.05, 0.85, 0.10]
+  bridge_rank: 256
+  bridge_mode: subspace
+  bridge_up_std: 0.01
+  bridge_drop_raw_h_prev: true
+  bridge_rms_preserve: true
+  bridge_anchor_max_start: 0.85
+  bridge_anchor_max_end: 0.20
+  bridge_anchor_anneal_frac: 0.60
+  bridge_anchor_aux_weight: 0.10
+  gate_clamp: [0.0, 1.0]
+  attn_adapter_rank: 64
+  step_embedding: true
+  gate_init: 0.0
+  per_pass_router: true
+  router_adapter_rank: 32
+  router_repel_init: 0.0
+  router_diversity_weight: 0.0
+  mor: false
+  write_mask: true
+  checkpoint: true
+  train_pass_probs: [0.15, 0.85]
+
+gdn2:
+  enabled: true
+  rank: 64
+  chunk_size: 64
+  decay_log_min: -3.0
+  decay_log_max: 0.5
+  qed_enabled: false
+  neg_eigval_max_boost: 0.0
+  backend: auto
+
+hssd:
+  enabled: false
+
+lsa:
+  enabled: true
+  mode: sparse
+  compact_active_slots: true
+  max_selected_keys: 768
+  num_query_passes: 2
+  index_dim: 64
+  index_on: nope
+  pool: 4
+  block_size: 512
+  avg_bucket_keys: 8
+  max_bucket_keys: 32
+  num_select: 64
+  window: 512
+  sinks: 64
+  search: flat
+  temperature: 0.1
+  query_chunk: 256
+
+bptt:
+  enabled: false
+
+experts:
+  enabled: false
+
+train:
+  init_from: runs/s2_v2_joint_bptt
+  steps: 500
+  micro_batch: 1
+  grad_accum: 8
+  log_every: 5
+  ckpt_every: 25
+  sha256_frozen_experts: true
+  train_loop_adapters: true
+  train_hssd: false
+  train_gdn2: true
+  train_lsa: true
+  trainable:
+    - "self_attn\\.(k_proj|v_proj|o_proj|q_norm|k_norm)"
+    - "input_layernorm|post_attention_layernorm"
+  allowed_groups: [loop_adapters, gdn2_adapters, lsa_indexers, attention, norms]
+  aux_weights:
+    _replace_: true
+    loop_aux: 1.0
+    lsa_kl: 0.2
+  optim:
+    lr: 2.0e-5
+    warmup_steps: 30
+    fused: false
+    max_grad_norm: 1.0
+    lr_mult:
+      _replace_: true
+      loop_adapters: 20.0
+      gdn2_adapter: 3.0
+      lsa_indexer: 3.0
+
+data:
+  seq_len: 16384
+  respect_doc_boundaries: true
+  holdout_mod: 100
+  holdout_eval_buckets: 2
+  sources:
+    - {name: openthoughts3, weight: 0.25}
+    - {name: nemotron_post, weight: 0.25}
+    - {name: finepdfs_mix, weight: 0.20}
+    - {name: fineweb_edu, weight: 0.15}
+    - {name: loop64_fable_sirsi, weight: 0.10}
+    - {name: arc_agi2_train, weight: 0.05}
+  decontaminate: {enabled: true, ngram: 13, groups: [aime_2026, gpqa, hle, arc_agi_2, kernelbench], on_missing: warn}
+
+eval_quick:
+  n_batches: 8
+  depths: [1, 2]

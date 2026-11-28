@@ -1365,9 +1365,13 @@ class GRPOTrainer:
         )
 
     def _reset_optim_state(self, step: int) -> None:
-        """Clear per-parameter optimizer state (incl. bf16 fp32 master copies) and sync LR schedule."""
+        """Clear per-parameter optimizer state (incl. bf16 fp32 master copies) while preserving init seeds."""
         for ent in self.opt.entries.values():
-            ent.opt.state.pop(ent.param, None)
+            st = ent.opt.state.get(ent.param)
+            if isinstance(st, dict) and "seed" in st:
+                ent.opt.state[ent.param] = {"seed": st["seed"]}
+            else:
+                ent.opt.state.pop(ent.param, None)
         self.opt.norm_ema = None
         self.opt.prev_global_norm = None
         self.opt.last_global_norm = None

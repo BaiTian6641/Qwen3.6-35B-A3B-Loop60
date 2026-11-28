@@ -697,7 +697,7 @@ def test_g1_bf16_rollback_without_optim_pt_clears_master_weights_and_moments(
             for n in bf16_names
         )
         assert max_drift_after_rb == 0.0
-        assert all(ent.param not in ent.opt.state for ent in tr2.opt.entries.values())
+        assert all(set(ent.opt.state.get(ent.param, {})) <= {"seed"} for ent in tr2.opt.entries.values())
         assert tr2.opt.norm_ema is None
         assert tr2.opt.prev_global_norm is None
         assert tr2.opt.step_count == 0
@@ -724,9 +724,96 @@ def test_g1_bf16_rollback_without_optim_pt_clears_master_weights_and_moments(
         tr3._resume()
         assert tr3.step == 5
         assert tr3.opt.step_count == 5
-        assert all(ent.param not in ent.opt.state for ent in tr3.opt.entries.values())
+        assert all(set(ent.opt.state.get(ent.param, {})) <= {"seed"} for ent in tr3.opt.entries.values())
     finally:
         tr3.pool.shutdown(wait=False)
+
+
+def test_g1_reset_optim_state_preserves_apollo_torch_seed(tmp_path: Path) -> None:
+    """`_reset_optim_state` preserves `apollo_torch.APOLLOAdamW` init `"seed"` while wiping training/master state."""
+
+    class _MockApolloTorchAdamW(torch.optim.Optimizer):
+        """Mirrors `apollo_torch.APOLLOAdamW`: `__init__` sets `state[p]['seed']`, `step()` reads it on re-init."""
+
+        def __init__(self, params: list[torch.nn.Parameter], lr: float = 1e-3) -> None:
+            super().__init__(params, {"lr": lr})
+            params_idx = 0
+            for group in self.param_groups:
+                for p in group["params"]:
+                    params_idx += 1
+                    self.state[p]["seed"] = params_idx
+
+        @torch.no_grad()
+        def step(self, closure: Any = None) -> Any:
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    state = self.state[p]
+                    if "step" not in state:
+                        state["step"] = 0
+                    if "projector" not in state:
+                        # Exact failure point in apollo_torch: raises KeyError('seed') if wiped
+                        state["projector"] = {"seed": state["seed"]}
+                    if "exp_avg" not in state:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                    state["step"] += 1
+                    p.add_(p.grad, alpha=-float(group["lr"]))
+            return None
+
+    cfg = _guard_toy_cfg(steps=5, fused=False)
+    cfg["train"]["trainable"] = [r"mlp\.gate\.weight$", r"shared_expert\.", r"input_layernorm\.weight$"]
+    cfg["train"]["optim"]["apollo"] = {"min_dim": 16}
+
+    tr = GRPOTrainer(cfg, str(tmp_path / "g1_apollo_seed_reset"))
+    try:
+        apollo_ent = next(ent for ent in tr.opt.entries.values() if ent.kind == "apollo")
+        other_ent = next(ent for ent in tr.opt.entries.values() if ent.kind != "apollo")
+
+        apollo_ent.opt = _MockApolloTorchAdamW([apollo_ent.param], lr=apollo_ent.base_lr)
+        assert apollo_ent.opt.state[apollo_ent.param] == {"seed": 1}
+
+        # Populate training & master state keys that must be cleared on reset
+        apollo_ent.opt.state[apollo_ent.param].update(
+            {
+                "step": 7,
+                "exp_avg": torch.ones_like(apollo_ent.param),
+                "exp_avg_sq": torch.ones_like(apollo_ent.param),
+                "projector": object(),
+                "master": apollo_ent.param.detach().float().clone(),
+            }
+        )
+        other_ent.opt.state[other_ent.param] = {
+            "step": 3,
+            "exp_avg": torch.ones_like(other_ent.param),
+            "master": other_ent.param.detach().float().clone(),
+        }
+        tr.opt.norm_ema = 1.5
+        tr.opt.prev_global_norm = 2.0
+        tr.opt.last_global_norm = 2.5
+
+        tr._reset_optim_state(0)
+
+        # Seed preserved; all training/master keys wiped
+        assert apollo_ent.opt.state[apollo_ent.param] == {"seed": 1}
+        assert other_ent.param not in other_ent.opt.state
+        assert tr.opt.norm_ema is None
+        assert tr.opt.prev_global_norm is None
+        assert tr.opt.last_global_norm is None
+        assert tr.opt.step_count == 0
+
+        # Post-reset step() succeeds without KeyError('seed') and re-initializes projector from preserved seed
+        before = apollo_ent.param.detach().clone()
+        apollo_ent.param.grad = torch.ones_like(apollo_ent.param)
+        other_ent.param.grad = torch.ones_like(other_ent.param)
+        tr.opt.step()
+        assert apollo_ent.opt.state[apollo_ent.param]["seed"] == 1
+        assert apollo_ent.opt.state[apollo_ent.param]["projector"] == {"seed": 1}
+        assert apollo_ent.opt.state[apollo_ent.param]["step"] == 1
+        assert not torch.equal(apollo_ent.param.detach(), before)
+    finally:
+        tr.pool.shutdown(wait=False)
 
 
 # ============================================================================ G2: Directional Regret Weighting

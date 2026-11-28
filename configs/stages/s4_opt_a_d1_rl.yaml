@@ -55,7 +55,7 @@ train:
   init_from: runs/s3_opt_a_block_attn_calib
   drop_inactive_loop_adapters: true
   gradient_checkpointing: true
-  steps: 30
+  steps: 20
   ckpt_every: 5
   sha256_frozen_experts: true
   train_loop_adapters: false
@@ -70,6 +70,8 @@ train:
   allowed_groups: [gdn2_adapters, lsa_indexers, router, shared_expert, attention, norms]
   aux_weights:
     _replace_: true
+    lsa_kl: 0.0
+    loop_aux: 0.0
   optim:
     lr: 1.0e-6
     warmup_steps: 10
@@ -78,8 +80,9 @@ train:
     max_grad_norm_per_param: 0.5
     lr_mult:
       _replace_: true
-      gdn2_adapter: 2.0
-      lsa_indexer: 2.0
+      gdn2_adapter: 0.1
+      lsa_indexer: 0.1
+      "self_attn\\.": 0.1
       "mlp\\.gate\\.weight$": 0.5
 
 rl:
@@ -98,7 +101,7 @@ rl:
   clip_high: 0.28
   adv_norm: std
   ppo_epochs: 1
-  kl_coef: 0.0
+  kl_coef: 0.02
   entropy_floor_frac: 0.6
   temperature_max: 1.3
   overlong:
@@ -131,7 +134,7 @@ rl:
     lambda_hurt: 2.0
     max_hurt_frac: 0.05
     max_bench_drop: 0.025
-    every: 15
+    every: 10
     depth: 1
     min_delta: 0.0
     max_len_growth: 1.5

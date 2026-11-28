@@ -46,6 +46,7 @@ from ..eval.kill_gate_k0 import (
     K0Example,
     K0Report,
     _clone_linear_states_into,
+    _resolve_model_inv_freq,
     _resolve_text_configs,
     build_corrected_partition_b_kv,
     build_default_smoke_examples,
@@ -56,6 +57,7 @@ from ..eval.kill_gate_k0 import (
 )
 from ..model._cache_compat import cache_kwarg_name, extract_output_cache
 from ..utils.tf32 import configure_tf32
+from .bptt import _ReplayKVCacheProxy
 from .checkpoint import CheckpointManager, deserialize_py_rng_state, serialize_py_rng_state
 from .loss import lm_loss
 from .optim import FusedStepOptimizer
@@ -1152,6 +1154,8 @@ class BlockAttentionCalibrator:
                 del sink_out
 
             # Independent session prefills -> Pre-RoPE un-rotate + sink-strip + H64-INT4 + virtual RoPE mount
+            # Thread live `rotary_emb.inv_freq` (e.g. `4.0x` YaRN) so Partition-B RoPE phase matches `Q` exactly.
+            live_inv_freq = _resolve_model_inv_freq(st.model, k0_cfg.rotary_dim, device=dev)
             base_mount_offset = max(int(k0_cfg.virtual_offset), live_sink_n) if self._accepts_pos_ids else live_sink_n
             cursor = base_mount_offset
             mnt_k_list: list[torch.Tensor] = []
@@ -1173,6 +1177,7 @@ class BlockAttentionCalibrator:
                     cursor,
                     local_k0_cfg,
                     blob_id=f"calib_s{self.step}_{s_idx}",
+                    inv_freq=live_inv_freq,
                 )
                 mnt_k_list.append(mnt.k.detach())
                 mnt_v_list.append(mnt.v.detach())
@@ -1211,49 +1216,77 @@ class BlockAttentionCalibrator:
         # Drop any stale no-grad aux terms created during teacher / prefill forwards
         self._clear_transient_state()
 
-        # 2. Differentiable student suffix forward with mounted Partition-B cache
-        with torch.enable_grad(), self._no_loop_checkpointing():
-            student_out = self._model_forward(
-                live_rest_and_suf,
-                cache=cache_c,
-                position_ids=live_pos_ids,
-                use_cache=True,
+        # 2. Differentiable student suffix forward wrapped in `_ReplayKVCacheProxy(..., readonly_base=True)`
+        # so TF 5.24 `LinearAttentionLayer.update_recurrent_state` (`dst_buf.copy_`) never mutates an
+        # `initial_state` saved by FLA `chunk_gdn2`/`chunk_dplr` in-place before `.backward()`.
+        student_cache: Any = (
+            _ReplayKVCacheProxy(cache_c, readonly_base=True)
+            if (
+                cache_c is not None
+                and (
+                    hasattr(cache_c, "update")
+                    or hasattr(cache_c, "layers")
+                    or hasattr(cache_c, "recurrent_states")
+                )
             )
-            start_s = len(live_rest_ids) - 1
-            student_logits = student_out.logits[:, start_s : start_s + t_suf, :]
-            loss, kl_val, ce_val = chunked_kl_ce_loss(
-                student_logits,
-                oracle_logits,
-                suffix_targets,
-                kl_weight=float(bcfg.kl_weight),
-                ce_weight=float(bcfg.ce_weight),
-                temperature=float(bcfg.kl_temperature),
-                chunk_size=int(bcfg.ce_chunk_size),
-            )
-            total = loss
-            aux_total = 0.0
-            aux_details: dict[str, float] = {}
-            for a_name, a_loss in st.aux_losses().items():
-                w_a = float(aux_w.get(a_name, 1.0))
-                if w_a != 0.0:
-                    total = total + w_a * a_loss
-                a_val = float(a_loss.detach().item())
-                aux_details[a_name] = a_val
-                aux_total += w_a * a_val
-            (total / float(max(accum, 1))).backward()
+            else cache_c
+        )
+        student_out: Any = None
+        student_logits: torch.Tensor | None = None
+        try:
+            with torch.enable_grad(), self._no_loop_checkpointing():
+                student_out = self._model_forward(
+                    live_rest_and_suf,
+                    cache=student_cache,
+                    position_ids=live_pos_ids,
+                    use_cache=True,
+                )
+                start_s = len(live_rest_ids) - 1
+                student_logits = student_out.logits[:, start_s : start_s + t_suf, :]
+                loss, kl_val, ce_val = chunked_kl_ce_loss(
+                    student_logits,
+                    oracle_logits,
+                    suffix_targets,
+                    kl_weight=float(bcfg.kl_weight),
+                    ce_weight=float(bcfg.ce_weight),
+                    temperature=float(bcfg.kl_temperature),
+                    chunk_size=int(bcfg.ce_chunk_size),
+                )
+                total = loss
+                aux_total = 0.0
+                aux_details: dict[str, float] = {}
+                for a_name, a_loss in st.aux_losses().items():
+                    w_a = float(aux_w.get(a_name, 1.0))
+                    if w_a != 0.0:
+                        total = total + w_a * a_loss
+                    a_val = float(a_loss.detach().item())
+                    aux_details[a_name] = a_val
+                    aux_total += w_a * a_val
 
-        self._clear_transient_state()
-        del student_out, student_logits, oracle_logits, cache_c, k_c_mount, v_c_mount
+                loss_val = float(loss.detach().item())
+                total_val = float(total.detach().item())
+                if (
+                    not math.isfinite(loss_val)
+                    or not math.isfinite(kl_val)
+                    or not math.isfinite(ce_val)
+                    or not math.isfinite(aux_total)
+                    or not math.isfinite(total_val)
+                ):
+                    raise FloatingPointError(
+                        f"non-finite block-attention calibration loss at step {self.step}: "
+                        f"total={total_val}, loss={loss_val}, kl={kl_val}, ce={ce_val}, aux={aux_total}"
+                    )
 
-        loss_val = float(loss.detach().item())
-        if not math.isfinite(loss_val) or not math.isfinite(kl_val) or not math.isfinite(ce_val):
-            raise FloatingPointError(
-                f"non-finite block-attention calibration loss at step {self.step}: "
-                f"loss={loss_val}, kl={kl_val}, ce={ce_val}"
-            )
+                (total / float(max(accum, 1))).backward()
+        finally:
+            if isinstance(student_cache, _ReplayKVCacheProxy):
+                student_cache.reset_segment()
+            self._clear_transient_state()
+
+        del student_out, student_logits, oracle_logits, student_cache, cache_c, k_c_mount, v_c_mount
 
         out: dict[str, float] = {
-            "total": loss_val + aux_total,
+            "total": total_val,
             "block_attn": loss_val,
             "kl": kl_val,
             "ce": ce_val,
@@ -1290,15 +1323,22 @@ class BlockAttentionCalibrator:
             a_val = float(a_loss.detach().item())
             aux_details[a_name] = a_val
             aux_total += w_a * a_val
+
+        lm_val = float(loss.detach().item())
+        total_val = float(total.detach().item())
+        if not math.isfinite(lm_val) or not math.isfinite(aux_total) or not math.isfinite(total_val):
+            self._clear_transient_state()
+            raise FloatingPointError(
+                f"non-finite contiguous LM anchor loss at step {self.step}: "
+                f"total={total_val}, lm={lm_val}, aux={aux_total}"
+            )
+
         (total / float(max(accum, 1))).backward()
         if st.loop is not None and callable(getattr(st.loop, "release_graph", None)):
             st.loop.release_graph()
 
-        lm_val = float(loss.detach().item())
-        if not math.isfinite(lm_val) or not math.isfinite(aux_total):
-            raise FloatingPointError(f"non-finite contiguous LM anchor loss at step {self.step}: lm={lm_val}")
         out: dict[str, float] = {
-            "total": lm_val + aux_total,
+            "total": total_val,
             "contiguous_lm": lm_val,
             "aux": aux_total,
             "contiguous_anchor": 1.0,

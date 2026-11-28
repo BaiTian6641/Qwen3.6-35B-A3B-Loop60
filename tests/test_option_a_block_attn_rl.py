@@ -41,12 +41,21 @@ import yaml
 from qloop.cli import main as cli_main
 from qloop.config import load_config
 from qloop.eval.generate import GenOut
-from qloop.eval.kill_gate_k0 import K0Example, run_k0_suite
+from qloop.eval.kill_gate_k0 import (
+    K0Config,
+    K0Example,
+    _resolve_model_inv_freq,
+    build_corrected_partition_b_kv,
+    run_k0_suite,
+)
 from qloop.eval.sprint2_audit import _load_arm_stack, _sync_cfg_to_checkpoint_payload
 from qloop.hub import HubSyncManager, load_qloop_from_hub
+from qloop.memory.kv_blob import strip_sinks_and_unrotate_k
 from qloop.model.experts import param_group_of
 from qloop.model.gdn2 import GDN2Config
 from qloop.model.lsa import LSAConfig
+from qloop.model.pos_rerope import apply_partial_rope_k, build_rope_inv_freq
+from qloop.model.toy import ToyCausalLMOutput, ToyConfig, ToyForCausalLM, ToyHybridCache
 from qloop.train.block_attn_calib import (
     BlockAttentionCalibrator,
     BlockAttnCalibConfig,
@@ -1010,6 +1019,7 @@ def test_option_a_stage_configs_hygiene_and_schema() -> None:
     assert s3.stage_type == "block_attn_calib"
     assert s3.train.init_from == "runs/s2_v2_joint_bptt"
     assert s3.train.drop_inactive_loop_adapters is True
+    assert float(s3.train.aux_weights.lsa_kl) == pytest.approx(0.2)
     assert int(s3.train.steps) == 300
     assert int(s3.data.holdout_mod) == 100
     assert int(s3.data.holdout_eval_buckets) == 2
@@ -1111,3 +1121,353 @@ def test_sprint2_audit_and_hub_loader_sync_option_a_checkpoint(tmp_path: Path) -
         hub_logits = st_hub.model(input_ids=probe_ids, use_cache=False).logits
     torch.testing.assert_close(hub_logits, ref_logits, rtol=1e-5, atol=1e-5)
     assert state_json.is_file()
+
+
+# ==============================================================================
+# 7. Real-GPU Regression Guards: TF 5.24 In-Place Recurrent State, 4.0x YaRN, Non-Finite Guard
+# ==============================================================================
+
+
+def test_block_attn_calib_replay_proxy_prevents_tf524_inplace_recurrent_crash(tmp_path: Path) -> None:
+    """BLOCKER-1 regression: TF 5.24 `dst_buf.copy_` + FLA `ctx.save_for_backward(initial_state)`.
+
+    Proves raw `cache_c` crashes `.backward()` with an in-place version mismatch, while
+    `BlockAttentionCalibrator` wrapping `cache_c` in `_ReplayKVCacheProxy(..., readonly_base=True)`
+    completes `.backward()` cleanly with finite grads and untouched base `dst_buf`.
+    """
+    torch.manual_seed(101)
+
+    class _FlaZeroCopyStateOp(torch.autograd.Function):
+        """Mirrors FLA `chunk_gdn2`/`chunk_dplr` saving zero-copy `initial_state` for backward."""
+
+        @staticmethod
+        def forward(  # type: ignore[override]
+            ctx: Any,
+            x: torch.Tensor,
+            w: torch.Tensor,
+            initial_state: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            ctx.save_for_backward(x, w, initial_state)
+            proj = x @ w
+            st_bias = initial_state.mean(dim=(1, 2, 3)).view(x.shape[0], 1, 1)
+            out = proj + st_bias * 0.1
+            final_state = initial_state * 0.9 + proj.mean(dim=(1, 2)).view(x.shape[0], 1, 1, 1)
+            return out, final_state
+
+        @staticmethod
+        def backward(  # type: ignore[override]
+            ctx: Any,
+            grad_out: torch.Tensor,
+            _grad_final: torch.Tensor | None,
+        ) -> tuple[torch.Tensor, torch.Tensor, None]:
+            x, w, init_st = ctx.saved_tensors
+            # Touch `init_st` during backward exactly as FLA kernels do (triggers version check!)
+            scale = 1.0 + 0.01 * float(init_st.abs().mean().item())
+            gx = (grad_out @ w.t()) * scale
+            gw = (x.reshape(-1, x.shape[-1]).t() @ grad_out.reshape(-1, grad_out.shape[-1])) * scale
+            return gx, gw, None
+
+    class _TF524InplaceLinearLayer:
+        def __init__(self) -> None:
+            self.conv_states: list[torch.Tensor | None] = [None]
+            self.recurrent_states: list[torch.Tensor | None] = [None]
+            self.is_recurrent_states_initialized: dict[int, bool] = {0: False}
+            self.has_previous_state: dict[int, bool] = {0: False}
+
+        def update_recurrent_state(self, state: torch.Tensor, state_idx: int = 0) -> torch.Tensor:
+            if not self.is_recurrent_states_initialized[state_idx]:
+                self.recurrent_states[state_idx] = torch.zeros_like(state)
+                self.is_recurrent_states_initialized[state_idx] = True
+            self.has_previous_state[state_idx] = True
+            dst = self.recurrent_states[state_idx]
+            assert dst is not None
+            dst.copy_(state.detach())  # TF 5.24 in-place copy_ increments `dst._version`!
+            return dst
+
+    class _TF524FullLayer:
+        def __init__(self) -> None:
+            self.keys: torch.Tensor | None = None
+            self.values: torch.Tensor | None = None
+
+        @property
+        def is_initialized(self) -> bool:
+            return self.keys is not None and self.keys.numel() > 0
+
+        def update(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            if not self.is_initialized:
+                self.keys, self.values = k, v
+            else:
+                assert self.keys is not None and self.values is not None
+                self.keys = torch.cat([self.keys, k], dim=-2)
+                self.values = torch.cat([self.values, v], dim=-2)
+            return self.keys, self.values
+
+        def get_seq_length(self) -> int:
+            return int(self.keys.shape[-2]) if self.is_initialized and self.keys is not None else 0
+
+    class _TF524MockHybridCache:
+        def __init__(self, _config: Any = None) -> None:
+            self.layers: list[Any] = [_TF524InplaceLinearLayer(), _TF524FullLayer()]
+
+        def has_previous_state(self, layer_idx: int) -> bool:
+            lyr = self.layers[layer_idx]
+            return bool(getattr(lyr, "has_previous_state", {}).get(0, False))
+
+        def get_recurrent_state(self, layer_idx: int) -> torch.Tensor | None:
+            lyr = self.layers[layer_idx]
+            return lyr.recurrent_states[0] if self.has_previous_state(layer_idx) else None
+
+        def update_recurrent_state(self, state: torch.Tensor, layer_idx: int) -> torch.Tensor:
+            return self.layers[layer_idx].update_recurrent_state(state)
+
+        def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int, cache_kwargs: Any = None):
+            del cache_kwargs
+            return self.layers[layer_idx].update(k, v)
+
+        def get_seq_length(self, layer_idx: int = 1) -> int:
+            return self.layers[layer_idx].get_seq_length()
+
+    # 1. Confirm raw cache_c DOES reproduce the exact TF 5.24 + FLA in-place version error!
+    raw_cache = _TF524MockHybridCache()
+    raw_cache.update_recurrent_state(torch.ones(1, 2, 4, 4), 0)
+    x_in = torch.randn(1, 4, 8, requires_grad=True)
+    w_param = torch.nn.Parameter(torch.randn(8, 8) * 0.1)
+    init_raw = raw_cache.get_recurrent_state(0)
+    assert init_raw is not None
+    y_raw, fin_raw = _FlaZeroCopyStateOp.apply(x_in, w_param, init_raw)
+    raw_cache.update_recurrent_state(fin_raw, 0)  # mutates `init_raw` in-place!
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        y_raw.sum().backward()
+
+    # 2. Wrap the exact same TF 5.24 cache + FLA op inside a tiny causal LM driven by `BlockAttentionCalibrator`
+    class _TF524MockCausalLM(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = ToyConfig(
+                vocab_size=32,
+                hidden_size=16,
+                num_hidden_layers=2,
+                layer_types=["linear_attention", "full_attention"],
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                head_dim=64,
+                partial_rotary_factor=0.25,
+                rope_theta=10_000.0,
+            )
+            self.embed_tokens = torch.nn.Embedding(32, 16)
+            self.lin_w = torch.nn.Parameter(torch.randn(16, 16) * 0.1)
+            self.q_proj = torch.nn.Linear(16, 2 * 64, bias=False)
+            self.k_proj = torch.nn.Linear(16, 2 * 64, bias=False)
+            self.v_proj = torch.nn.Linear(16, 2 * 64, bias=False)
+            self.o_proj = torch.nn.Linear(2 * 64, 16, bias=False)
+            self.lm_head = torch.nn.Linear(16, 32, bias=False)
+
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            past_key_values: Any = None,
+            use_cache: bool = False,
+        ) -> ToyCausalLMOutput:
+            h = self.embed_tokens(input_ids)
+            cache = past_key_values if past_key_values is not None else (_TF524MockHybridCache() if use_cache else None)
+            init_st = cache.get_recurrent_state(0) if cache is not None else None
+            if init_st is None:
+                init_st = h.new_zeros(h.shape[0], 2, 4, 4)
+            h_lin, fin_st = _FlaZeroCopyStateOp.apply(h, self.lin_w, init_st)
+            if cache is not None:
+                cache.update_recurrent_state(fin_st, 0)
+            h = h + h_lin
+            b, t, _ = h.shape
+            q = self.q_proj(h).view(b, t, 2, 64).transpose(1, 2)
+            k = self.k_proj(h).view(b, t, 2, 64).transpose(1, 2)
+            v = self.v_proj(h).view(b, t, 2, 64).transpose(1, 2)
+            if cache is not None:
+                k, v = cache.update(k, v, 1)
+            att = F.scaled_dot_product_attention(q, k, v)
+            h = h + self.o_proj(att.transpose(1, 2).reshape(b, t, 2 * 64))
+            return ToyCausalLMOutput(self.lm_head(h), None, cache)
+
+    from qloop.data.tokenizer import ToyTokenizer
+    from qloop.model.introspect import ModelParts
+    from qloop.train.stack import Stack
+
+    mock_model = _TF524MockCausalLM()
+    parts = ModelParts(
+        root=mock_model,
+        text_model=mock_model,
+        text_config=mock_model.config,
+        layers=torch.nn.ModuleList(),
+        lm_head=mock_model.lm_head,
+        layer_types=["linear_attention", "full_attention"],
+    )
+    named = {n: p for n, p in mock_model.named_parameters()}
+    mock_stack = Stack(
+        model=mock_model,
+        tokenizer=ToyTokenizer(),
+        parts=parts,
+        named_trainable=named,
+        named_all=named,
+    )
+    cfg = _toy_opt_a_block_attn_cfg(steps=1, synthetic_mix_prob=1.0, contiguous_lm_every=0, eval_k0_examples=0)
+    cal = BlockAttentionCalibrator(cfg, str(tmp_path / "tf524_proxy"), stack=mock_stack)
+    ep = BlockEpisode(
+        live_sink_ids=[1, 2],
+        sessions_ids=[[3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14]],
+        live_rest_ids=[15, 16, 17],
+        suffix_ids=[18, 19, 20],
+        source="synthetic",
+    )
+    cal.opt.zero_grad(set_to_none=True)
+    m_stats, n_tok = cal._block_attn_microstep(ep, accum=1, aux_w={})
+    assert n_tok == 6
+    assert m_stats["total"] >= 0.0
+    assert mock_model.lin_w.grad is not None and torch.isfinite(mock_model.lin_w.grad).all()
+    assert float(mock_model.lin_w.grad.abs().max()) > 0.0
+    assert mock_model.q_proj.weight.grad is not None and float(mock_model.q_proj.weight.grad.abs().max()) > 0.0
+
+
+def test_block_attn_calib_and_k0_live_yarn_inv_freq_zero_phase_error(tmp_path: Path) -> None:
+    """BLOCKER-2 regression: live `4.0x` YaRN `rotary_emb.inv_freq` eliminates Partition-B phase error."""
+    torch.manual_seed(29)
+    rotary_dim = 64
+    head_dim = 128
+    rope_theta = 10_000_000.0
+    std_inv = build_rope_inv_freq(rotary_dim, rope_theta=rope_theta, dtype=torch.float64)
+    # Construct genuine 4.0x YaRN ramp on mid/low frequency pairs (matching 262K -> 1M YaRN)
+    factor = 4.0
+    ramp = torch.linspace(0.0, 1.0, rotary_dim // 2, dtype=torch.float64)
+    yarn_inv = std_inv * (1.0 - ramp) + (std_inv / factor) * ramp
+    assert not torch.allclose(yarn_inv, std_inv)
+
+    # 1. Exact zero phase error when un-rotating & mounting with `inv_freq=yarn_inv` vs large error with `inv_freq=None`
+    k_pre = torch.randn(1, 2, 32, head_dim, dtype=torch.float64)
+    v_pre = torch.randn_like(k_pre)
+    pos_sess = torch.arange(0, 32, dtype=torch.long)
+    k_post_yarn = apply_partial_rope_k(
+        k_pre, pos_sess, inv_freq=yarn_inv, rotary_dim=rotary_dim, rope_theta=rope_theta
+    )
+    k_unrot_yarn = strip_sinks_and_unrotate_k(
+        k_post_yarn, pos_sess, rotary_dim=rotary_dim, rope_theta=rope_theta, sink_tokens=4, inv_freq=yarn_inv
+    )
+    torch.testing.assert_close(k_unrot_yarn, k_pre[..., 4:, :], rtol=1e-10, atol=1e-10)
+
+    k0_cfg = K0Config(rotary_dim=rotary_dim, rope_theta=rope_theta, sink_tokens=4, virtual_offset=10_000)
+    vpos = torch.arange(10_000, 10_028, dtype=torch.float64)
+    k_direct_yarn = apply_partial_rope_k(
+        k_pre[..., 4:, :], vpos, inv_freq=yarn_inv, rotary_dim=rotary_dim, rope_theta=rope_theta
+    ).float()
+
+    mnt_yarn = build_corrected_partition_b_kv(
+        k_post_yarn.float(), v_pre.float(), pos_sess, 4, 10_000, k0_cfg, inv_freq=yarn_inv
+    )
+    mnt_std = build_corrected_partition_b_kv(
+        k_post_yarn.float(), v_pre.float(), pos_sess, 4, 10_000, k0_cfg, inv_freq=None
+    )
+    err_yarn = float((mnt_yarn.k[..., :rotary_dim] - k_direct_yarn[..., :rotary_dim]).norm().item())
+    err_std = float((mnt_std.k[..., :rotary_dim] - k_direct_yarn[..., :rotary_dim]).norm().item())
+    # YaRN-threaded mount has only tiny INT4 quantization error; unscaled std mount suffers huge phase corruption!
+    assert err_yarn < 0.25 * err_std, f"expected YaRN inv_freq to eliminate phase error: yarn={err_yarn}, std={err_std}"
+
+    # 2. Verify `_resolve_model_inv_freq` + `ModelK0Evaluator` on a `position_ids`-aware 4.0x YaRN model
+    class _PosAwareYaRNToyLM(torch.nn.Module):
+        def __init__(self, inner: ToyForCausalLM) -> None:
+            super().__init__()
+            self.inner = inner
+            self.config = inner.config
+
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            position_ids: torch.Tensor | None = None,
+            past_key_values: ToyHybridCache | None = None,
+            use_cache: bool = False,
+        ) -> ToyCausalLMOutput:
+            tm = self.inner.model
+            h = tm.embed_tokens(input_ids)
+            if use_cache and past_key_values is None:
+                past_key_values = ToyHybridCache(self.config)
+            start = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(start, start + h.shape[1], device=h.device)
+            pos_ids = cache_position[None].expand(h.shape[0], -1) if position_ids is None else position_ids
+            pos_emb = tm.rotary_emb(h, pos_ids)
+            for layer in tm.layers[: self.config.num_hidden_layers]:
+                h = layer(
+                    h,
+                    position_embeddings=pos_emb,
+                    attention_mask=None,
+                    position_ids=pos_ids,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                )
+            h = tm.norm(h)
+            return ToyCausalLMOutput(self.inner.lm_head(h), None, past_key_values)
+
+    from qloop.data.tokenizer import ToyTokenizer
+
+    toy_cfg = ToyConfig(
+        vocab_size=ToyTokenizer().vocab_size,
+        hidden_size=32,
+        num_hidden_layers=4,
+        full_attention_interval=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=head_dim,
+        partial_rotary_factor=0.5,  # rotary_dim = 64
+        rope_theta=rope_theta,
+    )
+    backbone = ToyForCausalLM(toy_cfg).eval()
+    backbone.model.rotary_emb.inv_freq = yarn_inv.float()
+    pos_model = _PosAwareYaRNToyLM(backbone).eval()
+
+    resolved = _resolve_model_inv_freq(pos_model, rotary_dim, device="cpu")
+    assert resolved is not None
+    torch.testing.assert_close(resolved, yarn_inv.float().double(), rtol=1e-6, atol=1e-6)
+
+    ev = ModelK0Evaluator(pos_model, ToyTokenizer(), device="cpu", live_sink_len=4)
+    ex = K0Example(
+        example_id="yarn_4x_phase_check",
+        sessions=["Session 1 header text: yarn_target_key = 777 in module beta.py."],
+        live_prompt="Live sink prefix. Query yarn_target_key: ",
+        answer="777",
+    )
+    ev(ex, k0_cfg)
+    diag = ev.last_diagnostics
+    assert diag["base_mount_offset"] == 10_000
+    assert diag["rot_l2_pre"] <= 2.5 * diag["nope_l2_pre"] + 1e-3, (
+        f"YaRN rotary phase mismatch leaked into Arm (c)/(d): rot={diag['rot_l2_pre']}, nope={diag['nope_l2_pre']}"
+    )
+    assert tmp_path.exists()
+
+
+def test_block_attn_calib_nonfinite_guard_blocks_backward_before_grad_corruption(tmp_path: Path) -> None:
+    """MEDIUM regression: non-finite loss or aux_total raises BEFORE `.backward()` executes."""
+    cfg = _toy_opt_a_block_attn_cfg(
+        steps=1,
+        loop_enabled=False,
+        synthetic_mix_prob=0.5,
+        contiguous_lm_every=0,
+        eval_k0_examples=0,
+    )
+    cal = BlockAttentionCalibrator(cfg, str(tmp_path / "nonfinite_guard"))
+    cal.stream = cal._build_stream()
+
+    # 1. Inject a NaN `lsa_kl` aux loss during `_block_attn_microstep` -> must raise BEFORE `.backward()`!
+    cal.opt.zero_grad(set_to_none=True)
+    orig_aux = cal.stack.aux_losses
+    cal.stack.aux_losses = lambda: {"lsa_kl": torch.tensor(float("nan"), requires_grad=True)}  # type: ignore[method-assign]
+    ep = build_synthetic_calib_episode(cal.stack.tokenizer, cal.bcfg, episode_idx=0, base_seed=0)
+    with pytest.raises(FloatingPointError, match="non-finite block-attention calibration loss"):
+        cal._block_attn_microstep(ep, accum=1, aux_w={"lsa_kl": 0.2})
+    assert all(p.grad is None for p in cal.stack.named_trainable.values()), (
+        "`.backward()` ran despite NaN aux loss in `_block_attn_microstep`!"
+    )
+
+    # 2. Inject a NaN `lsa_kl` aux loss during `_contiguous_lm_microstep` -> must raise BEFORE `.backward()`!
+    cal.opt.zero_grad(set_to_none=True)
+    with pytest.raises(FloatingPointError, match="non-finite contiguous LM anchor loss"):
+        cal._contiguous_lm_microstep(accum=1, aux_w={"lsa_kl": 0.2}, impl="chunked", pass_pos=False)
+    assert all(p.grad is None for p in cal.stack.named_trainable.values()), (
+        "`.backward()` ran despite NaN aux loss in `_contiguous_lm_microstep`!"
+    )
+    cal.stack.aux_losses = orig_aux  # type: ignore[method-assign]
+

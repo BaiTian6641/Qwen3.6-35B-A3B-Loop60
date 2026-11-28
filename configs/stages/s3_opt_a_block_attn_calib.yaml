@@ -73,6 +73,7 @@ train:
   allowed_groups: [gdn2_adapters, lsa_indexers, attention, shared_expert, norms]
   aux_weights:
     _replace_: true
+    lsa_kl: 0.2
   optim:
     lr: 1.5e-5
     warmup_steps: 25

@@ -866,6 +866,7 @@ def build_corrected_partition_b_kv(
     boundary_header_v: torch.Tensor | None = None,
     boundary_header_positions: torch.Tensor | None = None,
     clamp_relative_to_q_pos: float | None = None,
+    inv_freq: torch.Tensor | None = None,
     t_created: float = 0.0,
     salience: float = 1.0,
     topic_tags: tuple[str, ...] = (),
@@ -900,6 +901,7 @@ def build_corrected_partition_b_kv(
         rotary_dim=eff_cfg.rotary_dim,
         rope_theta=eff_cfg.rope_theta,
         sink_tokens=sink_n,
+        inv_freq=inv_freq,
         interleaved=eff_cfg.interleaved,
     )
     v_kept = v4[..., sink_n:, :] if sink_n > 0 else v4.clone()
@@ -921,6 +923,7 @@ def build_corrected_partition_b_kv(
                 rotary_dim=eff_cfg.rotary_dim,
                 rope_theta=eff_cfg.rope_theta,
                 sink_tokens=0,
+                inv_freq=inv_freq,
                 interleaved=eff_cfg.interleaved,
             )
         hdr_applied = int(hk4.shape[-2])
@@ -966,6 +969,7 @@ def build_corrected_partition_b_kv(
         vpos,
         dtype=session_k.dtype,
         device=session_k.device,
+        inv_freq=inv_freq,
         interleaved=eff_cfg.interleaved,
         clamp_relative_to_q_pos=eff_clamp,
         linear_ceil=eff_cfg.linear_ceil,
@@ -2304,6 +2308,66 @@ def _resolve_text_configs(model: Any) -> list[Any]:
     return unique
 
 
+def _resolve_model_inv_freq(
+    model: Any,
+    rotary_dim: int,
+    *,
+    device: torch.device | str | None = None,
+) -> torch.Tensor | None:
+    """Extract live `rotary_emb.inv_freq` (e.g. `4.0x` YaRN-scaled) matching `rotary_dim // 2`.
+
+    Returns `None` when the model exposes no matching 1D finite `inv_freq` buffer, preserving
+    the exact legacy fallback to `build_rope_inv_freq(rotary_dim, rope_theta=...)`.
+    """
+    if rotary_dim <= 0 or rotary_dim % 2 != 0:
+        return None
+    expected = int(rotary_dim) // 2
+
+    def _valid_inv(t: Any) -> torch.Tensor | None:
+        if (
+            isinstance(t, torch.Tensor)
+            and t.ndim == 1
+            and int(t.shape[0]) == expected
+            and t.is_floating_point()
+            and bool(torch.isfinite(t).all().item())
+        ):
+            tgt_dev = t.device if device is None else torch.device(device)
+            return t.detach().to(device=tgt_dev, dtype=torch.float64)
+        return None
+
+    # Check direct owners in priority order (handles Qwen3.6, VLMs, Qwen36LoopHSSD, Toy, wrappers)
+    candidates: list[Any] = [model]
+    for attr in ("_text_model", "model", "backbone", "inner", "language_model"):
+        owner = getattr(model, attr, None)
+        if owner is not None:
+            candidates.append(owner)
+            for sub_attr in ("_text_model", "model"):
+                sub = getattr(owner, sub_attr, None)
+                if sub is not None:
+                    candidates.append(sub)
+
+    seen: set[int] = set()
+    for cand in candidates:
+        cid = id(cand)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        rot = getattr(cand, "rotary_emb", None)
+        if rot is not None:
+            inv = _valid_inv(getattr(rot, "inv_freq", None))
+            if inv is not None:
+                return inv
+
+    # Fallback scan across submodules carrying a matching `inv_freq` buffer/attr
+    modules_fn = getattr(model, "modules", None)
+    if callable(modules_fn):
+        for mod in modules_fn():
+            inv = _valid_inv(getattr(mod, "inv_freq", None))
+            if inv is not None:
+                return inv
+    return None
+
+
 class HFCheckpointK0Evaluator:
     """Real HF / `Qwen3.6-64L` Kill-Gate `K0` evaluator ready for single-GPU execution (`~30 min`).
 
@@ -2548,11 +2612,16 @@ class HFCheckpointK0Evaluator:
         oracle_v_slices: list[torch.Tensor] = []
         bytes_c = 0
         ora_cursor = live_sink_n
-        inv_freq = (
-            build_rope_inv_freq(cfg.rotary_dim, rope_theta=cfg.rope_theta, device=self.device, dtype=torch.float64)
-            if cfg.rotary_dim > 0
-            else None
-        )
+        inv_freq: torch.Tensor | None = None
+        if cfg.rotary_dim > 0:
+            live_inv = _resolve_model_inv_freq(self.model, cfg.rotary_dim, device=self.device)
+            inv_freq = (
+                live_inv
+                if live_inv is not None
+                else build_rope_inv_freq(
+                    cfg.rotary_dim, rope_theta=cfg.rope_theta, device=self.device, dtype=torch.float64
+                )
+            )
         for idx, (sk, sv, s_ids) in enumerate(raw_sessions_kv):
             if idx in superseded or not s_ids:
                 continue
@@ -2568,6 +2637,7 @@ class HFCheckpointK0Evaluator:
                 cursor,
                 local_cfg,
                 blob_id=f"{example.example_id}_s{idx}",
+                inv_freq=inv_freq,
             )
             mnt_k_list.append(mnt.k)
             mnt_v_list.append(mnt.v)

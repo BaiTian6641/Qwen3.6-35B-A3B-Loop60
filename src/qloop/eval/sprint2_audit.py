@@ -3784,6 +3784,18 @@ def _sync_cfg_to_checkpoint_payload(
         known_loop = {f.name for f in fields(LoopSpec)}
         prior_loop = {k: v for k, v in dict(smeta.get("loop") or {}).items() if k in known_loop}
         lpcfg = {k: v for k, v in dict(cfg_dict.get("loop") or {}).items() if k in known_loop}
+        if prior_loop:
+            for mhc_k in (
+                "bridge_drop_raw_h_prev",
+                "bridge_rms_preserve",
+                "bridge_anchor_max_start",
+                "bridge_anchor_max_end",
+                "bridge_anchor_anneal_frac",
+                "bridge_anchor_aux_weight",
+                "gate_clamp",
+            ):
+                if mhc_k not in prior_loop:
+                    lpcfg.pop(mhc_k, None)
         lpcfg.update(prior_loop)
         lpcfg["enabled"] = True
         cfg_dict["loop"] = lpcfg

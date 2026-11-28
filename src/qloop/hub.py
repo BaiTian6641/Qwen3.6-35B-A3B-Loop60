@@ -1157,6 +1157,18 @@ def load_qloop_from_hub(
         known_loop = {f.name for f in fields(LoopSpec)}
         prior_loop = {k: v for k, v in dict(smeta.get("loop") or {}).items() if k in known_loop}
         lpcfg = {k: v for k, v in dict(raw_cfg.get("loop") or {}).items() if k in known_loop}
+        if prior_loop:
+            for mhc_k in (
+                "bridge_drop_raw_h_prev",
+                "bridge_rms_preserve",
+                "bridge_anchor_max_start",
+                "bridge_anchor_max_end",
+                "bridge_anchor_anneal_frac",
+                "bridge_anchor_aux_weight",
+                "gate_clamp",
+            ):
+                if mhc_k not in prior_loop:
+                    lpcfg.pop(mhc_k, None)
         lpcfg.update(prior_loop)
         lpcfg["enabled"] = True
         raw_cfg["loop"] = lpcfg
@@ -1179,12 +1191,14 @@ def load_qloop_from_hub(
             if k.endswith("gdn2_adapter.down.weight") and t.ndim == 2:
                 gcfg["rank"] = int(t.shape[0])
                 break
-        if "qed_enabled" not in prior_gdn2 and any(k.endswith("gdn2_adapter.qed_lambda_raw") for k in saved):
-            gcfg["qed_enabled"] = True
-        if "neg_eigval_max_boost" not in prior_gdn2 and any(
-            k.endswith("gdn2_adapter.neg_gamma_raw") for k in saved
-        ):
-            gcfg["neg_eigval_max_boost"] = 0.5
+        if "qed_enabled" not in prior_gdn2:
+            gcfg["qed_enabled"] = any(k.endswith("gdn2_adapter.qed_lambda_raw") for k in saved)
+        if "neg_eigval_max_boost" not in prior_gdn2:
+            if any(k.endswith("gdn2_adapter.neg_gamma_raw") for k in saved):
+                if float(gcfg.get("neg_eigval_max_boost") or 0.0) <= 0.0:
+                    gcfg["neg_eigval_max_boost"] = 0.5
+            else:
+                gcfg["neg_eigval_max_boost"] = 0.0
         gcfg["enabled"] = True
         raw_cfg["gdn2"] = gcfg
         raw_cfg["hssd"] = {"enabled": False}

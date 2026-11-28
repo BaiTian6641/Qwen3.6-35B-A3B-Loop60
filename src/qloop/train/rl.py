@@ -550,6 +550,7 @@ class GRPOTrainer:
                 self.sirsi.slap_target_groups,
             )
         self.temperature = float(self.rl.get("temperature", 1.0))
+        self._logprob_chunk_size = max(1, int(self.rl.get("logprob_chunk_size", 512)))
         self.init_entropy: float | None = None
         self.ref: dict[str, torch.Tensor] | None = None
         if float(self.rl.get("kl_coef", 0.0)) > 0:
@@ -596,7 +597,13 @@ class GRPOTrainer:
 
     def _logprobs(self, ids: torch.Tensor) -> torch.Tensor:
         h = self.stack.hidden(ids)
-        return token_logprobs(h[:, :-1], self.stack.lm_head_weight, ids[:, 1:], temperature=self.temperature)
+        return token_logprobs(
+            h[:, :-1],
+            self.stack.lm_head_weight,
+            ids[:, 1:],
+            chunk_size=self._logprob_chunk_size,
+            temperature=self.temperature,
+        )
 
     @torch.no_grad()
     def _ref_logprobs(self, ids: torch.Tensor) -> torch.Tensor:
@@ -1027,6 +1034,7 @@ class GRPOTrainer:
         if not chunks:
             stats["temperature"] = self.temperature
             return stats
+        self.stack.model.train()
         clip_n = tok_n = 0.0
         for _ep in range(epochs):
             self.opt.zero_grad(set_to_none=True)
@@ -1063,6 +1071,7 @@ class GRPOTrainer:
                             del grads
                         del aux_now, lp, loss, ul_mean, span_bool, chunk_toks, sw, ids, mask, m, adv
                         continue
+                    del ul_mean, span_bool, chunk_toks, sw
                 elif kind == "teacher":
                     loss = -(lp * m).sum() / n_te_tok * sft_w
                     t_val = float(loss.detach())
@@ -1077,6 +1086,7 @@ class GRPOTrainer:
                     clip_n += float((((ratio < 1 - eps_lo) | (ratio > 1 + eps_hi)).float() * m).sum())
                     tok_n += float(m.sum())
                     stats["loss/pg"] += float(loss.detach())
+                    del ref_lp, ratio, a, surr
                     if kl_coef > 0 and self.ref is not None:
                         rlp = self._ref_logprobs(ids)
                         self.stack.aux_losses()
@@ -1084,10 +1094,12 @@ class GRPOTrainer:
                         kl = ((torch.exp(d) - d - 1) * m).sum() / n_pg_tok
                         loss = loss + kl_coef * kl
                         stats["loss/kl"] += float(kl.detach())
+                        del rlp, d, kl
                 for a_name, a_loss in aux_now.items():
                     loss = loss + float(aux_w.get(a_name, 1.0)) * a_loss
                     stats[f"loss/{a_name}"] = stats.get(f"loss/{a_name}", 0.0) + float(a_loss.detach())
                 loss.backward()
+                del ids, mask, adv, m, lp, loss, aux_now
             stats.update({f"optim/{k}": v for k, v in self.opt.step().items()})
             self.opt.zero_grad(set_to_none=True)
         stats["clip_frac"] = clip_n / max(tok_n, 1.0)
@@ -1095,9 +1107,15 @@ class GRPOTrainer:
             with torch.no_grad():
                 ids, mask, _ = self._batch(pg[:mb])
                 h = self.stack.hidden(ids)
-                ent = token_entropy(h[:, :-1], self.stack.lm_head_weight, temperature=self.temperature)
+                ent = token_entropy(
+                    h[:, :-1],
+                    self.stack.lm_head_weight,
+                    chunk_size=self._logprob_chunk_size,
+                    temperature=self.temperature,
+                )
                 stats["entropy"] = float((ent * mask[:, 1:]).sum() / mask[:, 1:].sum().clamp_min(1))
                 self.stack.aux_losses()
+                del ids, mask, h, ent
             self._adapt_temperature(stats["entropy"])
         stats["temperature"] = self.temperature
         return stats
@@ -1124,7 +1142,9 @@ class GRPOTrainer:
         require(mode in ("aggregate", "soft_hurt"), "rl.gate.mode must be 'aggregate' or 'soft_hurt'", mode=mode)
         depth = (gcfg.get("depth") or self.stack.loop.spec.num_passes) if self.stack.loop is not None else None
         gate_dir = os.path.join(self.run_dir, "gate", f"step_{self.step:07d}")
-        scores, lens = [], []
+        scores: list[float] = []
+        weights: list[float] = []
+        lens: list[float] = []
         res: dict[str, float] = {}
         cur_items: dict[str, float] = {}
         item_weights: dict[str, float] = {}
@@ -1138,6 +1158,7 @@ class GRPOTrainer:
             label, d = next(iter(summ["depths"].items()))
             b_score = float(d.get("mean_score", 0.0))
             scores.append(b_score * b_weight)
+            weights.append(b_weight)
             lens.append(float(d.get("mean_completion_tokens", 0.0)))
             res[b_name] = b_score
             if mode == "soft_hurt":
@@ -1164,7 +1185,7 @@ class GRPOTrainer:
                     item_weights[key] = w_i
         if not scores:
             return {}
-        score, mean_len = sum(scores) / len(scores), sum(lens) / len(lens)
+        score, mean_len = sum(scores) / max(sum(weights), 1e-12), sum(lens) / len(lens)
         gate_metrics: dict[str, Any] = {
             "gate/score": score,
             "gate/mean_len": mean_len,
@@ -1366,6 +1387,19 @@ class GRPOTrainer:
         self.best_gate, self.best_len = st.get("best_gate"), st.get("best_len")
         self.best_gate_items = {str(k): float(v) for k, v in (st.get("best_gate_items") or {}).items()}
         self.best_bench_scores = {str(k): float(v) for k, v in (st.get("best_bench_scores") or {}).items()}
+        if self.best_bench_scores:
+            gcfg = dict(self.rl.get("gate") or {})
+            w_num = 0.0
+            w_den = 0.0
+            for entry in gcfg.get("benchmarks") or []:
+                b = {"name": entry} if isinstance(entry, str) else dict(entry)
+                b_name = str(b["name"])
+                if b_name in self.best_bench_scores:
+                    b_weight = float(b.get("weight", 1.0))
+                    w_num += self.best_bench_scores[b_name] * b_weight
+                    w_den += b_weight
+            if w_den > 0.0:
+                self.best_gate = w_num / max(w_den, 1e-12)
         self.pinned_passed = {str(k) for k in (st.get("pinned_passed") or ())}
         if isinstance(st.get("regret_tracker"), dict):
             self.regret_tracker.load_state_dict(st["regret_tracker"])

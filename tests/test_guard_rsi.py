@@ -359,6 +359,90 @@ def test_g1_eval_at_step_0_and_resume_roundtrip(tmp_path: Path, monkeypatch: pyt
     assert [t.task_id for t in tr2.sampler.pinned_anchor_pool] == ["t0"]
 
 
+def test_g1_gate_weighted_score_normalization_and_step0_legacy_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify weighted `gate()` score normalization, legacy `best_gate` reconciliation, and step-0 resume."""
+    run_dir = str(tmp_path / "g1_weighted_resume")
+    gate_cfg = {
+        "mode": "soft_hurt",
+        "eval_at_step_0": True,
+        "every": 15,
+        "depth": 2,
+        "benchmarks": [
+            {"name": "aime_2026", "weight": 0.5},
+            {"name": "gpqa_diamond", "weight": 0.5},
+        ],
+    }
+    tr = GRPOTrainer(_guard_toy_cfg(steps=1, gate=gate_cfg), run_dir)
+    try:
+        bench_scores = {"aime_2026": 0.2333, "gpqa_diamond": 0.42}
+        bench_items = {
+            "aime_2026": {"a0": 1.0, "a1": 0.0},
+            "gpqa_diamond": {"g0": 1.0, "g1": 0.0},
+        }
+
+        def _fake_run_benchmark(name: str, gen: Any, **kw: Any) -> dict[str, Any]:
+            return {
+                "benchmark": name,
+                "depths": {
+                    "2": {
+                        "n_items": len(bench_items[name]),
+                        "mean_score": bench_scores[name],
+                        "mean_completion_tokens": 120.0,
+                        "item_scores": dict(bench_items[name]),
+                    }
+                },
+            }
+
+        monkeypatch.setattr("qloop.eval.runners.run_benchmark", _fake_run_benchmark)
+        g0 = tr.gate()
+        expected = 0.5 * 0.2333 + 0.5 * 0.42  # 0.32665, NOT 0.163325!
+        assert g0["gate/decision"] == "promoted"
+        assert g0["gate/score"] == pytest.approx(expected, abs=1e-9)
+        assert tr.best_gate == pytest.approx(expected, abs=1e-9)
+        assert tr.best_bench_scores == bench_scores
+        assert len(tr.best_gate_items) == 4
+    finally:
+        tr.pool.shutdown(wait=False)
+
+    # Corrupt saved `step_0000000/state.json` to mimic legacy `/ len(scores)` best_gate (0.163325)
+    state_path = Path(run_dir) / "checkpoints" / "step_0000000" / "state.json"
+    state_obj = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state_obj["step"] == 0
+    assert state_obj["best_gate_items"]
+    state_obj["best_gate"] = 0.163325
+    state_path.write_text(json.dumps(state_obj, indent=2), encoding="utf-8")
+
+    # Resume from step_0000000: must reconcile best_gate -> 0.32665, skip eval_at_step_0, and start at Step 1
+    tr2 = GRPOTrainer(_guard_toy_cfg(steps=1, gate=gate_cfg), run_dir)
+    gate_calls: list[int] = []
+    steps_seen: list[int] = []
+
+    def _fail_if_gated(name: str, gen: Any, **kw: Any) -> dict[str, Any]:
+        gate_calls.append(tr2.step)
+        raise AssertionError("eval_at_step_0 must be skipped when resuming step 0 with non-empty best_gate_items")
+
+    def _fake_gen(prompts: list[Any], **kw: Any) -> list[list[GenOut]]:
+        return [
+            [GenOut("The answer is \\boxed{42}.", [20, 21, 22]), GenOut("wrong", [20, 21, 23])]
+            for _ in prompts
+        ]
+
+    monkeypatch.setattr("qloop.eval.runners.run_benchmark", _fail_if_gated)
+    monkeypatch.setattr(tr2.gen, "generate", _fake_gen)
+    monkeypatch.setattr(tr2.gen, "encode_prompt", lambda prompt, **kw: [10, 11, 12])
+
+    res = tr2.train(on_step=lambda step, _m: steps_seen.append(step))
+    assert gate_calls == []
+    assert steps_seen == [1]
+    assert res["step"] == 1
+    assert tr2.best_gate == pytest.approx(expected, abs=1e-9)
+    assert tr2.best_bench_scores == bench_scores
+    assert len(tr2.best_gate_items) == 4
+
+
 def test_g1_aggregate_rollback_uses_restore_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run_dir = str(tmp_path / "g1_agg_rollback")
     cfg = _guard_toy_cfg(

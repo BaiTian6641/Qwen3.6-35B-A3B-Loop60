@@ -40,7 +40,7 @@ import yaml
 
 from qloop.cli import main as cli_main
 from qloop.config import load_config
-from qloop.eval.generate import GenOut
+from qloop.eval.generate import Generator, GenOut
 from qloop.eval.kill_gate_k0 import (
     K0Config,
     K0Example,
@@ -1035,7 +1035,11 @@ def test_option_a_stage_configs_hygiene_and_schema() -> None:
     # S4 Option A specifics
     assert s4.stage_type == "rl"
     assert s4.train.init_from == "runs/s3_opt_a_block_attn_calib"
-    assert int(s4.train.steps) == 40
+    assert s4.train.gradient_checkpointing is True
+    assert int(s4.train.steps) == 30
+    assert int(s4.train.ckpt_every) == 5
+    assert int(s4.rl.micro_batch_seqs) == 1
+    assert int(s4.rl.logprob_chunk_size) == 512
     assert int(s4.rl.max_new_tokens) == 2048
     assert s4.rl.enable_thinking is False
     assert s4.rl.overlong.enabled is True
@@ -1045,6 +1049,7 @@ def test_option_a_stage_configs_hygiene_and_schema() -> None:
     assert float(s4.rl.overlong.min_pass_rate) == pytest.approx(0.25)
     assert list(s4.rl.sirsi.slap_target_groups) == ["router", "shared_expert"]
     assert float(s4.rl.sirsi.anti_slop_weight) == pytest.approx(0.05)
+    assert int(s4.rl.gate.every) == 15
     assert int(s4.rl.gate.depth) == 1
     assert [b["name"] for b in s4.rl.gate.benchmarks] == ["aime_2026", "gpqa_diamond"]
 
@@ -1471,4 +1476,134 @@ def test_block_attn_calib_nonfinite_guard_blocks_backward_before_grad_corruption
         "`.backward()` ran despite NaN aux loss in `_contiguous_lm_microstep`!"
     )
     cal.stack.aux_losses = orig_aux  # type: ignore[method-assign]
+
+
+def test_grpo_update_forces_train_mode_and_forwards_logprob_chunk_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`GRPOTrainer.update()` sets `model.train()` and forwards `rl.logprob_chunk_size` to logprobs & entropy."""
+    import qloop.train.rl as rl_mod
+
+    # Default chunk size is 512 when omitted
+    tr_def = GRPOTrainer(_rl_opt_a_toy_cfg(steps=1, fused=False), str(tmp_path / "rl_chunk_default"))
+    try:
+        assert tr_def._logprob_chunk_size == 512
+    finally:
+        tr_def.pool.shutdown(wait=False)
+
+    cfg = _rl_opt_a_toy_cfg(steps=1, fused=False)
+    cfg["rl"]["micro_batch_seqs"] = 1
+    cfg["rl"]["logprob_chunk_size"] = 17
+    cfg["rl"]["kl_coef"] = 0.05
+    cfg["rl"]["ppo_epochs"] = 1
+    tr = GRPOTrainer(cfg, str(tmp_path / "rl_chunk_custom"))
+    try:
+        assert tr._logprob_chunk_size == 17
+        # Simulate model left in eval() by prior gate()/rollout()
+        tr.stack.model.eval()
+        assert tr.stack.model.training is False
+
+        hidden_training_flags: list[bool] = []
+        orig_hidden = tr.stack.hidden
+
+        def _spy_hidden(ids: torch.Tensor, *a: Any, **kw: Any) -> torch.Tensor:
+            hidden_training_flags.append(bool(tr.stack.model.training))
+            return orig_hidden(ids, *a, **kw)
+
+        lp_chunks: list[int | None] = []
+        orig_lp = rl_mod.token_logprobs
+
+        def _spy_lp(*a: Any, **kw: Any) -> torch.Tensor:
+            lp_chunks.append(kw.get("chunk_size"))
+            return orig_lp(*a, **kw)
+
+        ent_chunks: list[int | None] = []
+        orig_ent = rl_mod.token_entropy
+
+        def _spy_ent(*a: Any, **kw: Any) -> torch.Tensor:
+            ent_chunks.append(kw.get("chunk_size"))
+            return orig_ent(*a, **kw)
+
+        monkeypatch.setattr(tr.stack, "hidden", _spy_hidden)
+        monkeypatch.setattr(rl_mod, "token_logprobs", _spy_lp)
+        monkeypatch.setattr(rl_mod, "token_entropy", _spy_ent)
+
+        seqs = [
+            _Seq([1, 2, 3, 4, 5, 6], 2, 1.0, "pg"),
+            _Seq([1, 2, 7, 8, 9, 10], 2, -1.0, "pg"),
+        ]
+        st = tr.update(seqs)
+        assert tr.stack.model.training is True
+        assert hidden_training_flags and all(hidden_training_flags), (
+            f"expected model.training=True for every update() forward, got {hidden_training_flags}"
+        )
+        # 2 microbatches x (policy + ref logprobs) = 4 calls, all with chunk_size=17
+        assert len(lp_chunks) == 4 and all(c == 17 for c in lp_chunks)
+        assert ent_chunks == [17]
+        assert "entropy" in st
+    finally:
+        tr.pool.shutdown(wait=False)
+
+
+def test_generator_switches_model_to_eval_for_use_cache_with_grad_checkpointing() -> None:
+    """`Generator.generate()` puts model into `eval()` so `use_cache=True` works under HF gradient checkpointing."""
+    from qloop.data.tokenizer import ToyTokenizer
+
+    class _HFGradCkptMockLM(torch.nn.Module):
+        """Mirrors HF `if self.gradient_checkpointing and self.training: use_cache = False`."""
+
+        def __init__(self, inner: ToyForCausalLM) -> None:
+            super().__init__()
+            self.inner = inner
+            self.config = inner.config
+            self.gradient_checkpointing = True
+            self.seen_training: list[bool] = []
+            self.seen_use_cache: list[bool] = []
+
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            past_key_values: Any = None,
+            use_cache: bool = False,
+        ) -> ToyCausalLMOutput:
+            self.seen_training.append(bool(self.training))
+            effective_use_cache = bool(use_cache)
+            if self.gradient_checkpointing and self.training:
+                effective_use_cache = False
+            self.seen_use_cache.append(effective_use_cache)
+            return self.inner(
+                input_ids=input_ids,
+                past_key_values=past_key_values if effective_use_cache else None,
+                use_cache=effective_use_cache,
+            )
+
+    tok = ToyTokenizer()
+    toy_cfg = ToyConfig(
+        vocab_size=tok.vocab_size,
+        hidden_size=32,
+        num_hidden_layers=4,
+        full_attention_interval=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+    )
+    mock = _HFGradCkptMockLM(ToyForCausalLM(toy_cfg)).train()
+    assert mock.training is True
+
+    # Confirm the HF trap reproduces when called directly in train() mode
+    with torch.no_grad():
+        raw_out = mock(input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long), use_cache=True)
+    assert raw_out.past_key_values is None
+
+    mock.seen_training.clear()
+    mock.seen_use_cache.clear()
+    gen = Generator(mock, tok)
+    outs = gen.generate(["hello"], max_new_tokens=3, temperature=0.0)
+    assert len(outs) == 1 and len(outs[0]) == 1
+    assert outs[0][0].completion_tokens == 3
+    assert len(mock.seen_training) == 3
+    assert all(t is False for t in mock.seen_training)
+    assert all(c is True for c in mock.seen_use_cache)
+    assert mock.training is True
 

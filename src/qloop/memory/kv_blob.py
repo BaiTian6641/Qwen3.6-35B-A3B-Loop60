@@ -20,6 +20,7 @@ primitives directly:
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from typing import Any
 
@@ -254,6 +255,8 @@ class KVMemBlob:
     rotary_dim: int = 64
     hadamard_block_size: int = GROUP_SIZE_DEFAULT
     rope_theta: float = 10_000_000.0
+    gdn2_recurrent_states: dict[int, torch.Tensor] | None = None
+    gdn2_conv_states: dict[int, torch.Tensor] | None = None
 
     def __post_init__(self) -> None:
         if self.packed_k.shape != self.packed_v.shape:
@@ -299,6 +302,77 @@ class KVMemBlob:
 
     def header_wire_bytes(self) -> int:
         return self.header.header_wire_bytes()
+
+
+VALID_GDN2_STATE_QUANT_MODES: tuple[str, str, str] = ("bf16", "int8", "fp32")
+
+
+def _normalize_gdn2_quant_mode(mode: str) -> str:
+    qmode = str(mode).strip().lower()
+    if qmode not in VALID_GDN2_STATE_QUANT_MODES:
+        raise ValueError(
+            f"unknown gdn2 state quant mode {mode!r}; expected one of {VALID_GDN2_STATE_QUANT_MODES}"
+        )
+    return qmode
+
+
+def quantize_dequantize_gdn2_state(tensor: torch.Tensor, mode: str = "bf16") -> torch.Tensor:
+    """Simulate quantized storage round-trip for a `GDN-2` recurrent state tensor, returning `float32`.
+
+    Supported modes:
+      * `"fp32"`: lossless float32 pass-through.
+      * `"bf16"`: round-trip cast through `torch.bfloat16` back to `float32`.
+      * `"int8"`: per-head symmetric int8 quantization (`[-127, 127]`) with scale clamped `>= 1e-8`.
+    """
+    qmode = _normalize_gdn2_quant_mode(mode)
+    xf = tensor.detach().to(torch.float32)
+    if xf.numel() == 0 or qmode == "fp32":
+        return xf.clone()
+    if qmode == "bf16":
+        return xf.to(torch.bfloat16).to(torch.float32)
+    # Per-head symmetric int8 across trailing `(D_k, D_v)` state matrix dimensions
+    if xf.ndim >= 2:
+        max_abs = xf.abs().amax(dim=(-2, -1), keepdim=True)
+    elif xf.ndim == 1:
+        max_abs = xf.abs().amax(dim=-1, keepdim=True)
+    else:
+        max_abs = xf.abs()
+    scale = (max_abs / 127.0).clamp(min=1e-8)
+    quant = torch.clamp(torch.round(xf / scale), -127.0, 127.0)
+    return (quant * scale).to(torch.float32)
+
+
+def gdn2_state_bytes(
+    states: Mapping[int, torch.Tensor] | Sequence[torch.Tensor | None] | torch.Tensor | None,
+    mode: str = "bf16",
+) -> int:
+    """Compute exact compressed storage bytes for `GDN-2` recurrent states under `fp32` / `bf16` / `int8`."""
+    qmode = _normalize_gdn2_quant_mode(mode)
+    if states is None:
+        return 0
+    if isinstance(states, torch.Tensor):
+        tensors = [states]
+    elif isinstance(states, Mapping):
+        tensors = [v for v in states.values() if isinstance(v, torch.Tensor)]
+    elif isinstance(states, Sequence):
+        tensors = [v for v in states if isinstance(v, torch.Tensor)]
+    else:
+        raise TypeError(
+            f"states must be a Mapping, Sequence, Tensor, or None; got {type(states).__name__}"
+        )
+
+    total = 0
+    for t in tensors:
+        n = int(t.numel())
+        if qmode == "fp32":
+            total += n * 4
+        elif qmode == "bf16":
+            total += n * 2
+        else:
+            # 1 byte per int8 element + 4-byte float32 scale per `(B, H)` head matrix
+            n_scales = math.prod(t.shape[:-2]) if t.ndim >= 2 else (1 if n > 0 else 0)
+            total += n + int(n_scales) * 4
+    return int(total)
 
 
 def strip_sinks_and_unrotate_k(

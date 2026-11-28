@@ -43,20 +43,24 @@ from qloop.memory.kv_blob import (
     KVBlobConfig,
     KVMemBlob,
     SplitHorizonKVBlobStore,
+    gdn2_state_bytes,
     mount_kv_blob,
     pack_kv_blob,
+    quantize_dequantize_gdn2_state,
     strip_sinks_and_unrotate_k,
 )
 from qloop.model._cache_compat import cache_kwarg_name, extract_output_cache
 from qloop.model.pos_rerope import apply_partial_rope_k, build_rope_inv_freq, clamped_relative_distance
 
 CANONICAL_ARMS: tuple[str, str, str, str] = ("arm_a", "arm_b", "arm_c", "arm_d")
+OPTIONAL_ARMS: tuple[str, ...] = ("arm_e",)
 
 ARM_DISPLAY_NAMES: dict[str, str] = {
     "arm_a": "Arm (a) Contiguous Oracle",
     "arm_b": "Arm (b) Naive Spliced KV",
     "arm_c": "Arm (c) Pre-RoPE + Sink-Strip + H64-INT4",
     "arm_d": "Arm (d) Arm (c) + CacheBlend Refresh",
+    "arm_e": "Arm (e) Arm (c) + GDN-2 State Merge",
 }
 
 _ARM_ALIASES: dict[str, str] = {
@@ -73,6 +77,10 @@ _ARM_ALIASES: dict[str, str] = {
     "d": "arm_d",
     "arm_d": "arm_d",
     "cacheblend": "arm_d",
+    "e": "arm_e",
+    "arm_e": "arm_e",
+    "gdn2_merge": "arm_e",
+    "hybrid_merge": "arm_e",
 }
 
 
@@ -107,6 +115,9 @@ class K0Config:
     max_pos: int = 240_000
     interleaved: bool = False
     retention_metric: str = "exact_match"
+    eval_gdn2_state_merge: bool = False
+    gdn2_state_decay: float = 0.7
+    gdn2_state_quant: str = "bf16"
 
     def __post_init__(self) -> None:
         self.validate()
@@ -149,6 +160,12 @@ class K0Config:
         if self.retention_metric not in ("exact_match", "token_acc", "combined"):
             raise ValueError(
                 f"retention_metric must be 'exact_match', 'token_acc', or 'combined', got {self.retention_metric!r}"
+            )
+        if not math.isfinite(self.gdn2_state_decay) or not (0.0 <= self.gdn2_state_decay <= 1.0):
+            raise ValueError(f"gdn2_state_decay must be finite in [0, 1], got {self.gdn2_state_decay}")
+        if self.gdn2_state_quant not in ("bf16", "int8", "fp32"):
+            raise ValueError(
+                f"gdn2_state_quant must be 'bf16', 'int8', or 'fp32', got {self.gdn2_state_quant!r}"
             )
         self.blob_config.validate()
 
@@ -1883,12 +1900,18 @@ def run_k0_suite(
                 ep = _coerce_episode_result(norm_map[arm], arm, ex.example_id)
                 per_arm_rows[arm].append(ep)
                 cat_bucket[arm].append(ep)
+            for arm in OPTIONAL_ARMS:
+                if arm in norm_map:
+                    ep = _coerce_episode_result(norm_map[arm], arm, ex.example_id)
+                    per_arm_rows.setdefault(arm, []).append(ep)
+                    cat_bucket.setdefault(arm, []).append(ep)
         else:
-            for arm in CANONICAL_ARMS:
+            arms_to_run = (*CANONICAL_ARMS, "arm_e") if eff_cfg.eval_gdn2_state_merge else CANONICAL_ARMS
+            for arm in arms_to_run:
                 raw_ep = evaluator_fn(ex, arm, eff_cfg)
                 ep = _coerce_episode_result(raw_ep, arm, ex.example_id)
-                per_arm_rows[arm].append(ep)
-                cat_bucket[arm].append(ep)
+                per_arm_rows.setdefault(arm, []).append(ep)
+                cat_bucket.setdefault(arm, []).append(ep)
 
     def _agg(rows: list[K0EpisodeResult]) -> tuple[float, float, float, int, int, float]:
         n = float(len(rows))
@@ -1902,8 +1925,9 @@ def run_k0_suite(
 
     ora_nll, ora_acc, ora_em, _, _, _ = _agg(per_arm_rows["arm_a"])
     ora_has_signal = (ora_acc > 0.0) if eff_cfg.retention_metric == "token_acc" else (ora_em > 0.0 or ora_acc > 0.0)
+    active_arms = [*CANONICAL_ARMS, *(arm for arm in OPTIONAL_ARMS if per_arm_rows.get(arm))]
     arms_out: dict[str, K0ArmMetrics] = {}
-    for arm in CANONICAL_ARMS:
+    for arm in active_arms:
         rows = per_arm_rows[arm]
         nll, acc, em, tot_bytes, tot_ref, tot_ms = _agg(rows)
         ret = (
@@ -1935,7 +1959,9 @@ def run_k0_suite(
             (c_ora_acc > 0.0) if eff_cfg.retention_metric == "token_acc" else (c_ora_em > 0.0 or c_ora_acc > 0.0)
         )
         per_category_summary[cat] = {}
-        for arm in CANONICAL_ARMS:
+        for arm in active_arms:
+            if not arm_dict.get(arm):
+                continue
             c_nll, c_acc, c_em, _, c_ref, _ = _agg(arm_dict[arm])
             c_ret = (
                 (1.0 if c_ora_ok else 0.0)
@@ -1965,6 +1991,12 @@ def run_k0_suite(
 
 def format_k0_markdown(report: K0Report) -> str:
     """Format a concise, deterministic GitHub-flavored Markdown report for Kill-Gate `K0`."""
+    gdn2_cfg_str = (
+        f", `gdn2_state_merge = True` (`decay = {report.config.gdn2_state_decay:g}`, "
+        f"`quant = {report.config.gdn2_state_quant}`)"
+        if report.config.eval_gdn2_state_merge
+        else ""
+    )
     lines: list[str] = [
         "# Kill-Gate `K0` Report — Zero-Training Pre-RoPE KV-Mem Blob Injection",
         "",
@@ -1977,6 +2009,7 @@ def format_k0_markdown(report: K0Report) -> str:
             f"`sink_tokens = {report.config.sink_tokens}`, "
             f"`boundary_header_tokens = {report.config.boundary_header_tokens}`, "
             f"`rotary_dim = {report.config.rotary_dim}`"
+            f"{gdn2_cfg_str}"
         ),
     ]
     if report.rationale:
@@ -1994,7 +2027,8 @@ def format_k0_markdown(report: K0Report) -> str:
             "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         ]
     )
-    for arm_key in CANONICAL_ARMS:
+    table_arms = [*CANONICAL_ARMS, *(arm for arm in OPTIONAL_ARMS if report.get_arm(arm) is not None)]
+    for arm_key in table_arms:
         m = report.get_arm(arm_key)
         if m is None:
             continue
@@ -2006,21 +2040,46 @@ def format_k0_markdown(report: K0Report) -> str:
         )
 
     if report.per_category:
-        lines.extend(
-            [
-                "",
-                "## Per-Category Breakdown",
-                "",
-                "| Category | Arm (b) Naive | Arm (c) Partition-B | Arm (d) +CacheBlend | Arm (c) NLL Gap |",
-                "| :--- | :---: | :---: | :---: | :---: |",
-            ]
-        )
-        for cat, cdata in sorted(report.per_category.items()):
-            rb = cdata.get("arm_b", {}).get("oracle_retention_ratio", 0.0)
-            rc = cdata.get("arm_c", {}).get("oracle_retention_ratio", 0.0)
-            rd = cdata.get("arm_d", {}).get("oracle_retention_ratio", 0.0)
-            gc = cdata.get("arm_c", {}).get("nll_gap", 0.0)
-            lines.append(f"| `{cat}` | `{rb:.1%}` | `{rc:.1%}` | `{rd:.1%}` | `{gc:+.4f}` |")
+        has_arm_e = any("arm_e" in cdata for cdata in report.per_category.values())
+        if has_arm_e:
+            lines.extend(
+                [
+                    "",
+                    "## Per-Category Breakdown",
+                    "",
+                    (
+                        "| Category | Arm (b) Naive | Arm (c) Partition-B | Arm (d) +CacheBlend | "
+                        "Arm (e) +GDN-2 | Arm (c) NLL Gap | Arm (e) NLL Gap |"
+                    ),
+                    "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
+                ]
+            )
+            for cat, cdata in sorted(report.per_category.items()):
+                rb = cdata.get("arm_b", {}).get("oracle_retention_ratio", 0.0)
+                rc = cdata.get("arm_c", {}).get("oracle_retention_ratio", 0.0)
+                rd = cdata.get("arm_d", {}).get("oracle_retention_ratio", 0.0)
+                re_ = cdata.get("arm_e", {}).get("oracle_retention_ratio", 0.0)
+                gc = cdata.get("arm_c", {}).get("nll_gap", 0.0)
+                ge = cdata.get("arm_e", {}).get("nll_gap", 0.0)
+                lines.append(
+                    f"| `{cat}` | `{rb:.1%}` | `{rc:.1%}` | `{rd:.1%}` | `{re_:.1%}` | `{gc:+.4f}` | `{ge:+.4f}` |"
+                )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "## Per-Category Breakdown",
+                    "",
+                    "| Category | Arm (b) Naive | Arm (c) Partition-B | Arm (d) +CacheBlend | Arm (c) NLL Gap |",
+                    "| :--- | :---: | :---: | :---: | :---: |",
+                ]
+            )
+            for cat, cdata in sorted(report.per_category.items()):
+                rb = cdata.get("arm_b", {}).get("oracle_retention_ratio", 0.0)
+                rc = cdata.get("arm_c", {}).get("oracle_retention_ratio", 0.0)
+                rd = cdata.get("arm_d", {}).get("oracle_retention_ratio", 0.0)
+                gc = cdata.get("arm_c", {}).get("nll_gap", 0.0)
+                lines.append(f"| `{cat}` | `{rb:.1%}` | `{rc:.1%}` | `{rd:.1%}` | `{gc:+.4f}` |")
 
     return "\n".join(lines) + "\n"
 
@@ -2185,6 +2244,8 @@ def run_smoke_cpu(cfg: K0Config | None = None) -> K0Report:
 _LINEAR_LAYER_STATE_ATTRS: tuple[str, ...] = (
     "conv_states",
     "recurrent_states",
+    "conv_state",
+    "recurrent_state",
     "has_previous_state",
     "is_conv_states_initialized",
     "is_recurrent_states_initialized",
@@ -2239,18 +2300,25 @@ def _clone_state_value(val: Any, _memo: dict[int, Any] | None = None) -> Any:
     return val
 
 
+def _is_writable_top_level_list(cache: Any, attr: str) -> bool:
+    """Return True iff `cache.<attr>` is a direct writable `list` (NOT a read-only `@property` view)."""
+    if isinstance(getattr(type(cache), attr, None), property):
+        return False
+    return isinstance(getattr(cache, attr, None), list)
+
+
 def _clone_linear_states_into(src_cache: Any, dst_cache: Any) -> None:
     """Copy ONLY Partition-A linear-attention (`GDN-2`) states from `src_cache` to `dst_cache`."""
     if src_cache is None or dst_cache is None:
         return
 
-    # Path 1: Top-level `conv_states` / `recurrent_states` lists (`ToyHybridCache`, `HSSDHybridCache`,
-    # `QuantizedHybridCache` incl. Track-C). Return early so we never traverse cyclic `.layers` proxies.
+    # Path 1: Top-level writable `conv_states` / `recurrent_states` lists (`ToyHybridCache`,
+    # `HSSDHybridCache`, `QuantizedHybridCache` incl. Track-C). Return early to avoid cyclic `.layers`.
     copied_top_level = False
     for attr in ("conv_states", "recurrent_states"):
-        src_list = getattr(src_cache, attr, None)
-        dst_list = getattr(dst_cache, attr, None)
-        if isinstance(src_list, list) and isinstance(dst_list, list):
+        if _is_writable_top_level_list(src_cache, attr) and _is_writable_top_level_list(dst_cache, attr):
+            src_list = getattr(src_cache, attr)
+            dst_list = getattr(dst_cache, attr)
             copied_top_level = True
             for idx, item in enumerate(src_list):
                 if item is None:
@@ -2266,7 +2334,12 @@ def _clone_linear_states_into(src_cache: Any, dst_cache: Any) -> None:
     dst_layers = getattr(dst_cache, "layers", None)
     if isinstance(src_layers, (list, tuple)) and isinstance(dst_layers, (list, tuple)):
         for s_layer, d_layer in zip(src_layers, dst_layers):
-            if not (hasattr(s_layer, "conv_states") or hasattr(s_layer, "recurrent_states")):
+            if not (
+                hasattr(s_layer, "conv_states")
+                or hasattr(s_layer, "recurrent_states")
+                or hasattr(s_layer, "conv_state")
+                or hasattr(s_layer, "recurrent_state")
+            ):
                 continue
             for attr in _LINEAR_LAYER_STATE_ATTRS:
                 if not hasattr(s_layer, attr):
@@ -2277,6 +2350,221 @@ def _clone_linear_states_into(src_cache: Any, dst_cache: Any) -> None:
                         setattr(d_layer, attr, _clone_state_value(s_val))
                     except (AttributeError, TypeError):
                         pass
+
+
+def _unwrap_state_tensor(val: Any) -> torch.Tensor | None:
+    """Extract a `torch.Tensor` from either a direct tensor attribute or a single-slot list/tuple."""
+    if isinstance(val, torch.Tensor):
+        return val
+    if isinstance(val, (list, tuple)):
+        for item in val:
+            if isinstance(item, torch.Tensor):
+                return item
+    return None
+
+
+def _extract_linear_states(cache: Any) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+    """Extract `(conv_states, recurrent_states)` dicts keyed by physical layer index.
+
+    Mirrors `_clone_linear_states_into`'s exact dual-path structure:
+      * Path 1: top-level `conv_states` / `recurrent_states` lists (`ToyHybridCache`, `HSSDHybridCache`,
+        `QuantizedHybridCache`), returning early to avoid cyclic `.layers` proxies.
+      * Path 2: `transformers >= 5.24` `cache.layers[i]` exposing `.{conv_states,recurrent_states}`
+        (list or tensor) or `.{conv_state,recurrent_state}`.
+    """
+    conv_map: dict[int, torch.Tensor] = {}
+    rec_map: dict[int, torch.Tensor] = {}
+    if cache is None:
+        return conv_map, rec_map
+
+    # Path 1: Direct writable top-level lists (`ToyHybridCache`, `HSSDHybridCache`, `QuantizedHybridCache`)
+    has_top_conv = _is_writable_top_level_list(cache, "conv_states")
+    has_top_rec = _is_writable_top_level_list(cache, "recurrent_states")
+    if has_top_conv or has_top_rec:
+        if has_top_conv:
+            for idx, item in enumerate(cache.conv_states):
+                t = _unwrap_state_tensor(item)
+                if t is not None:
+                    conv_map[idx] = t
+        if has_top_rec:
+            for idx, item in enumerate(cache.recurrent_states):
+                t = _unwrap_state_tensor(item)
+                if t is not None:
+                    rec_map[idx] = t
+        return conv_map, rec_map
+
+    # Path 2: `transformers >= 5.24` `cache.layers[i]`
+    layers = getattr(cache, "layers", None)
+    if isinstance(layers, (list, tuple)):
+        for idx, lyr in enumerate(layers):
+            for c_attr in ("conv_states", "conv_state"):
+                c_t = _unwrap_state_tensor(getattr(lyr, c_attr, None))
+                if c_t is not None:
+                    conv_map[idx] = c_t
+                    break
+            for r_attr in ("recurrent_states", "recurrent_state"):
+                r_t = _unwrap_state_tensor(getattr(lyr, r_attr, None))
+                if r_t is not None:
+                    rec_map[idx] = r_t
+                    break
+    return conv_map, rec_map
+
+
+def _set_linear_state_slot(
+    dst_cache: Any,
+    layer_idx: int,
+    *,
+    conv: torch.Tensor | None = None,
+    recurrent: torch.Tensor | None = None,
+) -> None:
+    """Write merged `conv` and/or `recurrent` state tensors into `dst_cache` at `layer_idx`."""
+    has_top_conv = _is_writable_top_level_list(dst_cache, "conv_states")
+    has_top_rec = _is_writable_top_level_list(dst_cache, "recurrent_states")
+    if has_top_conv or has_top_rec:
+        if conv is not None and has_top_conv:
+            top_conv = dst_cache.conv_states
+            while len(top_conv) <= layer_idx:
+                top_conv.append(None)
+            top_conv[layer_idx] = conv.clone()
+        if recurrent is not None and has_top_rec:
+            top_rec = dst_cache.recurrent_states
+            while len(top_rec) <= layer_idx:
+                top_rec.append(None)
+            top_rec[layer_idx] = recurrent.clone()
+        return
+
+    dst_layers = getattr(dst_cache, "layers", None)
+    if not (isinstance(dst_layers, (list, tuple)) and 0 <= layer_idx < len(dst_layers)):
+        return
+    d_layer = dst_layers[layer_idx]
+
+    for val, attrs, init_flag in (
+        (conv, ("conv_states", "conv_state"), "is_conv_states_initialized"),
+        (recurrent, ("recurrent_states", "recurrent_state"), "is_recurrent_states_initialized"),
+    ):
+        if val is None:
+            continue
+        for attr in attrs:
+            if not hasattr(d_layer, attr):
+                continue
+            cur = getattr(d_layer, attr, None)
+            if isinstance(cur, list):
+                if not cur:
+                    cur.append(val.clone())
+                else:
+                    cur[0] = val.clone()
+            else:
+                try:
+                    setattr(d_layer, attr, val.clone())
+                except (AttributeError, TypeError):
+                    pass
+            init_map = getattr(d_layer, init_flag, None)
+            if isinstance(init_map, dict):
+                init_map[0] = True
+            prev_map = getattr(d_layer, "has_previous_state", None)
+            if isinstance(prev_map, dict):
+                prev_map[0] = True
+            if attr in ("conv_states", "conv_state"):
+                ck_map = getattr(d_layer, "conv_kernel_size", None)
+                if isinstance(ck_map, dict) and 0 not in ck_map and val.ndim >= 1:
+                    ck_map[0] = int(val.shape[-1])
+                if hasattr(d_layer, "batch_size") and getattr(d_layer, "batch_size", None) is None and val.ndim >= 1:
+                    try:
+                        d_layer.batch_size = int(val.shape[0])
+                    except (AttributeError, TypeError):
+                        pass
+            break
+
+
+def _merge_linear_states_into(
+    live_sink_cache: Any,
+    session_caches: Sequence[Any],
+    dst_cache: Any,
+    *,
+    decay: float = 0.7,
+    quant: str = "bf16",
+) -> int:
+    """Merge Partition-B `GDN-2` recurrent state snapshots + boundary `conv1d` state into `dst_cache`.
+
+    For each linear layer `i` with a non-None recurrent state, computes in `float32`:
+        `S_merged = (decay ** K) * S_sink + sum_{j=0}^{K-1} (decay ** (K - 1 - j)) * Q(S_sess_j)`
+    and casts back to `dst`'s dtype. Causal `conv1d` states are copied from the last active session
+    (`session_caches[-1]`, falling back to `live_sink_cache`). Returns total compressed state bytes
+    across all merged linear layers under `quant` (`"bf16"` | `"int8"` | `"fp32"`).
+    """
+    decay_f = float(decay)
+    if not math.isfinite(decay_f) or not (0.0 <= decay_f <= 1.0):
+        raise ValueError(f"decay must be finite in [0, 1], got {decay}")
+    if dst_cache is None:
+        return 0
+
+    # Snapshot any pre-existing dtype/device layout on `dst_cache` before cloning metadata
+    orig_dst_conv, orig_dst_rec = _extract_linear_states(dst_cache)
+    valid_sessions = [sc for sc in (session_caches or ()) if sc is not None]
+
+    # Prime TF 5.24 `LinearAttentionLayer` metadata/flags from sink and last active session
+    if live_sink_cache is not None:
+        _clone_linear_states_into(live_sink_cache, dst_cache)
+    if valid_sessions:
+        _clone_linear_states_into(valid_sessions[-1], dst_cache)
+
+    sink_conv, sink_rec = _extract_linear_states(live_sink_cache)
+    sess_states = [_extract_linear_states(sc) for sc in valid_sessions]
+    k_sess = len(sess_states)
+
+    all_rec_layers = sorted(set(sink_rec) | {idx for _, sr in sess_states for idx in sr})
+    merged_rec: dict[int, torch.Tensor] = {}
+    for layer_idx in all_rec_layers:
+        ref_t = orig_dst_rec.get(layer_idx)
+        if ref_t is None:
+            ref_t = sink_rec.get(layer_idx)
+        if ref_t is None:
+            for _, sr in reversed(sess_states):
+                if layer_idx in sr:
+                    ref_t = sr[layer_idx]
+                    break
+        assert ref_t is not None
+        dst_dtype = ref_t.dtype
+        dst_device = ref_t.device
+
+        acc: torch.Tensor | None = None
+        if layer_idx in sink_rec:
+            w_sink = decay_f**k_sess
+            acc = w_sink * sink_rec[layer_idx].detach().to(device=dst_device, dtype=torch.float32)
+        for j, (_, sr) in enumerate(sess_states):
+            if layer_idx in sr:
+                w_j = decay_f ** (k_sess - 1 - j)
+                s_q = quantize_dequantize_gdn2_state(sr[layer_idx].to(device=dst_device), mode=quant)
+                term = w_j * s_q
+                acc = term if acc is None else (acc + term)
+        if acc is not None:
+            merged_rec[layer_idx] = acc.to(dtype=dst_dtype)
+
+    all_conv_layers = sorted(set(sink_conv) | {idx for sc_conv, _ in sess_states for idx in sc_conv})
+    chosen_conv: dict[int, torch.Tensor] = {}
+    for layer_idx in all_conv_layers:
+        c_val: torch.Tensor | None = None
+        for sc_conv, _ in reversed(sess_states):
+            if layer_idx in sc_conv:
+                c_val = sc_conv[layer_idx]
+                break
+        if c_val is None:
+            c_val = sink_conv.get(layer_idx)
+        if c_val is not None:
+            ref_c = orig_dst_conv.get(layer_idx, c_val)
+            chosen_conv[layer_idx] = c_val.detach().to(device=ref_c.device, dtype=ref_c.dtype)
+
+    for layer_idx in sorted(set(merged_rec) | set(chosen_conv)):
+        _set_linear_state_slot(
+            dst_cache,
+            layer_idx,
+            conv=chosen_conv.get(layer_idx),
+            recurrent=merged_rec.get(layer_idx),
+        )
+
+    if not sess_states:
+        return 0
+    return gdn2_state_bytes(merged_rec, mode=quant)
 
 
 def _resolve_text_configs(model: Any) -> list[Any]:
@@ -2576,9 +2864,10 @@ class HFCheckpointK0Evaluator:
             live_sink_k, live_sink_v, _ = extract_layer_kv_pairs(sink_out, layer_indices=layer_indices)
             live_sink_cache = extract_output_cache(sink_out)
 
-        # Independent session prefills (shared across Arms b, c, d)
+        # Independent session prefills (shared across Arms b, c, d, and optional e)
         raw_sessions_kv: list[tuple[torch.Tensor, torch.Tensor, list[int]]] = []
-        for s_ids in all_sess_ids:
+        active_session_caches: list[Any] = []
+        for idx, s_ids in enumerate(all_sess_ids):
             if not s_ids:
                 raw_sessions_kv.append((oracle_k_full[..., :0, :], oracle_v_full[..., :0, :], []))
                 continue
@@ -2586,6 +2875,8 @@ class HFCheckpointK0Evaluator:
             s_out = self._forward(s_t)
             sk, sv, _ = extract_layer_kv_pairs(s_out, layer_indices=layer_indices)
             raw_sessions_kv.append((sk, sv, s_ids))
+            if cfg.eval_gdn2_state_merge and idx not in superseded:
+                active_session_caches.append(extract_output_cache(s_out))
 
         live_and_ans = torch.tensor([live_ids + ans_ids], dtype=torch.long, device=self.device)
         live_rest_and_ans = torch.tensor([live_rest_ids + ans_ids], dtype=torch.long, device=self.device)
@@ -2758,7 +3049,7 @@ class HFCheckpointK0Evaluator:
             "accepts_position_ids": self._accepts_pos_ids,
         }
 
-        return {
+        results: dict[str, K0EpisodeResult] = {
             "arm_a": K0EpisodeResult("arm_a", example.example_id, nll_a, acc_a, em_a, bytes_a, 0, ms_a, pred_a),
             "arm_b": K0EpisodeResult("arm_b", example.example_id, nll_b, acc_b, em_b, bytes_b, 0, ms_b, pred_b),
             "arm_c": K0EpisodeResult(
@@ -2792,6 +3083,45 @@ class HFCheckpointK0Evaluator:
                 },
             ),
         }
+
+        # Optional Arm (e): Arm (c) full-attention KV + decayed GDN-2 linear state snapshot merge
+        if cfg.eval_gdn2_state_merge:
+            t0_e = time.perf_counter()
+            cache_e = self._fresh_cache_from(ref_cache)
+            gdn2_bytes = _merge_linear_states_into(
+                live_sink_cache,
+                active_session_caches,
+                cache_e,
+                decay=cfg.gdn2_state_decay,
+                quant=cfg.gdn2_state_quant,
+            )
+            if k_c_mount.shape[-2] > 0:
+                inject_layer_kv_pairs(cache_e, k_c_mount, v_c_mount, layer_indices)
+            out_e = self._forward(live_rest_and_ans, cache=cache_e, position_ids=live_pos_ids)
+            nll_e, acc_e, em_e, pred_e = self._score_answer_from_logits(out_e.logits, ans_ids, len(live_rest_ids))
+            ms_e = ms_c + (time.perf_counter() - t0_e) * 1000.0
+            self.last_diagnostics["gdn2_state_bytes"] = gdn2_bytes
+            results["arm_e"] = K0EpisodeResult(
+                "arm_e",
+                example.example_id,
+                nll_e,
+                acc_e,
+                em_e,
+                bytes_c + gdn2_bytes,
+                0,
+                ms_e,
+                pred_e,
+                extra={
+                    "live_sink_tokens_prefilled": live_sink_n,
+                    "base_mount_offset": base_mount_offset,
+                    "gdn2_state_bytes": gdn2_bytes,
+                    "gdn2_state_decay": float(cfg.gdn2_state_decay),
+                    "gdn2_state_quant": str(cfg.gdn2_state_quant),
+                    "n_merged_sessions": len(active_session_caches),
+                },
+            )
+
+        return results
 
 
 def load_examples_from_file(path: str | Path) -> list[K0Example]:
@@ -2890,6 +3220,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--rotary-dim", type=int, default=64, help="Partial-RoPE rotary channel count.")
     ap.add_argument("--rope-theta", type=float, default=10_000_000.0, help="RoPE base frequency.")
     ap.add_argument("--virtual-offset", type=int, default=10_000, help="Partition-B virtual mount offset.")
+    ap.add_argument(
+        "--eval-gdn2-state-merge",
+        action="store_true",
+        default=False,
+        help="Enable optional Arm (e) hybrid GDN-2 linear state-snapshot merge alongside Arm (c) KV mount.",
+    )
+    ap.add_argument(
+        "--gdn2-state-decay",
+        type=float,
+        default=0.7,
+        help="Exponential session decay factor for Arm (e) GDN-2 recurrent state merging (in [0, 1]).",
+    )
+    ap.add_argument(
+        "--gdn2-state-quant",
+        type=str,
+        default="bf16",
+        choices=("bf16", "int8", "fp32"),
+        help="Quantization mode for Arm (e) GDN-2 recurrent state snapshots.",
+    )
     ap.add_argument("--device", type=str, default="auto", help="Target device for --checkpoint (auto/cuda/cpu).")
     return ap
 
@@ -2906,6 +3255,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         rotary_dim=args.rotary_dim,
         rope_theta=args.rope_theta,
         virtual_offset=args.virtual_offset,
+        eval_gdn2_state_merge=args.eval_gdn2_state_merge,
+        gdn2_state_decay=args.gdn2_state_decay,
+        gdn2_state_quant=args.gdn2_state_quant,
     )
 
     if args.smoke_cpu:
@@ -2944,6 +3296,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "ARM_DISPLAY_NAMES",
     "CANONICAL_ARMS",
+    "OPTIONAL_ARMS",
     "CacheBlendRefreshResult",
     "HFCheckpointK0Evaluator",
     "K0ArmMetrics",

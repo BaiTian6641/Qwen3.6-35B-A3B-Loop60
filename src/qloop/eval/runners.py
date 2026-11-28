@@ -523,6 +523,7 @@ def run_benchmark(spec: BenchmarkSpec | str, generator: Any, limit: int | None =
             dt = time.time() - t0
             records = [done[str(it["id"])] for it in items if str(it["id"]) in done]
             summ = summarize_records(records, spec.scorer)
+            summ["item_scores"] = {str(r["id"]): float(r["mean_score"]) for r in records}
             summ["wall_s_this_run"] = round(dt, 2)
             per_depth[label] = summ
             log.info("%s depth=%s: mean=%.4f %s", spec.name, label, summ.get("mean_score", float("nan")),

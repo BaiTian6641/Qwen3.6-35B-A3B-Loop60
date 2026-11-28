@@ -1096,8 +1096,10 @@ class GRPOTrainer:
                         stats["loss/kl"] += float(kl.detach())
                         del rlp, d, kl
                 for a_name, a_loss in aux_now.items():
-                    loss = loss + float(aux_w.get(a_name, 1.0)) * a_loss
                     stats[f"loss/{a_name}"] = stats.get(f"loss/{a_name}", 0.0) + float(a_loss.detach())
+                    w = float(aux_w.get(a_name, 1.0))
+                    if w > 0.0:
+                        loss = loss + w * a_loss
                 loss.backward()
                 del ids, mask, adv, m, lp, loss, aux_now
             stats.update({f"optim/{k}": v for k, v in self.opt.step().items()})
@@ -1294,19 +1296,29 @@ class GRPOTrainer:
         else:
             prom = self.ckpt.promoted()
             if prom and gcfg.get("rollback", True):
+                self.opt.zero_grad(set_to_none=True)
                 ck = self.ckpt.load(prom)
+                require(ck is not None, "failed to load promoted checkpoint for rollback", promoted=prom)
                 assert ck is not None
                 st_ck = ck.get("state") or {}
                 smeta = st_ck.get("stack") or {}
                 sc = float((smeta.get("expert_delta_scale")) or 1.0)
-                self.stack.restore_checkpoint(
+                restored = self.stack.restore_checkpoint(
                     ck["params"],
                     strict=False,
                     expert_delta_scale=sc,
                     prior_stack_meta=smeta,
                 )
+                if isinstance(restored, Mapping):
+                    require(
+                        int(restored.get("trainable", 0)) > 0,
+                        "promoted checkpoint rollback restored 0 trainable parameters",
+                        promoted=prom,
+                        restored=dict(restored),
+                    )
                 if ck["optim"] is not None:
                     self.opt.load_state_dict(ck["optim"])
+                self.opt.zero_grad(set_to_none=True)
                 decision = f"rolled back to {os.path.basename(prom)}"
             else:
                 decision = "rejected (no rollback)"
@@ -1403,6 +1415,28 @@ class GRPOTrainer:
         self.pinned_passed = {str(k) for k in (st.get("pinned_passed") or ())}
         if isinstance(st.get("regret_tracker"), dict):
             self.regret_tracker.load_state_dict(st["regret_tracker"])
+        ck_path = ck.get("path")
+        if (self.best_gate_items or self.best_gate is not None) and self.ckpt.promoted() is None and ck_path:
+            self.ckpt._write_pointer("PROMOTED", str(ck_path))
+            log.info("[rl] armed missing PROMOTED rollback pointer -> %s", os.path.basename(str(ck_path)))
+        if self.ref is not None:
+            prom_path = self.ckpt.promoted()
+            promoted_params: dict[str, torch.Tensor] | None = None
+            if prom_path and (not ck_path or os.path.abspath(prom_path) != os.path.abspath(str(ck_path))):
+                promoted_ck = self.ckpt.load(prom_path, restore_rng=False)
+                if promoted_ck is not None and isinstance(promoted_ck.get("params"), dict):
+                    promoted_params = promoted_ck["params"]
+            if promoted_params is not None:
+                self.ref = {
+                    n: (
+                        promoted_params[n].detach().to(device=p.device, dtype=p.dtype).clone()
+                        if n in promoted_params and promoted_params[n].shape == p.shape
+                        else p.detach().clone()
+                    )
+                    for n, p in self.stack.named_trainable.items()
+                }
+            else:
+                self.ref = {n: p.detach().clone() for n, p in self.stack.named_trainable.items()}
 
     def train(self, on_step: Callable[[int, dict[str, Any]], None] | None = None) -> dict[str, Any]:
         steps = int(self.tcfg.get("steps", 200))

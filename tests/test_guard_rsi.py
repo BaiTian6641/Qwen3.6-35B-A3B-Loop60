@@ -475,6 +475,153 @@ def test_g1_aggregate_rollback_uses_restore_checkpoint(tmp_path: Path, monkeypat
         tr.pool.shutdown(wait=False)
 
 
+def test_g1_resume_arms_missing_promoted_pointer_and_executes_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VM resume with `best_gate_items` and missing `PROMOTED` arms `PROMOTED` so failing `gate()` rolls back."""
+    run_dir = str(tmp_path / "g1_resume_promoted_rollback")
+    gate_cfg = {
+        "mode": "soft_hurt",
+        "eval_at_step_0": True,
+        "every": 10,
+        "depth": 2,
+        "lambda_hurt": 2.0,
+        "max_hurt_frac": 0.05,
+        "max_bench_drop": 0.025,
+        "rollback": True,
+        "benchmarks": [{"name": "bench_a", "weight": 1.0}],
+    }
+    tr = GRPOTrainer(_guard_toy_cfg(steps=20, gate=gate_cfg), run_dir)
+    try:
+        monkeypatch.setattr(
+            "qloop.eval.runners.run_benchmark",
+            lambda name, gen, **kw: _fake_bench_summary(name, {"i0": 1.0, "i1": 1.0, "i2": 0.0}),
+        )
+        g0 = tr.gate()
+        assert g0["gate/decision"] == "promoted"
+        step0_params = {n: p.detach().clone() for n, p in tr.stack.named_trainable.items()}
+    finally:
+        tr.pool.shutdown(wait=False)
+
+    # Simulate fresh VM restore where only `LATEST` exists and `PROMOTED` was never materialized
+    promoted_ptr = Path(run_dir) / "checkpoints" / "PROMOTED"
+    assert promoted_ptr.is_file()
+    promoted_ptr.unlink()
+    assert not promoted_ptr.exists()
+
+    tr2 = GRPOTrainer(_guard_toy_cfg(steps=20, gate=gate_cfg), run_dir)
+    try:
+        assert tr2.ckpt.promoted() is None
+        tr2._resume()
+        assert tr2.ckpt.promoted() is not None
+        assert os.path.basename(tr2.ckpt.promoted() or "") == "step_0000000"
+        assert promoted_ptr.read_text(encoding="utf-8").strip() == "step_0000000"
+
+        # Perturb weights and leave a stale gradient to confirm rollback restores weights & clears grads
+        with torch.no_grad():
+            for p in tr2.stack.named_trainable.values():
+                p.add_(0.75)
+                p.grad = torch.ones_like(p)
+        tr2.step = 10
+        monkeypatch.setattr(
+            "qloop.eval.runners.run_benchmark",
+            lambda name, gen, **kw: _fake_bench_summary(name, {"i0": 0.0, "i1": 0.0, "i2": 0.0}),
+        )
+        g10 = tr2.gate()
+        assert g10["gate/decision"] == "rolled back to step_0000000"
+        assert g10["gate/decision"] != "rejected (no rollback)"
+        for n, p0 in step0_params.items():
+            assert torch.allclose(tr2.stack.named_trainable[n].detach(), p0, atol=1e-6)
+            assert tr2.stack.named_trainable[n].grad is None
+    finally:
+        tr2.pool.shutdown(wait=False)
+
+
+def test_g1_resume_refreshes_kl_ref_from_restored_and_promoted_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resuming with `kl_coef > 0` refreshes `self.ref` from the promoted/restored checkpoint, never stock init."""
+    run_dir = str(tmp_path / "g1_resume_kl_ref")
+    gate_cfg = {
+        "mode": "soft_hurt",
+        "eval_at_step_0": True,
+        "every": 10,
+        "depth": 2,
+        "rollback": True,
+        "benchmarks": [{"name": "bench_a", "weight": 1.0}],
+    }
+    cfg = _guard_toy_cfg(steps=20, gate=gate_cfg)
+    cfg["rl"]["kl_coef"] = 0.02
+
+    tr1 = GRPOTrainer(cfg, run_dir)
+    try:
+        stock_params = {n: p.detach().clone() for n, p in tr1.stack.named_trainable.items()}
+        # Simulate pre-RL weights from `s3_opt_a@300` saved & promoted at step_0000000
+        with torch.no_grad():
+            for p in tr1.stack.named_trainable.values():
+                p.add_(0.5)
+        step0_params = {n: p.detach().clone() for n, p in tr1.stack.named_trainable.items()}
+        monkeypatch.setattr(
+            "qloop.eval.runners.run_benchmark",
+            lambda name, gen, **kw: _fake_bench_summary(name, {"i0": 1.0, "i1": 0.0}),
+        )
+        assert tr1.gate()["gate/decision"] == "promoted"
+
+        # Case 1: VM resume at step_0000000 with missing PROMOTED -> self.ref must equal step0_params (not stock!)
+        (Path(run_dir) / "checkpoints" / "PROMOTED").unlink()
+        tr2 = GRPOTrainer(cfg, run_dir)
+        try:
+            assert tr2.ref is not None
+            # Before _resume(), __init__ seeded self.ref from stock weights
+            first_k = next(iter(stock_params))
+            assert torch.allclose(tr2.ref[first_k], stock_params[first_k], atol=1e-6)
+            assert not torch.allclose(tr2.ref[first_k], step0_params[first_k], atol=1e-3)
+
+            tr2._resume()
+            for n, p0 in step0_params.items():
+                assert torch.allclose(tr2.ref[n], p0, atol=1e-6)
+                assert tr2.ref[n].device == tr2.stack.named_trainable[n].device
+                assert tr2.ref[n].dtype == tr2.stack.named_trainable[n].dtype
+            # Zero KL at exact baseline step
+            probe = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+            with torch.no_grad():
+                torch.testing.assert_close(tr2._logprobs(probe), tr2._ref_logprobs(probe), rtol=1e-6, atol=1e-6)
+        finally:
+            tr2.pool.shutdown(wait=False)
+
+        # Case 2: Resume at step_0000005 while PROMOTED stays at step_0000000 ->
+        # live weights load step 5, while self.ref anchors to PROMOTED step 0!
+        with torch.no_grad():
+            for p in tr1.stack.named_trainable.values():
+                p.add_(0.25)
+        step5_params = {n: p.detach().clone() for n, p in tr1.stack.named_trainable.items()}
+        tr1.step = 5
+        tr1._save_ckpt()
+    finally:
+        tr1.pool.shutdown(wait=False)
+
+    tr3 = GRPOTrainer(cfg, run_dir)
+    try:
+        tr3._resume()
+        assert tr3.step == 5
+        assert tr3.ref is not None
+        for n, p0 in step0_params.items():
+            assert torch.allclose(tr3.stack.named_trainable[n].detach(), step5_params[n], atol=1e-6)
+            assert torch.allclose(tr3.ref[n], p0, atol=1e-6)
+            assert not torch.allclose(tr3.ref[n], step5_params[n], atol=1e-3)
+        st_upd = tr3.update(
+            [
+                _Seq([1, 2, 3, 4, 5, 6], 2, 1.0, "pg"),
+                _Seq([1, 2, 7, 8, 9, 10], 2, -1.0, "pg"),
+            ]
+        )
+        assert st_upd["loss/kl"] >= 0.0 and torch.isfinite(torch.tensor(st_upd["loss/kl"]))
+    finally:
+        tr3.pool.shutdown(wait=False)
+
+
 # ============================================================================ G2: Directional Regret Weighting
 
 

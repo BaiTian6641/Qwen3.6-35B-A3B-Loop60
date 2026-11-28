@@ -1036,11 +1036,18 @@ def test_option_a_stage_configs_hygiene_and_schema() -> None:
     assert s4.stage_type == "rl"
     assert s4.train.init_from == "runs/s3_opt_a_block_attn_calib"
     assert s4.train.gradient_checkpointing is True
-    assert int(s4.train.steps) == 30
+    assert int(s4.train.steps) == 20
     assert int(s4.train.ckpt_every) == 5
+    assert float(s4.train.aux_weights.lsa_kl) == pytest.approx(0.0)
+    assert float(s4.train.aux_weights.loop_aux) == pytest.approx(0.0)
+    assert float(s4.train.optim.lr_mult["gdn2_adapter"]) == pytest.approx(0.1)
+    assert float(s4.train.optim.lr_mult["lsa_indexer"]) == pytest.approx(0.1)
+    assert float(s4.train.optim.lr_mult[r"self_attn\."]) == pytest.approx(0.1)
+    assert float(s4.train.optim.lr_mult[r"mlp\.gate\.weight$"]) == pytest.approx(0.5)
     assert int(s4.rl.micro_batch_seqs) == 1
     assert int(s4.rl.logprob_chunk_size) == 512
     assert int(s4.rl.max_new_tokens) == 2048
+    assert float(s4.rl.kl_coef) == pytest.approx(0.02)
     assert s4.rl.enable_thinking is False
     assert s4.rl.overlong.enabled is True
     assert s4.rl.overlong.accuracy_gated is True
@@ -1049,7 +1056,7 @@ def test_option_a_stage_configs_hygiene_and_schema() -> None:
     assert float(s4.rl.overlong.min_pass_rate) == pytest.approx(0.25)
     assert list(s4.rl.sirsi.slap_target_groups) == ["router", "shared_expert"]
     assert float(s4.rl.sirsi.anti_slop_weight) == pytest.approx(0.05)
-    assert int(s4.rl.gate.every) == 15
+    assert int(s4.rl.gate.every) == 10
     assert int(s4.rl.gate.depth) == 1
     assert [b["name"] for b in s4.rl.gate.benchmarks] == ["aime_2026", "gpqa_diamond"]
 
@@ -1606,4 +1613,77 @@ def test_generator_switches_model_to_eval_for_use_cache_with_grad_checkpointing(
     assert all(t is False for t in mock.seen_training)
     assert all(c is True for c in mock.seen_use_cache)
     assert mock.training is True
+
+
+def test_grpo_zero_aux_weight_skips_lsa_kl_grad_while_logging_metric(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`aux_weights: {lsa_kl: 0.0}` skips adding `lsa_kl` to `loss` (zero grad) while still logging `loss/lsa_kl`."""
+    from qloop.train.optim import build_param_groups
+
+    cfg = _rl_opt_a_toy_cfg(steps=1, fused=False)
+    cfg["train"]["aux_weights"] = {"lsa_kl": 0.0, "loop_aux": 0.0}
+    cfg["train"]["optim"]["lr_mult"] = {
+        "gdn2_adapter": 0.1,
+        "lsa_indexer": 0.1,
+        r"self_attn\.": 0.1,
+        r"mlp\.gate\.weight$": 0.5,
+    }
+    cfg["rl"]["micro_batch_seqs"] = 2
+    cfg["rl"]["ppo_epochs"] = 1
+    tr = GRPOTrainer(cfg, str(tmp_path / "rl_zero_aux"))
+    try:
+        # Verify s4_opt_a_d1_rl conservative lr_mult routing on the Option A trainable parameter set
+        groups = build_param_groups(tr.stack.named_trainable.items(), cfg["train"]["optim"])
+        lr_mult_by_name = {n: g["lr_mult"] for g in groups for n in g["names"]}
+        for n, mult in lr_mult_by_name.items():
+            grp = param_group_of(n)
+            if grp in ("gdn2_adapters", "lsa_indexers", "attention") or "self_attn." in n:
+                assert mult == pytest.approx(0.1), f"expected 0.1 lr_mult for {n} ({grp}), got {mult}"
+            elif grp == "router":
+                assert mult == pytest.approx(0.5), f"expected 0.5 lr_mult for {n} ({grp}), got {mult}"
+            elif grp in ("shared_expert", "norms"):
+                assert mult == pytest.approx(1.0), f"expected 1.0 lr_mult for {n} ({grp}), got {mult}"
+
+        # Pick an `lsa_indexer` parameter (unused by short-seq PG forward) and inject a huge differentiable `lsa_kl`
+        lsa_name, lsa_param = next(
+            (n, p) for n, p in tr.stack.named_trainable.items() if "lsa_indexer." in n
+        )
+        lsa_before = lsa_param.detach().clone()
+
+        def _fake_aux() -> dict[str, torch.Tensor]:
+            return {"lsa_kl": 1e3 * lsa_param.float().pow(2).sum() + 4.5}
+
+        seen_lsa_grads: list[torch.Tensor | None] = []
+        orig_step = tr.opt.step
+
+        def _spy_step() -> dict[str, float]:
+            seen_lsa_grads.append(None if lsa_param.grad is None else lsa_param.grad.detach().clone())
+            return orig_step()
+
+        monkeypatch.setattr(tr.stack, "aux_losses", _fake_aux)
+        monkeypatch.setattr(tr.opt, "step", _spy_step)
+
+        seqs = [
+            _Seq([1, 2, 3, 4, 5, 6], 2, 1.0, "pg"),
+            _Seq([1, 2, 7, 8, 9, 10], 2, -1.0, "pg"),
+        ]
+        st_zero = tr.update(seqs)
+        assert st_zero["loss/lsa_kl"] >= 4.5, "loss/lsa_kl must still be logged when weight is 0.0"
+        assert len(seen_lsa_grads) == 1 and seen_lsa_grads[0] is None, (
+            f"lsa_kl with weight 0.0 must not inject gradients into {lsa_name}"
+        )
+        assert torch.equal(lsa_param.detach(), lsa_before)
+
+        # Positive weight must inject gradient and update `lsa_param`
+        tr.tcfg["aux_weights"] = {"lsa_kl": 1.0, "loop_aux": 0.0}
+        st_pos = tr.update(seqs)
+        assert st_pos["loss/lsa_kl"] >= 4.5
+        assert len(seen_lsa_grads) == 2 and seen_lsa_grads[1] is not None
+        assert float(seen_lsa_grads[1].abs().max()) > 0.0
+        assert not torch.equal(lsa_param.detach(), lsa_before)
+    finally:
+        tr.pool.shutdown(wait=False)
+
 

@@ -38,6 +38,7 @@ from qloop.memory.kv_blob import (
 from qloop.model.toy import ToyConfig, ToyForCausalLM, ToyHybridCache
 from qloop.train.rl import GRPOTrainer, RLTask, _hf_tasks, load_rl_tasks, verify
 from qloop.train.sirsi import SIRSIConfig
+from qloop.train.stack import build_stack
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -258,6 +259,153 @@ def test_merge_linear_states_toy_and_hf524_caches() -> None:
     assert qh_dst.recurrent_states[0] is not None
 
 
+def test_merge_linear_states_tf524_dict_slots_inplace_copy_and_isolation() -> None:
+    """Regression test for real `transformers >= 5.20 / 5.24.1` `LinearAttentionCacheLayerMixin`.
+
+    Real TF 5.24.1 initializes `conv_states`, `recurrent_states`, and `conv_kernel_size` via
+    `dict.fromkeys(range(1))` (`{0: None}` -> `{0: tensor}`) and updates buffers in-place with
+    `self.recurrent_states[0].copy_(...)` / `self.conv_states[0].copy_(...)`.
+    """
+    torch.manual_seed(29)
+
+    class _TF524DictLinearLayer:
+        def __init__(self) -> None:
+            self.conv_states: dict[int, torch.Tensor | None] = dict.fromkeys(range(1))
+            self.recurrent_states: dict[int, torch.Tensor | None] = dict.fromkeys(range(1))
+            self.conv_kernel_size: dict[int, int | None] = dict.fromkeys(range(1))
+            self.is_conv_states_initialized: dict[int, bool] = {0: False}
+            self.is_recurrent_states_initialized: dict[int, bool] = {0: False}
+            self.has_previous_state: dict[int, bool] = {0: False}
+            self.batch_size: int | None = None
+            self.device: torch.device | None = None
+            self.dtype: torch.dtype | None = None
+
+        def update_conv_state(
+            self, conv_states: torch.Tensor, state_idx: int = 0, conv_kernel_size: int | None = None
+        ) -> torch.Tensor:
+            if not self.is_conv_states_initialized[state_idx]:
+                k = conv_states.shape[-1] if conv_kernel_size is None else int(conv_kernel_size)
+                self.conv_kernel_size[state_idx] = k
+                self.conv_states[state_idx] = torch.zeros(
+                    (*conv_states.shape[:-1], k), dtype=conv_states.dtype, device=conv_states.device
+                )
+                self.is_conv_states_initialized[state_idx] = True
+                self.batch_size = int(conv_states.shape[0])
+                self.device = conv_states.device
+                self.dtype = conv_states.dtype
+            if not self.has_previous_state[state_idx]:
+                full_cs = conv_states
+                self.has_previous_state[state_idx] = True
+            else:
+                prev = self.conv_states[state_idx]
+                assert prev is not None
+                full_cs = torch.cat([prev, conv_states], dim=-1)
+            k_size = self.conv_kernel_size[state_idx]
+            assert k_size is not None
+            dst_buf = self.conv_states[state_idx]
+            assert isinstance(dst_buf, torch.Tensor)
+            dst_buf.copy_(full_cs[..., -k_size:])
+            return full_cs
+
+        def update_recurrent_state(self, recurrent_states: torch.Tensor, state_idx: int = 0) -> torch.Tensor:
+            if not self.is_recurrent_states_initialized[state_idx]:
+                self.recurrent_states[state_idx] = torch.zeros_like(recurrent_states)
+                self.is_recurrent_states_initialized[state_idx] = True
+                self.device = recurrent_states.device
+                self.dtype = recurrent_states.dtype
+            dst_buf = self.recurrent_states[state_idx]
+            assert isinstance(dst_buf, torch.Tensor)
+            dst_buf.copy_(recurrent_states)
+            return dst_buf
+
+    class _TF524DictFullLayer:
+        def __init__(self) -> None:
+            self.keys: torch.Tensor | None = None
+            self.values: torch.Tensor | None = None
+
+    class _TF524DictDynamicCache:
+        def __init__(self) -> None:
+            self.layers: list[Any] = [_TF524DictLinearLayer(), _TF524DictFullLayer()]
+
+    def _populate(r_val: torch.Tensor, c_val: torch.Tensor, *, keep_meta_none: bool = False) -> _TF524DictDynamicCache:
+        cache = _TF524DictDynamicCache()
+        lyr = cache.layers[0]
+        if keep_meta_none:
+            lyr.conv_states[0] = c_val.clone()
+            lyr.recurrent_states[0] = r_val.clone()
+        else:
+            lyr.update_conv_state(c_val, conv_kernel_size=int(c_val.shape[-1]))
+            lyr.update_recurrent_state(r_val)
+        return cache
+
+    r_sink = torch.full((1, 2, 4, 4), 10.0, dtype=torch.float32)
+    r_s0 = torch.full((1, 2, 4, 4), 20.0, dtype=torch.float32)
+    r_s1 = torch.full((1, 2, 4, 4), 30.0, dtype=torch.float32)
+    c_sink = torch.full((1, 4, 3), 1.0, dtype=torch.float32)
+    c_s0 = torch.full((1, 4, 3), 2.0, dtype=torch.float32)
+    c_s1 = torch.full((1, 4, 3), 3.0, dtype=torch.float32)
+
+    sink_cache = _populate(r_sink, c_sink)
+    s0_cache = _populate(r_s0, c_s0)
+    # Deliberately keep conv_kernel_size={0: None}, device=None, dtype=None on s1 to verify metadata backfill
+    s1_cache = _populate(r_s1, c_s1, keep_meta_none=True)
+    dst_cache = _TF524DictDynamicCache()
+
+    decay = 0.7
+    gdn2_bytes = _merge_linear_states_into(sink_cache, [s0_cache, s1_cache], dst_cache, decay=decay, quant="fp32")
+    assert gdn2_bytes == r_s1.numel() * 4
+
+    dst_lin = dst_cache.layers[0]
+    assert isinstance(dst_lin.recurrent_states, dict)
+    assert isinstance(dst_lin.conv_states, dict)
+    merged_r = dst_lin.recurrent_states[0]
+    merged_c = dst_lin.conv_states[0]
+    assert isinstance(merged_r, torch.Tensor) and isinstance(merged_c, torch.Tensor)
+
+    # Exact decay-weighted sum: 0.7^2 * 10 + 0.7^1 * 20 + 0.7^0 * 30 = 4.9 + 14.0 + 30.0 = 48.9
+    expected_r = (decay**2) * r_sink + decay * r_s0 + r_s1
+    torch.testing.assert_close(merged_r, expected_r, rtol=1e-5, atol=1e-5)
+    assert torch.equal(merged_c, c_s1)
+    assert dst_lin.conv_kernel_size == {0: 3}
+    assert dst_lin.is_conv_states_initialized == {0: True}
+    assert dst_lin.is_recurrent_states_initialized == {0: True}
+    assert dst_lin.has_previous_state == {0: True}
+    assert dst_lin.batch_size == 1
+    assert dst_lin.device == r_s1.device
+    assert dst_lin.dtype == r_s1.dtype
+
+    # Subsequent in-place `.copy_()` updates on dst_cache MUST succeed and NEVER mutate source caches
+    next_conv = torch.full((1, 4, 2), 9.0, dtype=torch.float32)
+    full_cs = dst_lin.update_conv_state(next_conv)
+    assert full_cs.shape == (1, 4, 5)
+    assert torch.equal(full_cs[..., :3], c_s1) and torch.equal(full_cs[..., 3:], next_conv)
+
+    next_rec = torch.full((1, 2, 4, 4), 99.0, dtype=torch.float32)
+    updated_r = dst_lin.update_recurrent_state(next_rec)
+    assert torch.equal(updated_r, next_rec)
+
+    # Source caches remain 100% unmutated
+    assert torch.equal(sink_cache.layers[0].recurrent_states[0], r_sink)
+    assert torch.equal(s0_cache.layers[0].recurrent_states[0], r_s0)
+    assert torch.equal(s1_cache.layers[0].recurrent_states[0], r_s1)
+    assert torch.equal(sink_cache.layers[0].conv_states[0], c_sink)
+    assert torch.equal(s0_cache.layers[0].conv_states[0], c_s0)
+    assert torch.equal(s1_cache.layers[0].conv_states[0], c_s1)
+
+    # Verify fresh dst_cache without prior sink metadata also backfills conv_kernel_size={0: None}, device, dtype
+    dst_no_sink = _TF524DictDynamicCache()
+    b_no_sink = _merge_linear_states_into(None, [s1_cache], dst_no_sink, decay=0.7, quant="bf16")
+    assert b_no_sink == gdn2_state_bytes({0: r_s1}, mode="bf16")
+    d_ns = dst_no_sink.layers[0]
+    assert d_ns.conv_kernel_size == {0: 3}
+    assert d_ns.device == r_s1.device
+    assert d_ns.dtype == r_s1.dtype
+    assert d_ns.batch_size == 1
+    assert d_ns.has_previous_state == {0: True}
+    d_ns.update_recurrent_state(torch.full_like(r_s1, 77.0))
+    assert torch.equal(s1_cache.layers[0].recurrent_states[0], r_s1)
+
+
 # ==============================================================================
 # 3. End-to-End HFCheckpointK0Evaluator + run_k0_suite + Markdown + CLI Flags
 # ==============================================================================
@@ -350,6 +498,61 @@ def test_k0_arm_e_end_to_end_and_backward_compat() -> None:
         K0Config(gdn2_state_decay=1.5)
     with pytest.raises(ValueError, match="gdn2_state_quant"):
         K0Config(gdn2_state_quant="fp8")
+
+    # End-to-end check on a live `build_stack(...)` Option-A-style stack (gdn2 + lsa, loop disabled)
+    stack_cfg = {
+        "seed": 0,
+        "model": {
+            "name": "toy",
+            "dtype": "float32",
+            "device_map": "cpu",
+            "toy": {
+                "seed": 0,
+                "vocab_size": 260,
+                "hidden_size": 32,
+                "num_hidden_layers": 8,
+                "full_attention_interval": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 128,
+                "partial_rotary_factor": 0.5,
+            },
+        },
+        "loop": {"enabled": False},
+        "gdn2": {"enabled": True, "rank": 4, "chunk_size": 8, "qed_enabled": False, "neg_eigval_max_boost": 0.0},
+        "lsa": {
+            "enabled": True,
+            "mode": "sparse",
+            "num_query_passes": 1,
+            "index_dim": 8,
+            "pool": 2,
+            "avg_bucket_keys": 4,
+            "max_bucket_keys": 8,
+            "block_size": 16,
+            "window": 16,
+            "sinks": 2,
+        },
+        "train": {"trainable": [r"mlp\.gate\.weight$"]},
+    }
+    st = build_stack(stack_cfg)
+    st.model.eval()
+    st_eval = HFCheckpointK0Evaluator(st.model, st.tokenizer, device=st.device, live_sink_len=2)
+    st_rep = run_k0_suite(
+        examples,
+        st_eval,
+        K0Config(
+            rotary_dim=64,
+            rope_theta=10_000.0,
+            sink_tokens=2,
+            refresh_frac=0.10,
+            eval_gdn2_state_merge=True,
+            gdn2_state_decay=0.7,
+            gdn2_state_quant="bf16",
+        ),
+    )
+    assert set(st_rep.arms) == {*CANONICAL_ARMS, "arm_e"}
+    assert math.isfinite(st_rep.arms["arm_e"].answer_nll)
+    assert st_rep.arms["arm_e"].kv_bytes_mounted > st_rep.arms["arm_c"].kv_bytes_mounted
 
 
 # ==============================================================================

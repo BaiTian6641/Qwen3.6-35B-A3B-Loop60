@@ -2251,12 +2251,14 @@ _LINEAR_LAYER_STATE_ATTRS: tuple[str, ...] = (
     "is_recurrent_states_initialized",
     "conv_kernel_size",
     "batch_size",
+    "device",
+    "dtype",
 )
 
 
 def _clone_state_value(val: Any, _memo: dict[int, Any] | None = None) -> Any:
     """Recursively clone cached linear-attention state tensors with cycle protection."""
-    if val is None or isinstance(val, (bool, int, float, str)):
+    if val is None or isinstance(val, (bool, int, float, str, torch.device, torch.dtype)):
         return val
     if isinstance(val, torch.Tensor):
         return val.clone()
@@ -2353,9 +2355,16 @@ def _clone_linear_states_into(src_cache: Any, dst_cache: Any) -> None:
 
 
 def _unwrap_state_tensor(val: Any) -> torch.Tensor | None:
-    """Extract a `torch.Tensor` from either a direct tensor attribute or a single-slot list/tuple."""
+    """Extract a `torch.Tensor` from a tensor, single-slot list/tuple, or TF 5.24 `dict[int, Tensor | None]`."""
     if isinstance(val, torch.Tensor):
         return val
+    if isinstance(val, Mapping):
+        if 0 in val and isinstance(val[0], torch.Tensor):
+            return val[0]
+        for item in val.values():
+            if isinstance(item, torch.Tensor):
+                return item
+        return None
     if isinstance(val, (list, tuple)):
         for item in val:
             if isinstance(item, torch.Tensor):
@@ -2448,7 +2457,9 @@ def _set_linear_state_slot(
             if not hasattr(d_layer, attr):
                 continue
             cur = getattr(d_layer, attr, None)
-            if isinstance(cur, list):
+            if isinstance(cur, dict):
+                cur[0] = val.clone()
+            elif isinstance(cur, list):
                 if not cur:
                     cur.append(val.clone())
                 else:
@@ -2464,9 +2475,24 @@ def _set_linear_state_slot(
             prev_map = getattr(d_layer, "has_previous_state", None)
             if isinstance(prev_map, dict):
                 prev_map[0] = True
+            elif isinstance(prev_map, bool):
+                try:
+                    d_layer.has_previous_state = True
+                except (AttributeError, TypeError):
+                    pass
+            if hasattr(d_layer, "device") and getattr(d_layer, "device", None) is None:
+                try:
+                    d_layer.device = val.device
+                except (AttributeError, TypeError):
+                    pass
+            if hasattr(d_layer, "dtype") and getattr(d_layer, "dtype", None) is None:
+                try:
+                    d_layer.dtype = val.dtype
+                except (AttributeError, TypeError):
+                    pass
             if attr in ("conv_states", "conv_state"):
                 ck_map = getattr(d_layer, "conv_kernel_size", None)
-                if isinstance(ck_map, dict) and 0 not in ck_map and val.ndim >= 1:
+                if isinstance(ck_map, dict) and ck_map.get(0) is None and val.ndim >= 1:
                     ck_map[0] = int(val.shape[-1])
                 if hasattr(d_layer, "batch_size") and getattr(d_layer, "batch_size", None) is None and val.ndim >= 1:
                     try:
